@@ -1,0 +1,4 @@
+interface:
+  display_name: "主脑与苦力 Agent"
+  short_description: "按当前阶段委派执行、等待真实汇报、依据证据验收后推进任务"
+  default_prompt: "使用 $brain-worker 确认当前项目和授权边界，为执行 Agent 准备当前阶段任务，并在收到真实汇报后验收。"

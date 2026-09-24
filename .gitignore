@@ -1,0 +1,26 @@
+# Python and test caches
+__pycache__/
+*.py[cod]
+.pytest_cache/
+.mypy_cache/
+.ruff_cache/
+
+# Local configuration and credentials
+.env
+.env.*
+*.pem
+*.key
+*.token
+credentials.json
+secrets.json
+
+# Local runtime data
+*.sqlite3
+*.db
+logs/
+tmp/
+backups/
+
+# Agent handoff and validation material should stay outside this Skill repo
+handoffs/
+validation/
