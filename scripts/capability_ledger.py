@@ -80,9 +80,11 @@ def records(table, bearer):
             raise RuntimeError("飞书分页游标缺失")
 
 
-def canonical(agent, model):
+def canonical(agent, model, allow_pending=False):
     agent = agent.strip()
     model = model.strip()
+    if allow_pending and (not model or "未确认" in model or "未知" in model):
+        model = "待确认模型"
     if agent.startswith("ZCode"):
         agent = "ZCode"
     elif agent.startswith("Xiaomi MiMo"):
@@ -95,7 +97,7 @@ def canonical(agent, model):
         model = "火山 kimi-k2.8-preview"
     elif "MiMo V2.6 Pro" in model:
         model = "MiMo V2.6 Pro"
-    if not agent or not model or "未确认" in model or "未知" in model:
+    if not agent or not model or "未确认" in model or "未知" in model or (model == "待确认模型" and not allow_pending):
         raise RuntimeError("Agent 或模型身份不明确，不能合并评分")
     return agent, model, f"{agent} / {model}"
 
@@ -243,10 +245,19 @@ def main(argv=None):
     record.add_argument("--evidence", required=True)
     record.add_argument("--issue", default="")
     record.add_argument("--identity-confirmed", action="store_true")
+    resolve = sub.add_parser("resolve", help="Attribute one pending stage to a subsequently confirmed model")
+    resolve.add_argument("--pending-event-id", required=True)
+    resolve.add_argument("--agent", required=True)
+    resolve.add_argument("--model", required=True)
+    resolve.add_argument("--identity-evidence", required=True)
+    resolve.add_argument("--identity-confirmed", action="store_true")
     args = parser.parse_args(argv)
-    agent, model, key = canonical(args.agent, args.model)
-    if args.command == "record" and args.outcome != "证据不足" and not args.identity_confirmed:
-        raise RuntimeError("未确认实际执行模型，不能计分")
+    if args.command == "resolve" and not args.identity_confirmed:
+        raise RuntimeError("补评必须确认实际执行模型")
+    if args.command == "resolve" and not args.identity_evidence.strip():
+        raise RuntimeError("补评缺少模型身份依据")
+    pending = args.command == "record" and args.outcome != "证据不足" and not args.identity_confirmed
+    agent, model, key = canonical(args.agent, args.model, allow_pending=pending)
     if args.command == "record":
         try:
             datetime.fromisoformat(args.evaluated_at)
@@ -258,47 +269,93 @@ def main(argv=None):
         bearer = token()
         all_events = records(EVENTS, bearer)
         legacy_note = check_legacy_drift(all_events)
-        before = state(all_events, key)
         if args.command == "status":
+            before = state(all_events, key)
             print(json.dumps({**before, "能力等级": level(before["共享评分"], before["累计样本数"], before["最近三次结论"]), "读取时间": datetime.now(TZ).isoformat(timespec="seconds"), "旧台账提示": legacy_note}, ensure_ascii=False))
             return
-        event_id = args.event_id.strip()
+        if args.command == "resolve":
+            pending_id = args.pending_event_id.strip()
+            source = [r["fields"] for r in all_events if r["fields"].get("事件ID") == pending_id]
+            if len(source) != 1 or source[0].get("事件类型") != "identity_pending":
+                raise RuntimeError("未找到唯一的待确认阶段；旧版证据不足事件不能自动补评")
+            source = source[0]
+            if source.get("桌面应用") != agent or source.get("主脑结论") not in OUTCOMES or source.get("主脑结论") == "证据不足":
+                raise RuntimeError("待确认阶段的应用或评价不匹配")
+            resolved_id = "resolve:" + pending_id
+            existing = [r["fields"] for r in all_events if r["fields"].get("事件ID") == resolved_id]
+            if len(existing) > 1:
+                raise RuntimeError("补评事件 ID 重复；停止更新")
+            if existing:
+                if existing[0].get("事件类型") != "assessment" or existing[0].get("模型键") != key or existing[0].get("主脑结论") != source["主脑结论"]:
+                    raise RuntimeError("该阶段已归属其他模型或结论；停止重复计分")
+                current = state(all_events, key)
+                summary_upsert(bearer, agent, model, current, source.get("问题与限制", ""))
+                print(json.dumps({"idempotent": True, "resolvedFrom": pending_id, **current, "旧台账提示": legacy_note}, ensure_ascii=False))
+                return
+            event_id = resolved_id
+            task, stage, outcome = source["任务类型"], source["阶段编号"], source["主脑结论"]
+            evaluated_at = source["评估时间"]
+            evidence = source.get("证据", "") + "；模型身份补证：" + args.identity_evidence
+            issue = source.get("问题与限制", "")
+        else:
+            event_id = args.event_id.strip()
+            task, stage, outcome = args.task, args.stage, args.outcome
+            evaluated_at, evidence, issue = args.evaluated_at, args.evidence, args.issue
         matches = [r for r in all_events if r["fields"].get("事件ID") == event_id]
         if len(matches) > 1:
             raise RuntimeError("事件 ID 重复；停止更新")
         if matches:
             old = matches[0]["fields"]
-            expected = (key, args.task, args.stage, args.outcome, args.evaluated_at)
+            expected = (key, task, stage, outcome, evaluated_at)
             actual = tuple(old.get(k) for k in ("模型键", "任务类型", "阶段编号", "主脑结论", "评估时间"))
-            if actual != expected:
+            expected_type = "identity_pending" if pending else "assessment"
+            if actual != expected or old.get("事件类型") != expected_type:
                 raise RuntimeError("事件 ID 已用于不同内容；停止更新")
-            summary_upsert(bearer, agent, model, before, args.issue)
-            print(json.dumps({"idempotent": True, **before, "旧台账提示": legacy_note}, ensure_ascii=False))
+            if pending:
+                print(json.dumps({"idempotent": True, "pendingIdentity": True, "eventId": event_id, "拟评分变化": OUTCOMES[outcome][0]}, ensure_ascii=False))
+            else:
+                before = state(all_events, key)
+                summary_upsert(bearer, agent, model, before, issue)
+                print(json.dumps({"idempotent": True, **before, "旧台账提示": legacy_note}, ensure_ascii=False))
             return
+        if pending:
+            event = {"事件ID": event_id, "模型键": key, "桌面应用": agent, "模型/版本": model,
+                     "任务类型": task, "阶段编号": stage, "评估时间": evaluated_at,
+                     "记录时间": datetime.now(TZ).isoformat(timespec="microseconds"), "主脑结论": outcome,
+                     "证据": evidence, "事件类型": "identity_pending", "评分变化": OUTCOMES[outcome][0]}
+            if issue:
+                event["问题与限制"] = issue
+            request("POST", f"{BASE}/{EVENTS}/records", bearer, {"fields": event})
+            reread = [r["fields"] for r in records(EVENTS, bearer) if r["fields"].get("事件ID") == event_id]
+            if len(reread) != 1 or reread[0].get("事件类型") != "identity_pending":
+                raise RuntimeError("待确认阶段写入后回读失败")
+            print(json.dumps({"idempotent": False, "pendingIdentity": True, "eventId": event_id, "拟评分变化": OUTCOMES[outcome][0]}, ensure_ascii=False))
+            return
+        before = state(all_events, key)
         if not any(r["fields"].get("事件类型") == "baseline" for r in model_events(all_events, key)[0]):
             baseline = {"事件ID": "baseline:" + key, "模型键": key, "桌面应用": agent, "模型/版本": model,
-                        "任务类型": "新模型基线", "阶段编号": "initial", "评估时间": args.evaluated_at,
+                        "任务类型": "新模型基线", "阶段编号": "initial", "评估时间": evaluated_at,
                         "记录时间": datetime.now(TZ).isoformat(timespec="microseconds"), "主脑结论": "新模型初始状态",
                         "事件类型": "baseline", "评分后": 50, "步长后": 1, "样本数后": 0}
             request("POST", f"{BASE}/{EVENTS}/records", bearer, {"fields": baseline})
             all_events = records(EVENTS, bearer)
             before = state(all_events, key)
-        after_score, after_step, after_samples, delta = transition(before["共享评分"], before["当前步长"], before["累计样本数"], args.outcome)
+        after_score, after_step, after_samples, delta = transition(before["共享评分"], before["当前步长"], before["累计样本数"], outcome)
         event = {"事件ID": event_id, "模型键": key, "桌面应用": agent, "模型/版本": model,
-                 "任务类型": args.task, "阶段编号": args.stage, "评估时间": args.evaluated_at,
-                 "记录时间": datetime.now(TZ).isoformat(timespec="microseconds"), "主脑结论": args.outcome,
-                 "证据": args.evidence, "事件类型": "assessment", "评分变化": delta,
+                 "任务类型": task, "阶段编号": stage, "评估时间": evaluated_at,
+                 "记录时间": datetime.now(TZ).isoformat(timespec="microseconds"), "主脑结论": outcome,
+                 "证据": evidence, "事件类型": "assessment", "评分变化": delta,
                  "评分后": after_score, "步长后": after_step, "样本数后": after_samples}
-        if args.issue:
-            event["问题与限制"] = args.issue
+        if issue:
+            event["问题与限制"] = issue
         request("POST", f"{BASE}/{EVENTS}/records", bearer, {"fields": {k: v for k, v in event.items() if v is not None}})
         reread = records(EVENTS, bearer)
         matching = [r for r in reread if r["fields"].get("事件ID") == event_id]
         if len(matching) != 1:
             raise RuntimeError("事件写入后回读不唯一；停止更新")
         after = state(reread, key)
-        summary_upsert(bearer, agent, model, after, args.issue)
-        print(json.dumps({"idempotent": False, **after, "旧台账提示": legacy_note}, ensure_ascii=False))
+        summary_upsert(bearer, agent, model, after, issue)
+        print(json.dumps({"idempotent": False, "resolvedFrom": pending_id if args.command == "resolve" else None, **after, "旧台账提示": legacy_note}, ensure_ascii=False))
 
 
 if __name__ == "__main__":
