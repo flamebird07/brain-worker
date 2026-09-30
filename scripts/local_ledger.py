@@ -6,10 +6,13 @@
 scripts/capability_ledger.py（飞书后端）保持一致：
   - 每个已验收阶段一条事件；同一 event-id 重复提交内容一致则幂等返回，不重复计分。
   - 未确认模型身份的评价先记 identity_pending，不计分；后续 resolve 归因为 assessment。
-  - 状态 = 初始值（评分 50 / 步长 1 / 样本数 0）按记录时间依次应用所有 assessment 事件。
+  - 状态 = 初始值（评分 50 / 步长 1 / 样本数 0）按文件追加顺序依次应用所有
+    assessment 事件；时间字段（evaluated_at/recorded_at）只作记录，不参与排序，
+    避免同秒或跨时区时间戳字符串改变重放顺序。
 
 存储路径：环境变量 BRAIN_WORKER_LEDGER，否则 ~/.brain-worker/ledger.jsonl。
-写操作用文件锁串行化（POSIX 用 fcntl.flock，Windows 用 msvcrt.locking）。
+写操作用文件锁串行化（POSIX 用 fcntl.flock，Windows 用 msvcrt.locking）；
+等待超过 30 秒视为获取锁失败；无可用锁原语的平台直接报错，不静默无锁继续。
 """
 
 import argparse
@@ -65,7 +68,12 @@ class FileLock(object):
         if parent and not os.path.isdir(parent):
             os.makedirs(parent, exist_ok=True)
         self._fh = io.open(self.path, "a+b")
-        self._acquire()
+        try:
+            self._acquire()
+        except Exception:
+            self._fh.close()
+            self._fh = None
+            raise
         return self
 
     def __exit__(self, exc_type, exc, tb):
@@ -84,7 +92,7 @@ class FileLock(object):
             while True:
                 try:
                     self._fh.seek(0)
-                    msvcrt.locking(self._fh.fileno(), msvcrt.LK_LOCK, 1)
+                    msvcrt.locking(self._fh.fileno(), msvcrt.LK_NBLCK, 1)
                     return
                 except OSError as exc:
                     if time.time() >= deadline:
@@ -93,16 +101,25 @@ class FileLock(object):
         try:
             import fcntl
         except ImportError:
-            return  # 无可用锁原语的平台：单进程仍安全
-        self._fh.seek(0)
-        fcntl.flock(self._fh.fileno(), fcntl.LOCK_EX)
+            raise LedgerError(
+                "当前平台无可用文件锁原语（fcntl），拒绝在无互斥的情况下读写台账：%s" % self.path
+            )
+        deadline = time.time() + 30.0
+        while True:
+            try:
+                fcntl.flock(self._fh.fileno(), fcntl.LOCK_EX | fcntl.LOCK_NB)
+                return
+            except OSError:
+                if time.time() >= deadline:
+                    raise LedgerError("获取台账锁超时：%s" % self.path)
+                time.sleep(0.1)
 
     def _release(self):
         if os.name == "nt":  # pragma: no cover - Windows 分支
             import msvcrt
 
             self._fh.seek(0)
-            msvcrt.locking(self._fh.fileno(), msvcrt.LK_UNLCK)
+            msvcrt.locking(self._fh.fileno(), msvcrt.LK_UNLCK, 1)
             return
         try:
             import fcntl
@@ -186,7 +203,12 @@ def parse_time(value, field):
 
 
 def sort_key(event):
-    return (event.get("recorded_at") or "", event.get("evaluated_at") or "", event.get("_seq", 0))
+    """追加式 JSONL 的唯一重放顺序是文件追加顺序（行号 _seq）。
+
+    时间字段不参与排序：recorded_at 秒级精度存在同秒并列，ISO 字符串在
+    不同时区偏移下字典序也不等于时间先后；按时间排序会改写追加顺序。
+    """
+    return (event.get("_seq", 0),)
 
 
 def assessments_for(events, key):
