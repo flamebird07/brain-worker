@@ -25,3 +25,7 @@ backups/
 handoffs/
 validation/
 config.yaml
+
+# Ledger runtime data (default local-backend location is outside repo; guard anyway)
+*.jsonl
+*.jsonl.lock

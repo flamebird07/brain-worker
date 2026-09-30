@@ -4,6 +4,8 @@
 brain: muse  # 可选：muse | codex-cli
 # 执行方式：2 选 1
 execution: api-direct  # 可选：human-relay | api-direct
+# 台账后端：2 选 1（公共版本默认 local，开箱即用；feishu 为可选，需自建应用与表格）
+ledger: local  # 可选：local | feishu
 # api-direct 下 worker 下发配置（示例为 Qoder Cloud Agents，用户按自己环境改）
 worker:
   api_direct:
