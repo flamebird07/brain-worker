@@ -28,8 +28,11 @@ jobs:
         with:
           python-version: "3.11"
 
-      # 纯 local 隔离检查：不依赖任何第三方模块（PyYAML 仅为飞书 YAML 配置
-      # 测试所需，不是默认后端依赖）。先确保 PyYAML 不可导入再跑 local 侧两套。
+      # 纯 local 隔离检查：默认后端 local_ledger.py + 共享核心 ledger_core.py
+      # 仅以标准库即可导入并通过（test_local_ledger 经真实 CLI 子进程覆盖）；
+      # PyYAML 仅为飞书 YAML 配置测试所需，不是默认后端依赖。
+      # 注：test_ledger_core 的飞书 CLI 入口用例预期"缺少必需飞书配置"，
+      # 其设计前提为 PyYAML 已安装，故归入下方四套全量步骤，不进本隔离检查。
       - name: Pure-local isolation check (stdlib only, no PyYAML)
         shell: bash
         run: |
@@ -43,7 +46,8 @@ jobs:
           else:
               raise SystemExit("PyYAML unexpectedly importable; isolation check invalid")
           EOF
-          python -m unittest scripts.test_ledger_core scripts.test_local_ledger -v 2>&1 | tee 01-pure-local-stdlib-check.txt
+          python -c "import scripts.ledger_core, scripts.local_ledger; print('stdlib-only import OK: ledger_core, local_ledger')"
+          python -m unittest scripts.test_local_ledger -v 2>&1 | tee 01-pure-local-stdlib-check.txt
 
       # PyYAML 仅用于飞书 YAML 配置测试；纯 local 后端不依赖它。
       - name: Install PyYAML (config tests only)
