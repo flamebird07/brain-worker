@@ -2,25 +2,30 @@
 
 `brain-worker` 是一个 Codex Skill，用来固化“主脑 + 苦力 Agent”的分阶段协作方式。
 
-主脑负责理解需求、确认项目路径和授权边界、拆分当前阶段、审查风险、验收证据并决定下一步。大量代码阅读、批量修改、测试、迁移、审计和其他耗时执行工作交给由用户转发提示词的外部桌面 Agent。本流程不调用 Codex 子 Agent。
+主脑负责理解需求、确认项目路径和授权边界、拆分当前阶段、审查风险、验收证据并决定下一步。大量代码阅读、批量修改、测试、迁移、审计和其他耗时执行工作交给执行 Agent——`human-relay` 下由用户转发提示词给外部桌面 Agent，`api-direct` 下由主脑经用户配置的受控工具下发任务。本流程不调用 Codex 子 Agent。
 
 ## 快速上手
+
+两个使用场景，共用同一套核心规则：
+
+- **GPT 桌面（Windows，原有用法）**：零配置——GPT 做主脑，按 `human-relay` 生成完整可复制的阶段提示词，用户转发外部桌面 Agent，再上传原始报告供主脑验收。不需要创建 `config.yaml`，不需要任何 API。
+- **Linux**：主脑运行环境 2 选 1（`muse` / `codex-cli`，仅此时需要配置）。`muse` 是用户指定的 Linux 主脑运行环境名称，本仓库不假定其厂商、安装命令或接口。
 
 ```bash
 git clone https://github.com/flamebird07/brain-worker.git
 cd brain-worker
-cp config.yaml.example config.yaml   # 按需修改脑 / 执行方式 / 台账后端
+cp config.yaml.example config.yaml   # 仅 Linux 场景选择主脑、或需调整执行方式/台账时；缺省一律按 human-relay + local
 ```
 
-- 脑 2 选 1：`muse` / `codex-cli`；执行方式 2 选 1：`human-relay`（主脑生成提示词，用户转发给外部桌面 Agent）/ `api-direct`（主脑经受控 API 下发）。
+- 执行方式 2 选 1：`human-relay`（默认，零 API 配置：主脑生成提示词，用户转发给外部桌面 Agent）/ `api-direct`（主脑经用户显式配置的受控工具下发；未配置时不得启用，缺配置回退 human-relay；仓库不含自动消费配置的调度器，不承诺已实现的自动调用链）。
 - 台账后端 2 选 1：`local`（默认，本地 JSONL，纯标准库零配置，开箱即用）/ `feishu`（可选，需自建飞书应用与表格，见 SKILL.md“飞书后端接入（可选）”）。
-- Codex CLI 当脑时，用 `codex exec` 加载本 skill，按 `config.yaml` 的 dispatch 命令下发任务；不得调用 Codex 子 Agent 冒充执行。
+- Codex CLI 当主脑时，用 `codex exec` 加载本 skill，按 `config.yaml` 的 dispatch 命令下发任务；不得调用 Codex 子 Agent 冒充执行。
 
 ## 核心规则
 
 - 每次只定义当前阶段，不预设后续阶段一定成功。
 - 整体目标验收完成时，主脑明确告知客户业务结果；随后回读确认项目笔记和对应 GitHub 仓库已更新，未完成的同步事项单独说明。
-- 外部 Agent 只能通过可复制的阶段提示词接收任务；即使 Codex 子 Agent 工具可用也不调用，主脑不会声称已经直接调用外部 Agent。
+- 外部 Agent 通过完整的阶段提示词接收任务：`human-relay` 下提示词由用户转发，`api-direct` 下由主脑经用户配置的受控工具真实下发。两种方式都不得假称未实际发生的调用，也不把“任务已下发/已接单”当作完成；即使 Codex 子 Agent 工具可用也不调用它承担本流程执行。
 - 发出提示词、工具接单或进度消息都不等于完成。必须等待实际汇报，再由主脑验收。
 - 用户在等待期间补充信息属于常态，不会自动触发下一段提示词；只有用户明确要求立即转告当前 Agent，或明确说明 Agent 异常时，才处理对应交接或止损。
 - 苦力 Agent 可以在阶段之间更换。新 Agent 的提示词必须包含交接基线、已验证证据、未验证主张、未完成项和需要重新核对的内容。
@@ -42,22 +47,39 @@ brain-worker/
 ├── config.yaml.example           # 用户配置示例（复制为 config.yaml，gitignore）
 ├── agents/openai.yaml            # Codex 界面显示信息和默认入口提示
 └── scripts/
+    ├── ledger_core.py            # 台账共享核心（评分/等级/归一/幂等指纹，纯逻辑）
     ├── local_ledger.py           # 本地能力台账（默认后端，纯标准库）
     ├── capability_ledger.py      # 飞书能力台账（可选后端）
-    └── test_capability_ledger.py # 飞书脚本的离线测试
+    ├── test_ledger_core.py       # 共享核心与双后端一致性离线测试
+    ├── test_local_ledger.py      # 本地台账离线测试（真实子进程与文件锁）
+    ├── test_capability_config.py # 飞书配置解析离线测试（虚构标识与网络桩）
+    └── test_capability_ledger.py # 飞书评分逻辑离线测试
 ```
 
 Skill 的阶段协作规则可用于不同项目；本地台账脚本纯标准库、零配置，飞书后端需要自建应用与表格权限（见 SKILL.md“飞书后端接入（可选）”）。
 
 ## 验证
 
-使用 Codex 内置的 skill-creator 验证器检查结构和 frontmatter：
+三层验证，性质不同，不能互相替代：
 
-```text
-python <skill-creator>/scripts/quick_validate.py brain-worker
-```
+1. **结构检查**（Skill 结构/frontmatter）：使用 Codex 内置的 skill-creator 验证器：
 
-验证通过只说明 Skill 结构有效；它不代替具体业务项目的代码测试、部署回读或真实业务验收。
+   ```text
+   python <skill-creator>/scripts/quick_validate.py brain-worker
+   ```
+
+2. **脚本离线测试**（从仓库根以 `python -m` 运行；全部离线，不请求真实飞书、不写真实台账）：
+
+   ```text
+   python -m scripts.test_ledger_core         # 共享核心与双后端一致性（评分/归一/幂等指纹）
+   python -m scripts.test_local_ledger        # 本地台账：真实子进程与文件锁（Windows/Linux）
+   python -m scripts.test_capability_config   # 飞书配置解析：入口/优先级/缺配置零网络（虚构标识与网络桩）
+   python -m scripts.test_capability_ledger   # 飞书评分逻辑：pending/resolve/幂等
+   ```
+
+3. **真实调用验证**（需用户自行配置资源后进行，本仓库不包含也不承诺自动化端到端验证）：飞书后端联调（自建应用与表格）、api-direct 受控工具端到端等，均作为独立验收点。
+
+结构检查通过只说明 Skill 结构有效；离线测试通过不等于真实调用成功（配置测试用虚构标识与网络桩，仅证明请求目标构造与失败路径正确）；三者都不代替具体业务项目的代码测试、部署回读或真实业务验收。
 
 阶段提示词采用可整块复制的文本模板，Agent 的报告保存在原始文件中。汇报必须把事实、推断、测试退出码、未完成项、越界检查和阶段状态分开填写；没有内容写“无”或“未运行（原因）”，不能用自由叙述代替关键证据。若粘贴工具压平或截断报告，主脑以用户上传的原始文件为准，不要求 Agent 为格式传递问题重跑业务测试。
 
@@ -67,4 +89,4 @@ python <skill-creator>/scripts/quick_validate.py brain-worker
 
 ## 使用范围
 
-适合大量阅读、批量变更、长时间测试、迁移、审计，或用户明确要求主脑与苦力 Agent 分工的任务。简单单步任务不需要启用本 Skill。Skill 本身不安装、不连接业务项目，也不授予生产或外部写入权限。脑 2 选 1（muse / codex-cli），执行方式 2 选 1（human-relay / api-direct），用户在 config.yaml 中自行配置，示例见 config.yaml.example。
+适合大量阅读、批量变更、长时间测试、迁移、审计，或用户明确要求主脑与苦力 Agent 分工的任务。简单单步任务不需要启用本 Skill。Skill 本身不安装、不连接业务项目，也不授予生产或外部写入权限。GPT 桌面场景零配置直接用；Linux 场景主脑运行环境 2 选 1（muse / codex-cli）、执行方式 2 选 1（human-relay / api-direct），在 config.yaml 中自行配置，示例见 config.yaml.example。

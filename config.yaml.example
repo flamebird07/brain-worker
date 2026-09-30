@@ -1,14 +1,27 @@
 # brain-worker 用户配置示例：复制为 config.yaml 后按需修改。
 # config.yaml 已加入 .gitignore，只存本地，不进仓库。
-# 脑：2 选 1
+#
+# 使用场景：
+# - GPT 桌面（Windows）原有人工转发用法不需要本文件：GPT 做主脑，直接按
+#   human-relay 生成提示词，由用户转发外部桌面 Agent 并上传原始报告。
+# - Linux 场景才需要选择主脑运行环境；muse 是用户指定的 Linux 主脑运行环境
+#   名称，本仓库不假定其厂商、安装命令或接口。
+# - 未创建 config.yaml 时，任何平台都按 human-relay + local 台账执行。
+#
+# 主脑运行环境（仅 Linux 场景需要）：2 选 1
 brain: muse  # 可选：muse | codex-cli
-# 执行方式：2 选 1
-execution: api-direct  # 可选：human-relay | api-direct
-# 台账后端：2 选 1（公共版本默认 local，开箱即用；feishu 为可选，需自建应用与表格）
+# 执行方式：2 选 1；默认 human-relay（零 API 配置，人工转发）
+execution: human-relay  # 可选：human-relay | api-direct；api-direct 必须由用户显式选择并提供实际受控工具
+# 台账后端：2 选 1（默认 local，开箱即用；feishu 需自行配置，见 SKILL.md“飞书后端接入（可选）”）
 ledger: local  # 可选：local | feishu
-# api-direct 下 worker 下发配置（示例为 Qoder Cloud Agents，用户按自己环境改）
+# api-direct 下发配置：仅当 execution 显式设为 api-direct 时才需要填写。
+# 以下全为中性占位值，替换为你自己环境中实际可用的受控工具与接口说明。
+# 注意：当前配置由主脑按 SKILL.md 解释执行，仓库没有自动消费配置的调度器；
+# 本文件不构成已实现的自动调用链承诺。异常处理（超时/失败/中断/报告缺失）
+# 按 SKILL.md“执行方式”一节执行。
 worker:
   api_direct:
-    dispatch: "~/workspace/skills/qoder/bin/qoder.py"  # 下发阶段任务/轮询/取报告的命令或脚本
-    model: "qfmodel"  # Qwen3.8-Flash
-    poll_interval_sec: 20
+    dispatch: "python /path/to/your/controlled_tool.py"  # 你的下发/轮询/取报告命令（占位）
+    model: "<your-worker-model>"  # 你的受控工具实际使用的执行模型（占位）
+    poll_interval_sec: 20   # 轮询间隔（秒）
+    poll_timeout_sec: 1800  # 轮询总超时（秒）；超时≠取消成功，处理见 SKILL.md

@@ -1,4 +1,4 @@
 interface:
   display_name: "主脑与苦力 Agent"
-  short_description: "为外部桌面 Agent 准备阶段提示词，验收原始报告文件"
-  default_prompt: "使用 $brain-worker 确认当前项目和授权边界，生成可整块复制的当前阶段提示词；执行方式 human-relay 时由用户转发给外部桌面 Agent，api-direct 时经受控 API 下发；不调用 Codex 子 Agent。要求执行者按 WORKER_REPORT 模板汇报（human-relay 保存为 UTF-8 原始文件供上传，api-direct 在最终消息中完整输出）；依据主脑验收调整步长与评分。"
+  short_description: "为执行 Agent 准备阶段提示词，验收原始报告文件"
+  default_prompt: "使用 $brain-worker 确认当前项目和授权边界，生成可整块复制的当前阶段提示词（完整任务说明与 WORKER_REPORT 模板在同一可一键复制的文本块内）；执行方式默认 human-relay（用户转发给外部桌面 Agent，GPT 桌面场景零配置），api-direct 须用户显式配置受控工具后由主脑下发且按有限轮询与超时/失败处理；不调用 Codex 子 Agent，不得假称未实际发生的调用。要求执行者按 WORKER_REPORT 模板汇报（human-relay 保存为 UTF-8 原始文件供上传，api-direct 在最终消息中完整输出）；依据主脑验收调整步长与评分。"

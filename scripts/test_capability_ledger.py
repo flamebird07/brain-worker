@@ -8,6 +8,16 @@ from unittest.mock import patch
 
 from scripts import capability_ledger as ledger
 
+# 虚构配置：离线测试不读真实环境变量或 YAML，也不发起网络请求。
+FAKE_CFG = {
+    "app_id": "cli_fake",
+    "app_secret": "fake_secret",
+    "app_token": "fake_app_token",
+    "summary_table": "tbl_summary_fake",
+    "events_table": "tbl_events_fake",
+    "legacy_ledger": None,
+}
+
 
 class PendingScoreTests(unittest.TestCase):
     def setUp(self):
@@ -15,15 +25,16 @@ class PendingScoreTests(unittest.TestCase):
         self.summaries = []
 
         def records(table, _bearer):
-            return list(self.events if table == ledger.EVENTS else self.summaries)
+            return list(self.events if table == FAKE_CFG["events_table"] else self.summaries)
 
         def request(method, path, _bearer=None, body=None, params=None):
-            if method != "POST" or ledger.EVENTS not in path:
+            if method != "POST" or FAKE_CFG["events_table"] not in path:
                 self.fail(f"Unexpected API call: {method} {path}")
             self.events.append({"fields": body["fields"].copy()})
             return {}
 
         self.patches = [
+            patch.object(ledger, "cfg", lambda: FAKE_CFG),
             patch.object(ledger, "local_lock", lambda: contextlib.nullcontext()),
             patch.object(ledger, "token", lambda: "fake"),
             patch.object(ledger, "records", records),

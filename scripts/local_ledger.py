@@ -2,10 +2,14 @@
 # -*- coding: utf-8 -*-
 """brain-worker 本地能力台账（local 后端）。
 
-纯 Python 标准库实现，数据存本地 JSONL。评分、步长与幂等语义与
-scripts/capability_ledger.py（飞书后端）保持一致：
-  - 每个已验收阶段一条事件；同一 event-id 重复提交内容一致则幂等返回，不重复计分。
+纯 Python 标准库实现，数据存本地 JSONL。评分/步长/等级/身份归一/幂等指纹
+与飞书后端（scripts/capability_ledger.py）共用同一纯逻辑核心
+scripts/ledger_core.py（BW-DUAL-05 统一语义契约，详见该模块 docstring）：
+  - 每个已验收阶段一条事件；同一 event-id 重复提交指纹一致则幂等返回，不重复计分。
   - 未确认模型身份的评价先记 identity_pending，不计分；后续 resolve 归因为 assessment。
+  - 身份未知不可计分：identity_confirmed 且身份不明确时明确拒绝。
+  - 名称归一仅按核心已知别名表；事件匹配按事件 agent/model 以核心规则重算
+    （历史事件不迁移，归一后相同才合并）。
   - 状态 = 初始值（评分 50 / 步长 1 / 样本数 0）按文件追加顺序依次应用所有
     assessment 事件；时间字段（evaluated_at/recorded_at）只作记录，不参与排序，
     避免同秒或跨时区时间戳字符串改变重放顺序。
@@ -24,20 +28,12 @@ import sys
 import time
 from datetime import datetime
 
-OUTCOMES = {
-    "无问题": (10, 1),
-    "轻微问题": (-5, -1),
-    "重大问题": (-15, -2),
-    "严重问题": (-30, None),
-    "证据不足": (0, 0),
-}
+try:
+    import ledger_core as core
+except ImportError:  # 以 python -m scripts.local_ledger 运行时
+    from scripts import ledger_core as core
 
-INIT_SCORE = 50
-INIT_STEP = 1
-INIT_SAMPLES = 0
-SCORE_MIN, SCORE_MAX = 0, 100
-STEP_MIN, STEP_MAX = 1, 5
-RECOMMEND_RECENT_BAN = ("重大问题", "严重问题")
+OUTCOMES = core.OUTCOMES
 
 EVENT_ASSESSMENT = "assessment"
 EVENT_IDENTITY_PENDING = "identity_pending"
@@ -158,35 +154,61 @@ def append_event(path, event):
         os.fsync(fh.fileno())
 
 
-# ---------------------------------------------------------------- 语义核心
+# ---------------------------------------------------------------- 语义核心（共享核心的本地适配）
 
 def model_key(agent, model):
-    return "%s / %s" % (agent.strip(), model.strip())
+    """归一后的模型键（宽松版：不校验身份，用于存储与匹配，含 pending 事件）。"""
+    return core.lenient_key(agent, model)
 
 
-def clamp(value, low, high):
-    return max(low, min(high, value))
+def event_key(event):
+    """按事件的 agent/model 以核心规则重算键；历史事件不迁移。
+
+    单一历史存储键经重算兼容匹配；归一后仍不同（不同模型版本等）保持
+    分离，不静默合并。
+    """
+    return core.lenient_key(event.get("agent"), event.get("model"))
+
+
+def stored_keys_for(events, key):
+    """同一规范身份下已存在的存储键集合（按事件 agent/model 重算匹配）。
+
+    仅统计计分事件（assessment）：碰撞与存储身份针对计分对象，pending 事件
+    不参与计分，其存储键不构成碰撞。
+    """
+    return {e.get("model_key") for e in events
+            if e.get("type") == EVENT_ASSESSMENT and event_key(e) == key}
+
+
+def guard_key_collision(events, key):
+    """历史碰撞守卫（统一契约）：多个历史存储键映射到同一规范身份时拒绝。
+
+    禁止静默汇总、迁移、重算或改写历史；相关读写（status/record/resolve）
+    均须先通过本守卫。零追加、零外部写入。
+    """
+    stored = stored_keys_for(events, key)
+    if len(stored) > 1:
+        raise LedgerError(core.collision_message(key, stored))
+
+
+def plan_store_key(events, key):
+    """写前规划：返回新事件应使用的存储键；多个历史存储键时零写入拒绝。
+
+    单一历史别名对象沿用其既有存储键（规范键只用于匹配），从而不制造第二个
+    存储身份；既有真实碰撞直接拒绝。必须在 append 之前调用。
+    """
+    try:
+        return core.plan_stored_key(key, stored_keys_for(events, key))
+    except core.LedgerCoreError as exc:
+        raise LedgerError(str(exc))
 
 
 def transition(score, step, samples, outcome):
-    """返回 (评分, 步长, 样本数, 本次评分变化)。"""
-    if outcome not in OUTCOMES:
-        raise LedgerError("未知结论：%s；允许值为 %s" % (outcome, "、".join(sorted(OUTCOMES))))
-    delta, step_delta = OUTCOMES[outcome]
-
-    if score is None and outcome == "证据不足":
-        return (None, step, samples, 0)
-    if score is None:
-        score = INIT_SCORE
-
-    new_score = clamp(score + delta, SCORE_MIN, SCORE_MAX)
-    if step_delta is None:
-        new_step = STEP_MIN
-    else:
-        base = INIT_STEP if step is None else step
-        new_step = clamp(base + step_delta, STEP_MIN, STEP_MAX)
-    new_samples = samples + (0 if outcome == "证据不足" else 1)
-    return (new_score, new_step, new_samples, delta)
+    """共享核心转换；未知结论转为本地停止条件。"""
+    try:
+        return core.transition(score, step, samples, outcome)
+    except core.LedgerCoreError as exc:
+        raise LedgerError(str(exc))
 
 
 def parse_time(value, field):
@@ -212,12 +234,12 @@ def sort_key(event):
 
 
 def assessments_for(events, key):
-    hits = [e for e in events if e.get("type") == EVENT_ASSESSMENT and e.get("model_key") == key]
+    hits = [e for e in events if e.get("type") == EVENT_ASSESSMENT and event_key(e) == key]
     return sorted(hits, key=sort_key)
 
 
 def state_for(events, key):
-    score, step, samples = INIT_SCORE, INIT_STEP, INIT_SAMPLES
+    score, step, samples = core.INIT_SCORE, core.INIT_STEP, core.INIT_SAMPLES
     applied = []
     for event in assessments_for(events, key):
         score, step, samples, _delta = transition(score, step, samples, event.get("outcome"))
@@ -226,26 +248,15 @@ def state_for(events, key):
 
 
 def level_of(score, samples, recent):
-    if score is None:
-        base = "未定级"
-    elif score >= 80 and samples >= 3 and not any(r in RECOMMEND_RECENT_BAN for r in recent):
-        base = "推荐"
-    elif score >= 60:
-        base = "可用但需逐阶段审查"
-    elif score >= 40:
-        base = "观察"
-    else:
-        base = "受限或暂不推荐"
-    if samples < 3:
-        base += "（试用中）"
-    return base
+    return core.level(score, samples, recent)
 
 
 def status_payload(events, agent, model):
     key = model_key(agent, model)
+    guard_key_collision(events, key)
     st = state_for(events, key)
     recent = [e.get("outcome") for e in st["events"]][-3:]
-    pending = [e for e in events if e.get("type") == EVENT_IDENTITY_PENDING and e.get("model_key") == key]
+    pending = [e for e in events if e.get("type") == EVENT_IDENTITY_PENDING and event_key(e) == key]
     return {
         "模型键": key,
         "共享评分": st["score"],
@@ -264,10 +275,13 @@ def emit(payload):
 
 
 def content_of(event):
-    """幂等比较用的内容指纹；不含写入时间等每次都会变的字段。"""
-    keys = ("event_id", "type", "agent", "model", "model_key", "task", "stage",
-            "evaluated_at", "outcome", "evidence", "issues", "identity_confirmed", "resolved_from")
-    return {k: event.get(k) for k in keys}
+    """幂等指纹（共享核心）：model_key 统一取按事件 agent/model 重算的
+    规范键（新旧事件同一规则，历史存储键差异不影响原样重试幂等）；
+    issues 排序后比较（顺序不敏感）；recorded_at、行号等生成字段不参与。
+    """
+    norm = dict(event)
+    norm["model_key"] = event_key(event)
+    return core.idempotency_fingerprint(norm)
 
 
 def find_event(events, event_id):
@@ -323,10 +337,18 @@ def cmd_record(args, path):
     identity_confirmed = bool(args.identity_confirmed)
 
     etype = EVENT_ASSESSMENT if (outcome == "证据不足" or identity_confirmed) else EVENT_IDENTITY_PENDING
+    # 统一契约：身份未知不可计分；pending 允许“待确认模型”占位。
+    try:
+        core.canonical_triple(agent, model, allow_pending=(etype == EVENT_IDENTITY_PENDING))
+    except core.LedgerCoreError as exc:
+        raise LedgerError(str(exc))
     event = build_event(args.event_id, etype, args, agent, model, outcome, args.issue, identity_confirmed)
 
     with FileLock(path):
         events = read_events(path)
+        # 写前规划存储键：单一历史别名对象沿用其既有存储键（规范键只用于匹配），
+        # 既有碰撞在此零写入拒绝——不再"先追加再报碰撞"。
+        event["model_key"] = plan_store_key(events, model_key(agent, model))
         same = find_event(events, args.event_id)
         if len(same) > 1:
             raise LedgerError("台账内存在重复 event-id：%s，先人工核对事件链再继续。" % args.event_id)
@@ -334,7 +356,9 @@ def cmd_record(args, path):
             found = same[0]
             if content_of(found) != content_of(event):
                 raise LedgerError(
-                    "event-id %s 已存在且内容不一致；拒绝改写历史事件。请用新的稳定唯一标识。" % args.event_id
+                    "event-id %s 已存在且内容不一致；拒绝改写历史事件。"
+                    "请保留原事件 ID，核对原事件内容后修正重试参数再重试，"
+                    "或走明确补证流程；不得换新 ID 重复计分。" % args.event_id
                 )
             emit(merged(status_payload(events, agent, model), {
                 "idempotent": True,
@@ -364,9 +388,17 @@ def cmd_resolve(args, path):
     model = args.model.strip()
     if not agent or not model:
         raise LedgerError("--agent 与 --model 不能为空。")
+    # resolve 是补计分：目标身份必须明确（统一契约：身份未知不可计分）。
+    try:
+        core.canonical_triple(agent, model, allow_pending=False)
+    except core.LedgerCoreError as exc:
+        raise LedgerError(str(exc))
 
     with FileLock(path):
         events = read_events(path)
+        # 写前规划存储键（与 record 同一规则）：单一历史别名对象沿用其既有键，
+        # 既有碰撞在此零写入拒绝。
+        store_key = plan_store_key(events, model_key(agent, model))
         pending = [
             e for e in events
             if e.get("type") == EVENT_IDENTITY_PENDING and e.get("event_id") == args.pending_event_id
@@ -376,19 +408,20 @@ def cmd_resolve(args, path):
         if len(pending) > 1:
             raise LedgerError("待确认事件重复：%s" % args.pending_event_id)
         target = pending[0]
-        if target.get("agent") != agent:
+        # 统一契约：桌面应用按核心归一规则比较（已知别名前缀视为同一应用）。
+        if core.canonical_agent(target.get("agent")) != core.canonical_agent(agent):
             raise LedgerError(
                 "待确认事件 %s 的桌面应用为 %s，与本次 --agent %s 不匹配；拒绝错误归因。"
                 % (args.pending_event_id, target.get("agent"), agent)
             )
 
-        new_id = "resolve:%s" % args.pending_event_id
+        new_id = core.resolve_id(args.pending_event_id)
         resolved = {
             "event_id": new_id,
             "type": EVENT_ASSESSMENT,
             "agent": agent,
             "model": model,
-            "model_key": model_key(agent, model),
+            "model_key": store_key,
             "task": target.get("task"),
             "stage": target.get("stage"),
             "evaluated_at": target.get("evaluated_at"),
@@ -402,7 +435,10 @@ def cmd_resolve(args, path):
         same = [e for e in events if e.get("event_id") == new_id]
         if same:
             if content_of(same[0]) != content_of(resolved):
-                raise LedgerError("补评事件 %s 已存在且内容不一致。" % new_id)
+                raise LedgerError(
+                    "补评事件 %s 已存在且内容不一致。请保留原补评 ID，"
+                    "核对原补证内容后修正重试；不得换新 ID 重复计分。" % new_id
+                )
             emit(merged(status_payload(events, agent, model), {
                 "idempotent": True,
                 "action": "resolve",

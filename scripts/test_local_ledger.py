@@ -331,5 +331,128 @@ class TestPathSelection(Base):
         self.assertTrue(os.path.isfile(os.path.join(self.tmp, "sub", "rel-ledger.jsonl")))
 
 
+# 单一历史别名对象：旧版直拼存储键（未归一），agent/model 按核心规则重算后
+# 与规范键 "ZCode / GLM" 相同。
+LEGACY_ALIAS_LINE = json.dumps({
+    "event_id": "b", "type": "assessment", "agent": "ZCode Desktop", "model": "GLM",
+    "model_key": "ZCode Desktop / GLM", "task": "审查", "stage": "S1",
+    "evaluated_at": "2026-09-28T10:00:00+08:00", "outcome": "无问题", "issues": [],
+    "evidence": "e", "identity_confirmed": True, "resolved_from": None,
+    "recorded_at": "2026-09-28T10:00:05+08:00"}, ensure_ascii=False, sort_keys=True)
+
+
+class TestSingleLegacyAliasLifecycle05B(Base):
+    """BW-DUAL-05B：单一历史别名对象追加新评价不再自造碰撞（真实 CLI 子进程）。
+
+    05/05A 缺陷：对单一旧存储键对象追加新评价时先追加、后由 status 检测到两个
+    存储键而 exit 1——文件由 1 行变 2 行且此后 status 全部失败。本类覆盖修复后
+    的完整生命周期，并逐项检查最终行数、事件 ID、存储键、评分、步长、样本。
+    """
+
+    def _write_legacy_single(self):
+        with open(self.ledger, "w", encoding="utf-8") as fh:
+            fh.write(LEGACY_ALIAS_LINE + "\n")
+
+    def _stored_keys(self):
+        return [json.loads(line)["model_key"] for line in read_lines(self.ledger)]
+
+    def test_a_single_legacy_status_record_status_retry(self):
+        self._write_legacy_single()
+        first = self.status_payload()
+        self.assertEqual((first["共享评分"], first["当前步长"], first["累计样本数"]), (60, 2, 1))
+
+        proc = run_cli(self.ledger, *record_args("n1", stage="S2",
+                                                 evaluated_at="2026-09-30T12:00:00+08:00"))
+        self.assertEqual(proc.returncode, 0, proc.stderr)
+        recorded = parse_json(proc.stdout)
+        self.assertFalse(recorded["idempotent"])
+        self.assertEqual((recorded["共享评分"], recorded["当前步长"], recorded["累计样本数"]), (70, 3, 2))
+        self.assertEqual(len(read_lines(self.ledger)), 2)
+        self.assertEqual([json.loads(l)["event_id"] for l in read_lines(self.ledger)], ["b", "n1"])
+        # 沿用单一旧存储键：不产生第二个存储身份
+        self.assertEqual(set(self._stored_keys()), {"ZCode Desktop / GLM"})
+
+        after = self.status_payload()
+        self.assertEqual((after["共享评分"], after["当前步长"], after["累计样本数"]), (70, 3, 2))
+
+        again = run_cli(self.ledger, *record_args("n1", stage="S2",
+                                                  evaluated_at="2026-09-30T12:00:00+08:00"))
+        self.assertEqual(again.returncode, 0, again.stderr)
+        self.assertTrue(parse_json(again.stdout)["idempotent"])
+        self.assertEqual(len(read_lines(self.ledger)), 2)  # 原样重试零追加
+        self.assertEqual(set(self._stored_keys()), {"ZCode Desktop / GLM"})
+
+    def test_b_pending_resolve_single_identity_no_double_count(self):
+        # 单一旧别名对象在位时，pending→resolve 沿用其存储键，不产生第二个身份。
+        self._write_legacy_single()
+        pending = run_cli(self.ledger, *record_args("p1", confirmed=False))
+        self.assertEqual(pending.returncode, 0, pending.stderr)
+        self.assertEqual(parse_json(pending.stdout)["event_type"], "identity_pending")
+
+        resolve = run_cli(self.ledger, "resolve", "--pending-event-id", "p1",
+                          "--agent", "ZCode", "--model", "GLM",
+                          "--identity-evidence", "user-confirm", "--identity-confirmed")
+        self.assertEqual(resolve.returncode, 0, resolve.stderr)
+        resolved = parse_json(resolve.stdout)
+        self.assertFalse(resolved["idempotent"])
+        self.assertEqual((resolved["共享评分"], resolved["当前步长"], resolved["累计样本数"]), (70, 3, 2))
+        assessments = [json.loads(l) for l in read_lines(self.ledger)
+                       if json.loads(l)["type"] == "assessment"]
+        self.assertEqual({e["model_key"] for e in assessments}, {"ZCode Desktop / GLM"})
+
+        again = run_cli(self.ledger, "resolve", "--pending-event-id", "p1",
+                        "--agent", "ZCode", "--model", "GLM",
+                        "--identity-evidence", "user-confirm", "--identity-confirmed")
+        self.assertEqual(again.returncode, 0, again.stderr)
+        self.assertTrue(parse_json(again.stdout)["idempotent"])
+        self.assertEqual(self.status_payload()["累计样本数"], 2)  # 只补计一次
+        self.assertEqual(len([e for e in read_lines(self.ledger) if "resolve:p1" in e]), 1)
+
+    def test_c_existing_collision_rejected_zero_append_all_paths(self):
+        other = json.loads(LEGACY_ALIAS_LINE)
+        other["event_id"] = "a"
+        other["agent"] = "ZCode"
+        other["model_key"] = "ZCode / GLM"
+        pending = json.loads(LEGACY_ALIAS_LINE)
+        pending.update({"event_id": "p1", "type": "identity_pending", "agent": "ZCode",
+                        "model_key": "ZCode / GLM"})
+        with open(self.ledger, "w", encoding="utf-8") as fh:
+            for event in (other, json.loads(LEGACY_ALIAS_LINE), pending):
+                fh.write(json.dumps(event, ensure_ascii=False, sort_keys=True) + "\n")
+        before = read_lines(self.ledger)
+
+        status = self.status()
+        self.assertEqual(status.returncode, 1)
+        self.assertIn("身份碰撞", status.stderr)
+        record = run_cli(self.ledger, *record_args("c1"))
+        self.assertEqual(record.returncode, 1)
+        self.assertIn("身份碰撞", record.stderr)
+        resolve = run_cli(self.ledger, "resolve", "--pending-event-id", "p1",
+                          "--agent", "ZCode", "--model", "GLM",
+                          "--identity-evidence", "x", "--identity-confirmed")
+        self.assertEqual(resolve.returncode, 1)
+        self.assertIn("身份碰撞", resolve.stderr)
+        self.assertEqual(read_lines(self.ledger), before)  # 三条路径均零追加
+
+    def test_d_new_canonical_object_created_normally(self):
+        proc = run_cli(self.ledger, *record_args("d1"))
+        self.assertEqual(proc.returncode, 0, proc.stderr)
+        self.assertEqual(len(read_lines(self.ledger)), 1)
+        self.assertEqual(self._stored_keys(), ["ZCode / GLM"])
+        self.assertEqual(parse_json(proc.stdout)["累计样本数"], 1)
+
+    def test_e_distinct_model_versions_stay_independent(self):
+        self._write_legacy_single()
+        proc = run_cli(self.ledger, *record_args("v1", model="GLM-5.3-Flash"))
+        self.assertEqual(proc.returncode, 0, proc.stderr)
+        keys = set(self._stored_keys())
+        self.assertEqual(keys, {"ZCode Desktop / GLM", "ZCode / GLM-5.3-Flash"})
+        self.assertEqual(parse_json(proc.stdout)["累计样本数"], 1)  # 新版本独立计分
+        glm = run_cli(self.ledger, "status", "--agent", "ZCode", "--model", "GLM")
+        self.assertEqual((parse_json(glm.stdout)["共享评分"], parse_json(glm.stdout)["累计样本数"]), (60, 1))
+        flash = run_cli(self.ledger, "status", "--agent", "ZCode", "--model", "GLM-5.3-Flash")
+        self.assertEqual((parse_json(flash.stdout)["共享评分"], parse_json(flash.stdout)["累计样本数"]), (60, 1))
+
+
 if __name__ == "__main__":
     unittest.main(verbosity=2)

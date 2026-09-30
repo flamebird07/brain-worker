@@ -1,22 +1,67 @@
 name: local-ledger-validation
 
+# BW-DUAL-06：候选分支 bw-dual-final-validation 的 Windows/Linux 全量测试矩阵。
+# 仅读权限、无业务 Secrets、不请求真实飞书或付费 API；测试失败保留日志 artifact。
+
 on:
   push:
     branches:
-      - bw-dual-02-linux-validation
+      - bw-dual-final-validation
   workflow_dispatch:
 
 permissions:
   contents: read
 
 jobs:
-  local-ledger-linux:
-    runs-on: ubuntu-latest
-    timeout-minutes: 10
+  validation:
+    strategy:
+      fail-fast: false
+      matrix:
+        os: [ubuntu-latest, windows-latest]
+    runs-on: ${{ matrix.os }}
+    timeout-minutes: 20
+    env:
+      PYTHONUTF8: "1"
     steps:
       - uses: actions/checkout@v4
       - uses: actions/setup-python@v5
         with:
           python-version: "3.11"
-      - name: Run local_ledger regression tests
-        run: python -m scripts.test_local_ledger -v
+
+      # 纯 local 隔离检查：不依赖任何第三方模块（PyYAML 仅为飞书 YAML 配置
+      # 测试所需，不是默认后端依赖）。先确保 PyYAML 不可导入再跑 local 侧两套。
+      - name: Pure-local isolation check (stdlib only, no PyYAML)
+        shell: bash
+        run: |
+          set -o pipefail
+          python -m pip uninstall -y pyyaml || true
+          python - <<'EOF'
+          try:
+              import yaml  # noqa: F401
+          except ImportError:
+              print("PyYAML not importable: pure-local isolation OK")
+          else:
+              raise SystemExit("PyYAML unexpectedly importable; isolation check invalid")
+          EOF
+          python -m unittest scripts.test_ledger_core scripts.test_local_ledger -v 2>&1 | tee 01-pure-local-stdlib-check.txt
+
+      # PyYAML 仅用于飞书 YAML 配置测试；纯 local 后端不依赖它。
+      - name: Install PyYAML (config tests only)
+        run: python -m pip install pyyaml
+
+      # 四套测试逐项执行；tee + pipefail 保留真实退出码，失败不吞掉。
+      - name: Run four test suites (exact command)
+        shell: bash
+        run: |
+          set -o pipefail
+          python -m unittest scripts.test_ledger_core scripts.test_local_ledger scripts.test_capability_config scripts.test_capability_ledger -v 2>&1 | tee 02-four-suites-output.txt
+
+      - name: Upload test outputs
+        if: always()
+        uses: actions/upload-artifact@v4
+        with:
+          name: test-logs-${{ matrix.os }}
+          path: |
+            01-pure-local-stdlib-check.txt
+            02-four-suites-output.txt
+          if-no-files-found: error
