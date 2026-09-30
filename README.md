@@ -53,4 +53,4 @@ python <skill-creator>/scripts/quick_validate.py brain-worker
 
 ## 使用范围
 
-适合大量阅读、批量变更、长时间测试、迁移、审计，或用户明确要求主脑与苦力 Agent 分工的任务。简单单步任务不需要启用本 Skill。Skill 本身不安装、不连接业务项目，也不授予生产或外部写入权限。
+适合大量阅读、批量变更、长时间测试、迁移、审计，或用户明确要求主脑与苦力 Agent 分工的任务。简单单步任务不需要启用本 Skill。Skill 本身不安装、不连接业务项目，也不授予生产或外部写入权限。脑 2 选 1（muse / codex-cli），执行方式 2 选 1（human-relay / api-direct），用户在 config.yaml 中自行配置，示例见 config.yaml.example。

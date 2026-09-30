@@ -1,0 +1,12 @@
+# brain-worker 用户配置示例：复制为 config.yaml 后按需修改。
+# config.yaml 已加入 .gitignore，只存本地，不进仓库。
+# 脑：2 选 1
+brain: muse  # 可选：muse | codex-cli
+# 执行方式：2 选 1
+execution: api-direct  # 可选：human-relay | api-direct
+# api-direct 下 worker 下发配置（示例为 Qoder Cloud Agents，用户按自己环境改）
+worker:
+  api_direct:
+    dispatch: "~/workspace/skills/qoder/bin/qoder.py"  # 下发阶段任务/轮询/取报告的命令或脚本
+    model: "qfmodel"  # Qwen3.8-Flash
+    poll_interval_sec: 20

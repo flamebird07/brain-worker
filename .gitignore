@@ -24,3 +24,4 @@ backups/
 # Agent handoff and validation material should stay outside this Skill repo
 handoffs/
 validation/
+config.yaml
