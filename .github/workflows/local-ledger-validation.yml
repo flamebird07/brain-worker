@@ -1,12 +1,14 @@
 name: local-ledger-validation
 
-# BW-DUAL-06：候选分支 bw-dual-final-validation 的 Windows/Linux 全量测试矩阵。
+# BW-DUAL-07：Windows/Linux 全量测试矩阵；push 触发分支：bw-dual-final-validation、dual-mode-brain、main。
 # 仅读权限、无业务 Secrets、不请求真实飞书或付费 API；测试失败保留日志 artifact。
 
 on:
   push:
     branches:
       - bw-dual-final-validation
+      - dual-mode-brain
+      - main
   workflow_dispatch:
 
 permissions:
