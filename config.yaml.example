@@ -4,14 +4,15 @@
 # 使用场景：
 # - GPT 桌面（Windows）原有人工转发用法不需要本文件：GPT 做主脑，直接按
 #   human-relay 生成提示词，由用户转发外部桌面 Agent 并上传原始报告。
-# - Linux 场景才需要选择主脑运行环境；muse 是用户指定的 Linux 主脑运行环境
-#   名称，本仓库不假定其厂商、安装命令或接口。
+# - Linux 场景分别记录宿主/运行环境与主脑驱动；二者可以形成嵌套架构，例如
+#   在 muse 宿主环境中调用 codex-cli 作为主脑驱动。本仓库不假定宿主的厂商、
+#   安装命令或专有 API。
 # - 未创建 config.yaml 时，任何平台都按 human-relay + local 台账执行。
 #
-# 主脑运行环境（仅 Linux 场景需要）：2 选 1
-brain: muse  # 可选：muse | codex-cli
+runtime_environment: muse  # 宿主/运行环境名称，不假定厂商与专有 API
+brain_driver: codex-cli    # 主脑驱动：muse | codex-cli
 # 执行方式：2 选 1；默认 human-relay（零 API 配置，人工转发）
-execution: human-relay  # 可选：human-relay | api-direct；api-direct 必须由用户显式选择并提供实际受控工具
+execution: human-relay  # 可选：human-relay | api-direct；api-direct 必须由用户显式选择且对应适配器已通过预检
 # 台账后端：2 选 1（默认 local，开箱即用；feishu 需自行配置，见 SKILL.md“飞书后端接入（可选）”）
 ledger: local  # 可选：local | feishu
 # api-direct 下发配置：仅当 execution 显式设为 api-direct 时才需要填写。
@@ -21,7 +22,23 @@ ledger: local  # 可选：local | feishu
 # 按 SKILL.md“执行方式”一节执行。
 worker:
   api_direct:
-    dispatch: "python /path/to/your/controlled_tool.py"  # 你的下发/轮询/取报告命令（占位）
-    model: "<your-worker-model>"  # 你的受控工具实际使用的执行模型（占位）
-    poll_interval_sec: 20   # 轮询间隔（秒）
-    poll_timeout_sec: 1800  # 轮询总超时（秒）；超时≠取消成功，处理见 SKILL.md
+    # 四项可以是命令模板，也可以是适配器文档中明确的等价接口；占位符必须由适配器安全替换。
+    dispatch: "python /path/to/your/controlled_tool.py dispatch --request {request_file}"
+    poll: "python /path/to/your/controlled_tool.py poll --task-id {task_id}"
+    events: "python /path/to/your/controlled_tool.py events --task-id {task_id} --after {event_cursor}"
+    cancel: "python /path/to/your/controlled_tool.py cancel --task-id {task_id}"
+    model: "<your-worker-model>"
+    protocol:
+      output_format: json       # 必须为机器可读输出
+      task_id_field: task_id    # dispatch 返回的非空任务标识字段
+      status_field: status
+      event_id_field: event_id  # 或能稳定去重和追溯的等价序号字段
+      terminal_states:
+        succeeded: [completed]
+        failed: [failed]
+        cancelled: [cancelled]
+      error_code_field: error.code
+      error_message_field: error.message
+      timeout_behavior: return_timeout_without_cancel  # 超时不自动表示失败或取消
+    poll_interval_sec: 20
+    poll_timeout_sec: 1800
