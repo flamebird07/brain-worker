@@ -166,9 +166,9 @@ TRANSPORT_INSTRUCTION_END
 此档案是一次前台 CLI 调用，不实现通用 `dispatch/poll/events/cancel` 调度器，因此不按上节四接口协议冒充通用适配器已通过。其能力预检为：本机入口路径与官方登录态有效、受控参数调用、进程与输出可观察、原文存档和哈希回读、会话绑定及实际业务验收。脚本不提供取消 API、后台恢复或跨回合主动通知；若宿主不能观察运行中进程或在其返回时恢复验收，须报告该限制，不能宣称持续值守。模型任务已发送后不盲目重发，不自动杀进程。
 
 - 配置：使用技能目录下的 `scripts/local-entry.json`，或显式传 `--config`。示例见 `scripts/local-entry.json.example`；真实文件只存本机，node 与 qodercli 必须是现有官方运行时文件的绝对路径。缺失即拒绝，不自动安装、不自动登录或回落另一执行者。
-- 调用：`python <技能目录>/scripts/qoder_direct.py --workspace <项目绝对路径> --prompt-file <UTF-8提示词文件> --output-dir <不存在的新证据目录> --stage <非空阶段编号> [--model Qwen3.8-Flash] [--tools Read] [--resume-session-id <已确认会话>]`。主脑或传输层只派工和机械回读，不代替 Qoder 做阶段实质工作。
+- 调用：`python <技能目录>/scripts/qoder_direct.py --workspace <项目绝对路径> --prompt-file <UTF-8提示词文件> --output-dir <不存在的新证据目录> --stage <非空阶段编号> [--model Qwen3.8-Flash] [--tools Read] [--allowed-tools RULE ...] [--disallowed-tools RULE ...] [--add-dir DIR ...] [--resume-session-id <已确认会话>]`。主脑或传输层只派工和机械回读，不代替 Qoder 做阶段实质工作。
 - 模型：默认请求 Qwen3.8-Flash，不默认回落 GLM；观察到的 `modelUsage` 路由包括 `gfmodel`、`qfmodel`，它们不能独立证明后端模型版本。零 token/credits 字段不证明调用免费。
-- 权限：默认不给工具；只按本阶段授权传 `--tools`。直连不扩大生产、GitHub、凭据或外部写入授权。
+- 权限：`--tools` 控制工具可见性；需要限定范围时，逐项传 `--allowed-tools RULE`、`--disallowed-tools RULE`，外部读取另传 `--add-dir DIR`。显式允许规则完全替代兼容回退，不附加裸工具权限；不传规则时，旧工具名清单逐项转成允许规则，授权范围较宽。文件编辑与创建使用已验证的 `Edit(/工作区根相对文件)`，命令使用 `Bash(原样命令)`；不要用 `./路径` 或未经验证的根通配符。默认空工具，保持 `dont_ask`。权限拒绝须报告具体未执行动作，停止同类无效尝试，不重复索要已有授权。完整语法、回退行为和验证边界见 [Qoder 操作参考](references/qoder-direct.md)，直连不扩大生产、GitHub、凭据或外部写入授权。
 - 报告：该已验收驱动的机械检查沿用九节兼容模板，主脑必须从 [Qoder 操作参考](references/qoder-direct.md) 原样嵌入完整报告块，不能误用下方通用四节交付模板。项目/任务标识与阶段对应关系在提示词和看板中明确登记；通用任务状态、主动汇报、下发确认与验收逻辑继续适用。
 - 存档：`response.md` 是最终回复载荷的原样字节存档；同时保留 `stdout.json` 原始信封，记录请求、阶段、实际 session_id、哈希及续接请求。`body_ok` 只是正文核对，`bound` 还要求协议成功、非空会话、续接会话精确匹配、哈希回读及正文合格。协议退出码 0 不代表业务或绑定通过。
 - 循环：收到该任务原始报告并完成主脑验收后，才可在既有授权内补修或下发依赖任务。每轮汇报真实调用、返回、验收和下一步；不把下发、进程结束或机械绿测说成完成。

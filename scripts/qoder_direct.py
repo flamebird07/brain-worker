@@ -54,16 +54,90 @@ def load_entry_config(path=None) -> dict:
     return cfg
 
 
+def _validate_rule_list(value, *, field: str):
+    """严格校验可选规则/目录列表：None 直通；否则必须为 list/tuple，元素必须是非空
+    非空白字符串，且原样保留（不按逗号拆分、不做去空白）。非法项一律拒绝，不静默
+    过滤，因为静默过滤会让"看起来传了权限"实际变成"什么权限都没给"。"""
+    if value is None:
+        return None
+    if isinstance(value, (list, tuple)):
+        out = []
+        for item in value:
+            if not isinstance(item, str):
+                raise ValueError(f'{field} entries must be strings, got '
+                                 f'{type(item).__name__}: {item!r}')
+            if item == '' or item.isspace():
+                raise ValueError(f'{field} entries must be non-empty and not '
+                                 f'whitespace-only: {item!r}')
+            out.append(item)
+        return out
+    raise ValueError(f'{field} must be a list of strings or None, got '
+                     f'{type(value).__name__}')
+
+
+def _expand_tools_to_rules(tools) -> list[str]:
+    """兼容回退：把旧 --tools 逗号列表逐项转成 --allowed-tools 规则；空 tools 表示
+    零授权。这里只处理"工具名列表"的可见性参数，不代表细粒度权限规则；因此每个
+    分段必须非空且自身没有前后空白，避免静默丢规则或产生歧义条目。"""
+    if tools is None:
+        return []
+    if not isinstance(tools, str):
+        raise ValueError(f'tools must be a string, got {type(tools).__name__}')
+    if tools == '':
+        return []
+    out = []
+    for piece in tools.split(','):
+        if piece == '' or piece.isspace():
+            raise ValueError(f'legacy tools contains empty/whitespace item: {tools!r}')
+        if piece != piece.strip():
+            raise ValueError(f'legacy tools item has surrounding whitespace: {tools!r}')
+        out.append(piece)
+    return out
+
+
+def effective_permission_rules(tools=None, allowed_tools=None,
+                               disallowed_tools=None, add_dirs=None) -> dict:
+    """计算实际下发给 Qoder CLI 的权限规则与目录列表。
+
+    - --tools 只影响可见性；未显式给出 allowed_tools 时才按 tools 逗号逐项回退；
+    - 显式 allowed_tools（包括空列表）完全替代回退，不追加 Write/Edit/Bash 等默认；
+    - 规则、目录按原样保留：不按逗号拆分，不做去空白，非字符串/空/仅空白项一律拒绝；
+    - 无 shell 拼接：调用方拿到的是最终 argv 的逐元素值。"""
+    if allowed_tools is None:
+        allowed = _expand_tools_to_rules(tools)
+    else:
+        allowed = _validate_rule_list(allowed_tools, field='allowed_tools') or []
+    disallowed = _validate_rule_list(disallowed_tools, field='disallowed_tools') or []
+    dirs = _validate_rule_list(add_dirs, field='add_dirs') or []
+    return {'allowed_tools': allowed,
+            'disallowed_tools': disallowed,
+            'add_dirs': dirs}
+
+
 def build_argv(cfg: dict, workspace: str, model: str, tools: str,
-               session_id: str | None) -> list[str]:
-    """与 QODER-DIRECT-01 已验证调用形状一致的安全参数数组（无 shell）。"""
+               session_id: str | None, *,
+               allowed_tools=None, disallowed_tools=None,
+               add_dirs=None) -> list[str]:
+    """与 QODER-DIRECT-01 已验证调用形状一致的安全参数数组（无 shell）。
+
+    --tools 是可见性参数；--allowed-tools/--disallowed-tools/--add-dir 在官方 CLI
+    是可重复单值参数，一条规则/目录一项，不按逗号拆分。未显式提供 allowed_tools
+    时才按 tools 逗号列表逐项回退为 --allowed-tools；显式列表（含空列表）完全替代
+    回退，不会偷偷附加 Write/Edit/Bash 默认权限。permission-mode 固定 dont_ask，
+    永不启用 bypass_permissions。"""
+    perms = effective_permission_rules(tools, allowed_tools,
+                                        disallowed_tools, add_dirs)
     argv = [cfg['node'], cfg['qodercli'],
             '--cwd', workspace, '--model', model,
             '--tools', tools, '--permission-mode', 'dont_ask',
             '--strict-mcp-config', '--mcp-config', '{"mcpServers":{}}',
             '--output-format', 'json', '-p']
-    if tools:
-        argv += ['--allowed-tools', tools]
+    for rule in perms['allowed_tools']:
+        argv += ['--allowed-tools', rule]
+    for rule in perms['disallowed_tools']:
+        argv += ['--disallowed-tools', rule]
+    for d in perms['add_dirs']:
+        argv += ['--add-dir', d]
     if session_id:
         argv += ['--resume', session_id]
     return argv
@@ -256,7 +330,20 @@ def main():
                     help=f'Qoder model to request; defaults to {DEFAULT_MODEL}. An '
                          'explicit alternate model may be passed, but the default never '
                          'falls back to a GLM model.')
-    ap.add_argument('--tools', default='', help='Explicit tools, e.g. Read. Empty disables tools.')
+    ap.add_argument('--tools', default='', help='Tool visibility list (comma separated). '
+                    'Affects only what Qoder exposes; per-rule authorization is separate. '
+                    'Empty disables tools visibility.')
+    ap.add_argument('--allowed-tools', dest='allowed_tools', action='append', default=None,
+                    help='Repeatable fine-grained allow rule (e.g. Edit(/scripts/qoder_direct.py)). '
+                         'Each occurrence carries one verbatim rule; rules are never split on commas. '
+                         'Providing any --allowed-tools fully replaces the legacy --tools fallback; '
+                         'omitting it falls back to per-item --allowed-tools derived from --tools.')
+    ap.add_argument('--disallowed-tools', dest='disallowed_tools', action='append', default=None,
+                    help='Repeatable deny rule; each occurrence carries one verbatim rule.')
+    ap.add_argument('--add-dir', dest='add_dirs', action='append', default=None,
+                    help='Repeatable additional readable directory. Declaring a directory does '
+                         'not grant edit permission; it only extends file visibility outside '
+                         'the workspace root.')
     ap.add_argument('--resume-session-id', '--session-id', dest='session_id', default=None,
                     help='Resume a known Qoder session using the official --resume flag.')
     ap.add_argument('--config', default=str(DEFAULT_CONFIG),
@@ -272,11 +359,28 @@ def main():
         ap.error('Existing workspace and non-empty prompt required')
     out = Path(args.output_dir).resolve()
     out.mkdir(parents=True, exist_ok=False)  # refuse overwriting/replaying an existing invocation
-    argv = build_argv(cfg, str(work), args.model, args.tools, args.session_id)
+    perms = effective_permission_rules(args.tools, args.allowed_tools,
+                                        args.disallowed_tools, args.add_dirs)
+    argv = build_argv(cfg, str(work), args.model, args.tools, args.session_id,
+                      allowed_tools=perms['allowed_tools'],
+                      disallowed_tools=perms['disallowed_tools'],
+                      add_dirs=perms['add_dirs'])
+    # Put the carrier contract in the official system-prompt channel as well as
+    # the full task template. Never repair or trim the returned report.
+    contract = ('Final response must contain only the complete nine-section report. '
+                'First line: WORKER_REPORT_START. Last line: WORKER_REPORT_END. '
+                'Those markers must appear exactly once each; never quote them in the body. '
+                'No preface, epilogue, or code fences. Keep field names and values on the same line: '
+                f'阶段编号与执行方式：{args.stage}；direct。 '
+                f'实际项目绝对路径：{work}。 Use the exact path without punctuation in its field.')
+    argv[argv.index('-p'):argv.index('-p')] = ['--append-system-prompt', contract]
     request = {'started_at': datetime.now(timezone.utc).isoformat(),
                'workspace': str(work), 'prompt_file': str(prompt_path),
                'prompt_sha256': hashlib.sha256(prompt.encode('utf-8')).hexdigest(),
                'model_requested': args.model, 'tools': args.tools,
+               'allowed_tools': list(perms['allowed_tools']),
+               'disallowed_tools': list(perms['disallowed_tools']),
+               'add_dirs': list(perms['add_dirs']),
                'stage': args.stage, 'resume_session_id': args.session_id,
                'entry_config': str(Path(args.config).resolve()),
                'runtime': {'node': cfg['node'], 'qodercli': cfg['qodercli']},

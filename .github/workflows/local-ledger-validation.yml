@@ -68,6 +68,9 @@ jobs:
       - name: Qoder direct binding regression (no login or network)
         run: python tests/test_qoder_direct_binding_offline.py
 
+      - name: Qoder direct permissions regression (no login or network)
+        run: python tests/test_qoder_direct_permissions_offline.py
+
       - name: Upload test outputs
         if: always()
         uses: actions/upload-artifact@v4
