@@ -29,3 +29,7 @@ config.yaml
 # Ledger runtime data (default local-backend location is outside repo; guard anyway)
 *.jsonl
 *.jsonl.lock
+
+# Machine-specific Qoder entry and offline test artifacts
+scripts/local-entry.json
+tests/*-run-*/

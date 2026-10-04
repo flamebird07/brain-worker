@@ -62,6 +62,12 @@ jobs:
           set -o pipefail
           python -m unittest scripts.test_ledger_core scripts.test_local_ledger scripts.test_capability_config scripts.test_capability_ledger -v 2>&1 | tee 02-four-suites-output.txt
 
+      - name: Qoder direct transport regression (no login or network)
+        run: python tests/test_qoder_direct_offline.py
+
+      - name: Qoder direct binding regression (no login or network)
+        run: python tests/test_qoder_direct_binding_offline.py
+
       - name: Upload test outputs
         if: always()
         uses: actions/upload-artifact@v4

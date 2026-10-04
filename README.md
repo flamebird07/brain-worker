@@ -17,7 +17,7 @@ cd brain-worker
 cp config.yaml.example config.yaml   # 仅 Linux 场景选择主脑、或需调整执行方式/台账时；缺省一律按 human-relay + local
 ```
 
-- 执行方式 2 选 1：`human-relay`（默认，零 API 配置：主脑生成提示词，用户转发给外部桌面 Agent）/ `api-direct`（主脑经用户显式配置的受控工具下发；未配置时不得启用，缺配置回退 human-relay；仓库不含自动消费配置的调度器，不承诺已实现的自动调用链）。
+- 执行方式 2 选 1：`human-relay`（默认，零 API 配置：主脑生成提示词，用户转发给外部桌面 Agent）/ `api-direct`（主脑经用户显式配置的受控工具下发；未配置时不得启用；显式选择后缺配置则报告未就绪，不静默回退；仓库不含通用调度器；已有 Qoder CLI 专项直连入口，见下方）。
 - 台账后端 2 选 1：`local`（默认，本地 JSONL，纯标准库零配置，开箱即用）/ `feishu`（可选，需自建飞书应用与表格，见 SKILL.md“飞书后端接入（可选）”）。
 - Codex CLI 当主脑时，用 `codex exec` 加载本 skill，按 `config.yaml` 的 dispatch 命令下发任务；不得调用 Codex 子 Agent 冒充执行。
 
@@ -91,3 +91,20 @@ Skill 的阶段协作规则可用于不同项目；本地台账脚本纯标准�
 ## 使用范围
 
 适合大量阅读、批量变更、长时间测试、迁移、审计，或用户明确要求主脑与苦力 Agent 分工的任务。简单单步任务不需要启用本 Skill。Skill 本身不安装、不连接业务项目，也不授予生产或外部写入权限。GPT 桌面场景零配置直接用；Linux 场景主脑运行环境 2 选 1（muse / codex-cli）、执行方式 2 选 1（human-relay / api-direct），在 config.yaml 中自行配置，示例见 config.yaml.example。
+
+## Qoder 本机直连（免复制粘贴）
+
+GPT 桌面可直接担任主脑，调用已有官方 Qoder CLI 派工，回读原始报告并验收；不需要额外 Codex CLI 主脑。默认请求 Qwen3.8-Flash。
+
+1. 将 `scripts/local-entry.json.example` 复制为 `scripts/local-entry.json`，填写已有官方 node 和 Qoder CLI 文件的绝对路径，登录由官方程序完成。
+2. 主脑按 [Qoder 操作参考](references/qoder-direct.md) 嵌入完整九节兼容模板，并调用 `scripts/qoder_direct.py`。
+3. 回读协议结果、实际会话、哈希与最终绑定，再核对真实业务。每轮验收后才安排补修或依赖任务。
+
+真实配置、登录态、运行时依赖和业务报告不上传。此入口没有通用取消 API 或后台调度；ZCode 免费额度与接入实验不属于本次交付。新版通用四节模板继续保留，Qoder 驱动按上述九节兼容合同执行。
+
+本地离线回归（无登录、无网络）：
+
+```text
+python tests/test_qoder_direct_offline.py
+python tests/test_qoder_direct_binding_offline.py
+```
