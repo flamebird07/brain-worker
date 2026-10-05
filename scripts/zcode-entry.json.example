@@ -1,0 +1,19 @@
+{
+  "node": "/absolute/path/to/node",
+  "bootstrap": "/absolute/path/to/zcode-official-source/apps/zcode-cli/packages/bootstrap/dist/index.js",
+  "tsx_loader": "/absolute/path/to/zcode-official-source/node_modules/tsx/dist/loader.mjs",
+  "builtin_provider_config": "/absolute/path/to/zcode-config/builtin/provider_config.json",
+  "personal_provider_config": "/absolute/path/to/zcode-config/personal/provider_config.json",
+  "version": "0.0.0-official-build-id",
+  "environment": {
+    "HTTPS_PROXY": "http://127.0.0.1:0"
+  },
+  "_notes": [
+    "复制为 scripts/zcode-entry.json 后填入本机真实绝对路径；该文件已被 .gitignore 忽略，只存路径引用，不存任何 token/账号/凭据。",
+    "bootstrap 与 tsx_loader 必须是 ZCode 官方安装目录下真实存在的文件；本工具只读调用官方 API，不修改官方源码。",
+    "builtin_provider_config / personal_provider_config 会被注入为官方环境变量 ZCODE_BUILTIN_PROVIDER_CONFIG_FILE 与 ZCODE_PERSONAL_PROVIDER_CONFIG_FILE（两者必须同时提供）。",
+    "environment 是可选的字符串到字符串映射，只放明确需要透传给官方运行时的变量；不要写凭据值。",
+    "version 可选，只作为官方 createZCodeApp 的构建标识透传；已验证的同进程调用曾传 0.16.9。缺省时由官方默认值决定，若官方要求该值会按失败保留证据，不静默猜测。",
+    "node_args 与 runner 是可选的高级覆盖项，仅供离线测试替换执行载体；真实派工不要设置，缺省等价于 ['--import', <tsx_loader 的 fileURL>]。"
+  ]
+}

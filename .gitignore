@@ -30,6 +30,7 @@ config.yaml
 *.jsonl
 *.jsonl.lock
 
-# Machine-specific Qoder entry and offline test artifacts
+# Machine-specific Qoder/ZCode entry and offline test artifacts
 scripts/local-entry.json
+scripts/zcode-entry.json
 tests/*-run-*/

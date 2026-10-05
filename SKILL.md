@@ -1,6 +1,6 @@
 ---
 name: brain-worker
-description: 按主脑、传输层与执行 Agent 的职责边界推进大量阅读、批量修改、测试、迁移或审计；阶段提示词可由用户转发给外部桌面 Agent（human-relay），或由主脑直接或经宿主传输层调用受控 API 下发（api-direct，含已配置 Qoder CLI 的本机直连档案），主脑负责决策与验收，传输层只机械执行明确、可审计的控制面指令，执行 Agent 承担阶段实质工作。两种执行方式共用同一套核心规则、报告模板与安全边界；简单单步任务不必启用。主脑按任务维护并行状态，并在下发、里程碑、卡住、换方案、失败和交付时主动汇报；状态消息使用统一模板。
+description: 按主脑、传输层与执行 Agent 的职责边界推进大量阅读、批量修改、测试、迁移或审计；阶段提示词可由用户转发给外部桌面 Agent（human-relay），或由主脑直接或经宿主传输层调用受控 API 下发（api-direct，含已配置 Qoder CLI 或 ZCode 官方运行时的本机直连档案），主脑负责决策与验收，传输层只机械执行明确、可审计的控制面指令，执行 Agent 承担阶段实质工作。两种执行方式共用同一套核心规则、报告模板与安全边界；简单单步任务不必启用。主脑按任务维护并行状态，并在下发、里程碑、卡住、换方案、失败和交付时主动汇报；状态消息使用统一模板。
 ---
 
 # 主脑与苦力 Agent
@@ -83,6 +83,8 @@ TASK_BOARD_END
 
 执行 Agent 使用统一的下发确认、状态汇报和交付模板。若宿主不能后台观察或跨回合主动通知，须在下发确认中说明可观察方式和限制。
 - `api-direct`（受控工具直调）：主脑直接操作用户提供的受控工具/接口，或在主脑驱动不具备执行能力时经传输层机械调用该工具/接口，下发阶段任务；按任务 ID 持续观察状态；非终态结果用于更新看板和触发状态汇报，终态结果进入交付提取与验收（对应“任务级等待”），从对应任务的事件中提取 WORKER_REPORT 块，保存为“API 提取报告存档”后再验收。该存档不是 API 返回事件的原始载荷；省掉人工转发环节，但**不省掉任何验收**。
+
+已配置的 ZCode 官方运行时按下方 ZCode 专项档案直接派工；桌面人工转发仅在用户选择 human-relay 时使用。
 
 ### 传输层
 
@@ -172,6 +174,46 @@ TRANSPORT_INSTRUCTION_END
 - 报告：该已验收驱动的机械检查沿用九节兼容模板，主脑必须从 [Qoder 操作参考](references/qoder-direct.md) 原样嵌入完整报告块，不能误用下方通用四节交付模板。项目/任务标识与阶段对应关系在提示词和看板中明确登记；通用任务状态、主动汇报、下发确认与验收逻辑继续适用。
 - 存档：`response.md` 是最终回复载荷的原样字节存档；同时保留 `stdout.json` 原始信封，记录请求、阶段、实际 session_id、哈希及续接请求。`body_ok` 只是正文核对，`bound` 还要求协议成功、非空会话、续接会话精确匹配、哈希回读及正文合格。协议退出码 0 不代表业务或绑定通过。
 - 循环：收到该任务原始报告并完成主脑验收后，才可在既有授权内补修或下发依赖任务。每轮汇报真实调用、返回、验收和下一步；不把下发、进程结束或机械绿测说成完成。
+
+## ZCode 官方运行时直连（api-direct 的受限 CLI 档案）
+
+用户明确指定 ZCode、要求用官方运行时自动派工免粘贴时，主脑可使用 `scripts/zcode_direct.py`
+（执行器 `scripts/zcode_sdk_runner.mjs`）。它与 Qoder 档案并列，不替换 Qoder 逻辑，也不改变
+桌面 ZCode/Mimo 的 `human-relay` 转发方式与通用四接口适配器规则；Muse/Codex 主脑选择不变。
+
+- 档案性质：同进程官方 SDK 前台调用（`startProcessProviderRegistryRuntime` +
+  `createZCodeApp` + `submitPrompt`），不是 `dispatch/poll/events/cancel` 调度器，不得冒充通用
+  适配器已通过。无取消、无后台恢复、无跨回合主动通知；宿主不能观察运行中进程时如实声明。
+- 配置：`scripts/zcode-entry.json`（示例 `scripts/zcode-entry.json.example`，真实文件不入库），
+  或显式 `--config`。五项必填都是本机官方文件的绝对路径：node、bootstrap dist 入口、tsx loader
+  （以 `--import <fileURL>` 注册）、builtin 与 personal provider 配置。缺项或路径不存在即派工前
+  拒绝；不自动安装、不自动登录、不读 token、不改桌面模型、不编译或修改官方源码。
+- 调用：`python <技能目录>/scripts/zcode_direct.py --workspace <项目绝对路径> --prompt-file <UTF-8提示词文件> --output-dir <不存在的新证据目录> --stage <非空阶段编号> [--provider account:bigmodel-individual-coding-plan] [--model GLM-5.3-Flash] [--reasoning low|high|max] [--mode plan|edit] [--tools Read,Glob,Grep] [--resume-session-id <已确认会话>] [--preflight-only]`。
+- 模型：默认请求 `GLM-5.3-Flash`；预检逐项核对注册表、`validateSelection`、`App.listModels()`
+  的 `disabledReason`、`setModel` 后 `getCurrentModelOption().ref` 的 provider/model 与推理档位，
+  任一项不符即零提交并按失败保留证据，绝不回落到别的模型。已验证的同进程证据只加载
+  `account:bigmodel-individual-coding-plan`；StartPlan、TrustBuild 与免费额度均无证据，
+  不得宣称个人套餐免费，`free_quota_verified` 恒为 false。
+- 工具：只有整工具开关，没有 Qoder 式路径/命令规则，也不得仅凭 prompt 宣称机器限定路径或
+  文件级沙箱。默认禁用官方内置工具全目录（含注册名为 `js` 的 node_repl、`Task`/`Agent` 子
+  agent、`WebFetch`/`WebSearch` 联网、workflow、cron、Skill、Todo），`--tools` 显式名单才放行，
+  未知名或空白项拒绝；提交时再叠加运行时活注册表并集。`--mode plan` 只读，出现 `Write`/`Edit`/
+  `Bash` 派工前拒绝；`--mode edit` 需用户明确授权修改本项目；`yolo` 一律不构造。mcp、subagents、
+  dynamic workflow、Browser、项目 hooks 与自动记忆抽取按官方 API 证据关闭。Task/子 agent、联网与
+  Browser 工具对本入口不开放。
+- 报告：沿用九节兼容模板（与 Qoder 档案同一份模板文本，见 [ZCode 操作参考](references/zcode-direct.md)
+  与 [Qoder 操作参考](references/qoder-direct.md)），主脑原样嵌入完整代码块，不得误用下方通用四节
+  交付模板，也不得把本档案说成通用 API 适配器。格式指令拼在原任务之前、任务逐字保留；
+  `response.md` 是模型回复的原样字节，带前言时原文照存并判正文不合格，不替执行者删改。
+- 存档与绑定：`request.json`、`process.json`、`preflight.json`、`stdout.json`、`stderr.log`、
+  `result.json`、`events.jsonl`、`response.md`、`summary.json`、`report-state.json`。`body_ok` 只是
+  正文核对；`bound` 还要求协议成功、SHA-256 回读一致、非空 session_id 与 resume 精确一致；
+  `business_verified` 与 `free_quota_verified` 恒为 false，由主脑独立验收。退出码非零、预检失败、
+  信封缺失或异常退出都不得说成完成。用量取本轮 `result.usage`，官方口径的缓存读取已计入输入，
+  不再相加；`events.jsonl` 只落盘不整份打印。每轮须汇报真实调用次数、token 计数、事件数与
+  session/turn 标识，验收后才能下发依赖任务。
+
+ZCode 专项补充：活工具目录读取失败即零提交；完成以匹配 session/turn 的成功 turn_complete 和全部 model_request 精确模型记录为准，SDK 的 idle 投影不能单独判断成败。Read/Edit/Write 已实测；Bash 尚无命令审批代理，需审批的测试命令交由主脑执行，不得伪称 Agent 已运行。
 
 ## 使用场景与主脑选择
 

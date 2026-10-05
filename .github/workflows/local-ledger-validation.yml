@@ -29,6 +29,9 @@ jobs:
       - uses: actions/setup-python@v5
         with:
           python-version: "3.11"
+      - uses: actions/setup-node@v4
+        with:
+          node-version: "22"
 
       # 纯 local 隔离检查：默认后端 local_ledger.py + 共享核心 ledger_core.py
       # 仅以标准库即可导入并通过（test_local_ledger 经真实 CLI 子进程覆盖）；
@@ -70,6 +73,17 @@ jobs:
 
       - name: Qoder direct permissions regression (no login or network)
         run: python tests/test_qoder_direct_permissions_offline.py
+
+      # BW-ZCODE-INSTALL-01：ZCode 官方运行时入口的离线回归。真实子进程 stub 承载，
+      # 不登录 BigModel、不访问网络、不调用任何模型，也不证明真实 ZCode 后端能力。
+      - name: ZCode direct transport regression (no login or network)
+        run: python tests/test_zcode_direct_offline.py
+
+      - name: ZCode SDK runner syntax check (no execution)
+        run: node --check scripts/zcode_sdk_runner.mjs
+
+      - name: ZCode actual SDK adapter offline regression
+        run: python tests/test_zcode_sdk_runner.py
 
       - name: Upload test outputs
         if: always()

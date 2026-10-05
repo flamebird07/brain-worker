@@ -1,4 +1,4 @@
 interface:
   display_name: "主脑与苦力 Agent"
   short_description: "为执行 Agent 准备阶段提示词，验收原始报告文件"
-  default_prompt: "使用 $brain-worker 确认当前项目和授权边界，生成可整块复制的当前阶段提示词（完整任务说明与 WORKER_REPORT 模板在同一可一键复制的文本块内）；执行方式默认 human-relay（用户转发给外部桌面 Agent，GPT 桌面场景零配置），指定 Qoder 时可使用 scripts/qoder_direct.py 与本机入口配置，按 references/qoder-direct.md 的九节兼容模板直接派工并回读验收；其他 api-direct 须用户显式配置受控工具后由主脑下发且按有限轮询与超时/失败处理；不调用 Codex 子 Agent，不得假称未实际发生的调用。要求执行者按 WORKER_REPORT 模板汇报（human-relay 保存为 UTF-8 原始文件供主脑直接读取、无法访问时上传，api-direct 在最终消息中完整输出）；依据主脑验收调整步长与评分。"
+  default_prompt: "使用 $brain-worker 确认当前项目和授权边界，生成可整块复制的当前阶段提示词（完整任务说明与 WORKER_REPORT 模板在同一可一键复制的文本块内）；执行方式默认 human-relay（用户转发给外部桌面 Agent，GPT 桌面场景零配置），指定 Qoder 时可使用 scripts/qoder_direct.py 与本机入口配置，按 references/qoder-direct.md 的九节兼容模板直接派工并回读验收；指定 ZCode 官方运行时时可使用 scripts/zcode_direct.py 与 scripts/zcode-entry.json（同进程官方 SDK，按 references/zcode-direct.md 的九节兼容模板派工，只有整工具开关、无路径/命令规则，模型预检不符即零提交，不自动安装或登录）直接派工并回读验收；其他 api-direct 须用户显式配置受控工具后由主脑下发且按有限轮询与超时/失败处理；不调用 Codex 子 Agent，不得假称未实际发生的调用。要求执行者按 WORKER_REPORT 模板汇报（human-relay 保存为 UTF-8 原始文件供主脑直接读取、无法访问时上传，api-direct 在最终消息中完整输出）；依据主脑验收调整步长与评分。"
