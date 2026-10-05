@@ -85,6 +85,9 @@ jobs:
       - name: ZCode actual SDK adapter offline regression
         run: python tests/test_zcode_sdk_runner.py
 
+      - name: CodeBuddy direct transport offline regression
+        run: python tests/test_codebuddy_direct.py
+
       - name: Upload test outputs
         if: always()
         uses: actions/upload-artifact@v4

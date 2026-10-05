@@ -161,6 +161,10 @@ TRANSPORT_INSTRUCTION_END
 
 选择执行方式时确认一次即可。同项目切换执行方式只能发生在当前阶段已经验收或被用户明确取消/中断并核对状态之后，按“执行 Agent 交接”处理；切换后先对新方式重新执行能力预检，再生成或下发下一阶段任务。新方式未就绪时报告缺项并等待用户决定，不得继续使用旧方式冒充切换成功，也不得静默改用另一方式。无论哪种方式，主脑不得声称调用了实际未调用的 Agent 或工具，也不得把“提示词已生成 / 任务已下发”等同于完成。
 
+## 本机开发默认执行者
+
+本机已配置 Qoder 时，未另行指定执行者的代码开发、入口开发和逻辑补修默认由 Qoder / Qwen3.8-Flash 执行，主脑独立验收。用户明确指定 CodeBuddy、ZCode 或其他执行者时遵从；执行中改变默认选择只应用于验收后的下一轮，不替换在途任务。缺失 Qoder 配置时报告未就绪，不自行用另一执行者冒充。
+
 ## Qoder CLI 直连（api-direct 的受限 CLI 档案）
 
 用户明确指定 Qoder、要求本机自动派工或免复制粘贴时，主脑可以使用已验证的 `scripts/qoder_direct.py`；不另开 Codex 主脑，也不调用 Codex 子 Agent。桌面 ZCode/Mimo 的人工转发方式及通用 API 适配器规则继续保留。
@@ -639,3 +643,14 @@ AGENT_CAPABILITY_RECORD_END
 项目完成条件：所有属于客户目标的任务均已进入“完成”，且验收结果为“通过”或客户明确取消。单个任务完成不代表项目完成。
 
 这些是交接状态，不自动调用平台的目标、定时任务或配置工具。用户要求等待验收时，交付当前成果后停止。
+
+
+## CodeBuddy Code CLI 本机直连
+
+用户指定 CodeBuddy 或要求使用 WorkBuddy 对应 CLI 时，使用 `scripts/codebuddy_direct.py`，配置为本机 `scripts/codebuddy-entry.json`，参考 [CodeBuddy 操作说明](references/codebuddy-direct.md)。入口启用前须核对现有官方运行时、个人/企业登录方式和实际模型目录，再以隔离任务回读验收；安装、登录或模型菜单本身都不代表接入成功。
+
+- 调用：`python <技能目录>/scripts/codebuddy_direct.py --workspace <项目绝对路径> --prompt-file <UTF-8任务文件> --output-dir <不存在的新证据目录> --stage <非空阶段编号> --model <实际模型ID> [--tools Read,Write,Edit,Bash] [--allowed-tools RULE（每条重复）] [--disallowed-tools RULE（每条重复）] [--resume-session-id <已确认会话>]`。脚本要求显式模型；本机未另指定时按已核对目录选择 `glm-5.3-flash`，不传 auto/fallback。不自动登录、安装、升级或换模型。
+- 使用官方 `-p --output-format stream-json`，原始任务经 stdin 传入，不经过 shell 拼接；保持 dontAsk、工具白名单、空 strict MCP、空 setting sources、关闭 hooks 和主 Agent cli，不开子 Agent、动态派工、生产或外部通信工具。工具允许规则是 CLI 权限，不是文件沙箱；限定编辑仍须明确真实路径和授权。命令按原样运行，不添加 cd/echo/复合命令绕过规则。
+- 使用 Qoder 参考里的完整九节兼容报告；原文响应落盘后检查协议终态、会话、模型记录、完整正文及哈希回读，业务验收独立进行。原始事件 init.tools 是工具目录，不证明有效授权；最终 permission_denials 数组空也不能证明没有拒绝，须核对真实 tool_result 的明确拒绝证据。失败原件保留，禁止替模型删前言或改写报告。
+- 精确模型名称来自 CLI 的 init/assistant 记录，不据此独立保证服务商后端版本；用量和 modelUsage 保存原始口径，cost=0 不证明免费。WorkBuddy/CodeBuddy 账号积分及可用模型需登录后核对。
+- 直连是一次前台子进程调用，不是通用 dispatch/poll/events/cancel 服务；不宣称后台取消、跨回合主动通知或无人值守。验收当前报告后才能派发补修，最终显示来回总数和每轮总结。

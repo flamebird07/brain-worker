@@ -33,4 +33,5 @@ config.yaml
 # Machine-specific Qoder/ZCode entry and offline test artifacts
 scripts/local-entry.json
 scripts/zcode-entry.json
+scripts/codebuddy-entry.json
 tests/*-run-*/

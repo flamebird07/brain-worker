@@ -114,3 +114,8 @@ GPT 桌面可直接担任主脑，调用已有官方 Qoder CLI 派工，回读�
 python tests/test_qoder_direct_offline.py
 python tests/test_qoder_direct_binding_offline.py
 ```
+
+
+## CodeBuddy 自动派工与默认开发者
+
+本机开发任务未指定执行者时默认 Qoder / Qwen3.8-Flash；明确指定 CodeBuddy 时走 `scripts/codebuddy_direct.py`。CodeBuddy 支持个人国内站登录，模型须以当前账号目录为准；本机选择 `glm-5.3-flash` 时仍显式传入模型 ID，不自动回落。配置、权限规则、原始事件与九节报告验收见 [CodeBuddy 直连参考](references/codebuddy-direct.md)。机器配置、登录数据及调用日志不入库，cost=0 不作为免费证明。
