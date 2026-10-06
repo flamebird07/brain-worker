@@ -218,7 +218,11 @@ def main() -> int:
              summary['business_verified'] is False, summary['free_quota_verified'] is False,
              req['prompt'].startswith('Final response must contain only the complete nine-section report'),
              req['prompt'].endswith('\n\n' + ORIGINAL),
-             req['prompt_sha256'] == hashlib.sha256(req['prompt'].encode('utf-8')).hexdigest(),
+             req['prompt_sha256'] == hashlib.sha256(prompt_path.read_bytes()).hexdigest(),
+             req['prompt_payload']['sent_payload_sha256'] == hashlib.sha256(
+                 req['prompt'].encode('utf-8')).hexdigest(),
+             req['prompt_payload']['readback_match'] is True,
+             req['prompt_payload']['contract_sha256'] is not None,
              SECONDS_STAGE in req['prompt'], str(work) in req['prompt'],
              submit_count(out_ok) == 1]
     check('dispatch sends the format contract plus the verbatim task, one real submit',

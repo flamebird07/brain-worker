@@ -25,20 +25,18 @@ _SCRIPTS_DIR = Path(__file__).resolve().parent
 if str(_SCRIPTS_DIR) not in sys.path:
     sys.path.insert(0, str(_SCRIPTS_DIR))
 import execution_control as ec  # noqa: E402 任务级控制面（同目录，标准库）
+import prompt_contract as pc  # noqa: E402 三入口共享九节契约（标准库，不反向导入本模块）
 
 DEFAULT_CONFIG = _SCRIPTS_DIR / 'local-entry.json'
 DEFAULT_MODEL = 'Qwen3.8-Flash'
-REPORT_START = 'WORKER_REPORT_START'
-REPORT_END = 'WORKER_REPORT_END'
-# 明确可接受的字段名：阶段字段允许"阶段编号"或模板中的"阶段编号与执行方式"，
-# 且必须紧跟中/英文冒号；其余同前缀写法一律视为非本字段（拒绝误认）。
-STAGE_FIELD_NAMES = ('阶段编号', '阶段编号与执行方式')
-PATH_FIELD_NAMES = ('实际项目绝对路径',)
+# 契约单点定义在 prompt_contract；此处再导出同名常量，保持既有引用（analyze_report、
+# codebuddy/zcode 复用本模块的分析器）与 test_parallel_execution 的 qd.SECTION_HEADERS 不变。
+REPORT_START = pc.REPORT_START
+REPORT_END = pc.REPORT_END
+STAGE_FIELD_NAMES = pc.STAGE_FIELD_NAMES
+PATH_FIELD_NAMES = pc.PATH_FIELD_NAMES
 COLONS = ('：', ':')  # U+FF1A full-width and ASCII colon
-SECTION_HEADERS = ('一、当前基线与授权', '二、实际执行范围', '三、已验证事实',
-                   '四、推断（必须与事实分开）', '五、测试与验证',
-                   '六、未完成项与剩余风险', '七、实际副作用与越界检查',
-                   '八、本阶段状态', '九、建议下一步（只提出建议，不执行）')
+SECTION_HEADERS = pc.SECTION_HEADERS
 
 
 def load_entry_config(path=None) -> dict:
@@ -267,11 +265,13 @@ def analyze_report(text: str, stage: str | None, project_root: str) -> dict:
         reasons.append(f'missing report sections: {missing}')
     if not sections_in_order and not missing:
         reasons.append('report sections out of order')
-    closing_line = any(line.strip() == '本阶段汇报结束；等待主脑验收。'
+    closing_line = any(line.strip() == pc.CLOSING_LINE
                        for line in body.splitlines())
+    if not closing_line:
+        reasons.append('report lacks the required closing line')
 
     body_ok = (markers_ok and bool(stage) and stage_token_match is True
-               and path_match and not missing and sections_in_order)
+               and path_match and not missing and sections_in_order and closing_line)
     return {'note': 'transport-layer body-format check only; body_ok is the '
                     'mechanical text gate, NOT the final binding. The final '
                     'binding is produced by finalize_binding, which additionally '
@@ -399,7 +399,8 @@ def main():
     cfg = load_entry_config(args.config)
     work = Path(args.workspace).resolve(strict=True)
     prompt_path = Path(args.prompt_file).resolve(strict=True)
-    prompt = prompt_path.read_text(encoding='utf-8')
+    prompt_bytes = prompt_path.read_bytes()
+    prompt = prompt_bytes.decode('utf-8')
     if not work.is_dir() or not prompt.strip():
         ap.error('Existing workspace and non-empty prompt required')
     out = Path(args.output_dir).resolve()
@@ -410,15 +411,13 @@ def main():
                       disallowed_tools=perms['disallowed_tools'],
                       add_dirs=perms['add_dirs'])
     # Put the carrier contract in the official system-prompt channel as well as
-    # the full task template. Never repair or trim the returned report.
-    contract = ('Final response must contain only the complete nine-section report. '
-                'First line: WORKER_REPORT_START. Last line: WORKER_REPORT_END. '
-                'Those markers must appear exactly once each; never quote them in the body. '
-                'No preface, epilogue, or code fences. Keep field names and values on the same line: '
-                f'阶段编号与执行方式：{args.stage}；direct。 '
-                f'实际项目绝对路径：{work}。 Use the exact path without punctuation in its field.')
+    # the full task template. Never repair or trim the returned report. The contract
+    # comes from the shared prompt-contract module so all three entries emit an
+    # identical, verifiable nine-section payload before the call is made.
+    contract = pc.build_contract(args.stage, str(work))
     argv[argv.index('-p'):argv.index('-p')] = ['--append-system-prompt', contract]
-    prompt_sha256 = hashlib.sha256(prompt.encode('utf-8')).hexdigest()
+    # prompt_sha256 是原始提示词文件字节哈希（dispatch-plan 统一口径），不做换行归一。
+    prompt_sha256 = hashlib.sha256(prompt_bytes).hexdigest()
 
     # ---- 任务级预检（仅 --dispatch-plan 时启用）：实际 argv 建好后、Popen 与建目录前 ----
     plan_block = None
@@ -454,9 +453,29 @@ def main():
             return 2
 
     out.mkdir(parents=True, exist_ok=False)  # refuse overwriting/replaying an existing invocation
+    # Two send channels must both be evidenced by real bytes: the task text goes to
+    # stdin, the full contract goes to the official --append-system-prompt argv. Save
+    # exactly what is handed to the child and read it back before recording evidence.
+    stdin_payload = prompt.encode('utf-8')
+    (out / 'sent-payload-stdin.bin').write_bytes(stdin_payload)
+    (out / 'sent-contract-system-prompt.txt').write_bytes(contract.encode('utf-8'))
+    stdin_readback = (out / 'sent-payload-stdin.bin').read_bytes()
+    contract_readback = (out / 'sent-contract-system-prompt.txt').read_bytes()
+    prompt_payload = pc.payload_evidence(
+        raw_prompt_bytes=prompt_bytes, sent_task_text=prompt, contract=contract,
+        sent_payload_bytes=stdin_payload,
+        newline_caliber='raw-file-bytes-preserving-decode; task=stdin, contract=argv system-prompt')
+    prompt_payload['readback_match'] = (
+        stdin_readback == stdin_payload and contract_readback == contract.encode('utf-8'))
+    prompt_payload['channels'] = {
+        'task_stdin_sha256': pc.sha256_hex(stdin_readback),
+        'system_prompt_argv_sha256': pc.sha256_hex(contract_readback),
+        'contract_present_in_argv': contract in argv,
+    }
     request = {'started_at': datetime.now(timezone.utc).isoformat(),
                'workspace': str(work), 'prompt_file': str(prompt_path),
                'prompt_sha256': prompt_sha256,
+               'prompt_payload': prompt_payload,
                'model_requested': args.model, 'tools': args.tools,
                'allowed_tools': list(perms['allowed_tools']),
                'disallowed_tools': list(perms['disallowed_tools']),
@@ -473,7 +492,7 @@ def main():
         child = subprocess.Popen(argv, stdin=subprocess.PIPE, stdout=stdout, stderr=stderr)
         (out / 'process.json').write_text(json.dumps({'pid': child.pid, 'state': 'running'}),
                                           encoding='utf-8')
-        child.communicate(input=prompt.encode('utf-8'))
+        child.communicate(input=stdin_payload)
     summary = {'exit_code': child.returncode, 'finished_at': datetime.now(timezone.utc).isoformat(),
                'model_requested': args.model, 'protocol_success': False,
                'business_verified': False, 'output_dir': str(out)}

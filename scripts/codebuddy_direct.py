@@ -74,6 +74,7 @@ if str(_SCRIPTS_DIR) not in sys.path:
     sys.path.insert(0, str(_SCRIPTS_DIR))
 from qoder_direct import analyze_report, finalize_binding  # 共享正文核对/绑定，不改其文件
 import execution_control as ec  # 任务级控制面（同目录，标准库）
+import prompt_contract as pc  # 三入口共享九节契约（标准库；契约在调用前用于构造载荷）
 
 DEFAULT_CONFIG = _SCRIPTS_DIR / 'codebuddy-entry.json'
 BAD_TERMINAL_REASONS = ('cancelled', 'aborted', 'max_turns')
@@ -957,16 +958,24 @@ def main():
             return 2
 
     out.mkdir(parents=True, exist_ok=False)
-    contract = ('Final response must contain only the complete nine-section report. '
-                'First line: WORKER_REPORT_START. Last line: WORKER_REPORT_END. '
-                'Those markers must appear exactly once each; never quote them in the body. '
-                'No preface, epilogue, or code fences. Keep field names and values on the same line: '
-                f'阶段编号与执行方式：{args.stage}；direct。 '
-                f'实际项目绝对路径：{work}。 Use the exact path without punctuation in its field.')
-    stdin_payload = (contract + '\n\n' + prompt).encode('utf-8')
+    # The shared contract is prepended to the verbatim task and the whole payload is
+    # what actually goes to the child stdin; save those bytes and read them back so the
+    # recorded hashes describe the real send, not a re-serialization of a JSON file.
+    contract = pc.build_contract(args.stage, str(work))
+    stdin_payload = pc.compose_task_payload(contract, prompt).encode('utf-8')
+    (out / 'sent-payload-stdin.bin').write_bytes(stdin_payload)
+    stdin_readback = (out / 'sent-payload-stdin.bin').read_bytes()
+    prompt_sha256 = pc.sha256_hex(prompt_bytes)
+    prompt_payload = pc.payload_evidence(
+        raw_prompt_bytes=prompt_bytes, sent_task_text=prompt, contract=contract,
+        sent_payload_bytes=stdin_payload,
+        newline_caliber='raw-file-bytes-preserving-decode; task=stdin, contract prepended to task')
+    prompt_payload['readback_match'] = stdin_readback == stdin_payload
+    prompt_payload['channels'] = {'task_stdin_sha256': pc.sha256_hex(stdin_readback)}
     request = {'started_at': datetime.now(timezone.utc).isoformat(),
                'workspace': str(work), 'prompt_file': str(prompt_path),
-               'prompt_sha256': hashlib.sha256(prompt_bytes).hexdigest(),
+               'prompt_sha256': prompt_sha256,
+               'prompt_payload': prompt_payload,
                'model_requested': args.model, 'tools': args.tools,
                'tools_items': tools_items,
                'allowed_tools': list(perms['allowed_tools']),

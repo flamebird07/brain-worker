@@ -27,6 +27,7 @@ if str(SCRIPT_DIR) not in sys.path:
 # 复用已验收的正文格式核对与最终绑定，不改写旧脚本。
 from qoder_direct import analyze_report, finalize_binding  # noqa: E402
 import execution_control as ec  # noqa: E402 任务级控制面（同目录，标准库）
+import prompt_contract as pc  # noqa: E402 三入口共享九节契约（调用前用于构造发送载荷）
 DEFAULT_PROVIDER = 'account:bigmodel-individual-coding-plan'
 DEFAULT_MODEL = 'GLM-5.3-Flash'
 REASONING_LEVELS = ('low', 'high', 'max')
@@ -155,7 +156,8 @@ def build_node_argv(cfg: dict, runner: Path, request_path: Path) -> list:
 def build_request(cfg: dict, *, workspace: str, prompt: str, out_dir: Path,
                   stage: str, provider: str, model: str, reasoning: str,
                   mode: str, tools: list, resume_session_id,
-                  preflight_only: bool, runner: Path) -> dict:
+                  preflight_only: bool, runner: Path,
+                  prompt_sha256: str, prompt_payload: dict) -> dict:
     selection = {'providerId': provider, 'modelId': model,
                  'options': {'reasoningLevel': reasoning}}
     return {
@@ -165,7 +167,10 @@ def build_request(cfg: dict, *, workspace: str, prompt: str, out_dir: Path,
         'workspace': workspace,
         'output_dir': str(out_dir),
         'prompt': prompt,
-        'prompt_sha256': hashlib.sha256(prompt.encode('utf-8')).hexdigest(),
+        # prompt_sha256 是原始提示词文件字节哈希（dispatch-plan 统一口径）；完整发送载荷
+        # 与契约的哈希在 prompt_payload 里单独留证，绝不用本 JSON 文件哈希冒充 prompt 哈希。
+        'prompt_sha256': prompt_sha256,
+        'prompt_payload': prompt_payload,
         'selection': selection,
         'mode': mode,
         'allowed_tools': list(tools),
@@ -314,12 +319,16 @@ def main():
                          ensure_ascii=False))
         return 2
     try:
-        prompt_text = prompt_path.read_text(encoding='utf-8')
+        prompt_bytes = prompt_path.read_bytes()
+        # 发送任务文本沿用既有语义（换行归一，不回写原文件）；prompt_sha256 另取原始文件
+        # 字节哈希，CRLF 输入时二者可不同，均在 prompt_payload 里留证。
+        prompt_text = prompt_bytes.decode('utf-8').replace('\r\n', '\n').replace('\r', '\n')
     except (OSError, UnicodeDecodeError) as exc:
         print(json.dumps({'refused_before_dispatch': True,
                           'reasons': [f'prompt file unreadable as UTF-8: {exc}']},
                          ensure_ascii=False))
         return 2
+    prompt_sha256 = hashlib.sha256(prompt_bytes).hexdigest()
     if not prompt_text.strip():
         print(json.dumps({'refused_before_dispatch': True,
                           'reasons': ['prompt file is empty']}, ensure_ascii=False))
@@ -349,7 +358,7 @@ def main():
         actual = {'task_id': plan.get('task_id'), 'stage': args.stage,
                   'runtime': 'zcode', 'model': args.model, 'workspace': str(work),
                   'cwd': str(work),
-                  'prompt_sha256': hashlib.sha256(prompt_text.encode('utf-8')).hexdigest(),
+                  'prompt_sha256': prompt_sha256,
                   'argv': build_node_argv(cfg, runner, out / 'request.json'),
                   'shell': False,
                   # Record the actual whole-tool allow/deny sets; no fine-grained grants.
@@ -375,20 +384,38 @@ def main():
                          ensure_ascii=False))
         return 2
 
-    # 报告格式指令拼在原任务之前，逐字保留任务；不回换行、不修剪模型输出。
-    contract = ('Final response must contain only the complete nine-section report. '
-                'First line: WORKER_REPORT_START. Last line: WORKER_REPORT_END. '
-                'Those markers must appear exactly once each; never quote them in the body. '
-                'No preface, epilogue, or code fences. Keep field names and values on the same line: '
-                f'阶段编号与执行方式：{args.stage}；direct。 '
-                f'实际项目绝对路径：{work}. Use the exact path without punctuation in its field.')
+    # 报告格式指令拼在原任务之前，逐字保留任务；不回换行、不修剪模型输出。runner 把
+    # request['prompt'] 原样交给官方 submitPrompt，离线 receipts 记录它消费的哈希。
+    if args.preflight_only:
+        contract = None
+        sent_prompt = prompt_text
+    else:
+        contract = pc.build_contract(args.stage, str(work))
+        sent_prompt = pc.compose_task_payload(contract, prompt_text)
+    sent_payload_bytes = sent_prompt.encode('utf-8')
+    (out / 'sent-task-payload.bin').write_bytes(sent_payload_bytes)
+    sent_readback = (out / 'sent-task-payload.bin').read_bytes()
+    prompt_payload = pc.payload_evidence(
+        raw_prompt_bytes=prompt_bytes, sent_task_text=prompt_text, contract=contract,
+        sent_payload_bytes=sent_payload_bytes,
+        newline_caliber=('CRLF/CR-to-LF; preflight-only does not submit to SDK'
+                         if args.preflight_only else
+                         'CRLF/CR-to-LF; task=request.prompt to submitPrompt, '
+                         'contract prepended'))
+    prompt_payload['readback_match'] = sent_readback == sent_payload_bytes
+    prompt_payload['channels'] = {
+        'request_prompt_sha256': pc.sha256_hex(sent_readback),
+        'submit_channel': 'none' if args.preflight_only else 'sdk-request-prompt',
+        'payload_role': 'planned_request_prompt' if args.preflight_only else 'submission_prompt',
+        'contract_prepended': not args.preflight_only,
+    }
     request = build_request(cfg, workspace=str(work),
-                            prompt=(contract + '\n\n' + prompt_text)
-                            if not args.preflight_only else prompt_text,
+                            prompt=sent_prompt,
                             out_dir=out, stage=args.stage, provider=args.provider,
                             model=args.model, reasoning=args.reasoning, mode=args.mode,
                             tools=tools, resume_session_id=args.session_id,
-                            preflight_only=args.preflight_only, runner=runner)
+                            preflight_only=args.preflight_only, runner=runner,
+                            prompt_sha256=prompt_sha256, prompt_payload=prompt_payload)
     argv = build_node_argv(cfg, runner, out / 'request.json')
     request['argv'] = argv
     if plan_block is not None:

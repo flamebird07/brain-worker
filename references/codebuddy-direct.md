@@ -12,6 +12,12 @@ python scripts/codebuddy_direct.py --workspace <项目绝对路径> --prompt-fil
 `--model` 必填，无默认、无 auto、无 fallback。`--resume-session-id` 可选，内部传
 官方 `--resume`。不自动重装、登录、重试、后台取消或通知；主脑不开第二个 CLI 主脑。
 
+## 统一契约与哈希口径
+
+- 三入口调用前使用 `scripts/prompt_contract.py` 的完整九节契约，含精确标题、阶段/路径同一行、首末独占标记和结语。完整契约与任务拼接后经 stdin 发送。契约不能保证模型服从；原始响应照存，不合格仍保留 `bound=false`，不裁剪、不代写。
+- 新调用的 `prompt_sha256` 与 dispatch-plan 均绑定原提示词文件的原始字节；另外保存实际任务文本、契约和完整发送通道的字节与哈希。换行转换口径显式记录，不把 JSON 文件哈希当 SDK prompt 哈希；Qoder 两通道不冒称一个后端合成载荷。留证边界只到本地 CLI/SDK 提交，不证明服务端处理后的文本。
+- 不改提示词原文件或在途计划；旧调用记录沿用原入口版本的含义，升级后的新调用使用新计划。完整字段和留证位置见 [并行执行控制面](parallel-execution.md)。协议、报告绑定和独立业务验收分别报告，不能由本次传输回归推断真实业务恢复。
+
 ## 调用形状（本机 CLI 2.161.1 已核对）
 
 ```text

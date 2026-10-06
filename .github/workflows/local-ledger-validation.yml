@@ -94,6 +94,10 @@ jobs:
       - name: Parallel and fallback offline regression
         run: python tests/test_parallel_execution.py
 
+      # 三入口共享九节契约 + 实际发送载荷取证（真实子进程/SDK receipts，无网络、不调模型）。
+      - name: Prompt contract and sent-payload evidence offline regression
+        run: python tests/test_prompt_contract.py
+
       - name: Upload test outputs
         if: always()
         uses: actions/upload-artifact@v4
