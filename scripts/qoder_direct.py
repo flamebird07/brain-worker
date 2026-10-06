@@ -17,10 +17,16 @@ import json
 import os
 import re
 import subprocess
+import sys
 from datetime import datetime, timezone
 from pathlib import Path
 
-DEFAULT_CONFIG = Path(__file__).resolve().parent / 'local-entry.json'
+_SCRIPTS_DIR = Path(__file__).resolve().parent
+if str(_SCRIPTS_DIR) not in sys.path:
+    sys.path.insert(0, str(_SCRIPTS_DIR))
+import execution_control as ec  # noqa: E402 任务级控制面（同目录，标准库）
+
+DEFAULT_CONFIG = _SCRIPTS_DIR / 'local-entry.json'
 DEFAULT_MODEL = 'Qwen3.8-Flash'
 REPORT_START = 'WORKER_REPORT_START'
 REPORT_END = 'WORKER_REPORT_END'
@@ -318,6 +324,33 @@ def finalize_binding(body_ok: bool, body_reasons, *, protocol_success: bool,
             'reasons': reasons}
 
 
+def _qoder_failure_facts(summary: dict) -> dict:
+    """把 Qoder 终态结构映射为 failure_types 事实；只读协议/解析/拒绝/错误结构，
+    不扫描报告正文，不因报告格式失败算代码失败。真实结构化错误里有明确 429 时提取
+    quota_429；已知 quota/permission/parse 来源不泛化为模型差，model_execution_failure
+    只用于剩余未分型的执行失败。"""
+    parse_failure = bool(summary.get('parse_error'))
+    perms = summary.get('permission_denials')
+    permission_denied = isinstance(perms, (list, dict)) and bool(perms)
+    quota_429 = ec.explicit_429(summary.get('result_errors'),
+                                summary.get('result_errors_info'))
+    model_execution = (not summary.get('protocol_success')
+                       and not parse_failure and not permission_denied
+                       and not quota_429)
+    return {'quota_429': quota_429,
+            'protocol_parse_failure': parse_failure,
+            'permission_rule_denied': permission_denied,
+            'model_execution_failure': bool(model_execution),
+            'reset_hint': ec.extract_reset_hint(summary.get('result_errors'),
+                                                summary.get('result_errors_info')),
+            'evidence': {'stop_reason': summary.get('stop_reason'),
+                         'permission_denials': perms,
+                         'parse_error': summary.get('parse_error'),
+                         'result_errors': summary.get('result_errors'),
+                         'result_errors_info': summary.get('result_errors_info'),
+                         'model_requested': summary.get('model_requested')}}
+
+
 def main():
     ap = argparse.ArgumentParser()
     ap.add_argument('--workspace', required=True)
@@ -348,6 +381,18 @@ def main():
                     help='Resume a known Qoder session using the official --resume flag.')
     ap.add_argument('--config', default=str(DEFAULT_CONFIG),
                     help='Local entry config JSON with absolute node/qodercli paths.')
+    ap.add_argument('--dispatch-plan', dest='dispatch_plan', default=None,
+                    help='Optional task-level dispatch plan JSON. New parallel dispatch '
+                         'must supply it; the legacy path (no plan) stays compatible. '
+                         'When present, the argv/grants/cwd built here are exactly '
+                         'compared to the plan before any Popen; a rejected preflight '
+                         'exits 2 with the evidence directory never created.')
+    ap.add_argument('--active-tasks', dest='active_tasks', default=None,
+                    help='Optional JSON file of the active-task snapshot (list of '
+                         '{task_id,state,...}). When given it overrides the plan\'s '
+                         'own active_tasks; otherwise the plan snapshot is used, so a '
+                         'parallel plan that omits it is refused rather than treated as '
+                         '"nothing in flight".')
     args = ap.parse_args()
     if not args.stage or not args.stage.strip():
         ap.error('--stage is required and must be non-empty')
@@ -358,7 +403,6 @@ def main():
     if not work.is_dir() or not prompt.strip():
         ap.error('Existing workspace and non-empty prompt required')
     out = Path(args.output_dir).resolve()
-    out.mkdir(parents=True, exist_ok=False)  # refuse overwriting/replaying an existing invocation
     perms = effective_permission_rules(args.tools, args.allowed_tools,
                                         args.disallowed_tools, args.add_dirs)
     argv = build_argv(cfg, str(work), args.model, args.tools, args.session_id,
@@ -374,9 +418,45 @@ def main():
                 f'阶段编号与执行方式：{args.stage}；direct。 '
                 f'实际项目绝对路径：{work}。 Use the exact path without punctuation in its field.')
     argv[argv.index('-p'):argv.index('-p')] = ['--append-system-prompt', contract]
+    prompt_sha256 = hashlib.sha256(prompt.encode('utf-8')).hexdigest()
+
+    # ---- 任务级预检（仅 --dispatch-plan 时启用）：实际 argv 建好后、Popen 与建目录前 ----
+    plan_block = None
+    if args.dispatch_plan:
+        try:
+            plan = ec.load_plan(args.dispatch_plan)
+            visible = _expand_tools_to_rules(args.tools)
+            active_tasks = None
+            if args.active_tasks:
+                active_tasks = json.loads(Path(args.active_tasks).read_text(encoding='utf-8'))
+        except (ValueError, KeyError, OSError, json.JSONDecodeError) as exc:
+            print(json.dumps({'dispatch_plan_rejected': True, 'sent': False,
+                              'exit_code': 2, 'reasons': [str(exc)]},
+                             ensure_ascii=False))
+            return 2
+        actual = {'task_id': plan.get('task_id'), 'stage': args.stage,
+                  'runtime': 'qoder', 'model': args.model, 'workspace': str(work),
+                  'cwd': str(work), 'prompt_sha256': prompt_sha256,
+                  'argv': argv, 'shell': False,
+                  'grants': ec.grants_from_rules(perms['allowed_tools'],
+                                                 perms['add_dirs'],
+                                                 perms['disallowed_tools'], visible)}
+        result = ec.preflight(plan, actual, active_tasks=active_tasks)
+        plan_block = {'plan_path': str(Path(args.dispatch_plan).resolve()),
+                      'plan_hash': result['plan_hash'], 'ok': result['ok'],
+                      'reasons': result['reasons'], 'argv_sha256': result['argv_sha256'],
+                      'active_task_count': result['active_task_count'],
+                      'is_atomic_lock': result['is_atomic_lock']}
+        if not result['ok']:
+            print(json.dumps({'dispatch_plan_rejected': True, 'sent': False,
+                              'exit_code': 2, 'reasons': result['reasons'],
+                              'plan_hash': result['plan_hash']}, ensure_ascii=False))
+            return 2
+
+    out.mkdir(parents=True, exist_ok=False)  # refuse overwriting/replaying an existing invocation
     request = {'started_at': datetime.now(timezone.utc).isoformat(),
                'workspace': str(work), 'prompt_file': str(prompt_path),
-               'prompt_sha256': hashlib.sha256(prompt.encode('utf-8')).hexdigest(),
+               'prompt_sha256': prompt_sha256,
                'model_requested': args.model, 'tools': args.tools,
                'allowed_tools': list(perms['allowed_tools']),
                'disallowed_tools': list(perms['disallowed_tools']),
@@ -385,6 +465,8 @@ def main():
                'entry_config': str(Path(args.config).resolve()),
                'runtime': {'node': cfg['node'], 'qodercli': cfg['qodercli']},
                'argv': argv}
+    if plan_block is not None:
+        request['dispatch_plan'] = plan_block
     (out / 'request.json').write_text(json.dumps(request, ensure_ascii=False, indent=2),
                                       encoding='utf-8')
     with (out / 'stdout.json').open('wb') as stdout, (out / 'stderr.log').open('wb') as stderr:
@@ -403,7 +485,9 @@ def main():
                                          and result.get('stop_reason') == 'end_turn'),
                        session_id=result.get('session_id'), stop_reason=result.get('stop_reason'),
                        total_credits=result.get('total_credits'), model_usage=result.get('modelUsage'),
-                       permission_denials=result.get('permission_denials'))
+                       permission_denials=result.get('permission_denials'),
+                       result_errors=result.get('errors'),
+                       result_errors_info=result.get('errors_info'))
         response = result.get('result')
         if isinstance(response, str):
             (out / 'response.md').write_bytes(response.encode('utf-8'))
@@ -442,6 +526,7 @@ def main():
             json.dumps(report_state, ensure_ascii=False, indent=2), encoding='utf-8')
         summary['report_bound'] = report_state.get('bound', False)
         summary['report_state_file'] = str(out / 'report-state.json')
+    summary['diagnostics'] = ec.diagnose(_qoder_failure_facts(summary))
     (out / 'summary.json').write_text(json.dumps(summary, ensure_ascii=False, indent=2),
                                       encoding='utf-8')
     (out / 'process.json').write_text(json.dumps({'pid': child.pid, 'state': 'exited',

@@ -1,0 +1,209 @@
+# 并行执行控制面（BW-PARALLEL-UPGRADE）
+
+本文件描述 brain-worker 新增的任务级控制面：`scripts/execution_control.py`（纯标准库，
+**无常驻调度服务**）与三个执行入口新增的可选 `--dispatch-plan`。控制面做的是**主脑快照
+预检**，不是原子跨进程锁：它比对“计划 JSON”与“实际入口选择/工具 grant/cwd/argv”，
+拒绝缺 grant 或扩大权限，并在 Popen 之前退出 2。真正的进程串行化仍靠主脑看板与人工
+纪律，不靠本模块抢锁。旧入口（不传 plan）继续兼容。
+
+## 何时必须给 plan
+
+- 新并行派工：每个任务都要给 `--dispatch-plan`，把 task_id、stage、runtime、model、
+  workspace、cwd、grants、依赖和并发约定写死，便于逐任务隔离与回读。
+- 单任务或旧流程：可不给 plan，入口行为不变；只追加 `summary.diagnostics` 与请求/摘要中
+  的计划块（若有）。
+
+## 计划 JSON schema（与实现字段一致）
+
+顶层必填：`task_id`、`stage`、`runtime`、`model`、`workspace`、`cwd`、`prompt_sha256`、
+`grants`。可选（缺省即下列默认）：`depends_on`/`shared_writes`（默认 `[]`）、
+`tool_visibility`/`visible_tools`/`allowed_tools`/`disallowed_tools`（默认 `[]`）、
+`max_concurrency`（默认 `1`）、`isolation`（默认 `"independent_workspace"`）、
+`active_tasks`。`active_tasks` 是任务快照数组；**并行（`max_concurrency>1`）必须显式声明**
+（哪怕确认没有在途也写 `[]`），缺失不等于“没有在途工作”，`validate_plan` 直接拒。
+
+```jsonc
+{
+  "task_id": "T01",                       // 稳定不复用；绑定提示词/看板/报告
+  "stage": "BW-PARALLEL-UPGRADE-20261006-01",  // 与 --stage 精确一致
+  "runtime": "qoder",                     // qoder | codebuddy | zcode
+  "model": "Qwen3.8-Flash",               // 与 --model 精确一致（请求值，不证明后端版本）
+  "workspace": "C:\\abs\\ws-T01",          // 与 --workspace 解析后精确一致
+  "cwd": "C:\\abs\\ws-T01",                // 实际工作目录，与入口 cwd 一致
+  "prompt_sha256": "<64hex>",             // 下发的完整任务 prompt 的 SHA-256（锁定，不可改）
+  "grants": {
+    "edits": ["Edit(/scripts/qoder_direct.py)"],   // 逐文件 Edit 规则（原样字符串）
+    "bash": ["Bash(python -m unittest discover -s tests)"],  // 原样命令 Bash 规则
+    "read_dirs": ["C:\\abs\\read-only\\ref"]       // 外部只读目录（--add-dir）
+  },
+  "tool_visibility": ["Read", "Glob", "Grep"],  // bare 允许规则推出的整工具名（不含 Edit(/Bash()）
+  "visible_tools": ["Read", "Edit"],      // 实际 --tools 精确集合（真实 CLI 可见性）
+  "allowed_tools": ["Read", "Glob", "Grep", "Edit(/scripts/qoder_direct.py)"],  // 全量 allow 规则
+  "disallowed_tools": [],                 // 全量 deny 规则
+  "active_tasks": [                        // 并行必填：在途任务快照（主脑看板口径）
+    {"task_id": "T00", "state": "executing", "workspace": "C:\\abs\\ws-T00",
+     "prompt_sha256": "<64hex>", "writes": true, "shared_writes": []}
+  ],
+  "depends_on": ["T00"],                  // 依赖任务 ID；必须 completed 且 acceptance_result=passed
+  "shared_writes": [],                    // 会写的共享服务/外部对象标识；非空即需隔离
+  "max_concurrency": 4,                   // 显式并发上限；缺省 1
+  "isolation": "independent_workspace"    // independent_workspace | shared
+}
+```
+
+**四个列表口径的语义区别（不能互相冒充）**：`visible_tools` 是真实 `--tools` 的可见工具集
+合；`tool_visibility` 是从 bare 允许规则（非 `Edit(...)`/`Bash(...)`）推出的整工具名，
+Qoder/CodeBuddy 用它承载“看到哪些工具”，ZCode 只有这一层且计划须把它与 `visible_tools`
+对齐口径；`allowed_tools`/`disallowed_tools` 是完整 allow/deny 规则原文集合。缺 Read 也要
+被拒（不能只比“新增”而漏“缺失”）。真实 `--tools` 为空却需要 Read 的错误配置一律拒。
+
+比对规则（`preflight`）：
+- 身份绑定：`task_id/stage/runtime/model/workspace/cwd/prompt_sha256` 与实际逐项相等，
+  任一不符即拒。`prompt_sha256` 不符表示在途提示词被改 → 拒绝改 prompt/重发。
+- 能力表达：`runtime` 能力表见下；`edits`/`bash` 非空要求 `fine_grained`，`read_dirs` 非空
+  要求 `read_dirs` 能力，否则拒绝。
+- grant 精确集合：`grants.edits/bash/read_dirs` 与实际 argv 推出的同名集合**必须双向完全
+  相等**（既无未计划新增、也无缺计划）。`bash` 逐字比对（原样命令）。
+- 可见性/规则口径：`tool_visibility/visible_tools/allowed_tools/disallowed_tools` 四项
+  同样**双向精确集合相等**；bare `Edit/Write/Bash` 全局授权若未计划也按扩大权限拒绝。
+- `argv` 必须是先建好的 `list[str]`；出现 `shell=True` 一律拒。`argv` 以 `argv_sha256`
+  记录供追溯，但**不宣称**全 argv 与计划逐字比对——精确授权由上面的 grants/可见性集合
+  相等来保证。
+- 并发/冲突（见“并行检查”）。
+
+所有拒绝都发生在 Popen 之前，入口打印
+`{"dispatch_plan_rejected": true, "sent": false, "exit_code": 2, "reasons": [...],
+  "plan_hash": "..."}` 并返回 2，证据目录零创建。
+
+## 各运行时真实能力（不要臆造官方参数）
+
+| runtime | fine_grained（逐文件 Edit/原样 Bash） | read_dirs（外部只读目录） |
+| --- | --- | --- |
+| qoder | 是（`--allowed-tools Edit(...)`/`Bash(...)`、`--add-dir`） | 是 |
+| codebuddy | 是（`--allowedTools` 规则；无外部只读目录参数） | 否 |
+| zcode | **否**（只有整工具开关） | 否 |
+
+ZCode 的工具名白名单**不能假称细粒度文件权限**。当计划要求 ZCode 表达不了的逐文件/逐命令
+限制或外部只读目录时，`preflight` 直接拒绝，并要求：改用**隔离 workspace**、只按
+`tool_visibility`（整工具开关）授权，或换用能表达该限制的运行入口。不得给 ZCode 编造
+`--allowed-tools` 之类官方没有的参数。
+
+## 六类 failure_types（`summary.diagnostics`）
+
+分类只读错误/拒绝/工具失败的**结构**，绝不扫描正常 prompt/report 正文里的 429 字样。
+多类可共存；证据原文、错误码、reset 提示原样保留；平台/渠道/账号来源未知即不推断；
+账单未知，Qoder 的 0 占位不等于免费，不加缓存 token，不假称身份确认；报告格式不合格
+不自动算代码失败。
+
+1. `quota_429`：观测到明确 `status==429`/`code==429`，**或**原始错误文本**开头**的独立
+   `429`/`HTTP 429` 错误码（含带 reset 提示的 "429 …将在…重置"，与原 CodeBuddy 口径一致）。
+   仅 `category=quota`、或 id/正文中间的 429 数字一律不算；报告正文里的 429 字样从不扫描。
+2. `permission_rule_denied`：来自权限规则拒绝结构——CodeBuddy 的
+   `permission_denials`/fail-closed 拒绝，以及 ZCode 原始事件
+   `permission_resolved` 且 `payload.decision=="deny"` 且 reason **不是**缺客户端 marker。
+3. `permission_client_missing`：从 ZCode 原始 `events.jsonl` 提取，即使 summary 的
+   `permission_denials` 为 0。真实形状为 `type=="permission_resolved"` 且
+   `payload.decision=="deny"` 且 `payload.reason` 含 `No permission client configured for
+   Bash`，或 `type=="tool_call_result"` 且 `payload.isError` 且 `payload.error/result` 含该
+   marker。缺客户端与规则拒绝分类分开；`type=="model_request"` 携带的历史/prompt/report
+   正文从不参与分类（含其中的 429/缺 client 文案也不误报）。
+4. `protocol_parse_failure`：信封/流结构解析失败（非“有效失败信封”）。CodeBuddy 仅因权限
+   fail-closed 产生的 `parse_errors` **不**算语法失败；反之无效 JSON 行 + 合法失败信封仍
+   保留 `protocol_parse_failure`。
+5. `model_execution_failure`：**只**用于明确的模型/传输执行失败或剩余未分型的执行错误，
+   已知 quota/permission/parse 来源不泛化为模型差；与上面的分型独立共存，原始码/证据/
+   reset 提示不丢。
+6. `test_failure`：**只**来自已登记测试执行器的真实退出码，不从报告字句猜。
+
+## 已登记测试执行器（`execution_control run-test`）
+
+`run-test` 只跑注册表（`{"runs": {"<name>": {...}}}`）里登记的精确 `argv`、`cwd`、
+`inputs`、`env`；日志固定写到 `workspace/handoff/logs/<name>/`；证据写到
+`<evidence_root>/<name>/<fingerprint>/`。规则：
+
+- 禁止 `shell=True`、禁止猜命令、禁止覆盖旧证据（同 fingerprint 目录已存在且非 reuse
+  即拒绝）；注册 spec 的 `inputs` 必须声明**完整且非空**的 code/test/fixture 文件。
+- fingerprint = 全部输入文件 bytes 的 SHA-256 + argv + cwd + 环境口径。继承的 env 只在
+  证据里保存其 **hash**（`env_sha256`，不泄明文凭据），并绑定 Python/运行环境必要版本
+  （`runtime_version`）；环境或版本变化都算不同指纹。
+- 越界检查用 **realpath**（`os.path.realpath`）解析 symlink/junction：`cwd`、`inputs`、
+  `evidence_root`、日志目录任一逃出**真实解析后的 `--workspace`** 一律拒绝，不 spawn；
+  日志固定写到 `workspace/handoff/logs/<name>/`，不落父目录。
+- reuse 严格条件：相同 fingerprint **且**上次退出 0 **且** stdout/stderr **两份日志都存在**
+  且 SHA 回读一致 **且** `argv/cwd/inputs 哈希/env_sha256/runtime_version` 元数据全部吻合，
+  且输入在该次执行前后未改变。子进程继承环境仅保存哈希，不保存变量值。
+  损坏 JSON、空证据、丢任一日志、测试期间输入变动 → 都不 reuse，新建 attempt（带序号，
+  绝不覆盖旧原件）。
+- 返回真正退出码/stdout/stderr 与 `evidence.json`；`failure_types` 仅在退出码非 0 时含
+  `test_failure`。无 pytest 依赖，测试用 `unittest`。
+
+注册表示例：
+
+```jsonc
+{
+  "runs": {
+    "unittest": {
+      "argv": ["C:\\Python312\\python.exe", "-m", "unittest", "discover", "-s", "tests", "-p", "test_execution_control.py"],
+      "cwd": "C:\\abs\\ws",
+      "inputs": ["C:\\abs\\ws\\scripts\\execution_control.py",
+                 "C:\\abs\\ws\\scripts\\qoder_direct.py",
+                 "C:\\abs\\ws\\tests\\stub_qodercli.py",
+                 "C:\\abs\\ws\\tests\\test_execution_control.py"],
+      "env": {"PYTHONIOENCODING": "utf-8"}
+    }
+  }
+}
+```
+
+CLI：
+
+```text
+python scripts/execution_control.py run-test --registry <reg.json> --name unittest \
+  --workspace <abs ws> --evidence-root <abs evidence dir>
+python scripts/execution_control.py preflight --plan <plan.json> --actual <actual.json> \
+  [--active-tasks <tasks.json>] [--max-concurrency 4]
+```
+
+`preflight` 退出 0 表示可派工；退出 2 表示拒绝（含原因与 plan_hash），零 Popen。
+
+## 并行检查与隔离
+
+任务**五状态**：`pending / executing / blocked / awaiting_acceptance / completed`（不再有
+第六 `verified` 状态）。其中 `executing / awaiting_acceptance / blocked` 是占用 task_id 与
+并发槽位、门禁不能被绕过的“在途”态。三个真实入口接受可选 `--active-tasks <json>`（数组
+`{task_id,state,...}`）或在 plan 里带 `active_tasks`，都传给 `ec.preflight`；并行 plan 缺
+`active_tasks` 会被 `validate_plan` 拒绝，**缺失不当作“没有在途工作”**。
+
+- 相同文件、不同 workspace 的**独立副本**可以并行；合并时逐文件比对，不静默覆盖。
+- `shared_writes` 非空且与在途任务重叠、或同一 workspace 有写入 → 不能隔离即拒绝，须串行。
+- 依赖 `depends_on`：只有状态 `completed` **且** `acceptance_result=="passed"` 才放行；
+  `failed/cancelled/未知` 验收结果、或非 completed 的依赖一律拒（无 `verified` 一说）。
+- 同 `task_id` 在途（`executing/awaiting_acceptance/blocked`）：核验**看板记录 hash 与实际
+  下发 hash** 双向一致，改 prompt 或重发（即便 prompt 相同）一律拒绝，门禁不可被
+  `awaiting_acceptance`/`blocked` 绕过。
+- 并发默认 1，可显式 `max_concurrency`（本演练验证 4）。这是主脑快照预检，不是跨进程原子锁。
+
+## authorized fallback 边界
+
+- 失败任务的已授权 fallback（换入口/换模型）只影响**该失败任务**，且必须先记录失败证据
+  （对应 failure_type 与原始结构）后才接管；其它在途任务的提示词**不被改动**。
+- 一次权限拒绝（`permission_rule_denied`/`permission_client_missing`）不猜变体重试：
+  停止同类无效尝试，交主脑决策，不重复索要已有授权。
+- Bash 不可用（例如客户端缺失）时，执行 Agent 继续只读 `Read`/精确 `Edit`，把需要跑
+  命令的测试交主脑执行，不伪称已运行、不用管道/`cd`/改参数绕过规则（否则触发
+  `permission_rule_denied`）。
+
+## fixture 与持久 contract 的顺序
+
+- 先锁定**实际注册入口**与其持久 contract（真实生命周期口径），再设计 fixture：
+  按适用生命周期使用**真 SQLite**（本地/临时库）或**有状态远端 fake**；不给所有任务强套
+  一套清单。控制面不为业务做生命周期模拟，只覆盖真实 brain-worker 入口。
+- 累计全派工 diff、报告模板与任务书放 `handoff/`（上下文压缩后也从这里恢复）。
+- 格式待验时不重跑已验证代码；只对格式缺口补证。
+
+## 成本与身份边界
+
+六分型只描述失败类别与保留的原始证据，不代表成本或身份结论：账单未知不推断；
+Qoder 的 `total_credits=0` 是占位、不叫免费；缓存 token 不额外累加；`qfmodel`/`gfmodel`
+路由不证明底层 Qwen 版本，模型请求值 ≠ 已确认身份。评分沿用共享台账，阶段一次评分
+idempotent；主脑自身配置/预检失败单独归因，不计入执行 Agent 阶段样本。

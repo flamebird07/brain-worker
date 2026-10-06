@@ -18,6 +18,8 @@ from pathlib import Path
 
 REPO = Path(__file__).resolve().parent.parent
 ENTRY = REPO / 'scripts' / 'codebuddy_direct.py'
+sys.path.insert(0, str(REPO / 'scripts'))
+import codebuddy_direct as cb  # 纯函数离线测试（不启动子进程、不调模型）
 
 STUB_SOURCE = '''\
 import base64, hashlib, json, os, sys
@@ -239,10 +241,13 @@ class CodeBuddyDirectTests(unittest.TestCase):
     def test_success_binds_with_crlf_stdin_and_argv_rules(self):
         spec = self.write_spec(self.success_events())
         out = self.tmp / 'out-success'
+        # 旧测试用不可靠的 /scripts/x.py（Windows 根样式）；改为当前 workspace 的
+        # 实际绝对正斜杠单文件路径，Linux/Windows 均正确、断言强度不变。
+        edit_rule = f'Edit({self.workspace.as_posix()}/scripts/x.py)'
         res = self.run_entry(out, spec,
                              '--tools', 'Read,Grep',
                              '--allowed-tools', 'Read',
-                             '--allowed-tools', 'Edit(/scripts/x.py)')
+                             '--allowed-tools', edit_rule)
         self.assertEqual(res['rc'], 0, res['proc'].stderr.decode('utf-8', 'replace'))
         self.assertTrue(res['summary']['protocol_success'], res['summary']['parse_errors'])
         self.assertTrue(res['summary']['report_bound'])
@@ -266,7 +271,7 @@ class CodeBuddyDirectTests(unittest.TestCase):
              '--setting-sources', '',
              '--settings', '{"disableAllHooks":true}',
              '--agent', 'cli', '--no-session-persistence',
-             '--allowedTools', 'Read', 'Edit(/scripts/x.py)'])
+             '--allowedTools', 'Read', edit_rule])
         request = read_json(out / 'request.json')
         # request.json 记录含 node 前导的完整 argv；子进程 argv 去掉 node 后应一致
         self.assertEqual(request['argv'][0], sys.executable)
@@ -342,9 +347,12 @@ class CodeBuddyDirectTests(unittest.TestCase):
     def test_disallowed_rules_passed_variadic(self):
         spec = self.write_spec(self.success_events())
         out = self.tmp / 'out-disallowed'
+        # deny 侧同样受 Windows scoped 校验；旧 /secret.txt 是根样式，改用 workspace
+        # 实际绝对正斜杠路径，Linux/Windows 均原样透传，断言强度不变。
+        edit_rule = f'Edit({self.workspace.as_posix()}/secret.txt)'
         res = self.run_entry(out, spec, '--tools', 'Read',
                              '--disallowed-tools', 'Bash(rm -rf /)',
-                             '--disallowed-tools', 'Edit(/secret.txt)')
+                             '--disallowed-tools', edit_rule)
         self.assertEqual(res['rc'], 0, res['proc'].stderr.decode('utf-8', 'replace'))
         argv = res['record']['argv']
         i = argv.index('--disallowedTools')
@@ -353,7 +361,7 @@ class CodeBuddyDirectTests(unittest.TestCase):
             if token.startswith('--'):
                 break
             rules.append(token)
-        self.assertEqual(rules, ['Bash(rm -rf /)', 'Edit(/secret.txt)'])
+        self.assertEqual(rules, ['Bash(rm -rf /)', edit_rule])
 
     def test_resume_flag_passed(self):
         spec = self.write_spec(self.success_events())
@@ -1180,6 +1188,139 @@ class CodeBuddyDirectTests(unittest.TestCase):
         self.assertTrue(s['failure_envelope_valid'])
         self.assertTrue(s['recoverability'].startswith('unknown'))
         self.assertNotIn('rate_limited', s['recoverability'])
+
+    # ================= Windows scoped 文件授权派工前校验（真实入口）=================
+    # 这些端到端断言依赖当前宿主为 Windows；跨宿主的规则判定由下方纯函数类覆盖。
+
+    @unittest.skipUnless(sys.platform.startswith('win'),
+                         'entry-level Windows scoped checks need a win32 host')
+    def test_win_entry_accepts_canonical_absolute_and_argv_verbatim(self):
+        spec = self.write_spec(self.success_events())
+        out = self.tmp / 'out-win-ok'
+        rule = f'Edit({self.workspace.as_posix()}/probe.txt)'
+        res = self.run_entry(out, spec, '--tools', 'Read,Edit',
+                             '--allowed-tools', 'Read',
+                             '--allowed-tools', rule)
+        self.assertEqual(res['rc'], 0, res['proc'].stderr.decode('utf-8', 'replace'))
+        self.assertTrue(res['summary']['protocol_success'], res['summary']['parse_errors'])
+        # 规范绝对正斜杠单文件：规则原样透传进 argv 与 request.json，不被改写
+        self.assertIn(rule, res['record']['argv'])
+        self.assertIn(rule, read_json(out / 'request.json')['argv'])
+
+    @unittest.skipUnless(sys.platform.startswith('win'),
+                         'entry-level Windows scoped checks need a win32 host')
+    def test_win_entry_rejects_two_real_failure_forms_before_dispatch(self):
+        # 与两次真实探针同形：/probe.txt 根样式、probe.txt 裸相对，均在派工前拒绝
+        for label, rule in (('root', 'Edit(/probe.txt)'), ('bare', 'Edit(probe.txt)')):
+            with self.subTest(rule=rule):
+                spec = self.write_spec(self.success_events())
+                out = self.tmp / f'out-win-reject-{label}'
+                res = self.run_entry(out, spec, '--tools', 'Read,Edit',
+                                     '--allowed-tools', 'Read',
+                                     '--allowed-tools', rule)
+                self.assertEqual(res['rc'], 2)
+                self.assertFalse(out.exists())               # 证据目录零创建
+                self.assertFalse(self.record_path.is_file())  # 子进程未启动
+
+    @unittest.skipUnless(sys.platform.startswith('win'),
+                         'entry-level Windows scoped checks need a win32 host')
+    def test_win_entry_deny_side_rejects_equally(self):
+        spec = self.write_spec(self.success_events())
+        out = self.tmp / 'out-win-deny'
+        res = self.run_entry(out, spec, '--tools', 'Read',
+                             '--disallowed-tools', 'Edit(/probe.txt)')
+        self.assertEqual(res['rc'], 2)
+        self.assertFalse(out.exists())
+        self.assertFalse(self.record_path.is_file())
+
+    @unittest.skipUnless(sys.platform.startswith('win'),
+                         'entry-level Windows scoped checks need a win32 host')
+    def test_win_entry_bash_rule_passed_verbatim_untouched(self):
+        spec = self.write_spec(self.success_events())
+        out = self.tmp / 'out-win-bash'
+        rule = 'Bash(python -V)'
+        res = self.run_entry(out, spec, '--tools', 'Read,Bash',
+                             '--allowed-tools', rule)
+        self.assertEqual(res['rc'], 0, res['proc'].stderr.decode('utf-8', 'replace'))
+        self.assertIn(rule, res['record']['argv'])  # Bash 命令规则不当作文件规则校验
+
+
+class WindowsScopedGrantPureTests(unittest.TestCase):
+    """不依赖 CI 宿主的纯函数检查：显式传 platform 覆盖 Windows/Linux。"""
+    WS = 'C:/Users/test/work'
+
+    def _problems(self, allowed=None, disallowed=None, platform='win32'):
+        return cb.validate_windows_scoped_file_rules(
+            allowed, disallowed, self.WS, platform=platform)
+
+    def test_canonical_absolute_forward_slash_ok(self):
+        self.assertEqual(
+            self._problems(allowed=['Edit(C:/Users/test/work/probe.txt)']), [])
+        self.assertEqual(
+            self._problems(disallowed=['Read(C:/Users/test/work/a.txt)']), [])
+        self.assertEqual(
+            self._problems(allowed=['Write(C:/Users/test/work/new.md)']), [])
+
+    def test_unverified_forms_rejected(self):
+        bad = ['Edit(probe.txt)', 'Edit(./probe.txt)', 'Edit(../probe.txt)',
+               'Edit(/probe.txt)', 'Edit(/secret.txt)',
+               'Edit(\\\\srv\\share\\probe.txt)', 'Edit(//srv/share/probe.txt)',
+               'Edit(C:/work/*.txt)',
+               'Edit(C:/work/@(probe|other).txt)', 'Edit(C:/work/+(probe).txt)',
+               'Edit(C:/work/!(probe).txt)',
+               'Edit(C:/work/a?b.txt)', 'Read(~probe.txt)', 'Read(~/x.txt)',
+               'Write(C:/work/)', 'Edit()']
+        for rule in bad:
+            with self.subTest(rule=rule):
+                problems = self._problems(allowed=[rule])
+                self.assertTrue(problems, rule)
+                self.assertIn(repr(rule), problems[0])
+
+    def test_absolute_backslash_rules_accepted_without_rewriting(self):
+        rule = r'Edit(C:\work\probe.txt)'
+        self.assertEqual(self._problems(allowed=[rule], disallowed=[rule]), [])
+        argv = cb.build_argv({'node': 'node', 'cli': 'cli'}, self.WS, 'test', ['Edit'],
+                             None, allowed_tools=[rule], disallowed_tools=[rule])
+        self.assertEqual(argv[argv.index('--allowedTools') + 1], rule)
+        self.assertEqual(argv[argv.index('--disallowedTools') + 1], rule)
+
+    def test_bare_tool_and_bash_rules_untouched(self):
+        # 裸工具名与 Bash/非文件规则维持原样，不报错、不新增裸 Edit
+        self.assertEqual(self._problems(allowed=['Read', 'Edit', 'Write',
+                                                 'Bash(python -V)',
+                                                 'Bash(rm -rf /)']), [])
+
+    def test_non_windows_is_noop(self):
+        self.assertEqual(
+            self._problems(allowed=['Edit(/probe.txt)', 'Edit(probe.txt)',
+                                    'Edit(C:\\work\\probe.txt)'],
+                           platform='linux'), [])
+
+    def test_allow_and_deny_symmetric(self):
+        self.assertTrue(self._problems(allowed=['Edit(/probe.txt)']))
+        self.assertTrue(self._problems(disallowed=['Edit(/probe.txt)']))
+
+    def test_error_shows_workspace_absolute_forward_slash_example(self):
+        problems = self._problems(allowed=['Edit(/secret.txt)'])
+        self.assertTrue(problems)
+        self.assertIn('C:/Users/test/work', problems[0])
+        # 不把 /secret.txt 一概擅改成具体项目文件：示例保留占位相对段
+        self.assertIn('<relative/path/under/this/workspace>', problems[0])
+
+    def test_parse_scoped_file_rule_strict_fullmatch(self):
+        self.assertEqual(cb.parse_scoped_file_rule('Edit(C:/w/x.py)'),
+                         ('Edit', 'C:/w/x.py'))
+        self.assertIsNone(cb.parse_scoped_file_rule('Edit'))       # 裸工具名
+        self.assertIsNone(cb.parse_scoped_file_rule('Bash(echo Edit(/x))'))
+        self.assertIsNone(cb.parse_scoped_file_rule('Edit(C:/w/x.py) extra'))
+        # 内部含括号的真实路径仍按最后一个右括号解析
+        self.assertEqual(cb.parse_scoped_file_rule('Edit(C:/w/a(1).txt)'),
+                         ('Edit', 'C:/w/a(1).txt'))
+
+    def test_is_windows_platform_override(self):
+        self.assertTrue(cb.is_windows_platform('win32'))
+        self.assertFalse(cb.is_windows_platform('linux'))
+        self.assertFalse(cb.is_windows_platform('darwin'))
 
 
 if __name__ == '__main__':

@@ -54,6 +54,10 @@
   不视为免费证据；缓存分项不得与 input_tokens 重复累加。
 退出码：0 仅当 protocol_success 且 report_bound 均为真；preflight 校验错误为 2
 且证据目录零创建；其余失败为 3。权限范围不是文件 sandbox，见 references/codebuddy-direct.md。
+Windows 下 scoped Read/Edit/Write 文件规则在建目录与 Popen 前做派工前校验：只接受已证
+可靠的完整驱动器绝对单文件路径（推荐 C:/work/probe.txt），相对/根样式/UNC/
+~ /通配等未验证形态退出 2 并给出该 workspace 绝对正斜杠示例，不静默转换；Bash 等命令规则
+与裸工具名维持既有行为，非 Windows 维持原样，原始允许/拒绝列表仍逐字传给 CLI。
 """
 import argparse
 import hashlib
@@ -69,6 +73,7 @@ _SCRIPTS_DIR = Path(__file__).resolve().parent
 if str(_SCRIPTS_DIR) not in sys.path:
     sys.path.insert(0, str(_SCRIPTS_DIR))
 from qoder_direct import analyze_report, finalize_binding  # 共享正文核对/绑定，不改其文件
+import execution_control as ec  # 任务级控制面（同目录，标准库）
 
 DEFAULT_CONFIG = _SCRIPTS_DIR / 'codebuddy-entry.json'
 BAD_TERMINAL_REASONS = ('cancelled', 'aborted', 'max_turns')
@@ -190,6 +195,40 @@ def _tool_failure_stats(tool_failures) -> dict:
     return {'total': total, 'by_flag': by_flag}
 
 
+def _cb_failure_facts(parsed: dict, exit_code: int) -> dict:
+    """把已解析的 CodeBuddy 结构映射为 failure_types 事实：只读 errors/errors_info、
+    permission_denials、parse_success/failure_envelope 结构，绝不扫描报告正文里的 429
+    字样；quota_429 只认明确的 status/code=429 或错误文本开头的独立 429/HTTP 429。
+    权限拒绝（fail-closed）不算语法失败；无效 JSON 行等真实结构损坏仍算 parse 失败；
+    已知 quota/permission/parse 来源不泛化为模型差。多类可共存。"""
+    raw_errors = parsed.get('errors')
+    raw_errors_info = parsed.get('errors_info')
+    quota_429 = ec.explicit_429(raw_errors, raw_errors_info)
+    permission_denied = bool(parsed.get('permission_denials'))
+    # 结构错误：排除“权限 fail-closed”本身造成的 parse_errors，剩余才是真语法/结构破损。
+    structural = [e for e in (parsed.get('parse_errors') or [])
+                  if 'permission' not in str(e).lower()
+                  and 'fail-closed' not in str(e).lower()]
+    parse_failure = bool(structural)
+    execution_residual = (bool(parsed.get('failure_envelope_valid'))
+                          or exit_code != 0
+                          or parsed.get('terminal_state') == 'error')
+    model_execution = bool(execution_residual and not quota_429
+                           and not permission_denied and not parse_failure)
+    return {'quota_429': quota_429,
+            'permission_rule_denied': permission_denied,
+            'protocol_parse_failure': parse_failure,
+            'model_execution_failure': model_execution,
+            'reset_hint': parsed.get('reset_hint'),
+            'evidence': {'primary_failure': parsed.get('primary_failure'),
+                         'errors': raw_errors, 'errors_info': raw_errors_info,
+                         'terminal_state': parsed.get('terminal_state'),
+                         'failure_stage': parsed.get('failure_stage'),
+                         'recoverability': parsed.get('recoverability'),
+                         'exit_code': exit_code,
+                         'structural_parse_errors': structural}}
+
+
 def load_entry_config(path=None) -> dict:
     cfg_path = Path(path) if path else DEFAULT_CONFIG
     if not cfg_path.is_absolute():
@@ -258,6 +297,100 @@ def effective_permission_rules(tools_items, allowed_tools, disallowed_tools) -> 
                if allowed_tools is not None else list(tools_items))
     disallowed = _validate_rule_list(disallowed_tools, field='disallowed_tools')
     return {'allowed_tools': allowed, 'disallowed_tools': disallowed}
+
+
+# 官方原样 matchFileRule/normalizePath/normalizeFilePathPattern + bundled minimatch 的
+# 无上游探针证明：完整驱动器绝对路径能命中目标，另一文件不能命中。
+# `/probe.txt` 被 normalizeFilePathPattern 当作字面根路径不匹配；裸相对路径经
+# path.resolve 重新引入反斜杠也不匹配；点相对模式则保持相对，不解析到工作区。
+# 官方 Edit 已覆写 resolveNeedPermissionArgs 返回 {type:FilePath, value:file_path}
+# 扩展探针验证正斜杠与反斜杠绝对路径均可匹配。这里只接受完整驱动器绝对字面路径，
+# 相对/根样式/UNC/~ 与通配模式派工前拒绝；规则本身仍逐字传给 CLI。
+_SCOPED_FILE_RULE_RE = re.compile(r'^(Read|Edit|Write)\((.*)\)$', re.DOTALL)
+_WINDOWS_SCOPED_REASON_TEXT = {
+    'empty': '路径为空',
+    'relative': '相对路径（裸名、./ 或 ../），官方路径规范化无法匹配工作区绝对目标',
+    'root': '以 / 开头的项目根样式，官方按字面根路径规范化、无法命中目标文件',
+    'unc': 'UNC 路径本档案未验证',
+    'home': '~ 家目录形式本档案未验证',
+    'glob': '含通配等元字符，本阶段不支持文件 glob 语言',
+    'drive-no-sep': '驱动器号后缺绝对路径分隔符',
+    'no-file': '路径须指向单个文件、而非目录',
+}
+
+
+def is_windows_platform(platform=None) -> bool:
+    """判定是否 Windows。默认取当前宿主平台；纯函数测试可显式传 platform 覆盖，
+    不依赖 CI 宿主。"""
+    p = platform if platform is not None else sys.platform
+    return str(p).lower().startswith('win')
+
+
+def parse_scoped_file_rule(rule):
+    """整串 fullmatch 才认作 scoped Read/Edit/Write 文件规则，返回 (tool, inner_path)；
+    裸工具名（'Edit'）、Bash/其他规则、以及仅在字符串里包含 'Edit' 的一律返回 None，
+    维持既有行为、不把非文件规则误当文件规则。"""
+    if not isinstance(rule, str):
+        return None
+    match = _SCOPED_FILE_RULE_RE.fullmatch(rule)
+    if not match:
+        return None
+    return match.group(1), match.group(2)
+
+
+def _classify_windows_scoped_path(path: str) -> str:
+    """把 scoped 文件规则的 inner 路径分类为 'ok'（完整驱动器绝对、字面单文件路径）
+    或一个原因键；只做已证可靠形态的接受，其余一律不通过。绝不改写输入。"""
+    if path == '' or path.strip() == '':
+        return 'empty'
+    if any(ch in path for ch in '*?[]{}') or re.search(r'[+@!]\(', path):
+        return 'glob'
+    if path.startswith('~'):
+        return 'home'
+    if path.startswith('\\\\') or path.startswith('//'):
+        return 'unc'
+    # 仅用规范化副本做形态校验；传给官方 CLI 的原始授权字符串不变。
+    drive = re.match(r'^([A-Za-z]:)(.*)$', path.replace('\\', '/'))
+    if drive:
+        rest = drive.group(2)
+        if not rest.startswith('/'):
+            return 'drive-no-sep'
+        if rest == '/' or rest.endswith('/'):
+            return 'no-file'
+        return 'ok'
+    if path.startswith('/'):
+        return 'root'
+    return 'relative'
+
+
+def validate_windows_scoped_file_rules(allowed_rules, disallowed_rules, workspace,
+                                       platform=None) -> list:
+    """仅 Windows 生效的派工前校验：对 allow 与 deny 两侧的 scoped Read/Edit/Write 文件
+    规则做同等检查，非“完整驱动器绝对字面单文件”形态返回可读问题列表（供上层在
+    建目录与 Popen 之前退出 2）。非 Windows 返回 []（维持原样行为）。Bash 等命令规则、
+    裸工具名与非文件规则一律跳过、不改既有传参。问题里给出该 workspace 实际绝对
+    正斜杠示例（用占位相对段，不擅自把 /secret.txt 等改写成某个具体项目文件）。"""
+    if not is_windows_platform(platform):
+        return []
+    ws_posix = Path(workspace).as_posix()
+    problems: list[str] = []
+    for side, rules in (('allowed_tools', allowed_rules),
+                        ('disallowed_tools', disallowed_rules)):
+        for rule in (rules or []):
+            parsed = parse_scoped_file_rule(rule)
+            if parsed is None:
+                continue
+            tool, inner = parsed
+            reason = _classify_windows_scoped_path(inner)
+            if reason == 'ok':
+                continue
+            example = f'{tool}({ws_posix}/<relative/path/under/this/workspace>)'
+            problems.append(
+                f'{side} 里的 scoped 文件规则 {rule!r} 不受本入口 Windows 档案支持'
+                f'（{_WINDOWS_SCOPED_REASON_TEXT[reason]}）；请改用该授权文件的实际'
+                f'绝对路径，推荐正斜杠写法，形如 {example}。本入口仅支持已证可靠的完整驱动器'
+                f'绝对字面单文件路径，不静默转换、不偷偷转写。')
+    return problems
 
 
 def build_argv(cfg: dict, workspace: str, model: str, tools_items: list[str],
@@ -737,6 +870,17 @@ def main():
     ap.add_argument('--disallowed-tools', dest='disallowed_tools', action='append', default=None)
     ap.add_argument('--resume-session-id', dest='session_id', default=None)
     ap.add_argument('--config', default=str(DEFAULT_CONFIG))
+    ap.add_argument('--dispatch-plan', dest='dispatch_plan', default=None,
+                    help='Optional task-level dispatch plan JSON; new parallel dispatch '
+                         'supplies it, the legacy (no-plan) path stays compatible. The '
+                         'argv/grants/cwd built here are exactly compared to the plan '
+                         'before Popen; a rejected preflight exits 2 with zero output dir.')
+    ap.add_argument('--active-tasks', dest='active_tasks', default=None,
+                    help='Optional JSON file of the active-task snapshot (list of '
+                         '{task_id,state,...}). When given it overrides the plan\'s own '
+                         'active_tasks; otherwise the plan snapshot is used, so a parallel '
+                         'plan that omits it is refused rather than treated as "nothing '
+                         'in flight".')
     args = ap.parse_args()
 
     # ---- preflight：全部校验通过前不创建任何输出目录（失败退出码 2，零创建）----
@@ -764,15 +908,55 @@ def main():
         if out.exists():
             raise ValueError(f'output directory already exists (refusing to '
                              f'overwrite/replay): {out}')
+        # Windows scoped Read/Edit/Write 文件规则的派工前校验：无效形态在建目录与
+        # Popen 之前退出 2、零创建、零模型额度；allow 与 deny 两侧同等校验。原始
+        # 允许/拒绝列表随后仍逐字传给 CLI（不静默转换），非 Windows 维持原样行为。
+        scoped_problems = validate_windows_scoped_file_rules(
+            perms['allowed_tools'], perms['disallowed_tools'], str(work))
+        if scoped_problems:
+            raise ValueError('invalid Windows scoped file grant: '
+                             + ' | '.join(scoped_problems))
     except (ValueError, OSError, KeyError, json.JSONDecodeError) as exc:
         print(json.dumps({'preflight_error': str(exc), 'exit_code': 2},
                          ensure_ascii=False))
         return 2
-    out.mkdir(parents=True, exist_ok=False)
-
     argv = build_argv(cfg, str(work), args.model, tools_items, args.session_id,
                       allowed_tools=args.allowed_tools,
                       disallowed_tools=args.disallowed_tools)
+
+    # ---- 任务级预检（仅 --dispatch-plan 时启用）：argv 建好后、Popen/建目录前 ----
+    plan_block = None
+    if args.dispatch_plan:
+        try:
+            plan = ec.load_plan(args.dispatch_plan)
+            active_tasks = None
+            if args.active_tasks:
+                active_tasks = json.loads(Path(args.active_tasks).read_text(encoding='utf-8'))
+        except (ValueError, KeyError, OSError, json.JSONDecodeError) as exc:
+            print(json.dumps({'dispatch_plan_rejected': True, 'sent': False,
+                              'exit_code': 2, 'reasons': [str(exc)]}, ensure_ascii=False))
+            return 2
+        actual = {'task_id': plan.get('task_id'), 'stage': args.stage,
+                  'runtime': 'codebuddy', 'model': args.model, 'workspace': str(work),
+                  'cwd': str(work),
+                  'prompt_sha256': hashlib.sha256(prompt_bytes).hexdigest(),
+                  'argv': argv, 'shell': False,
+                  'grants': ec.grants_from_rules(perms['allowed_tools'], [],
+                                                 perms['disallowed_tools'],
+                                                 tools_items)}
+        result = ec.preflight(plan, actual, active_tasks=active_tasks)
+        plan_block = {'plan_path': str(Path(args.dispatch_plan).resolve()),
+                      'plan_hash': result['plan_hash'], 'ok': result['ok'],
+                      'reasons': result['reasons'], 'argv_sha256': result['argv_sha256'],
+                      'active_task_count': result['active_task_count'],
+                      'is_atomic_lock': result['is_atomic_lock']}
+        if not result['ok']:
+            print(json.dumps({'dispatch_plan_rejected': True, 'sent': False,
+                              'exit_code': 2, 'reasons': result['reasons'],
+                              'plan_hash': result['plan_hash']}, ensure_ascii=False))
+            return 2
+
+    out.mkdir(parents=True, exist_ok=False)
     contract = ('Final response must contain only the complete nine-section report. '
                 'First line: WORKER_REPORT_START. Last line: WORKER_REPORT_END. '
                 'Those markers must appear exactly once each; never quote them in the body. '
@@ -791,6 +975,8 @@ def main():
                'entry_config': str(Path(args.config).resolve()),
                'runtime': {'node': cfg['node'], 'cli': cfg['cli']},
                'argv': argv}
+    if plan_block is not None:
+        request['dispatch_plan'] = plan_block
     (out / 'request.json').write_bytes(json.dumps(request, ensure_ascii=False,
                                                   indent=2).encode('utf-8'))
     env = os.environ.copy()
@@ -839,6 +1025,9 @@ def main():
                'usage_billing_basis': 'unknown; raw usage saved without interpretation',
                'finished_at': datetime.now(timezone.utc).isoformat(),
                'output_dir': str(out)}
+    summary['diagnostics'] = ec.diagnose(_cb_failure_facts(parsed, exit_code))
+    if plan_block is not None:
+        summary['dispatch_plan'] = plan_block
     if parsed['response_text'] is not None:
         (out / 'response.md').write_bytes(parsed['response_text'].encode('utf-8'))
         disk = (out / 'response.md').read_bytes()

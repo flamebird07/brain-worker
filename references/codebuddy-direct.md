@@ -39,6 +39,42 @@ node <cli/bin/codebuddy> -p --verbose --output-format stream-json --model <ID> \
 权限规则不是文件 sandbox：dontAsk 模式下规则影响提示与自动放行，不构成对进程文件
 访问的强制隔离。敏感目录保护必须依靠主脑侧环境隔离，不能只依赖本入口。
 
+## Windows scoped 文件授权（2.161.1 版本差异）
+
+官方原样 `matchFileRule` / `normalizePath` / `normalizeFilePathPattern` 加官方 bundled
+minimatch 的无上游探针表明：Windows 下 scoped 文件规则
+（`Read(...)`/`Edit(...)`/`Write(...)`）使用**完整驱动器绝对路径**可以命中目标：
+
+- `C:/isolated/work/probe.txt` 命中，`C:/isolated/work/other.txt` 不误命中；
+- `/probe.txt` 被 `normalizeFilePathPattern` 当字面**根路径**、不解析到项目根，**不命中**
+  `C:/isolated/work/probe.txt`（旧文档“`/path`=项目根起”与实现不一致）；
+- 裸相对 `probe.txt` 经 `path.resolve` 重新引入**反斜杠**，与正斜杠规范化目标不等；
+  点相对 `./probe.txt`、`../probe.txt` 保持相对，不解析到工作区，均不命中绝对目标。
+- 完整反斜杠绝对路径也会在匹配前转为正斜杠，已通过同一官方匹配函数的正例验证。
+
+官方 Edit 已覆写 `resolveNeedPermissionArgs` 返回 `{type:FilePath, value:file_path}`，因此不能用基类的默认 Unknown 参数推断 Edit 缺少文件路径参数。
+
+因此本版本入口在 Windows 下对 scoped Read/Edit/Write 规则做**派工前校验**：仅接受完整
+驱动器绝对字面单文件路径（推荐正斜杠，完整反斜杠绝对路径同样支持）；相对、`/` 根样式、
+UNC（`\\...` / `//...`）、`~`、含通配元字符或 extglob（例如 `@(a|b)`）的模式，
+都在**创建证据目录与 Popen 之前退出 2**、
+零目录创建、零模型额度消耗，并给出该 workspace 的实际绝对正斜杠示例（示例用占位相对段，
+不擅自把 `/secret.txt` 改写成某个具体项目文件、也不静默转写）。`--allowedTools` 与
+`--disallowedTools` 两侧同等校验；Bash 等命令规则与裸工具名维持既有原样行为；原始允许/
+拒绝列表仍逐字传给官方 CLI，计划 grant 来源与既有 exact-argv/集合比对不变。非 Windows
+维持原样行为（该校验不生效）。
+
+正确最小单文件授权示例（Windows，路径须为该 workspace 下的实际绝对正斜杠路径）：
+
+```text
+--allowed-tools "Read" --allowed-tools "Edit(C:/绝对/到/workspace/目标/文件.txt)"
+```
+
+**边界（尚未证明）**：本轮只修派工前的授权形态校验，避免耗费额度后才被拒；未证明
+CodeBuddy 真实业务编辑已恢复，也未证明 429 配额恢复。完整 CLI 编辑链路、后端模型身份、
+配额窗口仍需主脑真实派工回读验证，不得据此声称业务已修复。429 失败信封、重复 init、
+报告绑定、usage 解析与既有并行升级均不变。
+
 ## 协议终态（不只看 exit 0）
 
 stdout 为 stream-json JSONL，逐字以字节保存 `stdout.jsonl`（stderr 同样逐字保存
