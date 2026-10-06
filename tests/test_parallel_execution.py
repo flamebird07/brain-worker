@@ -414,6 +414,11 @@ class ParallelRehearsalTests(unittest.TestCase):
         fail_sha = self._fail_summary(ws, 'fb429')
         self.assertEqual(len(fail_sha), 64)
 
+        # Keep the failed task's barrier evidence, but give the fallback cohort its
+        # own barrier. A completed failure is not one of its three live members.
+        self.barrier = self.base / 'barrier-fallback'
+        self.barrier.mkdir()
+
         # 2) 起两个 Qoder 成功任务（barrier_total=3），此刻它们仍卡在 barrier 内。
         inflight = {}
         for tag, stage in (('ia', 'BW-FB-IA'), ('ib', 'BW-FB-IB')):
@@ -432,17 +437,20 @@ class ParallelRehearsalTests(unittest.TestCase):
                                   stderr=subprocess.PIPE)
             inflight[tag] = (pr, outi)
 
-        # 等两个在途任务写出 request.json 并卡在 barrier（started<3 说明确仍在途）。
+        # Wait for the real child markers, not merely adapter request files: both
+        # independent tasks must be held until the fallback itself starts.
         import time as _t
         for tag, (pr, outi) in inflight.items():
             req = outi / 'request.json'
             for _ in range(200):
-                if req.is_file():
+                if req.is_file() and (self.barrier / ('started-' + tag)).is_file():
                     break
                 _t.sleep(0.05)
             self.assertTrue(req.is_file(), f'{tag} request.json not written')
-        self.assertLess(len(list(self.barrier.glob('started-*'))), 3,
-                        'in-flight tasks should still be gated before fallback dispatch')
+            self.assertTrue((self.barrier / ('started-' + tag)).is_file())
+            self.assertIsNone(pr.poll(), f'{tag} finished before fallback dispatch')
+            self.assertFalse((self.barrier / ('finished-' + tag)).exists())
+        self.assertEqual(len(list(self.barrier.glob('started-*'))), 2)
 
         # 快照两个在途任务的 prompt_sha256 + request.json 原字节哈希（fallback 前）。
         before = {}
@@ -468,11 +476,13 @@ class ParallelRehearsalTests(unittest.TestCase):
                          fb_proc.stderr.decode('utf-8', 'replace'))
         fb_summary = json.loads((wsfb / 'out' / 'summary.json').read_text(encoding='utf-8'))
         self.assertTrue(fb_summary['report_bound'])
+        fallback_started = float((self.barrier / 'started-fbtake').read_text())
 
         # 4) join 两个在途任务；证明 fallback 期间它们的 prompt/request 哈希一字未改。
         for tag, (pr, outi) in inflight.items():
             out, err = pr.communicate(timeout=120)
             self.assertEqual(pr.returncode, 0, err.decode('utf-8', 'replace'))
+            self.assertGreaterEqual(float((self.barrier / ('finished-' + tag)).read_text()), fallback_started)
             raw_after = (outi / 'request.json').read_bytes()
             self.assertEqual(_sha(raw_after), before[tag]['raw_sha'],
                              f'{tag} request.json bytes changed during fallback')

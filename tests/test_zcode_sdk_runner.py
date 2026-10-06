@@ -56,7 +56,7 @@ class ActualRunnerTests(unittest.TestCase):
             env = {**os.environ, 'CASE':case, 'RECEIPT':str(work/'receipt.txt')}
             process = subprocess.run([shutil.which('node'),str(ROOT/'scripts/zcode_sdk_runner.mjs'),
                                       '--request',str(path)],env=env,capture_output=True,timeout=30)
-            receipt=(work/'receipt.txt').read_text().splitlines()
+            receipt=(work/'receipt.txt').read_text(encoding='utf-8').splitlines()
             stdout=process.stdout.decode('utf-8').strip().splitlines()
             envelope=json.loads(stdout[0])
             self.assertEqual(len(stdout),1)
