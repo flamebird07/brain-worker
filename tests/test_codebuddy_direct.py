@@ -55,9 +55,9 @@ def read_json(path: Path):
 
 
 def init_event(session_id='S-1', model='GLM-CB-1', omit=None,
-               mcp_servers=None):
+               mcp_servers=None, permission_mode='dontAsk'):
     event = {'type': 'system', 'subtype': 'init', 'session_id': session_id,
-             'model': model, 'tools': ['Read'],
+             'model': model, 'tools': ['Read'], 'permissionMode': permission_mode,
              'mcp_servers': [] if mcp_servers is None else mcp_servers}
     for key in omit or []:
         event.pop(key, None)
@@ -710,6 +710,476 @@ class CodeBuddyDirectTests(unittest.TestCase):
         self.assertEqual(summary['usage'], {'input_tokens': 1, 'output_tokens': 2})
         self.assertEqual(summary['model_usage'],
                          {'GLM-CB-1': {'input_tokens': 1}})
+
+    # ---- 失败信封：429 / error_during_execution / is_error=true，无 result 文本 ----
+    # 精简合成流复现原始失败形状（不复制真实业务流），真实子进程回归。
+    def test_failure_envelope_429_parses_but_still_fails(self):
+        rate_msg = ('429 您的使用量已超出频率限制，将在 2026-10-06 13:55:40 UTC+8 '
+                    '重置，您也可以切换其他模型继续使用。')
+        events = [init_event(), status_event(),
+                  assistant_event(model=self.MODEL, text=rate_msg),
+                  result_event(subtype='error_during_execution', is_error=True,
+                               omit=['result'],
+                               extra={'errors': [rate_msg],
+                                      'errors_info': [{'status': 429, 'code': 6004,
+                                                       'category': 'quota',
+                                                       'details': rate_msg}]})]
+        out = self.tmp / 'out-429'
+        res = self.run_entry(out, self.write_spec(events))
+        summary = res['summary']
+        self.assertEqual(res['rc'], 3)
+        self.assertFalse(summary['protocol_success'])
+        self.assertFalse(summary['report_bound'])
+        self.assertTrue(summary['failure_envelope'])
+        self.assertEqual(summary['terminal_state'], 'error')
+        self.assertEqual(summary['failure_stage'], 'result_terminal')
+        self.assertIn('429', summary['primary_failure'])
+        self.assertIn('重置', summary['reset_hint'])
+        self.assertIn('rate_limited', summary['recoverability'])
+        self.assertEqual(summary['result_errors'], [rate_msg])
+        # 原始 errors_info 保留，不被当成“缺 result 字段”的结构损坏
+        self.assertEqual(summary['errors_info'][0]['category'], 'quota')
+        joined = ' '.join(summary['parse_errors'])
+        self.assertNotIn('result event missing fields', joined)
+        # CLI 退出码 0 也不能伪成功
+        self.assertEqual(summary['exit_code'], 0)
+        self.assertTrue((out / 'stdout.jsonl').is_file())
+        self.assertFalse((out / 'response.md').exists())
+        report_state = read_json(out / 'report-state.json')
+        self.assertTrue(report_state['carrier_missing'])
+        self.assertIn('429', report_state['primary_failure'])
+
+    # ---- 成功 result 缺 result 字段仍拒绝（未过度放宽）----
+    def test_success_result_missing_result_field_rejects(self):
+        events = [init_event(), status_event(),
+                  assistant_event(text=report_text(self.STAGE, str(self.workspace))),
+                  result_event(omit=['result'])]
+        res = self.run_entry(self.tmp / 'out-succnoresult', self.write_spec(events))
+        self.assertEqual(res['rc'], 3)
+        self.assertTrue(any('result event missing fields' in e
+                            for e in res['summary']['parse_errors']))
+
+    # ---- 身份稳定的重复 init：同会话重初始化被接受 ----
+    def test_identity_stable_duplicate_init_accepted(self):
+        rep = report_text(self.STAGE, str(self.workspace))
+        events = [init_event(), status_event(),
+                  assistant_event(text=rep), init_event(),
+                  result_event(text=rep)]
+        out = self.tmp / 'out-reinit-ok'
+        res = self.run_entry(out, self.write_spec(events))
+        self.assertEqual(res['rc'], 0, res['proc'].stderr.decode('utf-8', 'replace'))
+        self.assertTrue(res['summary']['protocol_success'], res['summary']['parse_errors'])
+        self.assertTrue(res['summary']['report_bound'])
+        reinit = res['summary']['reinit_events']
+        self.assertTrue(reinit)
+        self.assertTrue(all(r['identical'] for r in reinit))
+        self.assertEqual(reinit[0]['changed_fields'], [])
+
+    # ---- 重复 init 模型漂移：拒绝 ----
+    def test_duplicate_init_model_drift_rejects(self):
+        rep = report_text(self.STAGE, str(self.workspace))
+        drift = init_event(model='OTHER-MODEL')
+        events = [init_event(), status_event(),
+                  assistant_event(text=rep), drift, result_event(text=rep)]
+        res = self.run_entry(self.tmp / 'out-reinit-drift', self.write_spec(events))
+        self.assertEqual(res['rc'], 3)
+        self.assertFalse(res['summary']['protocol_success'])
+        self.assertTrue(any('identity drift' in e
+                            for e in res['summary']['parse_errors']))
+        drift_record = res['summary']['reinit_events'][0]
+        self.assertFalse(drift_record['identical'])
+        self.assertIn('model', drift_record['changed_fields'])
+
+    # ---- 重复 init 缺身份字段（permissionMode）：拒绝 ----
+    def test_duplicate_init_missing_identity_field_rejects(self):
+        rep = report_text(self.STAGE, str(self.workspace))
+        missing_perm = init_event()
+        missing_perm.pop('permissionMode')
+        events = [init_event(), status_event(),
+                  assistant_event(text=rep), missing_perm, result_event(text=rep)]
+        res = self.run_entry(self.tmp / 'out-reinit-missing', self.write_spec(events))
+        self.assertEqual(res['rc'], 3)
+        self.assertTrue(any('missing identity fields' in e
+                            for e in res['summary']['parse_errors']))
+        self.assertIn('permissionMode',
+                      res['summary']['reinit_events'][0]['missing_identity_fields'])
+
+    # ---- 普通工具失败仅诊断，不推翻后续合法修复成功 ----
+    def test_ordinary_tool_failure_is_diagnostic_and_later_success_binds(self):
+        rep = report_text(self.STAGE, str(self.workspace))
+        events = [init_event(), status_event(),
+                  assistant_event(model=self.MODEL, text=None,
+                                  tool_uses=[{'id': 'c1', 'name': 'Read'}]),
+                  tool_result_event(
+                      tool_use_id='c1', is_error=True,
+                      text='<tool_use_error>Error: File does not exist: '
+                           'notes/missing.md</tool_use_error>'),
+                  assistant_event(model=self.MODEL, text=rep),
+                  result_event(text=rep)]
+        out = self.tmp / 'out-toolfail'
+        res = self.run_entry(out, self.write_spec(events), '--tools', 'Read')
+        self.assertEqual(res['rc'], 0, res['proc'].stderr.decode('utf-8', 'replace'))
+        self.assertTrue(res['summary']['protocol_success'], res['summary']['parse_errors'])
+        self.assertTrue(res['summary']['report_bound'])
+        failures = res['summary']['tool_failures']
+        self.assertEqual(len(failures), 1)
+        self.assertEqual(failures[0]['tool_use_id'], 'c1')
+        self.assertEqual(failures[0]['line'], 4)
+        self.assertIn('file_not_found', failures[0]['flags'])
+        self.assertIn('tool_use_error', failures[0]['flags'])
+        self.assertIn('is_error_true', failures[0]['flags'])
+        stats = res['summary']['tool_failure_stats']
+        self.assertEqual(stats['total'], 1)
+        self.assertEqual(stats['by_flag']['file_not_found'], 1)
+        # 定位失败没有被记成协议错误
+        self.assertEqual(res['summary']['parse_errors'], [])
+
+    # ---- is_error=false 里藏权限拒绝：仍 fail-closed，且不当作普通工具失败 ----
+    def test_hidden_permission_denial_not_counted_as_tool_failure(self):
+        rep = report_text(self.STAGE, str(self.workspace))
+        denial = 'Error: Permission to use Bash has been denied (prompts unavailable).'
+        events = [init_event(), status_event(),
+                  assistant_event(model=self.MODEL, text=None,
+                                  tool_uses=[{'id': 'cb', 'name': 'Bash'}]),
+                  tool_result_event(tool_use_id='cb', text=denial, is_error=False),
+                  assistant_event(model=self.MODEL, text=rep),
+                  result_event(text=rep)]
+        res = self.run_entry(self.tmp / 'out-hidden-denial',
+                             self.write_spec(events), '--tools', 'Read,Bash')
+        self.assertEqual(res['rc'], 3)
+        self.assertFalse(res['summary']['protocol_success'])
+        # 权限拒绝单独记录，不落入普通 tool_failures
+        self.assertEqual(res['summary']['tool_failures'], [])
+        self.assertTrue(res['summary']['permission_denials'])
+
+    # ================= 第二轮补修：集中缺口 =====================
+
+    def _failure_events(self, *, errors, errors_info=None, subtype='error_during_execution',
+                        is_error=True, omit_result=True, text=None):
+        extra = {'errors': errors}
+        if errors_info is not None:
+            extra['errors_info'] = errors_info
+        if text is not None:
+            extra['result'] = text
+        evts = [init_event(), status_event(),
+                result_event(subtype=subtype, is_error=is_error,
+                             omit=['result'] if (omit_result and text is None) else [],
+                             extra=extra)]
+        return evts
+
+    # ---- 1. 全字段身份漂移：仅 __timestamp 不同被接受 ----
+    def test_duplicate_init_only_timestamp_difference_accepted(self):
+        rep = report_text(self.STAGE, str(self.workspace))
+        first = init_event()
+        first['cwd'] = 'C:\\ws'
+        first['apiKeySource'] = 'copilot.example'
+        first['__timestamp'] = 'T-1'
+        second = dict(first)
+        second['__timestamp'] = 'T-2'
+        events = [first, status_event(), assistant_event(text=rep), second,
+                  result_event(text=rep)]
+        res = self.run_entry(self.tmp / 'out-reinit-ts', self.write_spec(events))
+        self.assertEqual(res['rc'], 0, res['proc'].stderr.decode('utf-8', 'replace'))
+        self.assertTrue(res['summary']['protocol_success'], res['summary']['parse_errors'])
+        reinit = res['summary']['reinit_events'][0]
+        self.assertTrue(reinit['identical'])
+        self.assertEqual(reinit['changed_fields'], [])
+        self.assertEqual(reinit['added_fields'], [])
+        self.assertEqual(reinit['removed_fields'], [])
+
+    # ---- 1. 全字段身份漂移：cwd 值变化被拒绝（不再只比固定五键）----
+    def test_duplicate_init_cwd_drift_rejected(self):
+        rep = report_text(self.STAGE, str(self.workspace))
+        first = init_event()
+        first['cwd'] = 'C:\\ws-a'
+        second = init_event()
+        second['cwd'] = 'C:\\ws-b'
+        events = [first, status_event(), assistant_event(text=rep), second,
+                  result_event(text=rep)]
+        res = self.run_entry(self.tmp / 'out-reinit-cwd', self.write_spec(events))
+        self.assertEqual(res['rc'], 3)
+        self.assertFalse(res['summary']['protocol_success'])
+        reinit = res['summary']['reinit_events'][0]
+        self.assertFalse(reinit['identical'])
+        self.assertIn('cwd', reinit['changed_fields'])
+
+    # ---- 1. apiKeySource 漂移被拒绝 ----
+    def test_duplicate_init_api_key_source_drift_rejected(self):
+        rep = report_text(self.STAGE, str(self.workspace))
+        first = init_event()
+        first['apiKeySource'] = 'copilot.example'
+        second = init_event()
+        second['apiKeySource'] = 'other.example'
+        events = [first, status_event(), assistant_event(text=rep), second,
+                  result_event(text=rep)]
+        res = self.run_entry(self.tmp / 'out-reinit-key', self.write_spec(events))
+        self.assertEqual(res['rc'], 3)
+        self.assertIn('apiKeySource', res['summary']['reinit_events'][0]['changed_fields'])
+
+    # ---- 1. 重复 init 新增未知字段被拒绝 ----
+    def test_duplicate_init_added_unknown_field_rejected(self):
+        rep = report_text(self.STAGE, str(self.workspace))
+        first = init_event()
+        second = init_event()
+        second['brandNewSecurityField'] = {'mode': 'bypass'}
+        events = [first, status_event(), assistant_event(text=rep), second,
+                  result_event(text=rep)]
+        res = self.run_entry(self.tmp / 'out-reinit-add', self.write_spec(events))
+        self.assertEqual(res['rc'], 3)
+        self.assertFalse(res['summary']['protocol_success'])
+        reinit = res['summary']['reinit_events'][0]
+        self.assertFalse(reinit['identical'])
+        self.assertIn('brandNewSecurityField', reinit['added_fields'])
+
+    # ---- 1. 重复 init 删除既有字段（agent）被拒绝 ----
+    def test_duplicate_init_removed_field_rejected(self):
+        rep = report_text(self.STAGE, str(self.workspace))
+        first = init_event()
+        first['agent'] = 'cli'
+        second = init_event()  # 无 agent 键
+        events = [first, status_event(), assistant_event(text=rep), second,
+                  result_event(text=rep)]
+        res = self.run_entry(self.tmp / 'out-reinit-remove', self.write_spec(events))
+        self.assertEqual(res['rc'], 3)
+        self.assertFalse(res['summary']['protocol_success'])
+        reinit = res['summary']['reinit_events'][0]
+        self.assertFalse(reinit['identical'])
+        self.assertIn('agent', reinit['removed_fields'])
+
+    # ---- 1. 每个 init 仍校验必备类型：tools 非 list[str] 拒绝 ----
+    def test_first_init_bad_tools_type_rejected(self):
+        rep = report_text(self.STAGE, str(self.workspace))
+        bad = init_event()
+        bad['tools'] = 'Read'  # 不是 list
+        events = [bad, status_event(), assistant_event(text=rep), result_event(text=rep)]
+        res = self.run_entry(self.tmp / 'out-init-tools', self.write_spec(events))
+        self.assertEqual(res['rc'], 3)
+        self.assertFalse(res['summary']['protocol_success'])
+
+    # ---- 5. 协议事件带空 session_id 一律拒绝（不因 sid 空跳过核对）----
+    def test_empty_session_id_field_rejected(self):
+        rep = report_text(self.STAGE, str(self.workspace))
+        events = [init_event(session_id='S-1'),
+                  {'type': 'system', 'subtype': 'status', 'session_id': '   '},
+                  assistant_event(text=rep, session_id='S-1'),
+                  result_event(session_id='S-1', text=rep)]
+        res = self.run_entry(self.tmp / 'out-empty-sid', self.write_spec(events))
+        self.assertEqual(res['rc'], 3)
+        self.assertFalse(res['summary']['protocol_success'])
+        self.assertTrue(res['summary']['parse_errors'])
+
+    # ---- 3. is_error=true 但 content 缺失/空：仍记为失败，excerpt 可为 None ----
+    def test_empty_content_is_error_true_still_recorded(self):
+        rep = report_text(self.STAGE, str(self.workspace))
+        block = {'type': 'tool_result', 'tool_use_id': 'c9', 'is_error': True}
+        events = [init_event(), status_event(),
+                  assistant_event(model=self.MODEL, text=None,
+                                  tool_uses=[{'id': 'c9', 'name': 'Read'}]),
+                  {'type': 'user', 'session_id': 'S-1',
+                   'message': {'role': 'user', 'content': [block]}},
+                  assistant_event(model=self.MODEL, text=rep),
+                  result_event(text=rep)]
+        out = self.tmp / 'out-emptycontent-err'
+        res = self.run_entry(out, self.write_spec(events), '--tools', 'Read')
+        self.assertEqual(res['rc'], 0, res['proc'].stderr.decode('utf-8', 'replace'))
+        # 普通工具失败仍不推翻后续合法修复成功
+        self.assertTrue(res['summary']['protocol_success'], res['summary']['parse_errors'])
+        failures = res['summary']['tool_failures']
+        self.assertEqual(len(failures), 1)
+        self.assertIsNone(failures[0]['excerpt'])
+        self.assertEqual(failures[0]['tool_use_id'], 'c9')
+        self.assertIn('is_error_true', failures[0]['flags'])
+        self.assertEqual(res['summary']['tool_failure_stats']['by_flag']['is_error_true'], 1)
+
+    # ---- 4. 成功信封 errors 非空不得绿灯 ----
+    def test_success_envelope_with_errors_not_greenlit(self):
+        rep = report_text(self.STAGE, str(self.workspace))
+        events = [init_event(), status_event(), assistant_event(text=rep),
+                  result_event(text=rep, extra={'errors': ['latent error']})]
+        res = self.run_entry(self.tmp / 'out-succerrors', self.write_spec(events))
+        self.assertEqual(res['rc'], 3)
+        self.assertFalse(res['summary']['protocol_success'])
+        self.assertFalse(res['summary']['report_bound'])
+
+    # ---- 4. 缺/空 errors 不得声明合法已解析失败 ----
+    def test_error_terminal_missing_errors_not_valid_envelope(self):
+        for omit_extra in ({}, {'errors': []}):
+            with self.subTest(errors=omit_extra.get('errors')):
+                events = [init_event(), status_event(),
+                          result_event(subtype='error_during_execution', is_error=True,
+                                       omit=['result'], extra=dict(omit_extra))]
+                res = self.run_entry(
+                    self.tmp / f'out-noerr-{list(omit_extra.keys())}',
+                    self.write_spec(events))
+                self.assertEqual(res['rc'], 3)
+                self.assertFalse(res['summary']['protocol_success'])
+                self.assertFalse(res['summary']['failure_envelope'])
+                self.assertFalse(res['summary']['failure_envelope_valid'])
+                self.assertFalse(res['summary']['parse_success'])
+
+    # ---- 4. 矛盾 subtype/is_error 不算合法已解析失败 ----
+    def test_error_terminal_contradictory_subtype_is_error_invalid(self):
+        events = [init_event(), status_event(),
+                  result_event(subtype='error_during_execution', is_error=False,
+                               omit=['result'], extra={'errors': ['boom']})]
+        res = self.run_entry(self.tmp / 'out-contradict', self.write_spec(events))
+        self.assertEqual(res['rc'], 3)
+        self.assertFalse(res['summary']['protocol_success'])
+        self.assertFalse(res['summary']['failure_envelope_valid'])
+        self.assertFalse(res['summary']['parse_success'])
+
+    # ---- 4/2. 合法 429 失败信封：parse_success True 而 protocol_success False ----
+    def test_valid_429_envelope_parse_success_but_not_protocol(self):
+        rate_msg = ('上游返回 429，将在 2026-10-06 13:55:40 UTC+8 重置。')
+        events = self._failure_events(errors=[rate_msg],
+                                      errors_info=[{'status': 429, 'code': 6004,
+                                                   'category': 'quota',
+                                                   'details': rate_msg}])
+        res = self.run_entry(self.tmp / 'out-429-valid', self.write_spec(events))
+        self.assertEqual(res['rc'], 3)
+        self.assertTrue(res['summary']['parse_success'])
+        self.assertTrue(res['summary']['failure_envelope_valid'])
+        self.assertTrue(res['summary']['failure_envelope'])
+        self.assertFalse(res['summary']['protocol_success'])
+        self.assertEqual(res['summary']['terminal_state'], 'error')
+        self.assertTrue(res['summary']['reset_hint'])
+        self.assertTrue(res['summary']['recoverability'].startswith('rate_limited'))
+
+    # ---- 2. 明确 429 但无 reset：窗口未知，recoverability 不宣称 time-bound ----
+    def test_429_without_reset_window_unknown(self):
+        events = self._failure_events(errors=['usage exceeded'],
+                                      errors_info=[{'status': 429, 'details': 'usage exceeded'}])
+        res = self.run_entry(self.tmp / 'out-429-noreset', self.write_spec(events))
+        self.assertTrue(res['summary']['failure_envelope_valid'])
+        self.assertFalse(res['summary']['protocol_success'])
+        self.assertIsNone(res['summary']['reset_hint'])
+        self.assertTrue(res['summary']['recoverability'].startswith('rate_limited'))
+        self.assertNotIn('time-bound', res['summary']['recoverability'])
+
+    # ---- 2. 仅 quota 无 429：不足以断言 rate_limit，标 unknown ----
+    def test_quota_without_429_is_unknown_recoverability(self):
+        events = self._failure_events(errors=['quota plan limit reached'],
+                                      errors_info=[{'category': 'quota', 'status': 200,
+                                                   'details': 'quota plan limit reached'}])
+        res = self.run_entry(self.tmp / 'out-quota-only', self.write_spec(events))
+        self.assertTrue(res['summary']['failure_envelope_valid'])
+        self.assertFalse(res['summary']['protocol_success'])
+        self.assertTrue(res['summary']['recoverability'].startswith('unknown'))
+
+    # ---- 2. 正文出现 429 数字/id 但无明确 status/code 429：不推断限流 ----
+    def test_429_digit_in_body_does_not_imply_rate_limit(self):
+        events = self._failure_events(
+            errors=['request id 01a10f429... exceeded something (429 chars)'],
+            errors_info=[{'category': 'other', 'details': 'generic failure'}])
+        res = self.run_entry(self.tmp / 'out-429-body', self.write_spec(events))
+        self.assertTrue(res['summary']['failure_envelope_valid'])
+        self.assertTrue(res['summary']['recoverability'].startswith('unknown'))
+
+    # ---- 2. 后续 errors 含 reset 提示也不能丢失 ----
+    def test_reset_hint_scanned_across_all_errors(self):
+        events = self._failure_events(errors=['first failure without window',
+                                              '将在 2026-10-06 20:00 UTC+8 重置'],
+                                      errors_info=[{'status': 429,
+                                                   'details': 'first failure without window'}])
+        res = self.run_entry(self.tmp / 'out-reset-later', self.write_spec(events))
+        self.assertTrue(res['summary']['reset_hint'])
+        self.assertIn('重置', res['summary']['reset_hint'])
+        self.assertTrue(res['summary']['recoverability'].startswith('rate_limited'))
+
+    # ---- 4. 失败信封携带 result 文本：原样落盘待验、不绑定，无 response.md ----
+    def test_failure_envelope_carried_result_preserved_unbound(self):
+        carried = 'RAW RESULT TEXT \u4e2d\u6587  (pending verification, must not trim)  '
+        events = self._failure_events(errors=['error_during_execution happened'],
+                                      text=carried)
+        out = self.tmp / 'out-carried'
+        res = self.run_entry(out, self.write_spec(events))
+        self.assertEqual(res['rc'], 3)
+        self.assertTrue(res['summary']['failure_envelope_valid'])
+        self.assertFalse(res['summary']['protocol_success'])
+        self.assertFalse(res['summary']['report_bound'])
+        self.assertFalse((out / 'response.md').exists())
+        pending = out / 'failure-result.pending.txt'
+        self.assertTrue(pending.is_file())
+        # 原样保留，不 trim、不删前言
+        self.assertEqual(pending.read_bytes(), carried.encode('utf-8'))
+        report_state = read_json(out / 'report-state.json')
+        self.assertTrue(report_state['carrier_missing'])
+        self.assertFalse(report_state['bound'])
+
+    # ================= 第三轮定点补修 =====================
+
+    # ---- 6. 成功终态 errors 存在但非 list（string/dict/null）拒绝，原始值不 trim 保留 ----
+    def test_success_errors_non_list_rejected_and_preserved(self):
+        rep = report_text(self.STAGE, str(self.workspace))
+        cases = {
+            'string': '  latent error text  ',   # 含前后空格，须原样不 trim
+            'dict': {'code': 'E', 'message': 'boom'},
+            'null': None,
+        }
+        for label, value in cases.items():
+            with self.subTest(errors=label):
+                events = [init_event(), status_event(), assistant_event(text=rep),
+                          result_event(text=rep, extra={'errors': value})]
+                res = self.run_entry(self.tmp / f'out-succerr-{label}',
+                                     self.write_spec(events))
+                self.assertEqual(res['rc'], 3)
+                self.assertFalse(res['summary']['protocol_success'])
+                self.assertFalse(res['summary']['report_bound'])
+                self.assertTrue(any('not a list' in e
+                                    for e in res['summary']['parse_errors']))
+                # 原始 errors 保留进 result_errors（不 trim、不改写）
+                self.assertEqual(res['summary']['result_errors'], value)
+
+    # ---- 6. 成功终态缺 errors 字段与空 list 兼容，正常绑定 ----
+    def test_success_errors_missing_or_empty_list_ok(self):
+        for label, extra in (('missing', None), ('empty', {'errors': []})):
+            with self.subTest(errors=label):
+                events = self.success_events(result_extra=extra)
+                res = self.run_entry(self.tmp / f'out-succerr-ok-{label}',
+                                     self.write_spec(events))
+                self.assertEqual(res['rc'], 0,
+                                 res['proc'].stderr.decode('utf-8', 'replace'))
+                self.assertTrue(res['summary']['protocol_success'],
+                                res['summary']['parse_errors'])
+                self.assertTrue(res['summary']['report_bound'])
+                if label == 'empty':
+                    self.assertEqual(res['summary']['result_errors'], [])
+
+    # ---- 7. errors-only 开头独立 429：判限流、无 errors_info、无 reset 保持窗口未知 ----
+    def test_leading_429_errors_only_rate_limited_reset_unknown(self):
+        events = self._failure_events(errors=['429 frequency limit reached'])
+        res = self.run_entry(self.tmp / 'out-lead429', self.write_spec(events))
+        s = res['summary']
+        self.assertEqual(res['rc'], 3)
+        self.assertTrue(s['failure_envelope_valid'])
+        self.assertFalse(s['protocol_success'])
+        self.assertFalse(s['report_bound'])
+        self.assertTrue(s['recoverability'].startswith('rate_limited'))
+        # 无 reset：不宣称已提供窗口，明确标 unknown
+        self.assertIsNone(s['reset_hint'])
+        self.assertIn('no reset window', s['recoverability'])
+        self.assertIn('unknown', s['recoverability'])
+        self.assertNotIn('supplied an explicit reset window', s['recoverability'])
+        self.assertEqual(s['result_errors'], ['429 frequency limit reached'])
+        self.assertIsNone(s['errors_info'])
+
+    # ---- 7. HTTP 429 开头可识别为限流 ----
+    def test_http_429_leading_recognized(self):
+        events = self._failure_events(errors=['HTTP 429 Too Many Requests'])
+        res = self.run_entry(self.tmp / 'out-http429', self.write_spec(events))
+        s = res['summary']
+        self.assertTrue(s['failure_envelope_valid'])
+        self.assertTrue(s['recoverability'].startswith('rate_limited'))
+
+    # ---- 7. 普通正文中间出现 429 不误判为限流 ----
+    def test_plain_body_mid_429_not_rate_limited(self):
+        events = self._failure_events(
+            errors=['processed 429 records before generic failure'])
+        res = self.run_entry(self.tmp / 'out-mid429', self.write_spec(events))
+        s = res['summary']
+        self.assertTrue(s['failure_envelope_valid'])
+        self.assertTrue(s['recoverability'].startswith('unknown'))
+        self.assertNotIn('rate_limited', s['recoverability'])
 
 
 if __name__ == '__main__':

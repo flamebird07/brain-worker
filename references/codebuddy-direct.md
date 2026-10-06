@@ -45,26 +45,88 @@ stdout 为 stream-json JSONL，逐字以字节保存 `stdout.jsonl`（stderr 同
 `stderr.log`）。真实终态要求：
 
 - stdout 必须严格 UTF-8；出现非法字节保留原件并拒绝，禁止 `errors='replace'` 伪造原文。
-- 唯一最后 `type=result`、`subtype=success`、`is_error=false`、非空 text。
-- init.session_id 非空，所有带 session_id 的事件必须完全一致，不得漂移。
+- 终态 result 分两类，且必须区分“解析有效”与“交付失败”：
+  * **成功终态**：`subtype=success`、`is_error=false`、非空字符串 `result`，且与
+    最后 assistant 的最后一个 text 分片逐字一致（不 trim）。成功信封若 `errors`
+    非空则不得绿灯（记结构错误）。
+  * **失败信封**：仅 `subtype=error_during_execution` **AND** `is_error=true` 且带
+    非空 `errors`（官方形状：字符串列表）时才算**合法失败信封**——可结构解析
+    （`parse_success` / `failure_envelope_valid` 为真）而 `protocol_success=false`；
+    缺 `errors`、空 `errors`、`subtype`/`is_error` 矛盾或未知 subtype 不得声明为
+    合法已解析失败，一律记为结构错误（`parse_success=false`）。合法信封提取
+    `primary_failure`、原始 `errors`/`errors_info`、`reset_hint`（仅当**实际从全部
+    `errors` 与 `errors_info` 文本**中匹配到 “将在 … 重置” 时段才有；不只扫第一个
+    primary_failure）、`failure_stage=result_terminal` 与 `recoverability`。429 只认
+    明确的 `errors_info.status==429` 或独立错误码 `code==429`，或原始错误文本**开头**
+    的独立 429 错误码（如 `429 ...`、`429：`、`HTTP 429`），**不以正文里的 429
+    数字、id 或单纯 `category=quota` 推断限流**；仅 quota 而无 429 记 `unknown`。
+    recoverability **只在实际提取到 reset 提示时提窗口**，无 reset 明确标窗口未知，
+    不臆造时间框架。**已识别的交付失败根因（退出码等）单独归类，不再混成
+    `parse_errors` 结构错误**。失败信封若携带 `result` 文本，原样落盘
+    `failure-result.pending.txt` 待验、**不绑定、不生成 `response.md`**；无 result 不
+    生成报告。**protocol_success 与 report_bound 仍恒为 false**，CLI 退出码 0 也不得
+    伪报成功（解析正确 ≠ 交付成功）。
+- init.session_id 非空；协议事件**凡带 `session_id` 字段就必须是非空字符串**，否则
+  一律拒绝（不得因 sid 为空而跳过身份核对）。所有带 session_id 的事件必须与 init
+  完全一致，不得漂移。
 - init 模型及所有 `assistant.message.model` 与请求模型精确一致。
-- 至少一个 assistant.message 存在非空 text 分片；`result.result` 与最后 assistant
-  的最后一个 text 分片精确一致（不 trim）。
+- 至少一个 assistant.message 存在非空 text 分片（仅对成功终态强制）。
 - `init.mcp_servers` 必须严格为 `[]`；非空一律拒绝，不得宣称零 MCP。
 - `init.tools` 是整个工具注册表，不代表本次有效工具面；实际 `tool_use.name` 记录为
   已调用证据，若超出请求 `--tools` 白名单即判越权失败。
-- 权限拒绝实际出现在 `user.message.content[].type=tool_result` 的文本里（真实形状下
-  `is_error=false`、`result.permission_denials=[]`）。空 `permission_denials` 不作为
-  无拒绝证据：入口从 tool_result 文本扫描明确的 “Permission to use … has been denied”
-  文案，命中即 fail-closed，并原样保存拒绝字段与 tool_use_id。只检测 tool_result，
-  不匹配模型报告正文里的普通引用。
-- 未知事件/缺项/重复或缺失终态/尾随非 JSON/`terminal_reason` 为 cancelled、aborted、
-  max_turns / `result.permission_denials` 非空一律判协议失败并保留证据。事件字段版本
-  不同不猜测，缺项记 `parse_errors`，由主脑拿真实事件回读后再修。
+- **重复 init（同会话重初始化）**：本机真实流（`inputs/stdout.jsonl` 第 1、146 行）
+  在同一次请求作用域内发出两次 init，除 `__timestamp` 外全字段逐值一致。官方运行时
+  证据见 `inputs/independent-runtime-provenance.json` 的 `wasInitEmittedForTurn(` /
+  `createSystemMessage(` / `createMinimalSystemMessage(` 等 request-scope 上下文
+  （该文件里的 `character_offset`/`byte_offset` 是相对
+  `@tencent-ai/codebuddy-code/dist/codebuddy-headless.js` 的偏移，且 `official-runtime-snippets.json`
+  旧 snippets 记录的 offset 是**字符 offset、不是字节 offset**，引用须标清）。注意
+  `renderHistory` 让 model 变 `unknown` 只能证明历史模式会发 init，**不能独立证明
+  两次稳定 init 的因果**；重复发生的**具体原因未知，不断言是上下文压缩**。适配器
+  **只接受全字段身份稳定的重复 init**：除白名单可变传输字段 `__timestamp` 外，比较
+  两个 init 的**全字段键集与逐值**（含 `session_id`、`model`、`mcp_servers`、`tools`、
+  `permissionMode` 以及 `cwd`、`apiKeySource`、`agent` 等既有字段），任何值漂移、
+  **新增/删除的未知字段**一律拒绝；每次 init 仍校验必备字段/类型（`tools` 为
+  `list[str]`、`mcp_servers` 为 `[]`、`permissionMode` 为 `dontAsk`）且既有安全字段
+  不能缺；差异/缺失记录到 `reinit_events`（`changed_fields`/`added_fields`/
+  `removed_fields`/`missing_identity_fields`），不把所有元数据忽略。不放宽所有未知
+  字段、也不删所有重复校验（未知事件、空/重复 result、尾随垃圾、不匹配文本、越权
+  tool_use、session/model 漂移仍严格拒绝）。
+- **权限拒绝**：实际出现在 `user.message.content[].type=tool_result` 的文本里
+  （真实形状下 `is_error=false`、`result.permission_denials=[]`）。空
+  `permission_denials` 不作为无拒绝证据：从 tool_result 文本扫描明确的
+  “Permission to use … has been denied” 文案，命中即 fail-closed 并原样保存拒绝
+  字段与 tool_use_id。只检测 tool_result，不匹配模型报告正文里的普通引用；
+  权限拒绝单独记录，不落入普通 tool_failures。
+- **普通工具失败**：`user.tool_result` 里的 `File does not exist`、
+  `<tool_use_error>` 或 `is_error=true` 记录到 `tool_failures`（行号、
+  tool_use_id、`flags` 与摘录）并汇总到 `tool_failure_stats`，**仅诊断**，
+  不单独令协议失败，也不会把后续合法修复的成功误判为假失败；`is_error=true` 但
+  `content` 缺失/空也仍记为失败（`excerpt` 可为 None，行/id/flags 正确），不再被
+  静默丢弃；不设置机械固定次数让业务任务永久失败。
+- 未知事件/缺项/重复或缺失终态/尾随非 JSON/`terminal_reason` 为 cancelled、
+  aborted、max_turns / `result.permission_denials` 非空一律判协议失败并保留证据。
+  事件字段版本不同不猜测，缺项记 `parse_errors`，由主脑拿真实事件回读后再修。
+
+## 失败恢复与派工效率
+
+- **429 / 限流**：CLI 明确返回 `error_during_execution` + `errors_info.status=429`（或
+  独立错误码 `code==429`）时才算 `rate_limited`；仅 `category=quota` 而无 429、或正文/id
+  里出现 429 数字都**不足以断言限流**，一律标 `unknown`，不据此推断。此时必须保留原
+  `stdout.jsonl`、已生成文件、阶段进度与工具结果；**不立即重跑整项重任务**、不静默换
+  模型；只有实际从 errors/errors_info 提取到重置时段才保存窗口，无 reset 时明确标窗口
+  未知、不推断已重置；无最终报告不补写 WORKER_REPORT。评分同阶段不重复计分。
+- **恢复派工**：在**新证据目录**进行；开工前核对文件基线（HEAD/SHA-256）、授权
+  范围与最近的限流历史提示；不覆盖他人工作或原证据；未验证代码不加载。
+- **文件定位**：主脑派工优先给出**精确文件清单**，并显式开放 `Glob` / `Grep`
+  在允许目录下做搜索（本适配器 `ALLOWED_TOOLS` 已包含），避免反复猜文件名或
+  重复读整份大文件；同类定位失败会累计记录，供主脑调整检索策略。工具权限不是
+  文件沙箱，凭据仍不进派工目录。
 
 计费口径未知：`usage` / `modelUsage` 仅原样保存 raw 值；`total_cost_usd=0` 不视为
-免费证据；`business_verified`、`free_quota_verified`、`model_backend_identity_verified`
-恒为 false。CLI 路由标识不证明底层模型身份，零 token 不证明免费。
+免费证据；缓存分项不与 `input_tokens` 重复累加；`business_verified`、
+`free_quota_verified`、`model_backend_identity_verified` 恒为 false。CLI 路由标识
+不证明底层模型身份，零 token 不证明免费。
 
 ## 证据与退出码
 
