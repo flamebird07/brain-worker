@@ -530,13 +530,30 @@ class TestWorkspaceSingleWriterZ4(_SpawnMixin, unittest.TestCase):
         self.assertEqual(rows[0]['state'], 'reserved')
 
     def test_normpath_alias_same_directory_rejected(self):
-        # 平台创建 symlink 受限时用 normpath/normcase 别名证明同一真实目录同样拒绝。
+        # 用真实临时目录 + 当前 OS 分隔符构造同目录别名：normcase(realpath()) 归一后
+        # 指向同一真实目录，仍须单写入拒绝（symlink 受限平台的等价保证）。别名必须
+        # 跨 OS 有效——POSIX 上反斜杠是普通文件名字符而非分隔符，故仅 Windows 额外
+        # 验证反斜杠/正斜杠表示归一到同一真实目录。
+        base_dir = Path(self._tmp.name) / 'alias' / 'dir'
+        base_dir.mkdir(parents=True)
+        base = str(base_dir)
+        sep = os.sep
+        parent = str(Path(base).parent)
+        name = Path(base).name
+        aliases = [
+            base + sep,                              # 尾分隔符
+            base + sep + os.curdir,                  # dir/.
+            base + sep + 'sub' + sep + os.pardir,    # dir/sub/..（父 dot 回收）
+            parent + sep + os.curdir + sep + name,   # alias/./dir
+        ]
+        if os.name == 'nt':
+            aliases.append(base.replace('\\', '/'))  # Windows 正斜杠表示
+            aliases.append(base.replace('/', '\\'))  # Windows 反斜杠表示
         a = dp.select_and_claim(self.store, task_id='wa', runtime='zcode',
-                                model='GLM-5.3', workspace='C:/alias/dir',
+                                model='GLM-5.3', workspace=base,
                                 prompt_sha256='a' * 64, now=T0, _preclaim=False)
         self.assertTrue(a['allowed'], a)
-        for alias in ('C:/alias/dir/', 'C:/alias/dir/.', 'C:/alias/./dir',
-                      'C:\\alias\\dir'):
+        for alias in aliases:
             b = dp.select_and_claim(self.store, task_id='wb', runtime='zcode',
                                     model='GLM-5.3', workspace=alias,
                                     prompt_sha256='b' * 64, now=T0, _preclaim=False)
@@ -545,7 +562,7 @@ class TestWorkspaceSingleWriterZ4(_SpawnMixin, unittest.TestCase):
             self.assertFalse(b['sent'])
         # reserve / claim_due 国内回收与 Luna 分支同样不绕过（Luna 票据 scope 同目录）。
         r = dp.reserve(self.store, task_id='wc', runtime='zcode', model='GLM-5.3',
-                       workspace='C:/alias/dir', prompt_sha256='c' * 64, now=T0,
+                       workspace=base, prompt_sha256='c' * 64, now=T0,
                        _preclaim=False)
         self.assertFalse(r['allowed'])
         self.assertEqual(r['reason'], 'workspace_in_flight')
