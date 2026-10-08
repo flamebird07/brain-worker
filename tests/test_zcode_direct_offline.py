@@ -246,7 +246,7 @@ def main() -> int:
           all(facts), json.dumps({'rc': proc.returncode, 'facts': facts}, ensure_ascii=False))
     check('request.json carries the resolved selection and no credential values',
           req['selection'] == {'providerId': 'account:bigmodel-individual-coding-plan',
-                               'modelId': 'GLM-5.3-Flash',
+                               'modelId': 'GLM-5.3',
                                'options': {'reasoningLevel': 'low'}}
           and req['environment_keys'] == ['HTTPS_PROXY'] and 'environment' not in req,
           json.dumps({k: req.get(k) for k in ('selection', 'environment_keys')},
