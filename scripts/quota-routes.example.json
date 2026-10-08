@@ -1,0 +1,52 @@
+{
+  "_comment": [
+    "quota-routes.example.json — 随包的结构示例，不是运行配置。",
+    "scripts/quota-routes.json 是每台机器自持的受信任本机配置，被 .gitignore 排除，",
+    "仓库永不携带真实的 entry_cli / provider / 组名。把本示例复制为 scripts/quota-routes.json",
+    "后，请按本机实际运行时入口与套餐关系手工填写；不确认的关系一律留空/删除该条目，",
+    "让未匹配通道保守落入 unknown-shared 组，不要默认独立。",
+    "",
+    "字段口径（详见 references/quota-routing.md）：",
+    "- runtime：'codebuddy' | 'zcode'（其它 runtime 走通用规则）。",
+    "- match：套餐不敏感的运行时事实。CodeBuddy 推荐 'entry_cli'（Path(cfg['cli']).resolve()），",
+    "  不要绑定可被复制/改名的 entry config 路径；ZCode 用 provider id（如 'account:xxx'）。",
+    "- quota_group：本机分组名，只影响本地冷却/并发占位的粒度，不代表服务商账单事实。",
+    "- independence：只能是 'user_confirmed' 或 'shared_declared' 之一。",
+    "  'user_confirmed' = 用户明确确认两组额度独立（例如不同套餐、不同付费账号），",
+    "  未经确认不得填 'user_confirmed'；'shared_declared' = 用户明确声明共享同一份额度。",
+    "  未知关系请删除该条目，让通道落入 unknown-shared 由 §2 保守阻断兜底。",
+    "",
+    "政策例外（BW-ZCODE-MANUAL-QUOTA-20261008-S1）：ZCode 额度由用户手动管理/重置，",
+    "gate_dispatch(runtime='zcode') 与 ZCode 的 settle_attempt / import_terminal 都跳过",
+    "全部额度冷却/到期/自动恢复判定（429 分类仍如实提取，但不写 cooldown）；缺 routes、",
+    "落 unknown-shared 或共享组历史冷却都不再挡 ZCode。本示例只演示 CodeBuddy 侧的分组",
+    "填写口径；ZCode 条目仍可依本机需要登记，用于工作区单写入与通道单在途占位。",
+    "此策略不可由任务书关闭，也不提供关闭 CodeBuddy 冷却的开关。"
+  ],
+  "routes": [
+    {
+      "runtime": "codebuddy",
+      "match": {
+        "entry_cli": "<本机绝对路径>/path/to/codebuddy-cli.js"
+      },
+      "quota_group": "<本机自定义：例如 g-cb-payg>",
+      "independence": "user_confirmed"
+    },
+    {
+      "runtime": "zcode",
+      "match": {
+        "provider": "<本机 provider id：例如 account:bigmodel-individual-coding-plan>"
+      },
+      "quota_group": "<本机自定义：例如 g-zc-plan>",
+      "independence": "user_confirmed"
+    }
+  ],
+  "_notes": [
+    "示例中的两个条目假设 CodeBuddy 与 ZCode 属于两台已付款、额度互不相干的账号，",
+    "且用户 2026-10-08 明确确认为 user_confirmed；这仅是本机登记，不是账单核实。",
+    "如果本机 CodeBuddy 与 ZCode 使用同一套餐来源，请把两条 quota_group 改为同名并",
+    "把 independence 改为 shared_declared；如果无法确认，删除两个条目即可，运行时通道",
+    "会落 unknown-shared 由共享保守组兜底，绝不默认独立。",
+    "worker 的任意 plan/自报组名不参与解析；只有本文件的条目才影响分组。"
+  ]
+}

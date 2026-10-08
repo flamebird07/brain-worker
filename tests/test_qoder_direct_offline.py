@@ -22,6 +22,7 @@ import os
 import subprocess
 import sys
 import time
+import uuid
 from pathlib import Path
 
 HERE = Path(__file__).resolve().parent
@@ -172,6 +173,10 @@ def main() -> int:
         env = os.environ.copy()
         env['STUB_MODE'] = mode
         env['STUB_REPORT_FILE'] = str(report_path)
+        # 跨会话并发容量池隔离：每次回放用各自全新的临时 store，绝不读写真实
+        # ~/.brain-worker 池；空池下主力 Qwen3.8-Max 直接放行，不受 1:1 轮换历史影响。
+        env['BRAIN_WORKER_DISPATCH_STORE'] = str(
+            RUN_DIR / f'dispatch-{uuid.uuid4().hex}.sqlite3')
         cmd = [sys.executable, str(script_path),
                '--workspace', str(work), '--prompt-file', str(prompt_path),
                '--output-dir', str(out_dir), '--config', str(stub_cfg_path)]

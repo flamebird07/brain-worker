@@ -144,6 +144,9 @@ def main():
         env = os.environ.copy()
         env['STUB_MODE'] = mode
         env['STUB_REPORT_FILE'] = str(repfp)
+        # 并发容量池隔离：每个 out 用各自全新的临时 store，绝不读写真实 ~/.brain-worker 池。
+        env['BRAIN_WORKER_DISPATCH_STORE'] = str(
+            RUN_DIR / ('dispatch-' + Path(out).name + '.sqlite3'))
         cmd = [sys.executable, str(script_path), '--workspace', root,
                '--prompt-file', str(promptp), '--output-dir', str(out),
                '--config', str(cfgp), '--stage', stage]

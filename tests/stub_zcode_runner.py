@@ -151,10 +151,28 @@ envelope['usage'] = {'source': 'provider', 'model_request_count': 1, 'input_toke
                      'cache_write_tokens': 0, 'reasoning_tokens': 0,
                      'cache_read_included_in_input': True}
 envelope['event_count'] = 2
-(out_dir / 'events.jsonl').write_text(
-    json.dumps({'type': 'turn_started', 'turnId': 'turn_stub_1'}) + '\n'
-    + json.dumps({'type': 'turn_completed', 'turnId': 'turn_stub_1'}) + '\n',
-    encoding='utf-8')
+# 可选 STUB_EVENTS_FILE：用真实形状的工具事件（scheduled/result，带
+# sessionId/turnId）替换默认两条 turn 事件，供执行证据门禁做入口级端到端测试。
+events_spec = os.environ.get('STUB_EVENTS_FILE')
+if events_spec:
+    specs = json.loads(Path(events_spec).read_text(encoding='utf-8'))
+    lines = []
+    for ev in specs:
+        ev = dict(ev)
+        ev.setdefault('sessionId', envelope['session_id'])
+        ev.setdefault('turnId', envelope['turn_id'])
+        lines.append(json.dumps(ev, ensure_ascii=False))
+    (out_dir / 'events.jsonl').write_text('\n'.join(lines) + '\n', encoding='utf-8')
+    envelope['event_count'] = len(lines)
+else:
+    (out_dir / 'events.jsonl').write_text(
+        json.dumps({'type': 'turn_started', 'turnId': 'turn_stub_1'}) + '\n'
+        + json.dumps({'type': 'turn_completed', 'turnId': 'turn_stub_1'}) + '\n',
+        encoding='utf-8')
+# 可选 STUB_WRITE_FILE/STUB_WRITE_TEXT：模拟执行器对工作区文件的真实写入效果。
+write_file = os.environ.get('STUB_WRITE_FILE')
+if write_file:
+    Path(write_file).write_text(os.environ.get('STUB_WRITE_TEXT', ''), encoding='utf-8')
 (out_dir / 'result.json').write_text(json.dumps({
     'sessionId': envelope['session_id'], 'turnId': envelope['turn_id'],
     'usage': envelope['usage'], 'projection': {'status': 'completed'},

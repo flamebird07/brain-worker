@@ -32,7 +32,7 @@ def _plan(**over):
     g = _grants()
     plan = {
         'task_id': 'T01', 'stage': 'S-1', 'runtime': 'qoder',
-        'model': 'Qwen3.8-Flash', 'workspace': 'C:\\ws\\T01',
+        'model': 'Qwen3.8-Max', 'workspace': 'C:\\ws\\T01',
         'cwd': 'C:\\ws\\T01', 'prompt_sha256': 'a' * 64,
         'grants': {'edits': g['edits'], 'bash': g['bash'], 'read_dirs': g['read_dirs']},
         'tool_visibility': g['tool_visibility'], 'visible_tools': g['visible_tools'],
@@ -47,7 +47,7 @@ def _plan(**over):
 def _actual(**over):
     actual = {
         'task_id': 'T01', 'stage': 'S-1', 'runtime': 'qoder',
-        'model': 'Qwen3.8-Flash', 'workspace': 'C:\\ws\\T01',
+        'model': 'Qwen3.8-Max', 'workspace': 'C:\\ws\\T01',
         'cwd': 'C:\\ws\\T01', 'prompt_sha256': 'a' * 64,
         'argv': ['node', 'cli', '-p'], 'shell': False,
         'grants': _grants(),
@@ -213,6 +213,101 @@ class ParallelConflictTests(unittest.TestCase):
                 result = ec.preflight(_plan(max_concurrency=4), _actual(), active_tasks=active)
                 self.assertFalse(result['ok'])
                 self.assertTrue(any('workspace write conflict' in x for x in result['reasons']))
+
+    def test_awaiting_acceptance_frees_live_slot_but_protects_origin(self):
+        # 容量与业务占位分离：子进程已退出、仅待业务验收（awaiting_acceptance）的任务
+        # 不占用活进程并发槽——默认 max_concurrency=1 下仍允许为**另一个工作区**派新执行器。
+        active = [{'task_id': 'T00', 'state': 'awaiting_acceptance',
+                   'workspace': 'C:\\ws\\T00', 'prompt_sha256': 'c' * 64,
+                   'writes': True, 'shared_writes': []}]
+        other_ws = ec.preflight(_plan(task_id='T01', workspace='C:\\ws\\T01',
+                                      cwd='C:\\ws\\T01'),
+                                _actual(task_id='T01', workspace='C:\\ws\\T01',
+                                        cwd='C:\\ws\\T01'),
+                                active_tasks=active)
+        self.assertTrue(other_ws['ok'], other_ws['reasons'])
+        self.assertFalse(any('concurrency limit' in x for x in other_ws['reasons']))
+        # 但原工作区仍受保护：对同一工作区的写入照拒（HELD_STATES 独立维持）。
+        same_ws = ec.preflight(_plan(task_id='T02', workspace='C:\\ws\\T00',
+                                     cwd='C:\\ws\\T00'),
+                               _actual(task_id='T02', workspace='C:\\ws\\T00',
+                                       cwd='C:\\ws\\T00'),
+                               active_tasks=active)
+        self.assertFalse(same_ws['ok'])
+        self.assertTrue(any('workspace write conflict' in x for x in same_ws['reasons']))
+        # 原任务 id 仍不可重发（同 prompt 也被在途门禁锁住）。
+        resubmit = ec.preflight(_plan(task_id='T00', workspace='C:\\ws\\T00',
+                                      cwd='C:\\ws\\T00', prompt_sha256='c' * 64),
+                                _actual(task_id='T00', workspace='C:\\ws\\T00',
+                                        cwd='C:\\ws\\T00', prompt_sha256='c' * 64),
+                                active_tasks=active)
+        self.assertFalse(resubmit['ok'])
+        self.assertTrue(any('already in flight' in x for x in resubmit['reasons']))
+
+    def test_executing_still_counts_against_live_concurrency(self):
+        # 对照：真正持有活子进程的 executing 任务仍占并发槽，默认上限 1 时第二个被拒。
+        active = [{'task_id': 'T00', 'state': 'executing', 'workspace': 'C:\\ws\\T00',
+                   'prompt_sha256': 'c' * 64, 'writes': True, 'shared_writes': []}]
+        r = ec.preflight(_plan(task_id='T01', workspace='C:\\ws\\T01', cwd='C:\\ws\\T01'),
+                         _actual(task_id='T01', workspace='C:\\ws\\T01', cwd='C:\\ws\\T01'),
+                         active_tasks=active)
+        self.assertFalse(r['ok'])
+        self.assertTrue(any('concurrency limit 1' in x for x in r['reasons']), r['reasons'])
+
+    def test_six_luna_executing_do_not_block_domestic_gate(self):
+        # S5 复现缺陷：domestic=0、6 个 Luna executing、max_concurrency=6，旧全局快照
+        # 把 Luna 当成统一容量闸误报“concurrency limit 6 exceeded”。修复后 Luna 不占
+        # 国内六名额且无上限：一个新的国内 qoder 派工必须能进入真实国内闸。
+        active = [{'task_id': f'luna-{i}', 'state': 'executing', 'runtime': 'luna',
+                   'workspace': f'C:\\ws\\luna-{i}', 'prompt_sha256': 'b' * 64,
+                   'writes': True, 'shared_writes': []} for i in range(6)]
+        plan = _plan(task_id='T01', workspace='C:\\ws\\T01', cwd='C:\\ws\\T01',
+                     max_concurrency=6)
+        actual = _actual(task_id='T01', workspace='C:\\ws\\T01', cwd='C:\\ws\\T01')
+        r = ec.preflight(plan, actual, active_tasks=active, max_concurrency=6)
+        self.assertFalse(any('concurrency limit' in x for x in r['reasons']), r['reasons'])
+        self.assertTrue(r['ok'], r['reasons'])
+
+    def test_domestic_snapshot_cap_still_rejects_when_six_domestic_live(self):
+        # 分离 Luna 后，真实国内活进程槽仍被严格强制：6 个国内 executing + 第 7 个国内
+        # 派工（max_concurrency=6）→ 快照二级保护仍报 concurrency limit（绝不因排除 Luna
+        # 而放松国内上限；原子池容量另由 dispatch_pool 权威强制）。
+        active = []
+        for i in range(6):
+            rt = 'zcode' if i % 2 == 0 else 'qoder'
+            active.append({'task_id': f'D0{i}', 'state': 'executing', 'runtime': rt,
+                           'workspace': f'C:\\ws\\D0{i}', 'prompt_sha256': 'd' * 64,
+                           'writes': True, 'shared_writes': []})
+        plan = _plan(task_id='D99', workspace='C:\\ws\\D99', cwd='C:\\ws\\D99',
+                     max_concurrency=6)
+        actual = _actual(task_id='D99', workspace='C:\\ws\\D99', cwd='C:\\ws\\D99')
+        r = ec.preflight(plan, actual, active_tasks=active, max_concurrency=6)
+        self.assertFalse(r['ok'])
+        self.assertTrue(any('concurrency limit 6' in x for x in r['reasons']), r['reasons'])
+
+    def test_luna_inflight_does_not_count_toward_default_cap(self):
+        # Luna 是宿主原生救援通道，不是 dispatch_plan 运行时刻，永不进 preflight 计划校验；
+        # 但在途 Luna 活进程不占国内并发槽：默认上限 1、已有 1 个 Luna executing 时，
+        # 一个新的国内 qoder 派工仍放行（不因 Luna 触发 concurrency limit）。
+        active = [{'task_id': 'LUNA-0', 'state': 'executing', 'runtime': 'luna',
+                   'workspace': 'C:\\ws\\LUNA-0', 'prompt_sha256': 'e' * 64,
+                   'writes': True, 'shared_writes': []}]
+        r = ec.preflight(_plan(task_id='T01', workspace='C:\\ws\\T01', cwd='C:\\ws\\T01'),
+                         _actual(task_id='T01', workspace='C:\\ws\\T01', cwd='C:\\ws\\T01'),
+                         active_tasks=active)
+        self.assertFalse(any('concurrency limit' in x for x in r['reasons']), r['reasons'])
+        self.assertTrue(r['ok'], r['reasons'])
+
+    def test_retired_direct_runtime_excluded_from_domestic_concurrency(self):
+        # 已退休的 CodeBuddy/WorkBuddy 直连不计入国内活进程闸（默认上限 1 下仍放行新国内派工）。
+        active = [{'task_id': 'CB0', 'state': 'executing', 'runtime': 'codebuddy',
+                   'workspace': 'C:\\ws\\CB0', 'prompt_sha256': 'c' * 64,
+                   'writes': True, 'shared_writes': []}]
+        r = ec.preflight(_plan(task_id='T01', workspace='C:\\ws\\T01', cwd='C:\\ws\\T01'),
+                         _actual(task_id='T01', workspace='C:\\ws\\T01', cwd='C:\\ws\\T01'),
+                         active_tasks=active)
+        self.assertFalse(any('concurrency limit' in x for x in r['reasons']), r['reasons'])
+        self.assertTrue(r['ok'], r['reasons'])
 
     def test_shared_external_write_rejected(self):
         active = [{'task_id': 'T00', 'state': 'executing', 'workspace': 'C:\\ws\\T00',
@@ -543,7 +638,7 @@ class AdapterDispatchPlanTests(unittest.TestCase):
         g = _grants(rules=allowed, tools=())
         plan = {
             'task_id': 'TP', 'stage': self.stage, 'runtime': 'qoder',
-            'model': 'Qwen3.8-Flash', 'workspace': str(self.ws), 'cwd': str(self.ws),
+            'model': 'Qwen3.8-Max', 'workspace': str(self.ws), 'cwd': str(self.ws),
             'prompt_sha256': _sha(prompt.read_bytes()),
             'grants': {'edits': g['edits'], 'bash': g['bash'],
                        'read_dirs': g['read_dirs']},
@@ -558,6 +653,9 @@ class AdapterDispatchPlanTests(unittest.TestCase):
     def _run(self, plan_path, out_dir, allowed):
         env = os.environ.copy()
         env['STUB_MODE'] = 'not_json'  # 让协议失败，但派工已发生（证明预检放行）
+        # 跨会话并发容量池隔离：每个测试方法用 self.ws 下的临时 store，绝不读写真实
+        # ~/.brain-worker 池，也不继承全局 BRAIN_WORKER_DISPATCH_STORE 的在途名额。
+        env['BRAIN_WORKER_DISPATCH_STORE'] = str(self.ws / 'dispatch-pool.sqlite3')
         cmd = [sys.executable, str(REPO / 'scripts' / 'qoder_direct.py'),
                '--workspace', str(self.ws), '--prompt-file', str(self._prompt),
                '--output-dir', str(out_dir), '--stage', self.stage,

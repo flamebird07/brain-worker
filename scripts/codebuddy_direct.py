@@ -64,7 +64,6 @@ import hashlib
 import json
 import os
 import re
-import subprocess
 import sys
 from datetime import datetime, timezone
 from pathlib import Path
@@ -75,6 +74,8 @@ if str(_SCRIPTS_DIR) not in sys.path:
 from qoder_direct import analyze_report, finalize_binding  # 共享正文核对/绑定，不改其文件
 import execution_control as ec  # 任务级控制面（同目录，标准库）
 import prompt_contract as pc  # 三入口共享九节契约（标准库；契约在调用前用于构造载荷）
+import quota_control as qc  # 持久额度冷却与路由门禁（sqlite3，默认共享 store）
+import continuation_contract as cc  # 中断接续：baseline 冻结/终态交接（同目录）
 
 DEFAULT_CONFIG = _SCRIPTS_DIR / 'codebuddy-entry.json'
 BAD_TERMINAL_REASONS = ('cancelled', 'aborted', 'max_turns')
@@ -194,6 +195,51 @@ def _tool_failure_stats(tool_failures) -> dict:
         for flag in failure.get('flags', []):
             by_flag[flag] = by_flag.get(flag, 0) + 1
     return {'total': total, 'by_flag': by_flag}
+
+
+def _cb_write_receipts(parsed: dict) -> list:
+    """从已解析 stream 提取 Write/Edit 原始回执（缺陷 J + S4 缺陷 6 + S5/S6 会话核验）：
+    tool_use 事件带**非空** id/input.file_path；成功判定必须**同 ID + 同 session** 的真实
+    tool_result is_error 不为 true，且该 ID 不出现在任何 tool_failures.flags 里（失败 flags 排除）。
+    身份核验（S6 缺陷 1）必须**三者齐全且相等**：use.session、result.session 与本流当前会话
+    parsed['session_id']——三者都非空且彼此相等才 identity_verified=True。仅两事件 session
+    彼此相同（如同为 OLD）但≠当前 CURRENT session 的续用/复用，一律 unverified；绝不拿全局
+    session 补造事件缺失身份，也不据旧会话对判成功。附 stdout.jsonl 行号 + 原始载体 SHA 由
+    调用方（out/stdout.jsonl）保证可追溯；失败 result/失败 flags 保留但 successful=False。
+    缺字段的真实流只把回执身份标 unverified，不据此判定"无执行"。"""
+    failed_ids = {f.get('tool_use_id') for f in (parsed.get('tool_failures') or [])
+                  if isinstance(f.get('tool_use_id'), str) and f.get('tool_use_id')}
+    result_by_id = {}
+    for r in parsed.get('tool_results') or []:
+        tuid = r.get('tool_use_id')
+        if isinstance(tuid, str) and tuid:
+            result_by_id[tuid] = r
+    cur_sid = parsed.get('session_id')
+    cur_ok = isinstance(cur_sid, str) and cur_sid.strip()
+    receipts = []
+    for use in parsed.get('tool_use_events') or []:
+        if use.get('name') not in ('Write', 'Edit'):
+            continue
+        call_id = use.get('id')
+        if not isinstance(call_id, str) or not call_id:
+            continue  # 空 tool_use_id 无法关联 result，直接丢弃（不伪造回执）
+        res = result_by_id.get(call_id)
+        successful = (res is not None and res.get('is_error') is not True
+                      and call_id not in failed_ids)
+        use_sid = use.get('session')
+        res_sid = res.get('session') if isinstance(res, dict) else None
+        # 三者齐全且相等：use==result==当前 session_id；仅两事件同为 OLD 不算核验。
+        same_session = (bool(cur_ok) and isinstance(use_sid, str) and use_sid.strip()
+                        and isinstance(res_sid, str) and res_sid.strip()
+                        and use_sid == res_sid == cur_sid)
+        receipts.append({'tool': use.get('name'), 'tool_use_id': call_id,
+                         'file_path': use.get('file_path'),
+                         'successful': successful,
+                         'identity_verified': bool(same_session),
+                         'use_line': use.get('line'),
+                         'result_line': res.get('line') if isinstance(res, dict) else None,
+                         'source': 'stdout.jsonl'})
+    return receipts
 
 
 def _cb_failure_facts(parsed: dict, exit_code: int) -> dict:
@@ -459,7 +505,8 @@ def parse_stream(stdout_bytes: bytes, model_requested: str,
              'failure_envelope_valid': False, 'primary_failure': None, 'errors': None,
              'errors_info': None, 'reset_hint': None, 'failure_stage': None,
              'recoverability': None, 'carried_result': None,
-             'tool_failures': [], 'reinit_events': []}
+             'tool_failures': [], 'reinit_events': [],
+             'tool_use_events': [], 'tool_results': []}
     try:
         text = stdout_bytes.decode('utf-8')
     except UnicodeDecodeError as exc:
@@ -475,6 +522,8 @@ def parse_stream(stdout_bytes: bytes, model_requested: str,
     permission_denials: list[dict] = []
     tool_failures: list[dict] = []
     reinit_events: list[dict] = []
+    tool_use_events: list[dict] = []
+    tool_results: list[dict] = []
     session_ids_seen: set[str] = set()
 
     lines = text.splitlines()
@@ -593,6 +642,14 @@ def parse_stream(stdout_bytes: bytes, model_requested: str,
                     name = part.get('name')
                     if isinstance(name, str) and name:
                         observed_tool_calls.append(name)
+                        # 原始工具回执（缺陷 J）：id + 输入文件路径 + 行号，供接续
+                        # handoff 关联成功 Edit/Write，不凭报告关键词。
+                        tool_input = part.get('input')
+                        tool_use_events.append(
+                            {'line': lineno, 'name': name, 'id': part.get('id'),
+                             'session': event.get('session_id'),
+                             'file_path': tool_input.get('file_path')
+                             if isinstance(tool_input, dict) else None})
             assistants.append({'line': lineno, 'model': message['model'],
                                'texts': texts, 'usage': message['usage']})
         elif etype == 'user':
@@ -607,6 +664,10 @@ def parse_stream(stdout_bytes: bytes, model_requested: str,
             for block in content:
                 if not isinstance(block, dict) or block.get('type') != 'tool_result':
                     continue
+                tool_results.append({'line': lineno,
+                                     'tool_use_id': block.get('tool_use_id'),
+                                     'session': event.get('session_id'),
+                                     'is_error': block.get('is_error')})
                 is_err = block.get('is_error')
                 joined = _extract_tool_result_text(block)
                 if joined is None:
@@ -616,6 +677,7 @@ def parse_stream(stdout_bytes: bytes, model_requested: str,
                         tool_failures.append({
                             'line': lineno,
                             'tool_use_id': block.get('tool_use_id'),
+                            'session': event.get('session_id'),
                             'is_error': is_err,
                             'flags': ['is_error_true'],
                             'excerpt': None,
@@ -647,6 +709,7 @@ def parse_stream(stdout_bytes: bytes, model_requested: str,
                     tool_failures.append({
                         'line': lineno,
                         'tool_use_id': block.get('tool_use_id'),
+                        'session': event.get('session_id'),
                         'is_error': is_err,
                         'flags': flags,
                         'excerpt': joined,
@@ -853,10 +916,12 @@ def parse_stream(stdout_bytes: bytes, model_requested: str,
             'recoverability': recoverability,
             'carried_result': carried_result,
             'tool_failures': tool_failures,
-            'reinit_events': reinit_events}
+            'reinit_events': reinit_events,
+            'tool_use_events': tool_use_events,
+            'tool_results': tool_results}
 
 
-def main():
+def build_parser():
     ap = argparse.ArgumentParser()
     ap.add_argument('--workspace', required=True)
     ap.add_argument('--prompt-file', required=True)
@@ -882,217 +947,68 @@ def main():
                          'active_tasks; otherwise the plan snapshot is used, so a parallel '
                          'plan that omits it is refused rather than treated as "nothing '
                          'in flight".')
-    args = ap.parse_args()
+    ap.add_argument('--quota-store', dest='quota_store', default=None,
+                    help='Explicit quota cooldown store (sqlite3). Defaults to the '
+                         'stable shared store from quota_control (env '
+                         'BRAIN_WORKER_QUOTA_STORE or ~/.brain-worker).')
+    ap.add_argument('--quota-routes', dest='quota_routes', default=None,
+                    help='Trusted local quota-routes JSON mapping real channel '
+                         'identity to quota_group; unmatched channels share the '
+                         'conservative unknown-shared group.')
+    ap.add_argument('--quota-recovery-probe', dest='quota_probe',
+                    action='store_true',
+                    help='Run this dispatch as the single bounded recovery probe '
+                         '(allowed only after cooldown expiry; a scheduler-supplied '
+                         'minimal prompt must be used, never the full long task). '
+                         'Read-only tools only, no resume, no dispatch-plan, bounded '
+                         'prompt bytes and an explicit timeout are enforced '
+                         'programmatically before dispatch.')
+    ap.add_argument('--quota-probe-timeout-seconds', dest='quota_probe_timeout',
+                    type=int, default=qc.PROBE_DEFAULT_TIMEOUT_SECONDS,
+                    help=f'Bounded wall-clock timeout for the recovery probe child in '
+                         f'seconds [{qc.PROBE_TIMEOUT_MIN_SECONDS}, '
+                         f'{qc.PROBE_TIMEOUT_MAX_SECONDS}]; on timeout the child is '
+                         f'killed and settled as a non-429 failure (never healthy).')
+    ap.add_argument('--continuation-contract', dest='continuation_contract',
+                    default=None,
+                    help='Optional interruption-continuation contract JSON {files, '
+                         'todos?, original_report_ref?, original_error_ref?, '
+                         'prev_handoff?, test_evidence?}. Declared files are frozen '
+                         '(baseline bytes + SHA) before dispatch; after the confirmed '
+                         'terminal state a continuation.json handoff with terminal '
+                         'copies, real diffs, verified original refs and successful '
+                         'Write/Edit receipts is generated. prev_handoff drift is '
+                         'refused before dispatch. Without a contract the summary '
+                         'explicitly records unverified_no_contract.')
+    return ap
 
-    # ---- preflight：全部校验通过前不创建任何输出目录（失败退出码 2，零创建）----
-    try:
-        if not args.stage or not args.stage.strip():
-            raise ValueError('--stage is required and must be non-empty')
-        if not args.model or not args.model.strip():
-            raise ValueError('--model is required and must be non-empty (no fallback)')
-        cfg = load_entry_config(args.config)
-        work = Path(args.workspace).resolve(strict=True)
-        if not work.is_dir():
-            raise ValueError(f'workspace is not an existing directory: {args.workspace}')
-        prompt_path = Path(args.prompt_file).resolve(strict=True)
-        prompt_bytes = prompt_path.read_bytes()
-        try:
-            prompt = prompt_bytes.decode('utf-8')
-        except UnicodeDecodeError as exc:
-            raise ValueError(f'prompt file is not valid UTF-8: {prompt_path}: {exc}')
-        if not prompt.strip():
-            raise ValueError(f'prompt file is empty: {prompt_path}')
-        tools_items = parse_tools_arg(args.tools)
-        perms = effective_permission_rules(tools_items, args.allowed_tools,
-                                            args.disallowed_tools)
-        out = Path(args.output_dir).resolve()
-        if out.exists():
-            raise ValueError(f'output directory already exists (refusing to '
-                             f'overwrite/replay): {out}')
-        # Windows scoped Read/Edit/Write 文件规则的派工前校验：无效形态在建目录与
-        # Popen 之前退出 2、零创建、零模型额度；allow 与 deny 两侧同等校验。原始
-        # 允许/拒绝列表随后仍逐字传给 CLI（不静默转换），非 Windows 维持原样行为。
-        scoped_problems = validate_windows_scoped_file_rules(
-            perms['allowed_tools'], perms['disallowed_tools'], str(work))
-        if scoped_problems:
-            raise ValueError('invalid Windows scoped file grant: '
-                             + ' | '.join(scoped_problems))
-    except (ValueError, OSError, KeyError, json.JSONDecodeError) as exc:
-        print(json.dumps({'preflight_error': str(exc), 'exit_code': 2},
-                         ensure_ascii=False))
-        return 2
-    argv = build_argv(cfg, str(work), args.model, tools_items, args.session_id,
-                      allowed_tools=args.allowed_tools,
-                      disallowed_tools=args.disallowed_tools)
 
-    # ---- 任务级预检（仅 --dispatch-plan 时启用）：argv 建好后、Popen/建目录前 ----
-    plan_block = None
-    if args.dispatch_plan:
-        try:
-            plan = ec.load_plan(args.dispatch_plan)
-            active_tasks = None
-            if args.active_tasks:
-                active_tasks = json.loads(Path(args.active_tasks).read_text(encoding='utf-8'))
-        except (ValueError, KeyError, OSError, json.JSONDecodeError) as exc:
-            print(json.dumps({'dispatch_plan_rejected': True, 'sent': False,
-                              'exit_code': 2, 'reasons': [str(exc)]}, ensure_ascii=False))
-            return 2
-        actual = {'task_id': plan.get('task_id'), 'stage': args.stage,
-                  'runtime': 'codebuddy', 'model': args.model, 'workspace': str(work),
-                  'cwd': str(work),
-                  'prompt_sha256': hashlib.sha256(prompt_bytes).hexdigest(),
-                  'argv': argv, 'shell': False,
-                  'grants': ec.grants_from_rules(perms['allowed_tools'], [],
-                                                 perms['disallowed_tools'],
-                                                 tools_items)}
-        result = ec.preflight(plan, actual, active_tasks=active_tasks)
-        plan_block = {'plan_path': str(Path(args.dispatch_plan).resolve()),
-                      'plan_hash': result['plan_hash'], 'ok': result['ok'],
-                      'reasons': result['reasons'], 'argv_sha256': result['argv_sha256'],
-                      'active_task_count': result['active_task_count'],
-                      'is_atomic_lock': result['is_atomic_lock']}
-        if not result['ok']:
-            print(json.dumps({'dispatch_plan_rejected': True, 'sent': False,
-                              'exit_code': 2, 'reasons': result['reasons'],
-                              'plan_hash': result['plan_hash']}, ensure_ascii=False))
-            return 2
+def main():
+    """生产 CLI 公开入口：CodeBuddy/WorkBuddy 直连已退休为 human-relay only。
 
-    out.mkdir(parents=True, exist_ok=False)
-    # The shared contract is prepended to the verbatim task and the whole payload is
-    # what actually goes to the child stdin; save those bytes and read them back so the
-    # recorded hashes describe the real send, not a re-serialization of a JSON file.
-    contract = pc.build_contract(args.stage, str(work))
-    stdin_payload = pc.compose_task_payload(contract, prompt).encode('utf-8')
-    (out / 'sent-payload-stdin.bin').write_bytes(stdin_payload)
-    stdin_readback = (out / 'sent-payload-stdin.bin').read_bytes()
-    prompt_sha256 = pc.sha256_hex(prompt_bytes)
-    prompt_payload = pc.payload_evidence(
-        raw_prompt_bytes=prompt_bytes, sent_task_text=prompt, contract=contract,
-        sent_payload_bytes=stdin_payload,
-        newline_caliber='raw-file-bytes-preserving-decode; task=stdin, contract prepended to task')
-    prompt_payload['readback_match'] = stdin_readback == stdin_payload
-    prompt_payload['channels'] = {'task_stdin_sha256': pc.sha256_hex(stdin_readback)}
-    request = {'started_at': datetime.now(timezone.utc).isoformat(),
-               'workspace': str(work), 'prompt_file': str(prompt_path),
-               'prompt_sha256': prompt_sha256,
-               'prompt_payload': prompt_payload,
-               'model_requested': args.model, 'tools': args.tools,
-               'tools_items': tools_items,
-               'allowed_tools': list(perms['allowed_tools']),
-               'disallowed_tools': list(perms['disallowed_tools']),
-               'stage': args.stage, 'resume_session_id': args.session_id,
-               'entry_config': str(Path(args.config).resolve()),
-               'runtime': {'node': cfg['node'], 'cli': cfg['cli']},
-               'argv': argv}
-    if plan_block is not None:
-        request['dispatch_plan'] = plan_block
-    (out / 'request.json').write_bytes(json.dumps(request, ensure_ascii=False,
-                                                  indent=2).encode('utf-8'))
-    env = os.environ.copy()
-    env['DISABLE_AUTOUPDATER'] = '1'
-    with (out / 'stdout.jsonl').open('wb') as stdout, \
-            (out / 'stderr.log').open('wb') as stderr:
-        child = subprocess.Popen(argv, stdin=subprocess.PIPE, stdout=stdout,
-                                 stderr=stderr, cwd=str(work), env=env)
-        (out / 'process.json').write_bytes(json.dumps(
-            {'pid': child.pid, 'state': 'running'}, ensure_ascii=False).encode('utf-8'))
-        child.communicate(input=stdin_payload)
-    exit_code = child.returncode
-    parsed = parse_stream((out / 'stdout.jsonl').read_bytes(),
-                          args.model, tools_items)
-    protocol_success = bool(parsed['protocol_success'] and exit_code == 0)
-    if exit_code != 0:
-        parsed['parse_errors'].append(f'process exited non-zero: {exit_code}')
-    summary = {'protocol_success': protocol_success,
-               'report_bound': False,
-               'session_id': parsed['session_id'],
-               'model_requested': args.model,
-               'observed_models': parsed['observed_models'],
-               'observed_tool_calls': parsed['observed_tool_calls'],
-               'usage': parsed['usage'],
-               'model_usage': parsed['model_usage'],
-               'permission_denials': parsed['permission_denials'],
-               'parse_errors': parsed['parse_errors'],
-               'exit_code': exit_code,
-               'terminal_reason': parsed['terminal_reason'],
-               'terminal_state': parsed.get('terminal_state'),
-               'parse_success': parsed.get('parse_success'),
-               'failure_envelope': parsed.get('failure_envelope'),
-               'failure_envelope_valid': parsed.get('failure_envelope_valid'),
-               'primary_failure': parsed.get('primary_failure'),
-               'result_errors': parsed.get('errors'),
-               'errors_info': parsed.get('errors_info'),
-               'reset_hint': parsed.get('reset_hint'),
-               'failure_stage': parsed.get('failure_stage'),
-               'recoverability': parsed.get('recoverability'),
-               'tool_failures': parsed.get('tool_failures'),
-               'tool_failure_stats': _tool_failure_stats(parsed.get('tool_failures')),
-               'reinit_events': parsed.get('reinit_events'),
-               'business_verified': False,
-               'free_quota_verified': False,
-               'model_backend_identity_verified': False,
-               'usage_billing_basis': 'unknown; raw usage saved without interpretation',
-               'finished_at': datetime.now(timezone.utc).isoformat(),
-               'output_dir': str(out)}
-    summary['diagnostics'] = ec.diagnose(_cb_failure_facts(parsed, exit_code))
-    if plan_block is not None:
-        summary['dispatch_plan'] = plan_block
-    if parsed['response_text'] is not None:
-        (out / 'response.md').write_bytes(parsed['response_text'].encode('utf-8'))
-        disk = (out / 'response.md').read_bytes()
-        digest = hashlib.sha256(disk).hexdigest()
-        summary['response_sha256'] = digest
-        readback_match = digest == hashlib.sha256(
-            parsed['response_text'].encode('utf-8')).hexdigest()
-        body = analyze_report(parsed['response_text'], args.stage, str(work))
-        binding = finalize_binding(
-            body['body_ok'], body['reasons'],
-            protocol_success=protocol_success,
-            session_id=parsed['session_id'],
-            requested_session_id=args.session_id,
-            readback_match=readback_match)
-        report_state = {**body, 'response_sha256': digest,
-                        'readback_match': readback_match,
-                        'protocol_success': protocol_success,
-                        'session_id': parsed['session_id'],
-                        'requested_session_id': args.session_id,
-                        'binding': binding,
-                        'bound': binding['bound'],
-                        'reasons': binding['reasons']}
-    else:
-        report_state = {'bound': False, 'body_ok': False,
-                        'protocol_success': protocol_success,
-                        'parse_success': parsed.get('parse_success'),
-                        'failure_envelope_valid': parsed.get('failure_envelope_valid'),
-                        'reasons': ['no parseable text result in stream',
-                                    *parsed['parse_errors']],
-                        'carrier_missing': True}
-        if parsed.get('failure_envelope'):
-            report_state['terminal_state'] = parsed.get('terminal_state')
-            report_state['primary_failure'] = parsed.get('primary_failure')
-            report_state['reset_hint'] = parsed.get('reset_hint')
-            report_state['failure_stage'] = parsed.get('failure_stage')
-            report_state['recoverability'] = parsed.get('recoverability')
-            report_state['reasons'].insert(
-                0, f'failure envelope: no final report carrier; delivery failed '
-                   f'(protocol_success stays false)')
-        if parsed.get('carried_result') is not None:
-            # 失败信封携带的 result 文本原样落盘待验，不参与绑定（不生成 response.md）。
-            (out / 'failure-result.pending.txt').write_bytes(
-                parsed['carried_result'].encode('utf-8'))
-            report_state['carried_result_pending'] = str(out / 'failure-result.pending.txt')
-            report_state['carried_result_bound'] = False
-    (out / 'report-state.json').write_bytes(json.dumps(report_state, ensure_ascii=False,
-                                                       indent=2).encode('utf-8'))
-    summary['report_bound'] = bool(report_state.get('bound', False))
-    summary['report_state_file'] = str(out / 'report-state.json')
-    (out / 'summary.json').write_bytes(json.dumps(summary, ensure_ascii=False,
-                                                  indent=2).encode('utf-8'))
-    (out / 'process.json').write_bytes(json.dumps(
-        {'pid': child.pid, 'state': 'exited', 'exit_code': exit_code},
-        ensure_ascii=False).encode('utf-8'))
-    print(json.dumps(summary, ensure_ascii=False, indent=2))
-    return 0 if (protocol_success and summary['report_bound']) else 3
+    在读取配置/提示词、创建输出目录、进入额度门禁或 Popen 之前无条件固定拒绝任何
+    新的直接调用，返回明确 JSON 人工转交状态（sent=false、manual_relay_only）与非
+    成功退出码。无 plan、带 plan、resume、probe、配置存在/缺失一律不能绕过；本入口
+    不提供重新启用参数、环境变量或生产配置通道，也不把旧调用迁移到隐藏入口。
+
+    本生产模块已**彻底移除可执行传输**：不再有 dispatch_core，也不再 import subprocess，
+    因此生产路径无法 Popen 任何真实 CLI。旧真实传输（Popen + 额度结算 + 终态留证）已
+    完整搬到测试专用 tests/offline_codebuddy_harness.py 的 replay_dispatch，只在隔离
+    合成 stub 下回放历史失败。本模块只保留纯解析/终态诊断/历史证据函数
+    （parse_stream/_cb_failure_facts/_cb_write_receipts/build_argv/load_entry_config/
+    effective_permission_rules 等），供 harness 与离线单测复用。"""
+    build_parser().parse_args()  # 参数解析（含 --help）正常，但解析后一律拒绝派发
+    print(json.dumps({
+        'manual_relay_only': True,
+        'status': 'manual_relay_only',
+        'sent': False,
+        'dispatch_refused': True,
+        'reason': 'CodeBuddy/WorkBuddy direct dispatch retired: emit a complete '
+                  'copy-paste prompt and hand it to an external agent by hand. No '
+                  'new direct CodeBuddy call is submitted from the Skill/CLI/control '
+                  'plane. Prompt generation is NOT recorded as a dispatch.',
+        'exit_code': 2}, ensure_ascii=False))
+    return 2
 
 
 if __name__ == '__main__':

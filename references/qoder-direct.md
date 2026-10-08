@@ -3,14 +3,16 @@
 使用已有官方 `@qoder-ai/qodercli` 运行时与官方保存的登录态。复制 `scripts/local-entry.json.example` 为同目录的 `local-entry.json`，填写本机 node 和 `qodercli.js` 的绝对路径；也可通过 `--config` 指定配置。真实配置不会进入 Git。
 
 ```text
-python <技能目录>/scripts/qoder_direct.py --workspace <项目绝对路径> --prompt-file <UTF-8提示词文件> --output-dir <不存在的新证据目录> --stage <非空阶段编号> --model Qwen3.8-Flash --tools Read
+python <技能目录>/scripts/qoder_direct.py --workspace <项目绝对路径> --prompt-file <UTF-8提示词文件> --output-dir <不存在的新证据目录> --stage <非空阶段编号> --model Qwen3.8-Max --tools Read
 ```
 
-默认模型请求为 Qwen3.8-Flash；默认不给工具权限。续接使用 `--resume-session-id`，内部传官方 `--resume`。不自动重装、登录或无限调度。
+默认模型请求为 Qwen3.8-Max（本轮用户明确请求 Max，官方模型清单已确认 `Qwen3.8-Max` 为合法 `--model` 值；`Qwen3.8-Flash` 仍可显式选择，作为并发容量池的**溢出**组合）；默认不给工具权限。续接使用 `--resume-session-id`，内部传官方 `--resume`。不自动重装、登录或无限调度。
+
+入口在**建输出目录、Popen 之前**必须消费或校验一个跨会话共享的**并发容量 claim**（`scripts/dispatch_pool.py`，见 [global-dispatch](global-dispatch.md)）：给了 `--dispatch-claim <token>` 就精确校验（task/runtime/model/workspace/prompt_sha256 任一漂移即拒），没给就走 `select_and_claim` 原子路由；非被选中组合 → `routing_required`/`sent=false`/退出 2、零证据目录、不计轮次。可选 `--task-id`、`--dispatch-store`（默认 `BRAIN_WORKER_DISPATCH_STORE` 或 `~/.brain-worker/dispatch-pool.sqlite3`）、`--dispatch-claim`。子进程真实结束立即释放名额；存活未知不释放、不被抢占。**容量并发 ≠ 额度冷却**。
 
 ## 统一契约与哈希口径
 
-- 三入口调用前使用 `scripts/prompt_contract.py` 的完整九节契约，含精确标题、阶段/路径同一行、首末独占标记和结语。任务经 stdin，完整契约经官方 `--append-system-prompt`，两个通道各自留证。契约不能保证模型服从；原始响应照存，不合格仍保留 `bound=false`，不裁剪、不代写。
+- 当前直连入口（Qoder/ZCode）调用前使用 `scripts/prompt_contract.py` 的完整九节契约，含精确标题、阶段/路径同一行、首末独占标记和结语。任务经 stdin，完整契约经官方 `--append-system-prompt`，两个通道各自留证。契约不能保证模型服从；原始响应照存，不合格仍保留 `bound=false`，不裁剪、不代写。
 - 新调用的 `prompt_sha256` 与 dispatch-plan 均绑定原提示词文件的原始字节；另外保存实际任务文本、契约和完整发送通道的字节与哈希。换行转换口径显式记录，不把 JSON 文件哈希当 SDK prompt 哈希；Qoder 两通道不冒称一个后端合成载荷。留证边界只到本地 CLI/SDK 提交，不证明服务端处理后的文本。
 - 不改提示词原文件或在途计划；旧调用记录沿用原入口版本的含义，升级后的新调用使用新计划。完整字段和留证位置见 [并行执行控制面](parallel-execution.md)。协议、报告绑定和独立业务验收分别报告，不能由本次传输回归推断真实业务恢复。
 

@@ -18,38 +18,15 @@ from pathlib import Path
 
 REPO = Path(__file__).resolve().parent.parent
 ENTRY = REPO / 'scripts' / 'codebuddy_direct.py'
+# 直连已退休为 human-relay only：生产 main() 硬停，历史 stub 传输链改由测试专用
+# 离线 harness 调用 dispatch_core 在**隔离合成 stub** 下回放（见 offline_codebuddy_harness）。
+HARNESS = REPO / 'tests' / 'offline_codebuddy_harness.py'
+OFFLINE_FLAG = 'CB_OFFLINE_SYNTHETIC_STUB'
+# 仓库可信的固定合成 stub：harness 按仓库字节哈希核验 config.cli，环境变量无法定义白名单。
+# 所有回放都以本文件为唯一可执行载体，行为只由 CODEBUDDY_STUB_SPEC/RECORD 环境数据参数化。
+TRUSTED_STUB = REPO / 'tests' / 'offline_codebuddy_stub.py'
 sys.path.insert(0, str(REPO / 'scripts'))
 import codebuddy_direct as cb  # 纯函数离线测试（不启动子进程、不调模型）
-
-STUB_SOURCE = '''\
-import base64, hashlib, json, os, sys
-
-record_path = os.environ["CODEBUDDY_STUB_RECORD"]
-with open(os.environ["CODEBUDDY_STUB_SPEC"], "rb") as f:
-    spec = json.loads(f.read().decode("utf-8"))
-stdin_bytes = sys.stdin.buffer.read()
-record = {
-    "argv": sys.argv,
-    "cwd": os.getcwd(),
-    "stdin_sha256": hashlib.sha256(stdin_bytes).hexdigest(),
-    "stdin_len": len(stdin_bytes),
-    "stdin_has_crlf": b"\\r\\n" in stdin_bytes,
-    "env_disable_autoupdater": os.environ.get("DISABLE_AUTOUPDATER"),
-}
-with open(record_path, "wb") as f:
-    f.write(json.dumps(record, ensure_ascii=False).encode("utf-8"))
-out = sys.stdout.buffer
-for b64 in spec.get("stdout_raw_b64", []):
-    out.write(base64.b64decode(b64))
-    out.write(b"\\n")
-for line in spec.get("stdout", []):
-    out.write(line.encode("utf-8"))
-    out.write(b"\\n")
-out.flush()
-sys.stderr.buffer.write(spec.get("stderr", "").encode("utf-8"))
-sys.stderr.buffer.flush()
-sys.exit(spec.get("exit", 0))
-'''
 
 
 def read_json(path: Path):
@@ -181,13 +158,25 @@ class CodeBuddyDirectTests(unittest.TestCase):
         self.record_path = self.tmp / 'stub-record.json'
         self.prompt = self.tmp / 'prompt.md'
         self.prompt.write_bytes('请原样汇报。\r\n第二行。'.encode('utf-8'))
-        stub_path = self.tmp / 'codebuddy-stub.py'
-        stub_path.write_bytes(STUB_SOURCE.encode('utf-8'))
-        self.cli = stub_path
+        # config.cli 直接指向仓库可信固定 stub；harness 按仓库字节哈希核验，环境变量
+        # 无法定义/放宽白名单。stub 行为只由 CODEBUDDY_STUB_SPEC/RECORD 数据参数化。
+        self.cli = TRUSTED_STUB
+        self.stub_sha = hashlib.sha256(TRUSTED_STUB.read_bytes()).hexdigest()
         config_path = self.tmp / 'codebuddy-entry.json'
         config_path.write_bytes(json.dumps({'node': sys.executable,
                                             'cli': str(self.cli)}).encode('utf-8'))
         self.config = config_path
+        # 额度门禁隔离：显式临时 store/routes，绝不写真实 ~/.brain-worker 状态，
+        # 也不默认禁用门禁；未匹配路由时进保守共享组，门禁路径仍被真实执行。
+        self.quota_store = self.tmp / 'quota-store' / 'state.sqlite3'
+        self.quota_routes = self.tmp / 'quota-routes-absent.json'
+        self.base_env = {'CODEBUDDY_STUB_RECORD': str(self.record_path),
+                         'CODEBUDDY_STUB_SPEC': '__SPEC__',
+                         'CB_OFFLINE_SYNTHETIC_STUB': '1',
+                         'BRAIN_WORKER_QUOTA_STORE': str(self.quota_store),
+                         'BRAIN_WORKER_QUOTA_ROUTES': str(self.quota_routes),
+                         'SYSTEMROOT': os.environ.get('SYSTEMROOT', ''),
+                         'PYTHONIOENCODING': 'utf-8'}
 
     def tearDown(self):
         self._tmp.cleanup()
@@ -207,7 +196,7 @@ class CodeBuddyDirectTests(unittest.TestCase):
             self.prompt.write_bytes(prompt)
         out_dir = Path(out_dir)
         proc = subprocess.run(
-            [sys.executable, str(ENTRY),
+            [sys.executable, str(HARNESS),
              '--workspace', str(self.workspace),
              '--prompt-file', str(self.prompt),
              '--output-dir', str(out_dir),
@@ -216,10 +205,7 @@ class CodeBuddyDirectTests(unittest.TestCase):
              '--config', str(self.config),
              *extra_args],
             capture_output=True, cwd=str(self.tmp),
-            env={'CODEBUDDY_STUB_RECORD': str(self.record_path),
-                 'CODEBUDDY_STUB_SPEC': str(spec_path),
-                 'SYSTEMROOT': os.environ.get('SYSTEMROOT', ''),
-                 'PYTHONIOENCODING': 'utf-8'})
+            env={**self.base_env, 'CODEBUDDY_STUB_SPEC': str(spec_path)})
         result = {'proc': proc, 'out': out_dir, 'rc': proc.returncode}
         if (out_dir / 'summary.json').is_file():
             result['summary'] = read_json(out_dir / 'summary.json')
@@ -468,15 +454,12 @@ class CodeBuddyDirectTests(unittest.TestCase):
         spec = self.write_spec(self.success_events())
         out = self.tmp / 'out-nows'
         proc = subprocess.run(
-            [sys.executable, str(ENTRY), '--workspace', str(self.tmp / 'nope'),
+            [sys.executable, str(HARNESS), '--workspace', str(self.tmp / 'nope'),
              '--prompt-file', str(self.prompt), '--output-dir', str(out),
              '--stage', self.STAGE, '--model', self.MODEL,
              '--config', str(self.config)],
             capture_output=True, cwd=str(self.tmp),
-            env={'CODEBUDDY_STUB_RECORD': str(self.record_path),
-                 'CODEBUDDY_STUB_SPEC': str(spec),
-                 'SYSTEMROOT': os.environ.get('SYSTEMROOT', ''),
-                 'PYTHONIOENCODING': 'utf-8'})
+            env={**self.base_env, 'CODEBUDDY_STUB_SPEC': str(spec)})
         self.assertEqual(proc.returncode, 2)
         self.assertFalse(out.exists())
 
@@ -484,17 +467,129 @@ class CodeBuddyDirectTests(unittest.TestCase):
         spec = self.write_spec(self.success_events())
         out = self.tmp / 'out-nostage'
         proc = subprocess.run(
-            [sys.executable, str(ENTRY), '--workspace', str(self.workspace),
+            [sys.executable, str(HARNESS), '--workspace', str(self.workspace),
              '--prompt-file', str(self.prompt), '--output-dir', str(out),
              '--stage', '  ', '--model', self.MODEL,
              '--config', str(self.config)],
             capture_output=True, cwd=str(self.tmp),
-            env={'CODEBUDDY_STUB_RECORD': str(self.record_path),
-                 'CODEBUDDY_STUB_SPEC': str(spec),
-                 'SYSTEMROOT': os.environ.get('SYSTEMROOT', ''),
-                 'PYTHONIOENCODING': 'utf-8'})
+            env={**self.base_env, 'CODEBUDDY_STUB_SPEC': str(spec)})
         self.assertEqual(proc.returncode, 2)
         self.assertFalse(out.exists())
+
+    # ---- 生产入口已退休：真实 codebuddy_direct.py main() 在读配置/提示词、建输出、
+    #      quota gate、Popen 之前固定拒绝，返回 manual_relay_only/sent=false，零副作用。
+    #      配置缺失也不能绕过（证明未读配置）。无隔离标记的 harness 同样拒绝。 ----
+    def test_production_main_refuses_all_direct_dispatch(self):
+        for extra in ([], ['--resume-session-id', 'S-x'],
+                      ['--quota-recovery-probe'],
+                      ['--dispatch-plan', str(self.tmp / 'no-such-plan.json')]):
+            out = self.tmp / ('prod-refuse-' + str(abs(hash(tuple(extra)))))
+            proc = subprocess.run(
+                [sys.executable, str(ENTRY), '--workspace', str(self.workspace),
+                 '--prompt-file', str(self.tmp / 'no-such-prompt.txt'),
+                 '--output-dir', str(out), '--stage', self.STAGE,
+                 '--model', self.MODEL,
+                 '--config', str(self.tmp / 'no-such-config.json'), *extra],
+                capture_output=True, cwd=str(self.tmp),
+                env={**self.base_env})
+            self.assertEqual(proc.returncode, 2,
+                             proc.stdout.decode('utf-8', 'replace'))
+            payload = json.loads(proc.stdout.decode('utf-8', 'replace'))
+            self.assertTrue(payload['manual_relay_only'])
+            self.assertEqual(payload['status'], 'manual_relay_only')
+            self.assertFalse(payload['sent'])
+            self.assertFalse(out.exists())
+            self.assertFalse(self.record_path.is_file())
+
+    # ---- harness 隔离：缺隔离标记或 cli 非合成 stub 时拒绝，绝不落到真实运行时。 ----
+    def test_harness_refuses_without_isolation_or_real_cli(self):
+        spec = self.write_spec(self.success_events())
+        out = self.tmp / 'harness-noiso'
+        env = {**self.base_env}
+        env.pop('CB_OFFLINE_SYNTHETIC_STUB', None)
+        env['CODEBUDDY_STUB_SPEC'] = str(spec)
+        proc = subprocess.run(
+            [sys.executable, str(HARNESS), '--workspace', str(self.workspace),
+             '--prompt-file', str(self.prompt), '--output-dir', str(out),
+             '--stage', self.STAGE, '--model', self.MODEL,
+             '--config', str(self.config)],
+            capture_output=True, cwd=str(self.tmp), env=env)
+        self.assertEqual(proc.returncode, 2)
+        self.assertFalse(out.exists())
+        self.assertIn('offline_harness_refused',
+                      proc.stdout.decode('utf-8', 'replace'))
+
+    # ---- harness 强化隔离（Gap B）：真实 node / 非仓库可信字节 / 缺固定标记 / 生产默认
+    #      配置一律拒绝，绝不落到真实运行时；可信哈希只来自仓库文件，环境变量无法定义
+    #      白名单（自带标记 + 自报哈希自洽的任意脚本仍被拒）；校验只在测试 harness 内。 ----
+    def _harness_run(self, out, config, *, stub_sha=None, spec=None):
+        env = {**self.base_env}
+        # CB_OFFLINE_STUB_SHA256 现已被 harness 完全忽略（信任锚固定在仓库）；此处仍按
+        # 调用方意图设置它，用于证明“自报哈希”无法把任意脚本洗白。
+        env.pop('CB_OFFLINE_STUB_SHA256', None)
+        if stub_sha is not None:
+            env['CB_OFFLINE_STUB_SHA256'] = stub_sha
+        env['CODEBUDDY_STUB_SPEC'] = str(spec or self.write_spec(self.success_events()))
+        return subprocess.run(
+            [sys.executable, str(HARNESS), '--workspace', str(self.workspace),
+             '--prompt-file', str(self.prompt), '--output-dir', str(out),
+             '--stage', self.STAGE, '--model', self.MODEL, '--config', str(config)],
+            capture_output=True, cwd=str(self.tmp), env=env)
+
+    def test_harness_refuses_real_node_bad_hash_marker_and_default_config(self):
+        # (1) 真实 node（非本解释器）→ 拒绝，即使 cli 是仓库可信合成 stub。
+        #     node 必须是**已存在的绝对文件**才能通过 load_entry_config 的存在性校验，
+        #     从而抵达 harness 的 sys.executable realpath 比对；用一个真实存在的哑文件
+        #     冒充“某个真实 node 运行时”，它显然不等于当前测试解释器。
+        real_node = self.tmp / 'real-node-runtime.exe'
+        real_node.write_bytes(b'\x00not-the-test-interpreter\n')
+        real_node_cfg = self.tmp / 'cfg-realnode.json'
+        real_node_cfg.write_bytes(json.dumps(
+            {'node': str(real_node), 'cli': str(self.cli)}).encode('utf-8'))
+        out = self.tmp / 'harness-realnode'
+        proc = self._harness_run(out, real_node_cfg)
+        self.assertEqual(proc.returncode, 2)
+        self.assertFalse(out.exists())
+        self.assertIn('sys.executable', proc.stdout.decode('utf-8', 'replace'))
+
+        # (2) cli 自带固定标记、且调用方用环境变量自报一个与自身字节自洽的哈希，但其字节
+        #     不等于仓库可信 stub → 仍拒绝（环境变量无法定义/放宽白名单）。
+        impostor = self.tmp / 'impostor-stub.py'
+        impostor.write_bytes(
+            b'# OFFLINE-SYNTHETIC-CODEBUDDY-STUB v1\n'
+            b'import sys\nsys.stdout.write("arbitrary code")\nsys.exit(0)\n')
+        impostor_cfg = self.tmp / 'cfg-impostor.json'
+        impostor_cfg.write_bytes(json.dumps(
+            {'node': sys.executable, 'cli': str(impostor)}).encode('utf-8'))
+        out = self.tmp / 'harness-badhash'
+        proc = self._harness_run(
+            out, impostor_cfg,
+            stub_sha=hashlib.sha256(impostor.read_bytes()).hexdigest())
+        self.assertEqual(proc.returncode, 2)
+        self.assertFalse(out.exists())
+        self.assertIn('hash mismatch', proc.stdout.decode('utf-8', 'replace'))
+
+        # (3) 缺固定标记首行的“伪 stub”→ 拒绝。
+        fake = self.tmp / 'fake-stub.py'
+        fake.write_bytes(b'import sys\nsys.exit(0)\n')
+        fake_cfg = self.tmp / 'cfg-fake.json'
+        fake_cfg.write_bytes(json.dumps(
+            {'node': sys.executable, 'cli': str(fake)}).encode('utf-8'))
+        out = self.tmp / 'harness-nomarker'
+        proc = self._harness_run(out, fake_cfg,
+                                 stub_sha=hashlib.sha256(fake.read_bytes()).hexdigest())
+        self.assertEqual(proc.returncode, 2)
+        self.assertFalse(out.exists())
+        self.assertIn('repo-trusted synthetic stub',
+                      proc.stdout.decode('utf-8', 'replace'))
+
+        # (4) 生产默认入口配置 → 拒绝（禁止默认用户配置），且不读取其内容。
+        out = self.tmp / 'harness-defaultcfg'
+        proc = self._harness_run(out, cb.DEFAULT_CONFIG)
+        self.assertEqual(proc.returncode, 2)
+        self.assertFalse(out.exists())
+        self.assertIn('production default entry config',
+                      proc.stdout.decode('utf-8', 'replace'))
 
     # ---- 模型身份 ----
     def test_init_model_mismatch_rejects(self):

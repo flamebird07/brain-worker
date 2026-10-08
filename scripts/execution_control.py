@@ -45,10 +45,23 @@ CAPABILITY = {
     'zcode': {'fine_grained': False, 'read_dirs': False},
 }
 
+# CodeBuddy/WorkBuddy 直连已退休为 human-relay only：控制面对**新**的直接派发计划
+# 一律明确拒绝（同时检查 plan 与 actual 的真实 runtime），只允许生成可复制提示词交
+# 外部 Agent。此处不删除/清理历史 sqlite 行、锁、既有认证/模型配置，也不杀旧进程；
+# 历史诊断、额度结算与已存在占位保持可用，Qoder/ZCode 正常派发不受影响。
+RETIRED_DIRECT_RUNTIMES = ('codebuddy', 'workbuddy')
+
 # 控制面五状态（不用第六 verified）：待派发/执行中/卡住/待验收/完成。
 TASK_STATES = ('pending', 'executing', 'blocked', 'awaiting_acceptance', 'completed')
-# 仍占用 task_id 与并发槽位、门禁不能被绕过的“在途”状态。
+# 仍占用 task_id、且门禁（同任务去重/锁定提示词、同工作区写入冲突、共享写冲突）不能被
+# 绕过的“在途”状态。awaiting_acceptance 表示子进程已退出、只等业务验收，仍保护原任务/
+# 原工作区，但**不再占用一个真实进程并发槽**（见 LIVE_PROCESS_STATES）。
 HELD_STATES = ('executing', 'awaiting_acceptance', 'blocked')
+# 真正可能持有活子进程、占用并发容量槽的状态。容量（活进程槽）与业务占位（待验收）分离：
+# 已退出、仅待验收的任务不计入并发上限，从而允许为另一个工作区分配新执行器；跨会话真实
+# 容量池由 dispatch_pool 原子管理，本快照预检绝不把三个池当成统一的 max_concurrency 旧
+# 快照来卡死新派工。原任务/原工作区的保护仍由 HELD_STATES 独立维持。
+LIVE_PROCESS_STATES = ('executing', 'blocked')
 # 只有 completed 且 acceptance_result=passed 的依赖才可用；failed/cancelled/未知不放行。
 DEPENDENCY_PASS_RESULT = 'passed'
 
@@ -171,13 +184,37 @@ def _set_diff_reasons(label, planned, applied) -> list:
     return reasons
 
 
+def _counts_domestic_concurrency(task) -> bool:
+    """快照并发闸只统计国内 qoder/zcode 的活进程槽。Luna 是救援通道、无上限、绝不占用
+    国内六名额，已退休的 CodeBuddy/WorkBuddy 直连与其它非国内池 likewise 排除——否则
+    旧的全局快照 max 会把 Luna/旧 CB/其它池当成统一容量闸，误拒本可进入真实国内闸的新
+    qoder/zcode 派工（S5 复现：domestic=0、6 个 Luna executing 却报 concurrency 6
+    exceeded）。runtime 缺失/未知保守计入：真实国内容量上限由 dispatch_pool 原子池权威
+    强制，本闸只是业务快照二级保护，保守计入不会放松原子池。"""
+    rt = task.get('runtime')
+    if isinstance(rt, str):
+        low = rt.strip().lower()
+        if low == 'luna' or low in RETIRED_DIRECT_RUNTIMES:
+            return False
+    return True
+
+
 def check_parallel(plan, active_tasks, max_concurrency, actual_prompt_sha=None) -> list:
     reasons = []
-    held = [t for t in active_tasks if t.get('state') in HELD_STATES]
-    if len(held) + 1 > max_concurrency:
+    # 并发上限只统计真正可能持有活子进程的**国内**任务（executing/blocked 且属 qoder/zcode）：
+    # 已退出、仅待业务验收（awaiting_acceptance）的任务不占用活进程槽；Luna/退休 CB/其它池
+    # 不计入国内闸（Luna 无上限）。真实国内容量由 dispatch_pool 原子池权威强制。
+    # 同任务/同工作区/共享写保护仍由下面的 HELD_STATES 循环独立维持，不因容量分离而放宽。
+    plan_is_luna = str(plan.get('runtime', '')).strip().lower() == 'luna'
+    live = [t for t in active_tasks
+            if t.get('state') in LIVE_PROCESS_STATES
+            and _counts_domestic_concurrency(t)]
+    # 新派工本身是 Luna 时不受国内并发闸限制（Luna 救援无上限，只经 ask 票据 + claim-due）。
+    if not plan_is_luna and len(live) + 1 > max_concurrency:
         reasons.append(f'concurrency limit {max_concurrency} exceeded '
-                       f'({len(held)} task(s) already in flight: '
-                       f'{sorted(t.get("task_id") for t in held)})')
+                       f'({len(live)} domestic task(s) holding a live-process slot: '
+                       f'{sorted(t.get("task_id") for t in live)}; Luna/retired/other-pool '
+                       f'tasks are excluded and Luna capacity is unlimited)')
     plan_ws = _norm_dir(plan['workspace'])
     plan_shared = set(plan['shared_writes'])
     plan_writes = bool(plan['grants']['edits'] or plan['grants']['bash']
@@ -233,12 +270,37 @@ def preflight(plan, actual, *, active_tasks=None, max_concurrency=None) -> dict:
     这是主脑快照预检，不是原子跨进程锁：调用方在返回 not ok 时必须退出 2、零 Popen。
     active_tasks 若未显式传入，取自 plan['active_tasks']（validate_plan 已要求并行时
     显式声明，缺失不当作“无在途工作”）。"""
+    # 退休门禁：先按 plan 与 actual 的真实 runtime 判断是否为已退休的直连
+    # (CodeBuddy/WorkBuddy)。命中则明确拒绝，只允许人工转交提示词，绝不派发。
+    retired_reasons = []
+    for label, obj in (('plan', plan), ('actual', actual)):
+        rt = obj.get('runtime') if isinstance(obj, dict) else None
+        if isinstance(rt, str) and rt.lower() in RETIRED_DIRECT_RUNTIMES:
+            retired_reasons.append(
+                f'{label} runtime {rt!r} is retired to manual relay: no new '
+                f'CodeBuddy/WorkBuddy direct dispatch is accepted from the control '
+                f'plane; emit a copy-paste prompt for an external agent instead')
+    if retired_reasons:
+        plan_runtime = plan.get('runtime') if isinstance(plan, dict) else None
+        if not isinstance(plan_runtime, str) or plan_runtime not in CAPABILITY:
+            # 未知退休运行时（如 workbuddy）不在 CAPABILITY，validate_plan 会抛；
+            # 短路返回拒绝结构，仍带 sent=False/manual_relay_only，不派发。
+            return {'ok': False, 'reasons': retired_reasons, 'will_dispatch': False,
+                    'sent': False, 'manual_relay_only': True, 'plan_hash': None,
+                    'task_id': plan.get('task_id') if isinstance(plan, dict) else None,
+                    'stage': plan.get('stage') if isinstance(plan, dict) else None,
+                    'runtime': plan_runtime, 'max_concurrency': None,
+                    'active_task_count': 0, 'is_atomic_lock': False, 'argv_sha256': None,
+                    'preflight_at': _now(),
+                    'note': 'retired-direct-runtime refusal: manual relay only'}
+        # codebuddy 仍在 CAPABILITY：把退休理由作为首要原因带入完整预检，后续字段/
+        # 能力/并发检查照常追加（历史诊断/额度口径不丢），ok 必为 False。
     plan = validate_plan(dict(plan))
     if active_tasks is None:
         active_tasks = plan.get('active_tasks') or []
     if max_concurrency is None:
         max_concurrency = plan['max_concurrency']
-    reasons = []
+    reasons = list(retired_reasons)
 
     for field in ('task_id', 'stage', 'runtime', 'model', 'workspace', 'cwd'):
         if plan.get(field) != actual.get(field):
@@ -278,6 +340,7 @@ def preflight(plan, actual, *, active_tasks=None, max_concurrency=None) -> dict:
 
     ok = not reasons
     return {'ok': ok, 'reasons': reasons, 'will_dispatch': ok, 'sent': False,
+            'manual_relay_only': bool(retired_reasons),
             'plan_hash': plan_hash(plan), 'task_id': plan['task_id'],
             'stage': plan['stage'], 'runtime': plan['runtime'],
             'max_concurrency': max_concurrency,
@@ -425,6 +488,12 @@ def diagnose(facts) -> dict:
         types.append('protocol_parse_failure')
     if facts.get('model_execution_failure'):
         types.append('model_execution_failure')
+    # 两个业务证据分类：只接受调用方从结构化执行证据门禁结果（如
+    # zcode_execution_evidence 的 status）传入的布尔标记，不从提示/报告文本推断。
+    if facts.get('no_required_execution'):
+        types.append('no_required_execution')
+    if facts.get('execution_claim_mismatch'):
+        types.append('execution_claim_mismatch')
     test_exit = facts.get('test_exit_code')
     if isinstance(test_exit, int) and test_exit != 0:
         types.append('test_failure')

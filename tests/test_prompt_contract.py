@@ -36,6 +36,10 @@ import execution_control as ec  # noqa: E402
 QODER_ENTRY = SCRIPTS / 'qoder_direct.py'
 CODEBUDDY_ENTRY = SCRIPTS / 'codebuddy_direct.py'
 ZCODE_ENTRY = SCRIPTS / 'zcode_direct.py'
+# CB 直连已退休为人工转交；生产 CODEBUDDY_ENTRY main() 硬停，生产模块已无可执行传输。
+# 旧载荷/字节回归改由测试专用离线 harness 的 replay_dispatch 在合成 stub 下回放（不带
+# --dispatch-plan）。
+HARNESS = HERE / 'offline_codebuddy_harness.py'
 ZCODE_STUB = HERE / 'stub_zcode_runner.py'
 
 # 最小本地测试载体（嵌入本文件，不新增业务 stub）：记录收到的 stdin 原字节后回放信封。
@@ -54,6 +58,7 @@ sys.stdout.write(json.dumps(env, ensure_ascii=False))
 '''
 
 CODEBUDDY_STUB = '''\
+# OFFLINE-SYNTHETIC-CODEBUDDY-STUB v1
 import json, os, sys
 from pathlib import Path
 data = sys.stdin.buffer.read()
@@ -152,7 +157,7 @@ class _SubprocessBase(unittest.TestCase):
         self.ws = self.base / 'ws'
         self.ws.mkdir()
         self.stage = 'BW-PC-DISPATCH-01'
-        self.model_qoder = 'Qwen3.8-Flash'
+        self.model_qoder = 'Qwen3.8-Max'
         self.model_cb = 'PC-CB-1'
         self.report_file = self.base / 'report.txt'
         self.report_file.write_text(bound_report(self.stage, str(self.ws)),
@@ -161,6 +166,9 @@ class _SubprocessBase(unittest.TestCase):
         self.stub_dir.mkdir()
         (self.stub_dir / 'qoder_stub.py').write_text(QODER_STUB, encoding='utf-8')
         (self.stub_dir / 'cb_stub.py').write_text(CODEBUDDY_STUB, encoding='utf-8')
+        # harness 回放前校验固定合成 CB stub 的内容哈希：声明值取自磁盘真实字节。
+        self.cb_stub_sha = hashlib.sha256(
+            (self.stub_dir / 'cb_stub.py').read_bytes()).hexdigest()
 
     def tearDown(self):
         self._tmp.cleanup()
@@ -169,6 +177,14 @@ class _SubprocessBase(unittest.TestCase):
         env = os.environ.copy()
         env.update({'PYTHONIOENCODING': 'utf-8',
                     'SYSTEMROOT': os.environ.get('SYSTEMROOT', ''),
+                    'CB_OFFLINE_SYNTHETIC_STUB': '1',
+                    'CB_OFFLINE_STUB_SHA256': self.cb_stub_sha,
+                    # 额度门禁隔离：显式临时 store/routes，绝不写真实状态、不禁用门禁。
+                    'BRAIN_WORKER_QUOTA_STORE': str(self.base / 'quota-store' / 'state.sqlite3'),
+                    'BRAIN_WORKER_QUOTA_ROUTES': str(self.base / 'quota-routes-absent.json'),
+                    # 跨会话并发容量池隔离：显式临时 store（每个测试方法 setUp 新建 base，
+                    # 故每方法一个干净池），绝不读写真实 ~/.brain-worker 池。
+                    'BRAIN_WORKER_DISPATCH_STORE': str(self.base / 'dispatch-pool.sqlite3'),
                     'PC_REPORT_FILE': str(self.report_file),
                     'STUB_REPORT_FILE': str(self.report_file)})
         env.update(extra)
@@ -271,33 +287,54 @@ class QoderSendEvidenceTests(_SubprocessBase):
 
 
 class CodeBuddySendEvidenceTests(_SubprocessBase):
-    def test_codebuddy_crlf_raw_plan_and_received_bytes(self):
+    """CB 直连已退休：生产 codebuddy_direct.main 对所有直连（含带 --dispatch-plan）固定
+    拒绝、只走人工转交。载荷/原始字节回归保留为**离线 harness 回放**（dispatch_core 合成
+    stub，不带 plan），并额外断言带 plan 的生产入口被拒绝、零派发。"""
+
+    def test_codebuddy_crlf_raw_payload_bytes_offline_replay(self):
         prompt = self.base / 'cb-crlf.txt'
         raw = f'CodeBuddy 原字节 {MARKER_UNICODE}\r\n尾部保留\r\n'.encode('utf-8')
         prompt.write_bytes(raw)
-        plan = self._plan_for('codebuddy', prompt, model=self.model_cb)
         cfg = self.base / 'cb-crlf-cfg.json'
-        cfg.write_text(json.dumps({'node': sys.executable, 'cli': str(self.stub_dir / 'cb_stub.py')}), encoding='utf-8')
+        cfg.write_text(json.dumps({'node': sys.executable,
+                                   'cli': str(self.stub_dir / 'cb_stub.py')}), encoding='utf-8')
         received = self.base / 'cb-crlf-receipt.bin'
-        def run(out):
-            return subprocess.run([sys.executable, str(CODEBUDDY_ENTRY), '--workspace', str(self.ws),
-                '--prompt-file', str(prompt), '--output-dir', str(out), '--stage', self.stage,
-                '--model', self.model_cb, '--tools', 'Read', '--config', str(cfg), '--dispatch-plan', str(plan)],
-                env=self._env(PC_STDIN_FILE=str(received), PC_MODEL=self.model_cb), capture_output=True, timeout=30)
         out = self.ws / 'cb-crlf-ok'
-        proc = run(out)
+        proc = subprocess.run([sys.executable, str(HARNESS), '--workspace', str(self.ws),
+                               '--prompt-file', str(prompt), '--output-dir', str(out),
+                               '--stage', self.stage, '--model', self.model_cb,
+                               '--tools', 'Read', '--config', str(cfg)],
+                              env=self._env(PC_STDIN_FILE=str(received), PC_MODEL=self.model_cb),
+                              cwd=str(self.ws), capture_output=True, timeout=30)
         self.assertEqual(proc.returncode, 0, proc.stderr.decode('utf-8', 'replace'))
-        self.assertEqual(received.read_bytes(), pc.compose_task_payload(pc.build_contract(self.stage, str(self.ws)), raw.decode('utf-8')).encode('utf-8'))
+        self.assertEqual(received.read_bytes(),
+                         pc.compose_task_payload(pc.build_contract(self.stage, str(self.ws)),
+                                                 raw.decode('utf-8')).encode('utf-8'))
         self.assertEqual((out / 'sent-payload-stdin.bin').read_bytes(), received.read_bytes())
         self.assertEqual(prompt.read_bytes(), raw)
-        wrong = read_json(plan)
-        wrong['prompt_sha256'] = hashlib.sha256(raw.replace(b'\r\n', b'\n')).hexdigest()
-        plan.write_text(json.dumps(wrong), encoding='utf-8')
-        received.unlink()
-        proc = run(self.ws / 'cb-crlf-rejected')
-        self.assertEqual(proc.returncode, 2)
+
+    def test_codebuddy_direct_plan_is_refused_zero_dispatch(self):
+        # 生产入口携 --dispatch-plan 也被拒绝：读配置/提示词/建输出/Popen 之前硬停。
+        prompt = self.base / 'cb-plan.txt'
+        prompt.write_text('CodeBuddy 计划任务\n', encoding='utf-8', newline='\n')
+        plan = self._plan_for('codebuddy', prompt, model=self.model_cb)
+        cfg = self.base / 'cb-plan-cfg.json'
+        cfg.write_text(json.dumps({'node': sys.executable,
+                                   'cli': str(self.stub_dir / 'cb_stub.py')}), encoding='utf-8')
+        received = self.base / 'cb-plan-receipt.bin'
+        out = self.ws / 'cb-plan-refused'
+        proc = subprocess.run([sys.executable, str(CODEBUDDY_ENTRY), '--workspace', str(self.ws),
+                               '--prompt-file', str(prompt), '--output-dir', str(out),
+                               '--stage', self.stage, '--model', self.model_cb,
+                               '--tools', 'Read', '--config', str(cfg), '--dispatch-plan', str(plan)],
+                              env=self._env(PC_STDIN_FILE=str(received), PC_MODEL=self.model_cb),
+                              cwd=str(self.ws), capture_output=True, timeout=30)
+        self.assertEqual(proc.returncode, 2, proc.stdout.decode('utf-8', 'replace'))
+        payload = json.loads(proc.stdout.decode('utf-8', 'replace'))
+        self.assertTrue(payload['manual_relay_only'])
+        self.assertFalse(payload['sent'])
         self.assertFalse(received.exists())
-        self.assertFalse((self.ws / 'cb-crlf-rejected').exists())
+        self.assertFalse(out.exists())
 
     def test_codebuddy_contract_and_task_reach_single_stdin(self):
         prompt = self.base / 'prompt.txt'
@@ -307,11 +344,10 @@ class CodeBuddySendEvidenceTests(_SubprocessBase):
         cfg.write_text(json.dumps({'node': sys.executable,
                                    'cli': str(self.stub_dir / 'cb_stub.py')}), encoding='utf-8')
         stdin_file = self.base / 'cb-recv-stdin.bin'
-        cmd = [sys.executable, str(CODEBUDDY_ENTRY), '--workspace', str(self.ws),
+        cmd = [sys.executable, str(HARNESS), '--workspace', str(self.ws),
                '--prompt-file', str(prompt), '--output-dir', str(out),
                '--stage', self.stage, '--model', self.model_cb, '--tools', 'Read',
-               '--config', str(cfg), '--dispatch-plan',
-               str(self._plan_for('codebuddy', prompt, model=self.model_cb))]
+               '--config', str(cfg)]
         proc = subprocess.run(cmd, env=self._env(PC_STDIN_FILE=str(stdin_file),
                                                  PC_MODEL=self.model_cb),
                               cwd=str(self.ws), capture_output=True, timeout=120)
@@ -321,7 +357,6 @@ class CodeBuddySendEvidenceTests(_SubprocessBase):
                          hashlib.sha256(prompt.read_bytes()).hexdigest())
         pp = request['prompt_payload']
         received = stdin_file.read_bytes()
-        # 单一 stdin 通道同时携带契约与逐字任务，且等于留证字节。
         self.assertEqual(pp['sent_payload_sha256'], hashlib.sha256(received).hexdigest())
         self.assertEqual((out / 'sent-payload-stdin.bin').read_bytes(), received)
         self.assertTrue(pp['readback_match'])
@@ -343,7 +378,7 @@ class CodeBuddySendEvidenceTests(_SubprocessBase):
         cfg = self.base / 'cb-cfg-bad.json'
         cfg.write_text(json.dumps({'node': sys.executable,
                                    'cli': str(self.stub_dir / 'cb_stub.py')}), encoding='utf-8')
-        cmd = [sys.executable, str(CODEBUDDY_ENTRY), '--workspace', str(self.ws),
+        cmd = [sys.executable, str(HARNESS), '--workspace', str(self.ws),
                '--prompt-file', str(prompt), '--output-dir', str(out),
                '--stage', self.stage, '--model', self.model_cb, '--tools', 'Read',
                '--config', str(cfg)]
@@ -398,7 +433,7 @@ class ZcodeSendEvidenceTests(_SubprocessBase):
         prompt.write_text(f'ZCode 载荷任务 {MARKER_ASCII} {MARKER_UNICODE}\n',
                           encoding='utf-8', newline='\n')
         out = self.ws / 'out'
-        proc = self._run(prompt, out, plan=self._plan_for('zcode', prompt, model='GLM-5.3-Flash'))
+        proc = self._run(prompt, out, plan=self._plan_for('zcode', prompt, model='GLM-5.3'))
         self.assertEqual(proc.returncode, 0, proc.stderr.decode('utf-8', 'replace'))
         request = read_json(out / 'request.json')
         self.assertEqual(request['prompt_sha256'],
@@ -441,7 +476,7 @@ class ZcodeSendEvidenceTests(_SubprocessBase):
         self.assertNotEqual(raw_hash, normalized_hash, 'fixture must actually exercise CRLF')
 
         # 正确 plan 使用原始文件字节哈希 → 真实派发，且发送 hash 与原始 filehash 不同。
-        ok_plan = self._plan_for('zcode', prompt, model='GLM-5.3-Flash')
+        ok_plan = self._plan_for('zcode', prompt, model='GLM-5.3')
         self.assertEqual(json.loads(ok_plan.read_text(encoding='utf-8'))['prompt_sha256'], raw_hash)
         out = self.ws / 'out-crlf'
         proc = self._run(prompt, out, plan=ok_plan)

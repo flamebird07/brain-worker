@@ -1,0 +1,29 @@
+{
+  "_comment": [
+    "Synthetic offline fixture used by tests/test_quota_control.py.",
+    "This file is a hand-authored reproduction of the shape of a CodeBuddy terminal",
+    "envelope used by the quota classifier tests. It is NOT a worker report, NOT a",
+    "capture of any real session, and NOT an original provider payload. The session",
+    "and request identifiers below are obviously synthetic (synthetic-*) placeholders",
+    "with no relationship to any real conversation, account, or billing record.",
+    "The reset window (2026-10-08 18:14:13 UTC+8) and the 429/status-code-6004 quota",
+    "shape are preserved because the tests assert on those semantic facts; the",
+    "surrounding identifiers are fabricated on purpose so the fixture can ship with",
+    "the public package without exposing any real user/session/request data."
+  ],
+  "type": "result",
+  "subtype": "error_during_execution",
+  "is_error": true,
+  "errors": [
+    "429 您的使用量已超出频率限制，将在 2026-10-08 18:14:13 UTC+8 重置，您也可以切换其他模型继续使用。 (synthetic-request-id-00000000/synthetic-session-id-0000)"
+  ],
+  "errors_info": [
+    {
+      "status": 429,
+      "code": 6004,
+      "category": "quota",
+      "details": "429 您的使用量已超出频率限制，将在 2026-10-08 18:14:13 UTC+8 重置，您也可以切换其他模型继续使用。 (synthetic-request-id-00000000/synthetic-session-id-0000)"
+    }
+  ],
+  "session_id": "synthetic-session-id-0000"
+}

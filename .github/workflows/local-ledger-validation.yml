@@ -85,18 +85,79 @@ jobs:
       - name: ZCode actual SDK adapter offline regression
         run: python tests/test_zcode_sdk_runner.py
 
-      - name: CodeBuddy direct transport offline regression
+      # BW-GITHUB-CLOSEOUT-20261008-S3：CodeBuddy/WorkBuddy 直连退休为 human-relay only。
+      # 生产 codebuddy_direct.main 在读配置/提示词/建输出/quota gate/Popen 前固定拒绝；
+      # 旧 CB 真实 stub 传输链改由测试专用离线 harness（tests/offline_codebuddy_harness.py）
+      # 调 dispatch_core 在隔离合成 stub 下回放，不接真实运行时/账号。无网络、不调模型。
+      - name: CodeBuddy legacy pipeline offline replay (retired direct, synthetic stub)
         run: python tests/test_codebuddy_direct.py
+
+      - name: Manual-relay retirement refusal regression (control plane + production CLI)
+        run: python tests/test_manual_relay_routing.py
 
       - name: Task dispatch control offline regression
         run: python tests/test_execution_control.py
 
+      # BW-GITHUB-CLOSEOUT-20261008-S6：全局并发容量池（2 Zcode + 2 Max + 2 Flash 国内六
+      # 名额、1:1 轮转、Luna 救援票据裁决、跨 OS 进程并发初始化与 adopt-legacy 真实旧原件
+      # schema）的离线回归，Windows/Linux 矩阵都跑。三套 test_dispatch_pool* 全部使用每
+      # 用例独立临时 SQLite（setUp 显式断言 store != dispatch_pool.default_store_path()，
+      # 绝不读写真实 ~/.brain-worker 池）、随包固定合成 stub 与可注入假 PID 探针；无网络、
+      # 不登录、不调用任何真实模型。先核验固定合成 stub 已随包，保证离线入口回归可复现。
+      - name: Verify fixed synthetic stubs are packaged (offline, no real runtime)
+        shell: bash
+        run: |
+          set -o pipefail
+          for f in tests/stub_qodercli.py tests/offline_codebuddy_stub.py tests/stub_zcode_runner.py; do
+            test -f "$f" || { echo "missing packaged stub: $f" >&2; exit 1; }
+          done
+          python - <<'EOF'
+          import sys
+          sys.path.insert(0, 'scripts')
+          import dispatch_pool as dp
+          # 本地测试口径：默认真实库路径必须存在且测试绝不指向它（各用例 setUp 自断言）。
+          print('default real pool path (never used by tests):', dp.default_store_path())
+          print('packaged fixed synthetic stubs present; dispatch pool tests use temp SQLite')
+          EOF
+
+      - name: Dispatch pool core offline regression (temp SQLite, no real pool)
+        run: python -m unittest discover -s tests -p "test_dispatch_pool.py" -v
+
+      - name: Dispatch pool revision offline regression (temp SQLite, no real pool)
+        run: python -m unittest discover -s tests -p "test_dispatch_pool_revision.py" -v
+
+      - name: Dispatch pool multiprocess offline regression (cross-OS spawn, temp SQLite)
+        run: python -m unittest discover -s tests -p "test_dispatch_pool_multiprocess.py" -v
+
       - name: Parallel and fallback offline regression
         run: python tests/test_parallel_execution.py
 
-      # 三入口共享九节契约 + 实际发送载荷取证（真实子进程/SDK receipts，无网络、不调模型）。
+      # BW-GLOBAL-POOL-20261008-Z5/Z6：原生 Luna 终态收口（settle-native）的离线回归
+      # （临时 SQLite + 注入时钟，17 项隔离合成验证；无网络、不登录、不调真实模型、
+      # 不读写真实 ~/.brain-worker 池）。
+      - name: Native lifecycle settle-native offline regression (temp SQLite, no real pool)
+        run: python -m unittest discover -s tests -p "test_native_lifecycle.py" -v
+
+      # Qoder/ZCode 与 CodeBuddy 历史直连链路的九节契约 + 实际发送载荷取证
+      # （真实子进程/SDK receipts 的离线回放，无网络、不调模型；CB 生产已退休为
+      # human-relay only，此处仅为历史离线回放，不代表 CB 生产可直连）。
       - name: Prompt contract and sent-payload evidence offline regression
         run: python tests/test_prompt_contract.py
+
+      # BW-QUOTA-20261008 修复链路的离线回归：额度持久门禁、执行证据归并与权限 broker。
+      # 无网络、无真实模型、无真实 CLI；测试素材来自随包 tests/fixtures/quota-terminal.synthetic.json
+      # 与合成 stub，绝不写真实 ~/.brain-worker 状态。
+      - name: Quota control persistent gate offline regression
+        run: python tests/test_quota_control.py
+
+      - name: ZCode execution evidence offline regression
+        run: python tests/test_zcode_execution_evidence.py
+
+      - name: ZCode permission broker syntax check (no execution)
+        run: node --check scripts/zcode_permission_broker.mjs
+
+      - name: ZCode permission broker offline regression
+        run: python tests/test_zcode_permission_broker.py
 
       - name: Upload test outputs
         if: always()

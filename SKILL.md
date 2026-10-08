@@ -1,9 +1,55 @@
 ---
 name: brain-worker
-description: 按主脑与外部执行 Agent 分工完成大量阅读、开发、批量修改、测试、迁移或审计；主脑根据业务目标主动选择已就绪、已授权的 Qoder、ZCode 或 CodeBuddy 直连派工，独立成果可并行，回读原始报告并独立验收；也支持 human-relay。简单低成本任务直接处理。
+description: 按主脑与执行 Agent 分工完成大量阅读、开发、批量修改、测试、迁移或审计；支持已就绪且已授权的 Qoder、ZCode 直连及可选 GPT-6 Luna 云端原生子 Agent，Luna 遵循当前调用审批；CodeBuddy/WorkBuddy 改为 human-relay only（只生成可复制提示词、人工交外部 Agent，不再直接派发）；本机未另行指定时 ZCode 优先，Qoder 沿用现有唯一模型及入口兜底，回读原始报告并独立验收；也支持 human-relay。简单规划、推理与独立验收可由 GPT 主脑直接处理；工程实施由用户事先明确同意的执行器承担。
 ---
 
 # 主脑与苦力 Agent
+
+执行器范围（2026-10-08 用户决定，同日最新追加）：WorkBuddy 与独立 CodeBuddy CLI 均改为 human-relay only，不再从当前 Skill/CLI/控制面提交新的直接派发调用；选择它们时只生成完整可复制提示词，由客户人工交给外部 Agent，生成提示词不记成已派发。当前直连派发只保留 Qoder 与 ZCode，默认仍为 ZCode 优先、Qoder 沿用现有唯一模型及入口兜底。不再启动 WorkBuddy 的认证或测试。历史能力、原错误与模型信息与测试证据保留，仅作离线证据回放/档案，不作为重新启用授权。
+
+## GPT-6 Luna 原生子 Agent（可选）
+
+GPT-6 Luna（模型标识 `gpt-6-luna`）是可选执行端，通过所在宿主实际提供的原生子 Agent 工具调用。本机未另行指定时 ZCode 优先；Qoder 沿用现有唯一模型及入口配置兜底。Luna 不自动接替任何在途任务，也不改变适用任务/在途任务已有的执行选择；GPT/Luna 的工程实施须用户事先明确同意，不自动代做。
+
+每次考虑调用 Luna 时，检查当前环境工具是否提供该模型、当前用户授权及审批要求，并遵循当次生效的 custom rule 与平台规则；需要审批时取得对应批准后才启动。能力登记、历史启动成功或工具存在都不是后续调用授权；不把动态规则、过去批准或某次测试参数固化为永久授权或默认参数。
+
+原生子 Agent 只在所属云环境中执行，不能直接操作用户电脑。本云端主聊涉及用户电脑的本地工作仍通过已授权的 `cloud_threads` 进入对应本机环境，并遵循该环境的工具与权限边界；不得把中转能力归给 Luna。此项不提供统一 CLI，不把 `gpt-6-luna` 填进 Qoder、ZCode、CodeBuddy 的模型配置，也不宣称通用 CLI/四接口协议已接通。
+
+已有启动证据：根线程报告于 2026-10-07 使用 `collaboration.spawn_agent(model="gpt-6-luna", reasoning_effort="xhigh", fork_turns="none")` 完成一次合成排序验证，子 Agent 正常返回 `[2,5,7]`。这只支持该次原生启动与小任务返回；本机仅按根线程提供的结果登记，未独立回读原始云端调用日志，未重新调用。不证明本地桌面能力、完整业务闭环或套餐/额度节省。后续任务按实际任务标识保留原始交付、核对环境和副作用并由主脑独立验收；详细边界见 [Luna 原生执行端参考](references/luna-native.md)。
+
+Skill 使用与执行派发分别记录：`brain_worker=used/not-used`；外部执行仍记 `external_dispatch=dispatched/not-dispatched`，原生调用另记 `native_dispatch=dispatched/not-dispatched`、实际模型、任务标识与次数。仅更新指导或复用历史证据时，两种派发都记未派发，不计作新的执行轮次。
+
+## 本机 DOTS 默认入口与使用记录（用户已明确选择时）
+
+用户通过本机 DOTS 安排任务时，默认先实际读取并应用 brain-worker Skill，完成适用性判断、规划与分工；已授权且具备所需能力的具体执行优先交给已就绪的国内桌面 agent（CLI 或 API），GPT 保留必要的逻辑推导、任务分解和独立验收。简单低成本任务仍先做判断；不适合委派、工具不可用或权限受限时，明确说明原因和实际处理方式。
+
+每次执行前及最终汇报明确记录：brain_worker=used/not-used、实际 SKILL.md 路径、已应用的步骤与证据；另记 external_dispatch=dispatched/not-dispatched 及原因。used 仅用于已实际读取并按 Skill 执行本次适用步骤；只写说明、理解理念或准备提示词不能冒称已使用或已派工。未读取或未应用时记 not-used，并主动提醒用户原因；已使用 Skill 做判断但未派工时，分开说明，不能掩盖执行状态。
+
+此偏好不扩大用户授权、不覆盖安全要求；实际派工仍须确认运行时、模型、工具授权、隔离工作区和报告回读条件。CodeBuddy/WorkBuddy 相关只生成可复制提示词人工转交、不再直接派发；历史 Flash-only 模型口径（GLM 5.3 Flash，调用前核实实际可用模型 ID，不可用则报告障碍、不静默回退 GLM 5.3）仅适用于旧 CodeBuddy 直连档案，不作当前派发依据。
+
+已落实范围是本项目说明、对应 Obsidian 笔记、本机 brain-worker 安装版与仓库版的指导及 UI 默认提示。现有对话若缓存旧 Skill，需重新读取更新后的安装版；本规则不是已接通的 DOTS 全局自动路由，也不能保证未加载该 Skill 的其他入口自动执行。
+
+## 本机显式 local 台账模式（适用任务，优先于旧飞书专属要求）
+
+适用任务由用户在本机当次会话明确选择 local 台账时，不调用 Hermes 配置或飞书认证/读写。仓库版与安装版 scripts/local_ledger.py、scripts/ledger_core.py 采用同一实现；调用前须由用户显式设置 `BRAIN_WORKER_LEDGER=<本机隔离台账绝对路径>`，禁止落到默认用户目录，也不把这一路径当通用默认值固化给其他人。
+
+该次任务及其验收后的接续阶段，台账门禁使用该本地入口的 status/record/resolve，取代旧飞书专属命令、模板和共享来源要求；后文飞书指令仅用于另外明确选择并授权 feishu 的任务。local 就绪和本地回读足以满足该任务的台账门禁，不要求为此读取或写入飞书，也不把远程台账未同步当成本地记录失败。
+
+这是独立的新本地事件链，未迁移、导入、重算或覆盖历史远程评分；初始50分/步长1/样本0仅是本地初值。mode.json 明确 remote_score_synced=false、remote_write_performed=false、remote_history_imported=false。没有真实执行报告时只做status，不提前评价或计分；验收后以稳定event-id本地record，身份未证实不传--identity-confirmed，补证后本地resolve，写后回读。同阶段幂等，不因补修或重试新建加分样本。
+
+后续明确授权远程同步前，不运行 capability_ledger.py，不配置认证，不外发评分、报告或消息。派工与台账分开验证：台账就绪不是模型已调用或业务完成；执行端仍按 Qoder/ZCode 直连兜底，CodeBuddy 相关测试改为生成提示词人工转交（不再直接派发）。
+
+## 当前本机跨项目调度约定（仅适用于用户当次指定的并行链路）
+
+目标仍是 GPT 主脑负责必要推导、规划与验收，国内执行器承担具体执行，以节省 GPT 额度。用户在本机并行推进的多条链路（例如某业务任务与 brain-worker/CodeBuddy 修复链路）经父线程互传已验证结果，业务不等待适配器修复；具体的任务标识与台账路径由用户当次指定，本仓库不固化任何单一任务、目录或授权。
+
+用户指定的业务任务顺序（2026-10-08 最新决定）：小范围只读定位一类任务若选 CodeBuddy，则改为生成完整可复制提示词由客户人工交外部 Agent，不再从入口直接派发；ZCode 优先直接派工作为主路径，Qoder 沿用唯一模型兜底。ZCode/Qoder 的模型按各自档案与授权核对。切换先确认原调用终态，或明确停止并核对副作用；未知状态先查，不把“立即接续”变成同一目标的重复在途派发。成功与失败的原件保留。历史曾由独立 CodeBuddy CLI 用 GLM 5.3 Flash 先做定位、故障后 ZCode 接续，该直连步骤已停用、仅存档。
+
+执行端角色（2026-10-07 用户补充，2026-10-08 更新）：本机未另行指定执行者时 ZCode 优先（用户付费套餐，用户反馈有额度且速度快，未独立核实账单或剩余额度）；Qoder 沿用现有唯一模型及入口配置兜底，不覆盖配置、不新增或替换模型，也不重复询问模型名称；用户反馈当前活动无消耗，尚未独立核实，不当作免费事实。明确用户选择与在途任务不替换：选择变更只应用于验收后的下一轮。GPT 主脑可做规划、推理、确定性输入准备和独立验收；GPT/Luna 工程实施须用户事先明确同意，不自动代做。外派被授权校验、自动审批或环境限制拦住时报告原拒绝，不改成 GPT 代做，也不换执行器或其他入口绕过；普通已终态执行失败是否兜底，按已授权顺序决定。WorkBuddy/CodeBuddy 不再直接派发，只做提示词人工转交；历史 Flash-only 模型口径仅适用于旧 CodeBuddy 直连档案，不强制其他执行端切换 Flash。
+
+牛马修复链路按错误证据是否到达分级处置，不预设“当前没有新报告”这一状态：若本阶段确有新的真实错误证据，据其定位适配器/Skill 缺口，在独立范围内准备、验收后经父线程反馈；若此刻尚无新的错误报告，则等待父线程转交，不凭历史 429 或猜测重跑测试，不重复调用适用任务，也不修改适用任务占用的文件、工作区或运行对象。修复仅针对报告所证实的适配器/Skill 缺口；双方成果互推，但不把一方未验收状态当作另一方成功基线。
+
+交接按同一 task/stage、request/prompt哈希和session/turn标识串联 request、process退出码、原始stdout/stderr、summary、report-state、已有response/产物及其哈希；保留错误码、权限拒绝、用量和缓存口径、实际副作用。先查可恢复结果，再决定是否需要新调用；消耗、CLI退出0或运行结束均不等于完成。不传凭据，也不凭空补写worker报告。
 
 主脑负责理解需求、确认边界、以可独立验收的成果划分阶段、审查风险、形成明确指令、验收和决定下一步。执行 Agent 负责阶段内调查、修改、测试、迁移、审计及其他实质执行。主脑驱动不具备直接执行能力时，由传输层机械执行主脑明确给出的控制面指令；传输层不参与任务判断，也不是执行 Agent。委派和传输均不转移主脑的验收责任，也不扩大用户授权。
 
@@ -77,7 +123,7 @@ TASK_BOARD_END
 
 ## 执行方式
 
-本 Skill 支持两种执行方式，**核心规则、阶段门禁、WORKER_REPORT 模板、安全边界、验收标准与范围反思完全同一套**，差别只在”提示词怎么送达、报告怎么回来”：
+本 Skill 的外部执行支持下列两种方式；另有上方 Luna 云端原生可选档案，不套用外部 CLI/通用四接口协议。外部执行的**核心规则、阶段门禁、WORKER_REPORT 模板、安全边界、验收标准与范围反思完全同一套**，差别只在”提示词怎么送达、报告怎么回来”：
 
 - `human-relay`（人工转发，默认，零 API 配置；GPT 桌面原有用法即此方式）：主脑生成完整、可复制的阶段提示词，由用户转发给外部桌面 Agent（例如 ZCode、Xiaomi Mimo）；执行 Agent 把 WORKER_REPORT 保存为 UTF-8 原始文件，放到会话中约定、主脑可访问的路径，用户通知保存完成，主脑直接读取原文件验收；主脑无法访问该路径或文件缺失时才由用户上传原文件。
 
@@ -85,6 +131,20 @@ TASK_BOARD_END
 - `api-direct`（受控工具直调）：主脑直接操作用户提供的受控工具/接口，或在主脑驱动不具备执行能力时经传输层机械调用该工具/接口，下发阶段任务；按任务 ID 持续观察状态；非终态结果用于更新看板和触发状态汇报，终态结果进入交付提取与验收（对应“任务级等待”），从对应任务的事件中提取 WORKER_REPORT 块，保存为“API 提取报告存档”后再验收。该存档不是 API 返回事件的原始载荷；省掉人工转发环节，但**不省掉任何验收**。
 
 已配置的 ZCode 官方运行时按下方 ZCode 专项档案直接派工；桌面人工转发仅在用户选择 human-relay 时使用。
+
+### 持久额度冷却与路由门禁（2026-10-08，BW-QUOTA-20261008-S1）
+
+ZCode 真实派发入口（以及已退休为人工转交、现仅由 `tests/offline_codebuddy_harness.py` 在合成 stub 下离线回放的 CodeBuddy 直连流水线；生产 CodeBuddy 入口对任何新直连在读配置/建输出/Popen 前固定拒绝，不再进入实际派发）在所有 Popen 前经过 `scripts/quota_control.py` 的 sqlite 持久门禁（含不传 dispatch-plan 的兼容路径）：明确 429 按带时区 reset/结构化 Retry-After/无窗口 quota/临时退避分级冷却，跨进程、跨派工、跨工作区生效，冷却截止前不得跨任务重派该通道；同一真实工作区保持单一写入执行器；冷却到期仅 recovery_unverified，需单次有界核验通过才清，不把客户端切换当额度恢复。额度分组只来自受信任本机 quota-routes 配置（CodeBuddy 与 ZCode 额度独立为本机 user_confirmed，非服务商/账单核实；通用配置仍支持共享组；未知关系不默认独立）。**额度冷却政策例外（2026-10-08 用户决定，BW-ZCODE-MANUAL-QUOTA-20261008-S1）：ZCode 额度改由用户手动管理/重置，取消自动额度冷却——`gate_dispatch(runtime='zcode')` 与 ZCode 的 `settle_attempt`/`import_terminal` 跳过全部额度冷却/到期/自动恢复判定（429 分类仍如实提取，但不写 cooldown），缺 routes、落 unknown-shared 或共享组历史冷却都不再挡 ZCode；这是按真实 runtime 的固定策略、不可由任务书关闭，也不提供关闭 CodeBuddy 冷却的开关。CodeBuddy 及其它 runtime 的额度冷却规则完全不变，ZCode 也不得清除/覆盖同组里 CodeBuddy 的冷却。此处取消的只是额度冷却门禁，ZCode 的工作区单一写入与通道单在途并发占位仍保留（跨 CB/Z 同一真实工作区仍串行、同组跨工作区仍单在途、活任务不被抢占），普通 ZCode 派工不要求 recovery probe。** 中断接续用 `scripts/continuation_contract.py` 冻结受控文件清单与最后测试证据，下一执行器从既有产出继续，不回滚整批、不补写缺失报告、不用旧绿测证明改后通过。详见 [references/quota-routing.md](references/quota-routing.md)。
+
+### 全局并发容量池与 1:1 路由（2026-10-08，BW-GITHUB-CLOSEOUT-S4）
+
+所有会话共享同一持久**并发容量池** `scripts/dispatch_pool.py`（纯标准库 sqlite3、`BEGIN IMMEDIATE` 原子事务，默认 `~/.brain-worker/dispatch-pool.sqlite3`，`BRAIN_WORKER_DISPATCH_STORE` 覆盖；测试必须传显式临时 store）。分配口径：主力 `zcode:GLM-5.3` 与 `qoder:Qwen3.8-Max` 各最多 2 个真实在途执行器、按 committed 计数做 **best-effort 1:1** 轮换（非严格均衡，文档不宣称严格相等）；溢出 `qoder:Qwen3.8-Flash` 最多 2 个，**只有两主力池都满**才允许；**国内合计 6**；未授权组合容量为 0 一律拒。Luna（`luna:native`）**只做救援、无数量上限**：只有六名额全满、宿主**真的问过用户**（外部 agent 还是 Luna）、且 **300 秒无回复**后，经 `claim-due` 在同一事务内原子竞争裁决才可由**宿主原生调用**——Python 只落库票据、绝不谎称已问或已派生 Luna；一旦用户回复即不再自动裁决（等待超时≠默认无限授权）；等待期间任何国内名额释放**优先国内并原子取消同 task 的 pending 票据**（不双派国内+Luna）；原生工具已启动但在写出 agentID 前崩溃 → `launch_unknown` 待人工核验、**绝不自动重复启动**；Luna 沿用原任务文件/命令/副作用范围，不借救援绕过权限拒绝、额度错误或部署审批。
+
+Qoder/ZCode 入口在**建输出目录、Popen 之前**必须消费/校验一个容量 claim（`consume_for_entry`），**不能靠提示词或一个传入布尔跳过**：给了 `--dispatch-claim` 就精确校验（task/runtime/model/workspace/prompt_sha256 任一漂移即拒），没给就走 `select_and_claim` 原子路由，非被选中组合 → `routing_required`/`sent=false`/退出 2、**零证据目录、零 Popen、不计轮次**；路由选择绝不把权限拒绝/登录缺失/额度限流伪装成容量溢出。**子进程真实结束立即释放名额**（不等报告绑定/业务验收），启动失败/取消/异常结束释放本 attempt，wrapper 死但子进程仍活（或存活未知）不释放、不被抢占，PID 复用绑定创建时刻（Windows 只读 `GetProcessTimes`），Qoder 派生的工具子进程不算另一个 worker。**容量并发 ≠ 额度冷却**：额度门禁仍在 `quota_control`；两个 ZCode workspace 走同一 provider 时经**已校验的容量 claim**放行，同 workspace 单写入与 unknown/在途保护不变，不删通道行、不禁用门禁、不伪造 claim；CodeBuddy 旧限流与旧占位完全不变、不进池。详见 [references/global-dispatch.md](references/global-dispatch.md)。
+
+### 派工范围、观测边界与 ZCode 错误终态归并（2026-10-08，BW-ZCODE-MANUAL-20261008-S2）
+
+范围按独立可验收成果（状态机/副作用/必要接口/验证面/读取量）收敛，不靠“两文件/步长 1”机械阈值，耦合必要时保留完整闭环；提示词给精确函数与 harness、优先分段定位、避免重复整读，字节不等于 tokens。文字路径范围、工具可见性、实际授权分别记录——裸 Read 不是文件 sandbox，未经本机验证的单文件规则不得声称已生效，不静默扩权或读凭据。状态分型为已派发/真实Read/等待消息/真实写入/报告绑定/独立测试/业务回读；静默或心跳不等于死锁/429/工具执行，Windows 退出码 4294967295 不是 HTTP 429，`CODEBUDDY_MAX_RETRIES` 只是子进程有界重试、非总模型次数或全程时限；用户选择继续等待的在途任务不追溯套用新超时/换模型/重派，超时与增量流参数只作未来显式配置、须先授权且兼容验证后启用（本轮不实现）。能力分面（模型路由/工具可见/审批组件端口 ready/command_started/退出/输出回执）独立记录：当前 `command_contract` 路径已注入 permissionBroker，不声称 SDK 全无审批客户端，主动屏蔽 Bash 不算新失败，未登记命令被拒不等于整套测试不可用、更不因此放宽权限；CodeBuddy 直连已退休为人工转交、其额度冷却仅在离线回放中保留，S1 ZCode 手动额度政策保持现状。有 Read/Glob/Grep 时不额外跑 ls/date/cat/cd/echo/包装命令，未登记命令被权限拒绝须如实记“未执行”、不写成环境故障；未知写未知、时间由主脑记录。最终代码对应本次测试指纹，不把旧绿测当新、专项与全量不相加，报告格式失败与代码/测试验收分开、不为仅修格式重派，错误/部分成果保留、GPT/Luna 工程不自动替代，WorkBuddy 继续排除。证据侧：`scripts/zcode_execution_evidence.py` 现将 ZCode `tool_call_error` 作为明确失败终态按 toolCallId 归并（普通→`tool_result_failed`、权限→`permission_denied` 且 `is_error` 缺失也不掩盖拒绝），保留 `tool_call_result` 严格布尔 `success` 检查、孤立/畸形/身份漂移/成功与错误冲突检查与合法写入证据验收；`streaming_tool_ledger_updated` 的 `tool_result_committed` 仅为状态字段、绝不当成功，仅 committed 无 result/error 终态仍 `tool_result_missing`；原始事件全部保留不改写、不伪造报告、不放行业务。详见 [references/codebuddy-direct.md](references/codebuddy-direct.md)、[references/zcode-direct.md](references/zcode-direct.md) 的“派工范围与观测边界”与“执行证据门禁”。本段是本机 brain-worker 的观测口径，不作为通用 Skill 固化任何具体业务的授权或参数。
 
 ### 传输层
 
@@ -163,15 +223,15 @@ TRANSPORT_INSTRUCTION_END
 
 ## 自然派工与默认执行者
 
-- **何时主动派工**：任务呈现大量阅读、批量修改、开发、长测试或需要独立执行证据等适合委派的特征时，主脑读取最新能力台账与各直连档案的就绪状态，主动选择已就绪、已授权的外部执行器实际直连派工；不等待用户每轮点名执行者或指定固定配比（如 1:1:2）。简单、低成本、单步任务主脑直接处理；只有缺少会影响执行的必要信息（项目绝对路径、授权范围、验收标准等）时才询问，其余不追问。
-- **怎么选**：以“该成果由谁执行最合适”为准——台账评分、步长、限制与身份确认状态，直连档案预检是否通过，任务类型与隔离需求。未另行指定执行者时，代码开发、入口开发和逻辑补修默认由 Qoder / Qwen3.8-Flash 执行，主脑独立验收；用户已授权 ZCode 直连时，ZCode 可并行承担相互独立的成果。用户明确指定 CodeBuddy、ZCode 或其他执行者时遵从；执行中改变默认选择只应用于验收后的下一轮，不替换在途任务。
+- **何时主动派工**：任务呈现大量阅读、批量修改、开发、长测试或需要独立执行证据等适合委派的特征时，主脑读取最新能力台账与各直连档案的就绪状态，主动选择已就绪、已授权的外部执行器实际直连派工；不等待用户每轮点名执行者或指定固定配比（如 1:1:2）。简单规划、推理与单步检查可由 GPT 主脑直接处理；工程实施仍按上述分工与授权执行。只有缺少会影响执行的必要信息（项目绝对路径、授权范围、验收标准等）时才询问，其余不追问。
+- **怎么选**：以“该成果由谁执行最合适”为准——台账评分、步长、限制与身份确认状态，直连档案预检是否通过，任务类型与隔离需求。本机未另行指定时 ZCode 优先，可在已有授权内承担相互独立的成果；Qoder 沿用现有唯一模型及入口配置兜底，不覆盖配置。GPT 主脑只做规划、推理、确定性输入准备和独立验收；GPT/Luna 的工程实施须用户事先明确同意，不自动代做。GPT-6 Luna 是云端可选执行端，按上方原生档案检查当前工具、授权与调用审批，不自动成为兜底。用户明确指定执行者时遵从；选择变更只应用于验收后的下一轮，不替换在途任务或适用任务既有选择。
 - **无可用直连执行器时**：如实说明缺项（未配置、预检未通过或配额终态），按授权改走 `human-relay` 或等待用户配置，不假调用、不冒称已派工、不自行用另一执行者冒充默认执行者。
 - **成本口径**：个人版免费积分目标保留（例如个人版 Trae 免费积分）；企业 CLI、成本未知或零占位用量的调用一律不得冒称免费，账单未知就写未知。本仓库没有已验证的 Trae 直连入口，未验证前不宣称可用。
 - **并行边界**：并行派工按“独立可验收成果”划分，允许有价值的并行、不凑并发数量；任务图/看板快照、计划预检、单项失败兜底与合并门禁见 [并行执行控制面](references/parallel-execution.md)。
 
 ## Qoder CLI 直连（api-direct 的受限 CLI 档案）
 
-用户明确指定 Qoder、要求本机自动派工或免复制粘贴时，主脑可以使用已验证的 `scripts/qoder_direct.py`；不另开 Codex 主脑，也不调用 Codex 子 Agent。桌面 ZCode/Mimo 的人工转发方式及通用 API 适配器规则继续保留。
+用户明确指定 Qoder、要求本机自动派工或免复制粘贴时，主脑可以使用已验证的 `scripts/qoder_direct.py`；不另开 Codex 主脑；Luna 原生可选档案独立核对当前授权与审批，不混入本 Qoder 调用。桌面 ZCode/Mimo 的人工转发方式及通用 API 适配器规则继续保留。
 
 此档案是一次前台 CLI 调用，不实现通用 `dispatch/poll/events/cancel` 调度器，因此不按上节四接口协议冒充通用适配器已通过。其能力预检为：本机入口路径与官方登录态有效、受控参数调用、进程与输出可观察、原文存档和哈希回读、会话绑定及实际业务验收。脚本不提供取消 API、后台恢复或跨回合主动通知；若宿主不能观察运行中进程或在其返回时恢复验收，须报告该限制，不能宣称持续值守。模型任务已发送后不盲目重发，不自动杀进程。
 
@@ -221,25 +281,79 @@ TRANSPORT_INSTRUCTION_END
   不再相加；`events.jsonl` 只落盘不整份打印。每轮须汇报真实调用次数、token 计数、事件数与
   session/turn 标识，验收后才能下发依赖任务。
 
-ZCode 专项补充：活工具目录读取失败即零提交；完成以匹配 session/turn 的成功 turn_complete 和全部 model_request 精确模型记录为准，SDK 的 idle 投影不能单独判断成败。Read/Edit/Write 已实测；Bash 尚无命令审批代理，需审批的测试命令交由主脑执行，不得伪称 Agent 已运行。
+ZCode 专项补充：活工具目录读取失败即零提交；完成以匹配 session/turn 的成功 turn_complete 和全部 model_request 精确模型记录为准，SDK 的 idle 投影不能单独判断成败。Read/Edit/Write 已实测；Bash 已实现受控命令审批（装饰官方公开执行端口为前置闸门 + 官方
+`permissionBroker`，只放行 `--command-contract` 逐字登记且显式 cwd 的命令；只读 Bash 绕过 broker
+仍必经 `executionPort.run`，故以装饰执行端口为强制点；官方 broker request 无 cwd，改用宿主 realpath 冻结
+的 `trustedWorkingDirectory`，闸门在启动 inner 前用原声明路径重新解析并比对登记物理目标（junction/alias
+改指即 `deny-input-target-moved`，登记期穿越别名的声明路径保守拒绝），再复核当前 input 文件字节/边界/SHA
+（登记后改写仍被拦），审批只约束 `toolName === 'Bash'`（其它工具携同一登记命令亦规则拒绝），拒绝用官方有效错误形状、
+spawn_error 不计已执行、`command_started` 在 started 审计写失败时仍单列保留、`claimResponse` 至多一次；REPAIR3：官方 Bash handler 硬编码注入 embedded-search `bashPrelude`（无既有会话级开关），旧闸门把它与 `env`/`stdin` 同列一律 `deny-extra-exec-channel` 会让合法登记命令也无法执行（LIVE-POSITIVE 即 broker 判 `approved-registered` 但 attempted/started/receipt 全 0——不是 GLM/登录故障、不是已执行）；现改为 runner 用同树公开解析器 `resolveDefaultEmbeddedSearchBackend` 冻结宿主可信 backend、回灌 `runtimeConfig.embeddedSearchBackend`+`nativeSearchEnhancementsEnabled:false` 并把期望 prelude 规范 SHA 绑进闸门，仅**逐字节匹配冻结 prelude 且真实 Bash trace（sessionId/turnId/toolCallId 非空、toolName==='Bash'）**才放行，否则 `deny-bash-prelude-mismatch`/`deny-bash-trace-unverified`；`env`/`stdin`/无绑定 prelude 仍拒、inner=0，`captureCwdAfterSuccess` 内部字段不据此拒，审计只记存在性布尔与结构 hash），但目前**仅离线（真实 runner + bootstrap
+双身、真实官方 request 形状含 prelude+captureCwd）验证，未取得隔离真实现场回执**，不得把离线桩通过写成现场能力，也不宣称执行 Agent 已运行。
+当次 Bash 现场能力未验或组件未 ready 时的路由，见下方「ZCode 能力验收与现场放行（决策规则）」默认路由
+一条（计划阶段限定 ZCode 只做读写 → 既有 Qoder 串行登记测试；实际授权/环境/自动审批拒绝不能换执行器
+绕过）；ZCode 的 CAPABILITY `fine_grained` 维持 `false`（无法表达 `grants.edits` 与 `grants.bash` 两种
+细粒度规则，`command_contract` 是另一套本地逐字命令闸门、不授文件沙箱）。执行证据与报告绑定分离：`protocol_success`/`report_bound` 原含义不变，`business_verified` 始终由主脑独立验收；可选 `--execution-contract` 按“最小任务执行契约 × 同 session/turn 工具事件 × 磁盘回读”产出 `execution_evidence_ok` 与具体状态（无契约时显式 null，不默认 true），规则见 [ZCode 操作参考](references/zcode-direct.md) 的执行证据门禁一节。工程任务派工应声明并使用执行契约，业务完成仍由主脑独立验收；CLI 缺省无契约仅是为兼容旧调用的显式未验状态，不能当作工程完成的证据。
+
+## ZCode 能力验收与现场放行（决策规则）
+
+- **分层取证**：submitted（本机 App 提交调用已进入，**不独证服务端模型请求**，服务端须回读
+  `model_request` 与终态）、工具可见（`tool_visible_bash`）、审批就绪（`approval_client_ready`）、
+  闸门就绪（`controlled_pre_exec_gate_ready`/`command_contract_present`）、started（`command_started`）、
+  真实退出+回执（`command_actually_executed`/`command_executed_receipts`）、独立业务验收
+  （`execution_evidence_ok`、主脑判 `business_verified`）逐层分开记录，任一层不越权替下一层背书；
+  某层 `false` 限定两种情形：任务**主动不授权/不要求该层**时 false 为预期、不当失败，任务**明确要求**
+  的必要执行层 false/缺失时要**拒绝完成或拒绝放行**、按证据分类归因，未知写 `null`/「未验证」；
+  原始 `business_verified` 仍恒 false，主脑独立结论只写进能力快照，绝不改写运行时字段。
+- **现场放行**：同一 session/turn/toolCallId 的 gate `allowed=true`、该命令**自身独立**
+  `execution_started` 审计、严格整数 exit0 完成回执与 stdout/stderr SHA 独立回读、输入事前事后
+  未漂移齐全才可**放行成功**；**一切 Bash 调用（含只读）都须有当次 `command_contract` 并过 gate**，
+  `zcode_direct.py` 在 Bash 无契约时派发前拒绝；只读可能绕过 permissionBroker 使 approval 不适用，但
+  **绝不免除契约**。`summary.command_started`/回执 `started`（累计值）**不作逐命令证明**，缺该命令独立
+  started 审计时即便累计>0 也不放行；单个 completed 或单个 `approved` 都不足。未登记命令须按其
+  toolCallId 逐命令回读「拒绝且无 started/completed」，**不得**用累计数字反推 inner=0；
+  started+真实回执即证「已执行」：非零退出（如 exit7）是**已执行但失败**，不抹成未验或零动作；未取得
+  完整取证记缺证/未放行。「离线-only」只描述 REPAIR3 当前版本既有事实，不给任意缺条件案例套用。
+- **可信 deny**：新并行计划的 `disallowed_tools` 从受信任本机入口 `build_tool_disallowlist(tools)`
+  派生并与预检 actual 精确相等；runner 的 `tool_disallowlist_effective`（= base deny ∪（活 catalog −
+  allowed_tools），只追加 deny）是更严格运行时边界，单列回读，不冒充预检已见 live catalog；
+  `sent=false`/退出2 不计轮次；仅计划口径缺漏且尚未派发、不扩权时重建新计划并保留原计划/原拒绝，
+  不在途改提示词或删 deny。
+- **失败分型**：缺客户端、规则拒绝、prelude 不匹配、未启动、输入漂移、审批/执行取消超时、TLS/模型、
+  报告格式、工程测试失败分别归因；`approval_client_ready=false` 单独不判缺客户端，实际错误按原始来源读：
+  `execution_control.py` **已消费** `events.jsonl` 官方 `permission_resolved`/工具失败的缺客户端标记
+  （会自动进 diagnostics），`permission-events.jsonl` 细项未全部自动映射、须主脑读原始事件归因，不一概
+  断定「都会/都不会」。这些是独立验收分类，不宣称 `execution_control.diagnostics` 已全部支持，也不修改
+  summary 旧六分类；`test_failure` 只来自登记测试
+  实际非零退出，`no_required_execution`/`execution_claim_mismatch` 属缺执行/口径冲突，另列不写成测试失败。
+- **默认路由**：本机未另行指定时 ZCode 优先，Qoder 沿用现有唯一模型及入口兜底；当 Bash 现场能力
+  尚未独立验收放行、或审批/闸门未就绪时，计划阶段显式把该任务限定为 ZCode 只做读写（Edit/Write 是
+  写入不是「只读」），再退回既有 Qoder 串行跑登记测试并保留结果。`ready=true` 只表示组件就绪、
+  **不等于现场已验证**；**不得**靠换入口/模型绕过真实授权拒绝。REPAIR3 版仅离线验证、尚无该版本
+  隔离现场回执，L1 的 Read/Edit/Write 真执行不能当 Bash 现场证明；GPT/Luna 的工程实施须用户事先
+  明确同意，规划与独立验收可由主脑直接做。`fine_grained=false` 限制派发计划无法表达 `grants.edits` 与
+  `grants.bash` 两种细粒度规则（非只逐文件），`command_contract` 是另一套本地逐字命令闸门、不授文件沙箱。
+
+字段清单、放行最小条件表、失败分型映射与可信 deny 派生的可复用示例见
+[ZCode 能力验收与现场放行](references/zcode-capability-acceptance.md)；闸门/执行证据的操作细节仍以
+[ZCode 操作参考](references/zcode-direct.md) 与 [并行执行控制面](references/parallel-execution.md) 为准。
 
 ## 使用场景与主脑选择
 
-先区分四件独立的事：**主脑所在的宿主/运行环境**（`runtime_environment`）、**承担主脑职责的驱动**（`brain_driver`）、**在主脑驱动缺少执行能力时机械承载调用的传输层**（`transport`）与**提示词怎么送达执行 Agent**（`execution`）。不要把宿主环境、主脑驱动、传输层、执行 Agent 和执行方式混为一谈。实际部署可以是嵌套架构，例如在 `muse` 宿主环境中调用 `codex-cli` 作为主脑驱动，由 Muse 承载传输层。执行 Agent 始终是外部桌面 Agent 或受控 API 任务；主脑和传输层都不得亲自承担阶段内批量执行或其他实质工作。
+先区分四件独立的事：**主脑所在的宿主/运行环境**（`runtime_environment`）、**承担主脑职责的驱动**（`brain_driver`）、**在主脑驱动缺少执行能力时机械承载调用的传输层**（`transport`）与**提示词怎么送达执行 Agent**（`execution`）。不要把宿主环境、主脑驱动、传输层、执行 Agent 和执行方式混为一谈。实际部署可以是嵌套架构，例如在 `muse` 宿主环境中调用 `codex-cli` 作为主脑驱动，由 Muse 承载传输层。执行 Agent 可为外部桌面 Agent、受控 API 任务，或按 Luna 原生档案获准启动的云端子 Agent；主脑和传输层都不得亲自承担阶段内批量执行或其他实质工作。
 
 - **GPT 桌面场景（原有用法，零配置）**：GPT 所在桌面环境是宿主，GPT 会话承担主脑职责，按 `human-relay` 执行——主脑生成完整、可复制的阶段提示词，用户转发给外部桌面 Agent，报告保存为原始文件后通知主脑直接读取（无法访问时上传）。若 GPT 会话能够直接读取附件或文件，则传输层退化为主脑自身的直接操作；若读取动作实际由宿主代为完成，则宿主仅按主脑明确指定的路径和校验条件机械回传内容。此场景不需要创建 `config.yaml`，也不需要任何 API 配置。
 - **Linux 场景**：用户复制 `config.yaml.example` 为 `config.yaml` 后，分别配置 `runtime_environment` 与 `brain_driver`。`runtime_environment` 只记录宿主/运行环境名称；本 Skill 不假定其厂商、安装命令或专有 API。`brain_driver` 记录实际承担本 Skill 主脑职责的驱动。传输层按实际能力关系判定，不因某个环境或驱动名称自动成立。未创建 `config.yaml` 时，任何平台都按 `human-relay` 执行方式与 `local` 台账执行，不默认启用任何 API。
 - `runtime_environment: muse`、`brain_driver: codex-cli` 表示在 Muse 宿主环境中调用 Codex CLI 作为主脑驱动；两者不是互斥选项。若该 Codex CLI 实例不能执行 shell 或调用工具，Muse 可以作为传输层，但只能执行 Codex CLI 通过 `TRANSPORT_INSTRUCTION` 给出的确切控制面命令、原样中转结果及完成机械回读校验。
 - `brain_driver: muse` 时，由 Muse 中实际承担主脑职责的能力按所选执行方式执行；如果同一 Muse 能力可以直接调用工具，传输层退化为主脑自身的直接操作。启用前仍须通过“能力预检”。
-- `brain_driver: codex-cli` 时，用 `codex exec` 加载本 skill；执行方式为 `human-relay` 时生成完整提示词由用户转发，执行方式为 `api-direct` 时由 Codex CLI 直接调用，或在其缺少调用能力时经传输层调用已通过预检的适配器，下发阶段任务、轮询并取回报告。无论调用由谁承载，都遵守阶段门禁、WORKER_REPORT 模板与验收标准，不得调用 Codex 子 Agent、宿主或传输层冒充执行 Agent。
+- `brain_driver: codex-cli` 时，用 `codex exec` 加载本 skill；执行方式为 `human-relay` 时生成完整提示词由用户转发，执行方式为 `api-direct` 时由 Codex CLI 直接调用，或在其缺少调用能力时经传输层调用已通过预检的适配器，下发阶段任务、轮询并取回报告。无论调用由谁承载，都遵守阶段门禁、WORKER_REPORT 模板与验收标准，Luna 原生执行单独按可选档案核对；不得以宿主或传输层冒充执行 Agent，也不得以原生子 Agent 冒充外部 CLI。
 - 宿主执行了主脑给出的逐字补丁、文件编辑命令、测试命令或其他阶段实质步骤时，宿主承担的是执行 Agent 工作，不是传输层工作；即使主脑完成了全部分析和方案设计，也仍视为主脑亲自执行。
 - 无论哪种主脑和传输形态，核心规则、阶段门禁、报告模板、安全边界完全同一套；不按场景复制规则，也不因主脑缺少执行能力而削弱等待汇报与验收门禁。执行方式和传输形态只改变控制面调用由谁承载、提示词如何送达及报告如何取回，不构成绕过“下发 → 等待汇报 → 主脑验收”、自动连跑或让宿主代做的依据。
 
 ## 选择流程与执行方式
 
-- 大量阅读、批量变更、长测试或需要独立执行证据的任务适合委派。简单低成本任务直接处理；用户明确要求此分工时遵循其选择。
+- 大量阅读、批量变更、长测试或需要独立执行证据的任务适合委派。简单规划、推理与独立验收可由主脑直接处理，工程实施仍须用户事先明确同意的执行器承担；用户明确要求此分工时遵循其选择。
 - 确认实际项目绝对路径、目标、完成标准、允许动作、禁止事项及执行方式。沿用会话中仍有效的授权；缺失且影响执行的信息先问清，不能猜测路径。
-- 执行方式为 `human-relay` 时，苦力 Agent 只使用用户转发的外部桌面 Agent（例如 ZCode、Xiaomi Mimo）。执行方式为 `api-direct` 时，主脑直接或经传输层使用用户已确认并说明的受控工具/接口下发任务。两种方式下，即使 Codex 子 Agent、宿主 shell 或文件工具可用，也不得调用它们承担本流程的阅读、修改、测试或审计；不得把新建 Codex 任务、宿主代改文件或传输层代跑阶段任务当作苦力 Agent。若用户未指定执行者与执行方式，沿用已确认的；仍不明确时先确认。
+- 执行方式为 `human-relay` 时，苦力 Agent 只使用用户转发的外部桌面 Agent（例如 ZCode、Xiaomi Mimo）。执行方式为 `api-direct` 时，主脑直接或经传输层使用用户已确认并说明的受控工具/接口下发任务。这两种外部方式不得以 Codex 子 Agent、宿主 shell 或文件工具冒充外部执行；Luna 原生档案是独立的可选执行方式，按当前用户授权与审批调用。不得把未获授权的新建 Codex 任务、宿主代改文件或传输层代跑阶段任务当作苦力 Agent。若用户未指定执行者与执行方式，沿用已确认的；仍不明确时先确认。
 - `human-relay` 下，主脑只生成当前阶段完整、可复制的提示词，由用户转发；提示词必须要求外部 Agent 将完整报告保存成 UTF-8 `.txt` 或 `.md` 原始文件，并给出主脑可直接读取的文件绝对路径（同机无法访问、文件缺失或需跨机传输时才由用户上传原文件），不以聊天粘贴正文作为唯一交付。明确“尚未调用，等待用户通知报告已保存或带回报告文件”。`api-direct` 下，主脑能直接调用时真实下发；不能直接调用时先生成包含确切 `dispatch` 命令、参数和期望输出的 `TRANSPORT_INSTRUCTION`，只有传输层返回实际任务标识和原始调用结果后才能明确“已下发，等待执行完成”。两种方式都不得假称已调用、正在运行或编造结果。主脑可在已有授权内做有针对性的独立复核；主脑或传输层均不得代替苦力 Agent 执行阶段内的批量工作，主脑的复核也不得扩展为实施阶段方案。
 
 ## 阶段循环
@@ -256,7 +370,7 @@ ZCode 专项补充：活工具目录读取失败即零提交；完成以匹配 s
 - 并行任务须确认不存在共享写入、环境冲突或未验收依赖。
 - 允许有价值的并行，不凑并发数量：按独立可验收成果维护任务图/看板快照，相互独立的隔离副本可同时执行，存在依赖或共享写入的串行；原始报告验收前，该在途任务的提示词不改、不重复派发。
 - 一项任务出现 429 或权限终态失败时，先按证据验收失败并保留原件，再仅在既有授权内对该任务启用兜底；其他独立任务继续执行，不因单项失败冻结整批。
-- 新的并行派工必须为每个任务提供 `--dispatch-plan`（计划 JSON），由 `scripts/execution_control.py` 做任务级快照预检：把计划与实际入口选择、工具 grant 与 cwd 做精确比对，真实 argv 记录哈希供回读，缺 grant、扩大权限、同 task_id 在途改 prompt/重发、共享写入不能隔离或依赖未验收一律在 Popen 前拒绝（退出 2）。预检是主脑快照，不是原子跨进程锁，也没有常驻调度器或跨轮自动唤醒；默认并发 1，可显式提升。三执行入口对旧无计划调用保持兼容，仅追加 `summary.diagnostics`（六类 failure_types）。详见 [并行执行控制面](references/parallel-execution.md)。
+- 新的并行派工必须为每个任务提供 `--dispatch-plan`（计划 JSON），由 `scripts/execution_control.py` 做任务级快照预检：把计划与实际入口选择、工具 grant 与 cwd 做精确比对，真实 argv 记录哈希供回读，缺 grant、扩大权限、同 task_id 在途改 prompt/重发、共享写入不能隔离或依赖未验收一律在 Popen 前拒绝（退出 2）。预检是主脑快照，不是原子跨进程锁，也没有常驻调度器或跨轮自动唤醒；默认并发 1，可显式提升。两个直连执行入口（Qoder/ZCode；CodeBuddy/WorkBuddy 已退役为 human-relay）对旧无计划调用保持兼容，仅追加 `summary.diagnostics`（六类 failure_types）。详见 [并行执行控制面](references/parallel-execution.md)。
 - 卡住、失败或换方案时使用“状态汇报”，无需另建模板；收到完整交付后更新为`待验收`。
 - 主脑核对任务 ID、交付物、SHA-256 和基线后，将任务更新为`完成`或退回`执行中`。
 
@@ -372,7 +486,7 @@ ETA 只能采用执行 Agent、工具或已有速率证据支持的时间；没�
 执行前检查：读取适用指令，核对路径、基线、未提交改动和必要状态。
 验收标准与检查点：通过所需证据，真实动作前后的边界及回读要求。
 停止条件：授权不清、基线冲突、泄露风险、目标不符或执行结果未知。
-状态消息协议：接单后发送“下发确认”；到达里程碑、心跳点、卡住、失败或换方案时发送“状态汇报”；结束时发送“交付”。卡住、需要客户决策和完成待验收必须即时发送。`human-relay`：将“统一状态消息协议”一节的“交付”模板完整填写，保存为 UTF-8 `.txt` 或 `.md` 原始文件，放在会话中已约定、主脑可直接访问的路径；不要写入业务仓库或覆盖已有文件，无同机可访问路径时放在用户可上传的位置。回复用户时给出文件绝对路径并通知已保存完成，主脑直接读取该原文件验收，无法访问或文件缺失时才请用户上传，不要让用户复制粘贴报告正文。不要另发下一阶段提示词。`api-direct`：在最终回复中完整输出本阶段所用执行档案对应的 WORKER_REPORT 块（首尾标记各独占一行；Qoder/ZCode/CodeBuddy 直连使用各自操作参考中的九节模板，通用适配器使用下方“交付”模板），由主脑保存为 API 提取报告存档，并记录 provider、task/session/turn ID、事件 ID 或范围、提取时间、SHA-256 及是否原样提取。不要另发下一阶段提示词。
+状态消息协议：接单后发送“下发确认”；到达里程碑、心跳点、卡住、失败或换方案时发送“状态汇报”；结束时发送“交付”。卡住、需要客户决策和完成待验收必须即时发送。`human-relay`：将“统一状态消息协议”一节的“交付”模板完整填写，保存为 UTF-8 `.txt` 或 `.md` 原始文件，放在会话中已约定、主脑可直接访问的路径；不要写入业务仓库或覆盖已有文件，无同机可访问路径时放在用户可上传的位置。回复用户时给出文件绝对路径并通知已保存完成，主脑直接读取该原文件验收，无法访问或文件缺失时才请用户上传，不要让用户复制粘贴报告正文。不要另发下一阶段提示词。`api-direct`：在最终回复中完整输出本阶段所用执行档案对应的 WORKER_REPORT 块（首尾标记各独占一行；Qoder/ZCode 直连使用各自操作参考中的九节模板，CodeBuddy/WorkBuddy 已退休为人工转交、不再直接派发，通用适配器使用下方“交付”模板），由主脑保存为 API 提取报告存档，并记录 provider、task/session/turn ID、事件 ID 或范围、提取时间、SHA-256 及是否原样提取。不要另发下一阶段提示词。
 ```
 
 ## 统一状态消息协议
@@ -665,14 +779,63 @@ AGENT_CAPABILITY_RECORD_END
 这些是交接状态，不自动调用平台的目标、定时任务或配置工具。用户要求等待验收时，交付当前成果后停止。
 
 
-## CodeBuddy Code CLI 本机直连
+## CodeBuddy / WorkBuddy：仅人工转交（直连已退休）
 
-用户指定 CodeBuddy 或要求使用 WorkBuddy 对应 CLI 时，使用 `scripts/codebuddy_direct.py`，配置为本机 `scripts/codebuddy-entry.json`，参考 [CodeBuddy 操作说明](references/codebuddy-direct.md)。入口启用前须核对现有官方运行时、个人/企业登录方式和实际模型目录，再以隔离任务回读验收；安装、登录或模型菜单本身都不代表接入成功。
+按 2026-10-08 用户最新明确决定，CodeBuddy 与 WorkBuddy 一律改为 human-relay only：**不再从
+当前 Skill/CLI/控制面提交任何新的直接派发调用**。选择它们执行时，主脑只产出完整、可复制的阶段
+提示词，由客户人工交给外部 Agent 处理；生成提示词不记成已派发/已验收，也不冒充 API 返回结果。
 
-- 调用：`python <技能目录>/scripts/codebuddy_direct.py --workspace <项目绝对路径> --prompt-file <UTF-8任务文件> --output-dir <不存在的新证据目录> --stage <非空阶段编号> --model <实际模型ID> [--tools Read,Write,Edit,Bash] [--allowed-tools RULE（每条重复）] [--disallowed-tools RULE（每条重复）] [--resume-session-id <已确认会话>]`。脚本要求显式模型；本机未另指定时按已核对目录选择 `glm-5.3-flash`，不传 auto/fallback。不自动登录、安装、升级或换模型。
-- 使用官方 `-p --output-format stream-json`，原始任务经 stdin 传入，不经过 shell 拼接；保持 dontAsk、工具白名单、空 strict MCP、空 setting sources、关闭 hooks 和主 Agent cli，不开子 Agent、动态派工、生产或外部通信工具。工具允许规则是 CLI 权限，不是文件沙箱；限定编辑仍须明确真实路径和授权。命令按原样运行，不添加 cd/echo/复合命令绕过规则。
-- 使用 Qoder 参考里的完整九节兼容报告；原文响应落盘后检查协议终态、会话、模型记录、完整正文及哈希回读，业务验收独立进行。原始事件 init.tools 是工具目录，不证明有效授权；最终 permission_denials 数组空也不能证明没有拒绝，须核对真实 tool_result 的明确拒绝证据。失败原件保留，禁止替模型删前言或改写报告。
-- 终态分成功与失败两类，须区分“解析有效”与“交付失败”。仅 `subtype=error_during_execution` 且 `is_error=true` 且带非空 `errors`（官方字符串列表）才是合法失败信封：可结构解析（parse_success/failure_envelope_valid 为真）而 protocol_success=false；缺/空 errors、矛盾 subtype/is_error 记结构错误、不声明合法已解析失败。摘要保留 primary_failure、原始 errors、failure_stage 与 recoverability，reset 只在实际从全部 errors/errors_info 提取到窗口时才有，429 只认明确 status/code=429（仅 quota 标 unknown）；失败信封若携带 result 原样落盘待验、不绑定，无 result 不生成报告。成功信封 errors 非空不得绿灯。CLI 退出码 0 也不伪成功（解析正确 ≠ 交付成功）。重复 init 除白名单可变字段 `__timestamp` 外比较两个 init 的全字段键集与逐值（cwd/apiKeySource/agent 及任何新增/删除/变化的未知字段都拒绝），每次 init 仍校验 tools/mcp_servers/permissionMode 等必备字段类型；协议事件凡带 session_id 必须是非空字符串否则拒绝。普通 `File does not exist` / `<tool_use_error>` / `is_error=true` 记入 tool_failures 仅诊断（content 缺失但 is_error=true 也仍记为失败），权限拒绝单独 fail-closed；定位失败不推翻后续合法修复的成功。
-- 派工效率：优先给精确文件清单并显式开放 `Glob`/`Grep` 做定位（白名单已含），避免反复猜文件名或重复读大文件；命中 429 时保留已产出文件、原始证据与阶段进度，不盲目整项重跑、不静默换模型，无报告不补写；恢复在新证据目录并先核对文件基线/授权/限流历史提示，同阶段不重复计分。
-- 精确模型名称来自 CLI 的 init/assistant 记录，不据此独立保证服务商后端版本；用量和 modelUsage 保存原始口径、缓存分项不与 input_tokens 重复累加，cost=0 不证明免费。WorkBuddy/CodeBuddy 账号积分及可用模型需登录后核对。
-- 直连是一次前台子进程调用，不是通用 dispatch/poll/events/cancel 服务；不宣称后台取消、跨回合主动通知或无人值守。验收当前报告后才能派发补修，最终显示来回总数和每轮总结。
+- 生产入口 `scripts/codebuddy_direct.py` **已彻底移除可执行传输**：不再 `import subprocess`、
+  不再有 `dispatch_core`，因此生产路径结构上无法 `Popen` 任何真实 CLI。`main()` 在读配置/提示词、
+  创建输出目录、进入额度门禁之前对任何新直连固定拒绝，返回 `sent=false`、`status=manual_relay_only`
+  与非成功退出码；无 plan、带 plan、`--resume-session-id`、`--quota-recovery-probe`、配置存在/缺失
+  一律不能绕过，不提供重新启用参数、环境变量或隐藏入口。生产模块只保留纯解析/终态诊断/历史取证
+  函数。控制面 `execution_control.preflight` 对 CodeBuddy/WorkBuddy 计划（同时检查 plan 与 actual
+  的真实 runtime）同样拒绝。
+- 当前操作方式：用 `scripts/prompt_contract.py` 生成含完整九节契约 + 任务原文的可复制提示词，
+  交给外部 Agent；执行 Agent 把 WORKER_REPORT 保存为 UTF-8 原始文件后按 `human-relay` 流程回读
+  验收（见上文 human-relay 一节）。
+- 当前直连派发只保留 Qoder 与 ZCode；两者正常派工不受本次退休影响，并接入跨会话共享的并发容量池
+  （见 [全局并发容量池与 1:1 路由](references/global-dispatch.md)）。
+
+以下内容为**历史直连档案**，保留原有解析/诊断/额度/终态口径与原始错误模型信息，仅供离线证据
+回放（真实传输管线已整体迁到**仅测试**的 `tests/offline_codebuddy_harness.py::replay_dispatch`，
+在隔离合成 stub 下重放旧失败链；harness 只认 `sys.executable` + 仓库可信固定 stub + 声明的内容
+SHA-256，禁止真实 node、禁止任意 stub 目录里的真实 CLI、禁止生产默认用户配置），
+**不是**当前可执行的操作指引，也不宣称旧 API 已彻底无产出：
+
+- 历史调用形状：`python scripts/codebuddy_direct.py --workspace <绝对路径> --prompt-file <UTF-8
+  任务文件> --output-dir <不存在的新证据目录> --stage <非空阶段编号> --model <实际模型ID>
+  [--tools ...] [--allowed-tools RULE] [--disallowed-tools RULE] [--resume-session-id <会话>]`；
+  要求显式模型、无 auto/fallback，曾选 `glm-5.3-flash`。此调用现被生产入口固定拒绝，仅存档。
+- 历史传输细节：官方 `-p --output-format stream-json`，任务经 stdin、不经 shell 拼接；保持
+  dontAsk、工具白名单、空 strict MCP、空 setting sources、关闭 hooks 与主 Agent cli；工具允许规则
+  是 CLI 权限、非文件沙箱；命令按原样运行，不添加 cd/echo/复合命令绕过规则。
+- 历史报告与终态口径（离线回放保留原始失败）：使用九节兼容报告，原文响应落盘后核对协议终态、
+  会话、模型记录、完整正文与哈希回读，业务验收独立进行；`init.tools` 不证明有效授权，最终
+  `permission_denials` 为空也不能证明无拒绝，须核对真实 tool_result 明确拒绝。仅
+  `subtype=error_during_execution` 且 `is_error=true` 且带非空 `errors` 才是合法失败信封；缺/空
+  errors、矛盾 subtype/is_error 记结构错误；摘要保留 primary_failure、原始 errors、failure_stage、
+  recoverability，reset 只在实际提取到窗口时才有，429 只认明确 status/code=429（仅 quota 标
+  unknown）；CLI 退出码 0 不伪成功；重复 init 除白名单 `__timestamp` 外比较全字段键集与逐值；普通
+  `File does not exist` / `<tool_use_error>` / `is_error=true` 记入 tool_failures 仅诊断。
+- 历史模型/成本口径：精确模型名来自 CLI init/assistant 记录，不独立保证后端版本；用量与
+  modelUsage 保存原始口径、缓存分项不与 input_tokens 重复累加，cost=0 不证明免费；账号积分与
+  可用模型需登录后核对（本次不查询额度/认证/账单）。
+- 历史直连曾是一次前台子进程调用，非通用 dispatch/poll/events/cancel 服务；现该直连已停用。
+
+完整历史解析档案见 [CodeBuddy 历史直连参考](references/codebuddy-direct.md)。
+
+
+> **Luna 原生任务结束后的收口**：Luna 原生任务没有本地子进程，不能走普通 finish。
+> 任务真实结束后，先用原生工具回读该 agentID 的终态并保留原始回执，再执行：
+> `dispatch_pool.py settle-native --task-id <task> --token <claim-due 的 token>
+> --agent-id <agentID> --terminal finished|native_failed --receipt '{"source_tool":
+> ...,"receipt_ref":...,"sha256":...}'`。它会校验票据/agent/scope 与回执元信息，
+> 在一个事务里把 attempt 与票据置终态并释放原 task/workspace（不影响国内六名额）。
+> 运行中/未知状态、缺回执、信息不匹配一律拒绝且不释放；重复结算只有"同终态+同原
+> 回执哈希"才算幂等成功，错误 agent/不同终态/换回执一律拒绝；--success 只能与
+> terminal 一致（finished=成功、native_failed=失败）；sha256 必须是 64 位十六进制，
+> string 回执原文按 UTF-8 原字节哈希（不加 JSON 引号）；launch_unknown 需人工核验，
+> 绝不自动重派；worker 说"我结束了"不算终态，必须宿主回读原生回执；国内 attempt
+> 永不经过 settle-native 退出。

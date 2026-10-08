@@ -1,7 +1,15 @@
 # 并行执行控制面（BW-PARALLEL-UPGRADE）
 
+> **当前运行时口径（2026-10-08 最新决定）：直连派发只保留 Qoder 与 ZCode。WorkBuddy 与
+> CodeBuddy 改为 human-relay only。** `execution_control.preflight` 对 plan 或 actual 真实
+> runtime 为 `codebuddy`/`workbuddy` 的计划一律明确拒绝（返回 `sent=false`、
+> `manual_relay_only`，不派发）；生产 `codebuddy_direct.main` 亦在读配置/建输出/Popen 前固定
+> 拒绝。下文 `runtime` 枚举与能力表中出现的 `codebuddy`、以及旧“三入口”派发示例，均保留为
+> **历史/离线说明**：选择 CodeBuddy/WorkBuddy 时只生成完整可复制提示词、由人工交外部 Agent，
+> 生成提示词不记成已派发。Qoder/ZCode 的实际并行、重叠、grants 精确比对与额度结算继续有效。
+
 本文件描述 brain-worker 新增的任务级控制面：`scripts/execution_control.py`（纯标准库，
-**无常驻调度服务**）与三个执行入口新增的可选 `--dispatch-plan`。控制面做的是**主脑快照
+**无常驻调度服务**）与两个直连执行入口（Qoder/ZCode）新增的可选 `--dispatch-plan`。控制面做的是**主脑快照
 预检**，不是原子跨进程锁：它比对“计划 JSON”与“实际入口选择/工具 grant/cwd/argv”，
 拒绝缺 grant 或扩大权限，并在 Popen 之前退出 2。真正的进程串行化仍靠主脑看板与人工
 纪律，不靠本模块抢锁；也不提供跨轮自动唤醒——并行推进依赖主脑在会话内主动派工、观察
@@ -58,6 +66,14 @@ Qoder/CodeBuddy 用它承载“看到哪些工具”，ZCode 只有这一层且�
 对齐口径；`allowed_tools`/`disallowed_tools` 是完整 allow/deny 规则原文集合。缺 Read 也要
 被拒（不能只比“新增”而漏“缺失”）。真实 `--tools` 为空却需要 Read 的错误配置一律拒。
 
+ZCode 的 `disallowed_tools` 应从**受信任本机入口** `build_tool_disallowlist(tools)` 派生（默认禁
+全目录、仅显式名单放行），并与预检 actual 集合精确相等核对；runner 提交时把活注册表里**未被显式
+放行**的项追加 deny，得到 `tool_disallowlist_effective`（= base deny ∪（`observed_tool_catalog` −
+`allowed_tools`）），是**更严格的运行时边界**，单列回读，**不得说预检已经见过 live
+catalog**。被派发前拒绝（`sent=false`/退出 2）不计模型轮次；仅计划口径缺漏且尚未派发、不扩权时
+才可重建新计划，保留原计划与原拒绝，不在途改提示词或删 deny。可复用示例见
+[ZCode 能力验收与现场放行](zcode-capability-acceptance.md)。
+
 比对规则（`preflight`）：
 - 身份绑定：`task_id/stage/runtime/model/workspace/cwd/prompt_sha256` 与实际逐项相等，
   任一不符即拒。`prompt_sha256` 不符表示在途提示词被改 → 拒绝改 prompt/重发。
@@ -88,7 +104,7 @@ Qoder/CodeBuddy 用它承载“看到哪些工具”，ZCode 只有这一层且�
 
 旧版 Qoder/ZCode 计划采用 LF 文本口径，旧 CodeBuddy 采用原文件字节口径；这属于历史版本记录。保留旧提示词、计划和原始事件，升级后仅为新调用生成新计划，不修订在途任务。历史 CRLF/LF 预检拒绝没有 CLI 派发，不计轮次。
 
-本地 CLI/SDK 载荷证据不证明服务端最终文本，也不证明业务产出或模型恢复。实际留证文件与字段由三个入口的请求元数据指明。
+本地 CLI/SDK 载荷证据不证明服务端最终文本，也不证明业务产出或模型恢复。实际留证文件与字段由各入口的请求元数据指明。
 
 请求中的 `prompt_payload` 保存 `task_text_utf8_sha256`、`contract_sha256`、`sent_payload_sha256`、`readback_match`、`newline_conversion` 与 `channels`。Qoder 保存 `sent-payload-stdin.bin` 和 `sent-contract-system-prompt.txt`，CodeBuddy 保存 `sent-payload-stdin.bin`，ZCode 保存 `sent-task-payload.bin`。Qoder/CodeBuddy 任务保留原字节；ZCode CRLF/CR 归一 LF，不回写原文件。ZCode 纯预检的文件是计划载荷，`submit_channel=none`、`payload_role=planned_request_prompt`，不算实际提交。
 
@@ -103,10 +119,18 @@ Qoder/CodeBuddy 用它承载“看到哪些工具”，ZCode 只有这一层且�
 
 ZCode 的工具名白名单**不能假称细粒度文件权限**。当计划要求 ZCode 表达不了的逐文件/逐命令
 限制或外部只读目录时，`preflight` 直接拒绝，并要求：改用**隔离 workspace**、只按
-`tool_visibility`（整工具开关）授权，或换用能表达该限制的运行入口。不得给 ZCode 编造
-`--allowed-tools` 之类官方没有的参数。
+`tool_visibility`（整工具开关）授权，或换用能表达该限制的运行入口。此「改隔离/换入口」
+**只适用于尚未派发的能力表达不支持**，且须在**原授权内、不降格约束**（不能借机放宽 deny/可见性）；
+**不能套用于实际授权拒绝**（运行时真跑被 `permission_rule_denied`/`permission_client_missing` 拦下时，
+按原拒绝报告，不换入口绕过）。不得给 ZCode 编造 `--allowed-tools` 之类官方没有的参数。
 
 ## 六类 failure_types（`summary.diagnostics`）
+
+> 本节六类是运行时 `execution_control.py` **已实现**的诊断分类，不因文档改动而扩大。主脑
+> 验收时另用一套**独立失败分型**（缺客户端、规则拒绝、prelude 不匹配、未启动、输入漂移、
+> 审批/执行取消超时、TLS/模型、报告格式、工程测试失败）分别归因，这些只是验收口径、引用上面
+> 的原始事件/状态，**不宣称 diagnostics 已全部支持**，也不修改本节六分类。分层放行条件与
+> 可信 deny 派生见 [ZCode 能力验收与现场放行](zcode-capability-acceptance.md)。
 
 分类只读错误/拒绝/工具失败的**结构**，绝不扫描正常 prompt/report 正文里的 429 字样。
 多类可共存；证据原文、错误码、reset 提示原样保留；平台/渠道/账号来源未知即不推断；
@@ -188,9 +212,16 @@ python scripts/execution_control.py preflight --plan <plan.json> --actual <actua
 
 任务**五状态**：`pending / executing / blocked / awaiting_acceptance / completed`（不再有
 第六 `verified` 状态）。其中 `executing / awaiting_acceptance / blocked` 是占用 task_id 与
-并发槽位、门禁不能被绕过的“在途”态。三个真实入口接受可选 `--active-tasks <json>`（数组
+并发槽位、门禁不能被绕过的“在途”态。两个真实直连入口（Qoder/ZCode；CodeBuddy/WorkBuddy 已
+退役为 human-relay，仅提示词人工中继，不进池）接受可选 `--active-tasks <json>`（数组
 `{task_id,state,...}`）或在 plan 里带 `active_tasks`，都传给 `ec.preflight`；并行 plan 缺
 `active_tasks` 会被 `validate_plan` 拒绝，**缺失不当作“没有在途工作”**。
+
+`ec.check_parallel` 的快照并发闸只统计**国内 qoder/zcode** 的活进程槽（`executing/blocked`）：
+Luna 救援通道无上限、绝不占用国内六名额，已退休的 CodeBuddy/WorkBuddy 直连与其它非国内池同样
+排除——旧的全局快照 max 绝不把 Luna/旧 CB/其它池当成统一容量闸（否则会出现 domestic=0、6 个
+Luna executing 却误报“concurrency limit 6 exceeded”）。真实国内容量上限另由 `dispatch_pool`
+原子池权威强制；同 task/同 workspace/共享写/依赖的快照保护仍独立维持，不因容量分离而放宽。
 
 - 允许有价值的并行，不凑并发数量：并发上限服务于独立成果的真实节省；没有独立可验收
   成果就不并行，不为凑数拆任务。
@@ -208,11 +239,13 @@ python scripts/execution_control.py preflight --plan <plan.json> --actual <actua
 - 失败任务的已授权 fallback（换入口/换模型）只影响**该失败任务**，且必须先记录失败证据
   （对应 failure_type 与原始结构）后才接管；其它在途任务的提示词**不被改动**，独立任务
   也不被单项 429/权限失败冻结——照常继续执行、观察与验收。
-- 一次权限拒绝（`permission_rule_denied`/`permission_client_missing`）不猜变体重试：
-  停止同类无效尝试，交主脑决策，不重复索要已有授权。
-- Bash 不可用（例如客户端缺失）时，执行 Agent 继续只读 `Read`/精确 `Edit`，把需要跑
-  命令的测试交主脑执行，不伪称已运行、不用管道/`cd`/改参数绕过规则（否则触发
-  `permission_rule_denied`）。
+- **换入口/换模型不是绕过真实授权拒绝的手段**：一次 `permission_rule_denied` /
+  `permission_client_missing` 不猜变体重试，也不借「换个入口」把同一越权动作再发一遍；
+  拒绝照原样记录，交主脑决策，不重复索要已有授权。
+- ZCode 的 **Bash 现场能力未经验收放行时**，在计划阶段就把该任务限定为 ZCode 只做读写
+  （Read/Glob/Grep/Edit/Write，注意 Edit/Write 是写入不是「只读」），把需要跑原样命令的登记测试
+  **串行**交给现有 Qoder（沿用其唯一模型与入口），保留其结果；**不把「Bash 未验证」默认转成主脑
+  代跑**。执行 Agent 仍不伪称已运行、不用管道/`cd`/改参数绕过规则（否则触发 `permission_rule_denied`）。
 
 ## 自然派工案例（策略示例，非真实调用记录）
 
@@ -223,15 +256,19 @@ python scripts/execution_control.py preflight --plan <plan.json> --actual <actua
    修复”“合并与发布准备”）。前两项相互独立；第三项依赖前两项验收通过。
 2. **读取台账与预检状态**：派工前逐项读取能力台账（评分、步长、限制、身份确认状态）与
    三个直连档案的就绪状态；未就绪的入口不进入候选，不因配置存在就认定可用。简单、低
-   成本的部分（如单文件小修）主脑直接处理，不强行委派凑数。
-3. **选择执行者**：代码类成果默认 Qoder；用户已授权 ZCode 直连时，另一独立成果可并行
-   给 ZCode，两者使用相互隔离的工作副本。没有就绪直连入口时如实告知缺项并按授权改走
-   `human-relay`，不假调用；个人版免费积分目标保留，企业 CLI 或成本未知调用不冒称免费。
+   成本的规划或独立验收判断主脑可直接做，但**工程实施（写代码/跑命令）须用户事先明确同意**，
+   不把「单文件小修」这类工程默认自动交主脑代做。
+3. **选择执行者**：本机未另行指定时 **ZCode 优先**（用户已授权直连时）；**Qoder 沿用现有唯一
+   模型及入口兜底**，不覆盖配置、不新增或替换模型。两个并行任务使用相互隔离的工作副本。没有
+   就绪直连入口时如实告知缺项并按授权改走 `human-relay`，不假调用；个人版免费积分目标保留，
+   企业 CLI 或成本未知调用不冒称免费。
 4. **每入口一份 plan**：两个并行任务各带 `--dispatch-plan`，逐次刷新 `active_tasks`
    快照：首次确实无在途时用空数组，后发任务登记先发任务；不把尚未派发者写成执行中。
    `prompt_sha256` 统一按原文件字节预计算。技能要求主脑拒绝无计划的新并行派工；旧入口仍兼容无计划调用，不能假称适配器能自行识别未声明的并行。
-5. **单项失败兜底**：一项出现 429/权限终态时，先按原件与 failure_types 验收失败证据，
-   再仅在授权内对该任务兜底；另一独立任务继续，不因单项失败冻结整批。
+5. **单项失败兜底**：一项出现 429/普通**已终态、非授权拒绝**的失败时，先按原件与 failure_types
+   验收失败证据，再**依既有授权顺序**仅对该任务兜底；另一独立任务继续，不因单项失败冻结整批。
+   若是**授权校验/自动审批/环境限制**拦下（`permission_rule_denied`/`permission_client_missing`），
+   **按原拒绝报告、不换入口或模型绕过**，只停该任务的无效尝试交主脑决策。
 6. **合并门禁**：两份原始报告保留，成果各自完成独立验收、报告绑定另行说明后，才在合并目录做逐文件比对与必要合并检查；
    合并结果由主脑独立验收，不静默覆盖任何一方副本。依赖任务在依赖
    `completed 且 acceptance_result=passed` 后才派发；看板/控制面是快照不是原子锁，验收

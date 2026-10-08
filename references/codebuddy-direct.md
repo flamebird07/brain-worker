@@ -1,11 +1,32 @@
-# CodeBuddy Code CLI 本机直连（最小传输入口）
+# CodeBuddy Code CLI 本机直连（历史解析档案）
 
-使用已登录的官方 CodeBuddy Code CLI（本阶段核对版本 2.161.1）。复制
-`scripts/codebuddy-entry.json.example` 为同目录的 `codebuddy-entry.json`，填写本机
-node 与 CodeBuddy CLI 入口文件（`bin/codebuddy`）的绝对路径；也可用 `--config`
-指定。真实配置含本机路径与安装位置，不得提交 Git。
+> **当前状态（2026-10-08 起）：CodeBuddy/WorkBuddy 直连已退休，改为 human-relay only。**
+> 生产入口 `scripts/codebuddy_direct.py` **已彻底移除可执行传输**：不再 `import subprocess`、
+> 不再有 `dispatch_core`，生产路径结构上无法 `Popen` 任何真实 CLI，只保留纯解析/终态诊断/
+> 历史取证函数。`main()` 在读配置/提示词、创建输出目录、进入额度门禁之前，对任何新的直接调用
+> 一律固定拒绝（`sent=false`、`manual_relay_only`、非成功退出码）；无 plan、带 plan、resume、
+> probe、配置存在/缺失都不能绕过，也不提供重新启用参数、环境变量或隐藏入口。控制面
+> `execution_control.preflight` 对 CodeBuddy/WorkBuddy 计划同样拒绝。当前操作**只**产出一份完整
+> 可复制提示词，由人工交给外部 Agent 处理；提示词生成不记成已派发。本文其余内容保留为历史
+> 解析/诊断档案（含原调用形状、事件流、额度冷却与错误分类口径），仅供离线证据回放（真实传输
+> 管线已整体迁到**仅测试**的 `tests/offline_codebuddy_harness.py::replay_dispatch`，在隔离合成
+> stub 下重放旧失败链；harness 只认 `sys.executable` + 仓库可信固定 stub + 声明的内容 SHA-256，
+> 禁止真实 node、禁止任意 stub 目录里的真实 CLI、禁止生产默认用户配置），不再作为当前可直接
+> 执行的命令指引。
+
+## 人工转交方式（当前唯一路径）
+
+1. 用 `scripts/prompt_contract.py` 生成含完整九节契约的可复制提示词文本（与任务原文一并给出）。
+2. 由人工把该提示词复制到外部 CodeBuddy/WorkBuddy Agent 执行，主脑/Skill/CLI 不提交新的直连调用。
+3. 记录只标 `manual_relay_only`/`sent=false`，不得把“生成了提示词”当作“已派发/已验收”。
+
+## 历史直连调用形状（已停用，仅存档）
+
+以下为退休前 `scripts/codebuddy_direct.py` 的真实派发形状，现已被生产入口固定拒绝，只作历史
+解析档案保留，**不要**据此再执行新的直接调用：
 
 ```text
+# 已停用：生产入口现固定拒绝，不执行新直连；仅离线 harness 在合成 stub 下回放解析/终态。
 python scripts/codebuddy_direct.py --workspace <项目绝对路径> --prompt-file <UTF-8提示词文件> --output-dir <不存在的新证据目录> --stage <非空阶段编号> --model <模型ID>
 ```
 
@@ -14,7 +35,7 @@ python scripts/codebuddy_direct.py --workspace <项目绝对路径> --prompt-fil
 
 ## 统一契约与哈希口径
 
-- 三入口调用前使用 `scripts/prompt_contract.py` 的完整九节契约，含精确标题、阶段/路径同一行、首末独占标记和结语。完整契约与任务拼接后经 stdin 发送。契约不能保证模型服从；原始响应照存，不合格仍保留 `bound=false`，不裁剪、不代写。
+- 当前直连入口（Qoder/ZCode）与 CodeBuddy 历史流水线调用前使用 `scripts/prompt_contract.py` 的完整九节契约，含精确标题、阶段/路径同一行、首末独占标记和结语。完整契约与任务拼接后经 stdin 发送。契约不能保证模型服从；原始响应照存，不合格仍保留 `bound=false`，不裁剪、不代写。
 - 新调用的 `prompt_sha256` 与 dispatch-plan 均绑定原提示词文件的原始字节；另外保存实际任务文本、契约和完整发送通道的字节与哈希。换行转换口径显式记录，不把 JSON 文件哈希当 SDK prompt 哈希；Qoder 两通道不冒称一个后端合成载荷。留证边界只到本地 CLI/SDK 提交，不证明服务端处理后的文本。
 - 不改提示词原文件或在途计划；旧调用记录沿用原入口版本的含义，升级后的新调用使用新计划。完整字段和留证位置见 [并行执行控制面](parallel-execution.md)。协议、报告绑定和独立业务验收分别报告，不能由本次传输回归推断真实业务恢复。
 
@@ -160,6 +181,17 @@ stdout 为 stream-json JSONL，逐字以字节保存 `stdout.jsonl`（stderr 同
   未知、不推断已重置；无最终报告不补写 WORKER_REPORT。评分同阶段不重复计分。
 - **恢复派工**：在**新证据目录**进行；开工前核对文件基线（HEAD/SHA-256）、授权
   范围与最近的限流历史提示；不覆盖他人工作或原证据；未验证代码不加载。
+- **持久冷却门禁（2026-10-08 起）**：所有 Popen 前经过 `scripts/quota_control.py`
+  的 sqlite 持久门禁（含不传 `--dispatch-plan` 的兼容路径）：明确 429 的带时区 reset
+  （如 `2026-10-08 18:14:13 UTC+8` = `2026-10-08T10:14:13Z`）、结构化 Retry-After、
+  无窗口 quota、临时 429 分级冷却，跨进程/跨派工/跨工作区生效；冷却拒绝退出 2、
+  `sent=false`、附 UTC 截止、零输出目录。到期仅 `recovery_unverified`，需
+  `--quota-recovery-probe` 单次有界核验通过才清。额度分组只来自受信任
+  `quota-routes.json`（CodeBuddy/ZCode 独立为本机 user_confirmed，非账单核实），
+  未知关系进保守共享组，plan 不能自报组绕过。子进程 env 显式
+  `CODEBUDDY_MAX_RETRIES=2`、`CODEBUDDY_RETRY_WATCHDOG=0`（有界重试、关无限
+  watchdog，只改本次子进程，不动用户全局），记入 `request.json.cli_retry_policy`。
+  详见 [quota-routing](quota-routing.md)。
 - **文件定位**：主脑派工优先给出**精确文件清单**，并显式开放 `Glob` / `Grep`
   在允许目录下做搜索（本适配器 `ALLOWED_TOOLS` 已包含），避免反复猜文件名或
   重复读整份大文件；同类定位失败会累计记录，供主脑调整检索策略。工具权限不是
@@ -183,3 +215,32 @@ https://www.codebuddy.cn/docs/cli/iam 。字段若与真实 CLI 回读不同，�
 回读为准，本入口标未知待修。
 
 运行时参数名称为 `--allowedTools` / `--disallowedTools`（camelCase）；入口对外的重复 `--allowed-tools RULE` / `--disallowed-tools RULE` 由脚本转换，不能原样传给官方 CLI。已实测 kebab-case 会在模型调用前退出。
+
+## 派工范围与观测边界（BW-ZCODE-MANUAL-20261008-S2 指导）
+
+本节是主脑派工与观测口径的通用指导，不绑定本广告业务的具体授权或参数，不得据此把某项
+一次性授权写成通用 Skill。CodeBuddy 的持久 429 冷却门禁保留现状，S1 的 ZCode 手动额度政策
+也保持现状，本节不改变二者。
+
+- 范围按**独立可验收成果**收敛，判据是状态机、副作用、必要接口与验证面、读取量，而不是
+  “两文件”或“步长 1”这类机械阈值；耦合确有必要时保留完整闭环，不为凑数强行拆小。提示词
+  给出**精确函数与 harness**，优先分段定位、避免重复完整读取；字节数不等于实际 tokens。
+- **文字路径范围、工具可见性、实际授权**三者分别记录：`--tools` 白名单与 scoped 规则不是
+  文件 sandbox（见“权限范围限制”）；一条绝对单文件授权规则若未经本机验证，不能声称已生效；
+  不静默扩权，也不读取凭据。
+- 状态严格分型：已派发 / 真实 Read / 等待消息 / 真实写入 / 报告绑定 / 独立测试 / 业务回读。
+  静默或心跳不等于死锁、429 或工具执行；Windows 退出码 `4294967295` 不是 HTTP 429。
+  `CODEBUDDY_MAX_RETRIES` 是子进程有界生成前重试，**不是**总模型次数，也**不是**全程时限；
+  `CODEBUDDY_RETRY_WATCHDOG=0` 关掉无限 watchdog。用户选择继续等待的**在途任务**不得追溯套用
+  新超时、换模型或重派；超时与增量流参数只作为**未来显式配置**，须事先授权并通过兼容性验证
+  后才启用——本轮不实现新超时、不新增 CLI 流参数。
+- 能力分面独立记录：模型路由、工具可见、审批组件/端口 ready、`command_started`、真实退出、
+  输出回执。CodeBuddy `dontAsk` 与 ZCode SDK permissionBroker、宿主自动审批分属不同机制，
+  分别归型；`--permission-mode dontAsk` 下对越权/未授权动作的拒绝不代表整套测试不可用，更不
+  因此放宽权限或启用 bypass。某次任务主动把 Bash 排除出 `--tools` 属该次边界选择，不算新失败。
+- 已有 Read/Glob/Grep 时**不额外运行** ls/date/cat/cd/echo/包装命令。已知反例：S1 实际尝试
+  过 2 条未登记命令（`cd && python -c`、`date`/`echo`）均被权限模式拒绝、**没有执行**，须如实
+  记为“未获授权、未执行”，不写成环境故障；本轮不再重试。未知信息写“未知”，时间由主脑记录。
+- 最终代码对应**本次测试指纹哈希**，不把旧绿测当新结果、重叠的专项测与全量测不相加；
+  原始报告的格式失败与代码/测试验收分开，不为仅修格式而重派；错误或部分成果如实保留，
+  GPT/Luna 的工程实施不自动替代执行器。WorkBuddy 继续排除。

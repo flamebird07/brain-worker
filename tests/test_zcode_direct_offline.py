@@ -121,13 +121,30 @@ def main() -> int:
     counter = {'n': 0}
 
     def run_transport(out_dir, *, mode='ok', report=good_report, stage=STAGE,
-                      config=None, extra=()):
+                      config=None, extra=(), events_file=None,
+                      write_file=None, write_text=None):
         counter['n'] += 1
         env = os.environ.copy()
+        # 额度门禁隔离：显式临时 store/routes，绝不写真实 ~/.brain-worker 状态，
+        # 也不默认禁用门禁；未匹配路由时进保守共享组，门禁路径仍被真实执行。
+        env['BRAIN_WORKER_QUOTA_STORE'] = str(RUN_DIR / 'quota-store' / 'state.sqlite3')
+        env['BRAIN_WORKER_QUOTA_ROUTES'] = str(RUN_DIR / 'quota-routes-absent.json')
+        # 跨会话并发容量池隔离：每次回放用各自全新的临时 store（按调用序号唯一），绝不
+        # 读写真实 ~/.brain-worker 池；空池下主力 GLM-5.3 直接放行，不受轮换历史影响。
+        env['BRAIN_WORKER_DISPATCH_STORE'] = str(
+            RUN_DIR / ('dispatch-%d.sqlite3' % counter['n']))
         env['STUB_MODE'] = mode
         env.pop('STUB_REPORT_FILE', None)
+        env.pop('STUB_EVENTS_FILE', None)
+        env.pop('STUB_WRITE_FILE', None)
+        env.pop('STUB_WRITE_TEXT', None)
         if report is not None:
             env['STUB_REPORT_FILE'] = str(report)
+        if events_file is not None:
+            env['STUB_EVENTS_FILE'] = str(events_file)
+        if write_file is not None:
+            env['STUB_WRITE_FILE'] = str(write_file)
+            env['STUB_WRITE_TEXT'] = write_text or ''
         cmd = [sys.executable, str(script), '--workspace', str(work),
                '--prompt-file', str(prompt_path), '--output-dir', str(out_dir),
                '--config', str(config or cfg_path), '--stage', stage, *extra]
@@ -404,6 +421,101 @@ def main() -> int:
           proc.returncode == 0 and req['allowed_tools'] == ['Read', 'Grep', 'Write']
           and {'Edit', 'Bash', 'js', 'Task'} <= eff and 'Read' not in eff
           and state['bound'] is True, json.dumps(sorted(eff)[:8], ensure_ascii=False))
+
+    # ---------- 执行证据契约：派工前拒绝与缺省未验 ----------
+    check('no execution contract leaves execution_evidence_ok explicitly null',
+          summary['execution_evidence_ok'] is None
+          and summary['execution_evidence_status'] == 'unverified_no_contract'
+          and (out_ok / 'execution-evidence.json').is_file(),
+          json.dumps({'ok': summary.get('execution_evidence_ok'),
+                      'status': summary.get('execution_evidence_status')},
+                     ensure_ascii=False))
+    bad_contract = RUN_DIR / 'bad-contract.json'
+    bad_contract.write_text(json.dumps(
+        {'task_type': 'engineering', 'required_reads': ['../outside.py'],
+         'expected_artifacts': []}, ensure_ascii=False), encoding='utf-8')
+    proc, _, _ = run_transport(RUN_DIR / 't-contract-escape',
+                               extra=['--execution-contract', str(bad_contract)])
+    check('contract path escaping the workspace is refused before dispatch',
+          proc.returncode == 2 and not (RUN_DIR / 't-contract-escape').exists()
+          and 'escapes workspace' in proc.stdout, proc.stdout[:200])
+
+    # ---------- 入口级端到端：显式契约 × stub 工具事件 × baseline ----------
+    (work / 'task.md').write_text('original task file\n', encoding='utf-8')
+    zero_tool_contract = RUN_DIR / 'zero-tool-contract.json'
+    zero_tool_contract.write_text(json.dumps(
+        {'task_type': 'engineering', 'required_reads': ['task.md'],
+         'required_modified_files': [], 'allow_no_changes': True},
+        ensure_ascii=False), encoding='utf-8')
+    tag = RUN_DIR / 't-contract-zero-tools'
+    proc, summary, state = run_transport(tag, extra=['--execution-contract',
+                                                      str(zero_tool_contract)])
+    check('explicit contract with zero tool events fails evidence but keeps protocol/bound',
+          proc.returncode == 3 and summary['protocol_success'] is True
+          and summary['report_bound'] is True and state['bound'] is True
+          and summary['execution_evidence_ok'] is False
+          and summary['execution_evidence_status'] == 'no_required_execution',
+          json.dumps({'rc': proc.returncode,
+                      'status': summary.get('execution_evidence_status')},
+                     ensure_ascii=False))
+
+    good_contract = RUN_DIR / 'good-contract.json'
+    good_contract.write_text(json.dumps(
+        {'task_type': 'engineering', 'required_reads': ['task.md'],
+         'required_modified_files': ['task.md']}, ensure_ascii=False),
+        encoding='utf-8')
+    events_path = RUN_DIR / 'tool-events.json'
+    task_abs = str(work / 'task.md')
+    events_path.write_text(json.dumps([
+        {'type': 'tool_call_scheduled',
+         'payload': {'toolCallId': 'a', 'toolName': 'Read',
+                     'input': {'file_path': task_abs}}},
+        {'type': 'tool_call_result',
+         'payload': {'toolCallId': 'a', 'result': {'success': True,
+                                                   'content': 'read ok'}}},
+        {'type': 'tool_call_scheduled',
+         'payload': {'toolCallId': 'b', 'toolName': 'Edit',
+                     'input': {'file_path': task_abs}}},
+        {'type': 'tool_call_result',
+         'payload': {'toolCallId': 'b', 'result': {'success': True,
+                                                   'content': 'edited'}}},
+    ], ensure_ascii=False), encoding='utf-8')
+    tag = RUN_DIR / 't-contract-verified'
+    original_sha = hashlib.sha256((work / 'task.md').read_bytes()).hexdigest()
+    proc, summary, state = run_transport(
+        tag, extra=['--execution-contract', str(good_contract)],
+        events_file=events_path, write_file=work / 'task.md',
+        write_text='changed by stub executor\n')
+    req = json.loads((tag / 'request.json').read_text(encoding='utf-8'))
+    baseline = req.get('execution_contract_baseline') or {}
+    ev_file = json.loads((tag / 'execution-evidence.json').read_text(encoding='utf-8'))
+    check('valid read+modify contract with dispatch baseline verifies and exits 0',
+          proc.returncode == 0 and summary['execution_evidence_ok'] is True
+          and summary['execution_evidence_status'] == 'verified'
+          and req['execution_contract_sha256'] is not None
+          and any(v.get('sha256') == original_sha for v in baseline.values())
+          and ev_file.get('write_evidence'), json.dumps(
+              {'rc': proc.returncode, 'status': summary.get('execution_evidence_status'),
+               'baseline_keys': sorted(baseline)}, ensure_ascii=False))
+
+    # 契约文件在执行后被改写：request 里的快照与哈希不受影响（入口从不重读契约文件）
+    good_contract.write_text(json.dumps(
+        {'task_type': 'reasoning'}, ensure_ascii=False), encoding='utf-8')
+    check('post-run rewrite of the contract file cannot change the recorded snapshot',
+          req['execution_contract']['task_type'] == 'engineering'
+          and req['execution_contract']['required_reads'] == ['task.md'],
+          json.dumps(req.get('execution_contract'), ensure_ascii=False))
+
+    tag = RUN_DIR / 't-contract-preflight'
+    proc, summary, state = run_transport(tag, extra=['--preflight-only',
+                                                      '--execution-contract',
+                                                      str(good_contract)])
+    check('preflight-only with a contract never claims real execution success',
+          proc.returncode == 3 and summary['submitted'] is False
+          and summary['execution_evidence_status'] == 'unverified_preflight_only',
+          json.dumps({'rc': proc.returncode,
+                      'status': summary.get('execution_evidence_status')},
+                     ensure_ascii=False))
 
     # ---------- 纯函数直连检查 ----------
     sys.path.insert(0, str(ROOT / 'scripts'))

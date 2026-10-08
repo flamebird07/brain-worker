@@ -24,10 +24,12 @@ pytest 依赖。本文件不在本机执行过真实派工——由主脑运行�
 import hashlib
 import json
 import os
+import shutil
 import subprocess
 import sys
 import tempfile
 import unittest
+from contextlib import closing
 from pathlib import Path
 
 REPO = Path(__file__).resolve().parent.parent
@@ -36,10 +38,15 @@ sys.path.insert(0, str(SCRIPTS))
 import execution_control as ec  # noqa: E402
 import qoder_direct as qd  # noqa: E402  复用九节头做绑定报告，不改其文件
 import zcode_direct as zd
+import dispatch_pool as dp  # noqa: E402  真实容量池：并发入口 Popen 前必须消费 claim
 
 QODER_ENTRY = SCRIPTS / 'qoder_direct.py'
 CODEBUDDY_ENTRY = SCRIPTS / 'codebuddy_direct.py'
 ZCODE_ENTRY = SCRIPTS / 'zcode_direct.py'
+# CodeBuddy/WorkBuddy 直连已退休为 human-relay only：生产 CODEBUDDY_ENTRY main() 硬停。
+# 旧 CB 真实 stub 传输链（429/限流/冷却/解析）改由测试专用离线 harness 调用
+# codebuddy_direct.dispatch_core 在隔离合成 stub 下回放，不参与生产直连派发。
+HARNESS = REPO / 'tests' / 'offline_codebuddy_harness.py'
 
 # 所有 stub 共享的 barrier：每个 stub 启动即写 started-<id>，等满 BARRIER_TOTAL 个
 # 后才写 finished-<id>；只有四子进程真正同时在跑，max(started) 才会 <= min(finished)。
@@ -75,7 +82,7 @@ sys.stdout.write(json.dumps(env, ensure_ascii=False))
 sys.stdout.flush()
 '''
 
-CODEBUDDY_STUB = BARRIER_SNIPPET + '''
+CODEBUDDY_STUB = '# OFFLINE-SYNTHETIC-CODEBUDDY-STUB v1\n' + BARRIER_SNIPPET + '''
 import json, sys
 sys.stdin.read()
 _barrier()
@@ -162,19 +169,55 @@ class ParallelRehearsalTests(unittest.TestCase):
     def setUp(self):
         self._tmp = tempfile.TemporaryDirectory()
         self.base = Path(self._tmp.name).resolve()
+        self._live_procs = []
         self.barrier = self.base / 'barrier'
         self.barrier.mkdir()
         self.stub_dir = self.base / 'stubs'
         self.stub_dir.mkdir()
+        # 每个测试方法一套全新容量池（connect 会自动建父目录），绝不碰真实默认库。
+        self.dispatch_store = self.base / 'dispatch-pool.sqlite3'
         self._write_stubs()
+        self._write_routes()
+        # harness 回放前校验固定合成 CB stub 的内容哈希：声明值取自磁盘真实字节。
+        self.cb_stub_sha = hashlib.sha256(
+            (self.stub_dir / 'codebuddy_stub.py').read_bytes()).hexdigest()
 
     def tearDown(self):
-        self._tmp.cleanup()
+        # 先可靠收尸本测试登记的所有子进程，再清理临时目录：Windows 下若子进程仍持有
+        # ws-* 目录句柄，TemporaryDirectory.cleanup() 会抛 WinError 32 并掩盖真实断言
+        # 失败。收尸后仍清理不掉时退化为 ignore_errors（绝不让清理噪声顶替测试结果）。
+        for pr in getattr(self, '_live_procs', []):
+            try:
+                if pr.poll() is None:
+                    pr.terminate()
+                pr.communicate(timeout=30)
+            except Exception:
+                pass
+        try:
+            self._tmp.cleanup()
+        except (PermissionError, OSError):
+            shutil.rmtree(self._tmp.name, ignore_errors=True)
 
     def _write_stubs(self):
         (self.stub_dir / 'qoder_stub.py').write_text(QODER_STUB, encoding='utf-8')
         (self.stub_dir / 'codebuddy_stub.py').write_text(CODEBUDDY_STUB, encoding='utf-8')
         (self.stub_dir / 'zcode_stub.py').write_text(ZCODE_STUB, encoding='utf-8')
+
+    def _write_routes(self):
+        # CodeBuddy 与 ZCode 额度独立来自用户 2026-10-08 明确确认（user_confirmed）：
+        # 两个不同 quota_group，让二者可在各自 workspace 并行接续而不互相串行阻塞。
+        # 通道标识用运行时事实（CodeBuddy entry_cli、ZCode provider），config 别名不改变通道。
+        routes = {'routes': [
+            {'runtime': 'codebuddy',
+             'match': {'entry_cli': str((self.stub_dir / 'codebuddy_stub.py').resolve())},
+             'quota_group': 'cb-local', 'independence': 'user_confirmed'},
+            {'runtime': 'zcode',
+             'match': {'provider': zd.DEFAULT_PROVIDER},
+             'quota_group': 'zc-local', 'independence': 'user_confirmed'},
+        ]}
+        self.routes_path = self.base / 'quota-routes-independent.json'
+        self.routes_path.write_text(json.dumps(routes, ensure_ascii=False),
+                                    encoding='utf-8', newline='\n')
 
     def _mk_workspace(self, tag: str) -> Path:
         ws = (self.base / ('ws-' + tag)).resolve()
@@ -220,31 +263,58 @@ class ParallelRehearsalTests(unittest.TestCase):
         env.update({'BARRIER_DIR': str(self.barrier), 'BARRIER_TOTAL': str(barrier_total),
                     'TASK_ID': task_id, 'WORKSPACE': str(ws),
                     'PYTHONIOENCODING': 'utf-8',
-                    'SYSTEMROOT': os.environ.get('SYSTEMROOT', '')})
+                    'SYSTEMROOT': os.environ.get('SYSTEMROOT', ''),
+                    # CB 退休：旧链仅在合成 stub 下离线回放，harness 需显式隔离标记。
+                    'CB_OFFLINE_SYNTHETIC_STUB': '1',
+                    'CB_OFFLINE_STUB_SHA256': self.cb_stub_sha,
+                    # 额度门禁隔离：显式临时 store + user_confirmed 独立路由，绝不写真实
+                    # 状态、不禁用门禁；cb/zc 落各自独立组，跨 workspace 可并行接续。
+                    'BRAIN_WORKER_QUOTA_STORE': str(self.base / 'quota-store' / 'state.sqlite3'),
+                    'BRAIN_WORKER_QUOTA_ROUTES': str(self.routes_path),
+                    # 容量池：四并发入口共享同一临时 store，claim 精确消费，绝不用默认
+                    # ~/.brain-worker 真实库。setUp 已重置（每测试方法独立 base）。
+                    'BRAIN_WORKER_DISPATCH_STORE': str(self.dispatch_store)})
         if report is not None:
             env['STUB_REPORT_FILE'] = str(report)
         return env
 
-    def _qoder_cmd(self, ws, prompt, out, stage, plan):
+    def _qoder_cmd(self, ws, prompt, out, stage, plan, model, claim):
         cfg = self.base / f'qoder-cfg-{ws.name}.json'
         cfg.write_text(json.dumps({'node': sys.executable,
                                     'qodercli': str(self.stub_dir / 'qoder_stub.py')}),
                        encoding='utf-8')
+        # --model 必须与 plan.model 一致（preflight 双向比对）；--dispatch-claim 精确
+        # 消费事先 reserve 的容量名额，--dispatch-store 指向本测试独立临时池。
         return [sys.executable, str(QODER_ENTRY), '--workspace', str(ws),
                 '--prompt-file', str(prompt), '--output-dir', str(out), '--stage', stage,
-                '--tools', 'Read', '--config', str(cfg), '--dispatch-plan', str(plan)]
+                '--model', model, '--tools', 'Read', '--config', str(cfg),
+                '--dispatch-plan', str(plan), '--dispatch-store', str(self.dispatch_store),
+                '--dispatch-claim', claim]
+
+    def _reserve(self, task_id, runtime, model, ws, prompt_path, stage):
+        # 并发演练：为确切 (runtime, model) 预留 claim，入口再用 --dispatch-claim 精确
+        # 消费。reserve 与 select-and-claim 共用统一国内 1:1 轮转策略（绝不绕过轮转），
+        # 因此需要连续占满同一主力时，测试按轮转顺序插入另一主力的合法预留来配平。
+        # prompt_sha256 用原始字节哈希，与入口口径一致。
+        res = dp.reserve(self.dispatch_store, task_id=task_id, runtime=runtime,
+                         model=model, workspace=str(ws),
+                         prompt_sha256=hashlib.sha256(prompt_path.read_bytes()).hexdigest(),
+                         stage=stage)
+        self.assertTrue(res['allowed'], res)
+        return res['token']
 
     def _codebuddy_cmd(self, ws, prompt, out, stage, plan):
+        # CB 直连已退休，旧 429/限流链改走离线 harness（dispatch_core 合成 stub 回放），
+        # 不带 --dispatch-plan（plan 路径在生产控制面已拒绝）。plan 形参保留以稳定调用点。
         cfg = self.base / f'cb-cfg-{ws.name}.json'
         cfg.write_text(json.dumps({'node': sys.executable,
                                    'cli': str(self.stub_dir / 'codebuddy_stub.py')}),
                        encoding='utf-8')
-        return [sys.executable, str(CODEBUDDY_ENTRY), '--workspace', str(ws),
+        return [sys.executable, str(HARNESS), '--workspace', str(ws),
                 '--prompt-file', str(prompt), '--output-dir', str(out), '--stage', stage,
-                '--model', 'CB-PARR-429', '--tools', 'Read', '--config', str(cfg),
-                '--dispatch-plan', str(plan)]
+                '--model', 'CB-PARR-429', '--tools', 'Read', '--config', str(cfg)]
 
-    def _zcode_cmd(self, ws, prompt, out, stage, plan):
+    def _zcode_cmd(self, ws, prompt, out, stage, plan, model, claim):
         fixture = {}
         for key, name in (('bootstrap', 'boot.js'), ('tsx_loader', 'loader.mjs'),
                           ('builtin_provider_config', 'builtin.json'),
@@ -258,7 +328,9 @@ class ParallelRehearsalTests(unittest.TestCase):
             'node_args': [], 'environment': {}, **fixture}), encoding='utf-8')
         return [sys.executable, str(ZCODE_ENTRY), '--workspace', str(ws),
                 '--prompt-file', str(prompt), '--output-dir', str(out), '--stage', stage,
-                '--tools', 'Read', '--config', str(cfg), '--dispatch-plan', str(plan)]
+                '--model', model, '--tools', 'Read', '--config', str(cfg),
+                '--dispatch-plan', str(plan), '--dispatch-store', str(self.dispatch_store),
+                '--dispatch-claim', claim]
 
     def test_four_task_parallel_rehearsal(self):
         specs = []
@@ -273,22 +345,28 @@ class ParallelRehearsalTests(unittest.TestCase):
         # 2) ZCode 缺 Bash 权限客户端（协议仍成功）
         ws = self._mk_workspace('zcperm')
         prompt = self._write('prompt-zcperm.txt', 'ZCode 并行演练任务，原样汇报。\n')
-        plan = self._plan('T-ZC', 'BW-PARR-ZCPERM', 'zcode', 'GLM-5.3-Flash', ws,
+        plan = self._plan('T-ZC', 'BW-PARR-ZCPERM', 'zcode', 'GLM-5.3', ws,
                           prompt, ['Read'])
+        zc_claim = self._reserve('T-ZC', 'zcode', 'GLM-5.3', ws, prompt, 'BW-PARR-ZCPERM')
         report = self._write('report-zcperm.txt',
                              build_bound_report('BW-PARR-ZCPERM', str(ws)))
         specs.append(('zcperm', self._zcode_cmd(ws, prompt, ws / 'out',
-                                                'BW-PARR-ZCPERM', plan),
+                                                'BW-PARR-ZCPERM', plan, 'GLM-5.3',
+                                                zc_claim),
                       self._base_env('zcperm', ws, report), ws, 'BW-PARR-ZCPERM'))
         # 3 & 4) 两个 Qoder 成功完整绑定报告（独立 workspace，同名 output.py）
+        #    两者同为主力 Qwen3.8-Max，恰好占满该池容量 2（并发上限，不溢出）。
         for tag, stage in (('qa', 'BW-PARR-QA'), ('qb', 'BW-PARR-QB')):
             ws = self._mk_workspace(tag)
             prompt = self._write(f'prompt-{tag}.txt', f'Qoder {tag} 并行演练任务。\n')
-            plan = self._plan('T-' + tag.upper(), stage, 'qoder', 'Qwen3.8-Flash', ws,
+            plan = self._plan('T-' + tag.upper(), stage, 'qoder', 'Qwen3.8-Max', ws,
                               prompt, ['Read'])
+            claim = self._reserve('T-' + tag.upper(), 'qoder', 'Qwen3.8-Max', ws,
+                                  prompt, stage)
             report = self._write(f'report-{tag}.txt',
                                  build_bound_report(stage, str(ws)))
-            specs.append((tag, self._qoder_cmd(ws, prompt, ws / 'out', stage, plan),
+            specs.append((tag, self._qoder_cmd(ws, prompt, ws / 'out', stage, plan,
+                                               'Qwen3.8-Max', claim),
                           self._base_env(tag, ws, report), ws, stage))
 
         # 并发启动四适配器子进程（真实重叠由 barrier 门控完成证明）。
@@ -420,14 +498,27 @@ class ParallelRehearsalTests(unittest.TestCase):
         self.barrier.mkdir()
 
         # 2) 起两个 Qoder 成功任务（barrier_total=3），此刻它们仍卡在 barrier 内。
+        #    两者同为主力 Qwen3.8-Max，恰好占满该池容量 2；第三个接管任务只能走溢出
+        #    Qwen3.8-Flash（主力已满，溢出合法），从而不突破任一池上限。
+        #    1:1 轮转下不能连续预留同一主力：插入两个 zcode 幻影预留把 zcode 池也填到
+        #    上限，ia/ib 两个 Max 才合法占满主力 Max 池（幻影名额只占容量、从不 launch）。
+        self._reserve('T-PHZ0', 'zcode', 'GLM-5.3', self._mk_workspace('phz0'),
+                      self._write('prompt-phz0.txt', 'phantom zcode 0\n'), 'BW-FB-PHZ0')
         inflight = {}
         for tag, stage in (('ia', 'BW-FB-IA'), ('ib', 'BW-FB-IB')):
+            if tag == 'ib':
+                self._reserve('T-PHZ1', 'zcode', 'GLM-5.3', self._mk_workspace('phz1'),
+                              self._write('prompt-phz1.txt', 'phantom zcode 1\n'),
+                              'BW-FB-PHZ1')
             wsi = self._mk_workspace(tag)
             pi = self._write(f'prompt-{tag}.txt', f'Qoder {tag} 在途任务。\n')
-            pl = self._plan('T-' + tag.upper(), stage, 'qoder', 'Qwen3.8-Flash', wsi,
+            pl = self._plan('T-' + tag.upper(), stage, 'qoder', 'Qwen3.8-Max', wsi,
                             pi, ['Read'])
+            claim = self._reserve('T-' + tag.upper(), 'qoder', 'Qwen3.8-Max', wsi,
+                                  pi, stage)
             outi = wsi / 'out'
-            pr = subprocess.Popen(self._qoder_cmd(wsi, pi, outi, stage, pl),
+            pr = subprocess.Popen(self._qoder_cmd(wsi, pi, outi, stage, pl,
+                                                  'Qwen3.8-Max', claim),
                                   env=self._base_env(tag, wsi,
                                                      self._write(f'report-{tag}.txt',
                                                                  build_bound_report(
@@ -435,6 +526,7 @@ class ParallelRehearsalTests(unittest.TestCase):
                                                      barrier_total=3),
                                   cwd=str(wsi), stdout=subprocess.PIPE,
                                   stderr=subprocess.PIPE)
+            self._live_procs.append(pr)
             inflight[tag] = (pr, outi)
 
         # Wait for the real child markers, not merely adapter request files: both
@@ -465,10 +557,14 @@ class ParallelRehearsalTests(unittest.TestCase):
         pfb = self._write('prompt-fbtake.txt', 'Qoder 接管 fallback 任务。\n')
         plfb = self._plan('T-FB-TAKE', 'BW-FB-TAKE', 'qoder', 'Qwen3.8-Flash', wsfb,
                           pfb, ['Read'])
+        # 主力 Qwen3.8-Max 已被 ia/ib 占满，接管任务显式预留溢出 Qwen3.8-Flash 名额。
+        fb_claim = self._reserve('T-FB-TAKE', 'qoder', 'Qwen3.8-Flash', wsfb, pfb,
+                                 'BW-FB-TAKE')
         fb_report = self._write('report-fbtake.txt',
                                 build_bound_report('BW-FB-TAKE', str(wsfb)))
         fb_proc = subprocess.run(self._qoder_cmd(wsfb, pfb, wsfb / 'out',
-                                                 'BW-FB-TAKE', plfb),
+                                                 'BW-FB-TAKE', plfb, 'Qwen3.8-Flash',
+                                                 fb_claim),
                                  env=self._base_env('fbtake', wsfb, fb_report,
                                                     barrier_total=3),
                                  cwd=str(wsfb), capture_output=True, timeout=120)
@@ -578,7 +674,9 @@ class ParallelRehearsalTests(unittest.TestCase):
     def test_codebuddy_missing_grant_rejects_zero_spawn(self):
         ws = self._mk_workspace('reject')
         prompt = self._write('prompt-reject.txt', 'CodeBuddy 拒绝演练任务。\n')
-        # 计划要求一个入口不会实际授予的 Edit grant → 缺 grant → rc 2、零目录
+        # 直连已退休：即便携带 --dispatch-plan 与任何 grant，生产 CODEBUDDY_ENTRY 也在
+        # 读配置/建输出/quota gate/Popen 前固定拒绝，返回 manual_relay_only/sent=false，
+        # 零输出目录、零子进程、零额度副作用。
         p = self.base / 'plan-reject.json'
         p.write_text(json.dumps({
             'task_id': 'T-RJ', 'stage': 'BW-PARR-REJECT', 'runtime': 'codebuddy',
@@ -590,14 +688,55 @@ class ParallelRehearsalTests(unittest.TestCase):
             'active_tasks': [], 'depends_on': [], 'shared_writes': [],
             'max_concurrency': 1}), encoding='utf-8', newline='\n')
         out = ws / 'out'
-        cmd = self._codebuddy_cmd(ws, prompt, out, 'BW-PARR-REJECT', p)
+        cfg = self.base / 'cb-cfg-reject.json'
+        cfg.write_text(json.dumps({'node': sys.executable,
+                                   'cli': str(self.stub_dir / 'codebuddy_stub.py')}),
+                       encoding='utf-8')
+        cmd = [sys.executable, str(CODEBUDDY_ENTRY), '--workspace', str(ws),
+               '--prompt-file', str(prompt), '--output-dir', str(out),
+               '--stage', 'BW-PARR-REJECT', '--model', 'CB-PARR-429', '--tools', 'Read',
+               '--config', str(cfg), '--dispatch-plan', str(p)]
         env = self._base_env('reject', ws)
         proc = subprocess.run(cmd, env=env, cwd=str(ws), capture_output=True,
                               timeout=120)
         self.assertEqual(proc.returncode, 2)
         self.assertFalse(out.exists())
-        self.assertIn('dispatch_plan_rejected',
-                      proc.stdout.decode('utf-8', 'replace'))
+        payload = json.loads(proc.stdout.decode('utf-8', 'replace'))
+        self.assertTrue(payload['manual_relay_only'])
+        self.assertFalse(payload['sent'])
+        self.assertFalse((self.base / 'quota-store' / 'state.sqlite3').exists())
+
+    def test_qoder_entry_claim_chat_drift_zero_popen(self):
+        # item-4：显式 claim 的原 scope 含 chat_id；入口用漂移的 --chat-id 消费必须在
+        # Popen 前被容量门拒绝（claim_invalid），零输出目录、零子进程，原预留仍 reserved
+        # （漂移拒绝绝不消费/释放名额，也绝不改派绕过）。这同时证明 --chat-id 确实被
+        # 透传进 consume_for_entry 并参与精确绑定校验。
+        ws = self._mk_workspace('chatdrift')
+        prompt = self._write('prompt-chatdrift.txt', 'Qoder chat 漂移演练任务。\n')
+        stage = 'BW-FB-CHATDRIFT'
+        plan = self._plan('T-CHAT', stage, 'qoder', 'Qwen3.8-Max', ws, prompt, ['Read'])
+        res = dp.reserve(self.dispatch_store, task_id='T-CHAT', runtime='qoder',
+                         model='Qwen3.8-Max', workspace=str(ws),
+                         prompt_sha256=hashlib.sha256(prompt.read_bytes()).hexdigest(),
+                         stage=stage, chat_id='C-ORIG')
+        self.assertTrue(res['allowed'], res)
+        out = ws / 'out'
+        cmd = self._qoder_cmd(ws, prompt, out, stage, plan, 'Qwen3.8-Max', res['token'])
+        cmd += ['--chat-id', 'C-WRONG']
+        proc = subprocess.run(cmd, env=self._base_env('chatdrift', ws), cwd=str(ws),
+                              capture_output=True, timeout=120)
+        self.assertEqual(proc.returncode, 2, proc.stderr.decode('utf-8', 'replace'))
+        self.assertFalse(out.exists())  # 零 Popen：门禁在建输出目录之前拒绝
+        payload = json.loads(proc.stdout.decode('utf-8', 'replace'))
+        self.assertTrue(payload['capacity_gate_rejected'])
+        self.assertFalse(payload['sent'])
+        self.assertEqual(payload['reason'], 'claim_invalid')
+        with closing(dp.connect(self.dispatch_store)) as conn:
+            row = conn.execute('SELECT state FROM attempts WHERE token=?',
+                               (res['token'],)).fetchone()
+        self.assertEqual(row['state'], 'reserved')
+        self.assertEqual(
+            dp.status(self.dispatch_store)['pools']['qoder:Qwen3.8-Max']['active'], 1)
 
 
 if __name__ == '__main__':

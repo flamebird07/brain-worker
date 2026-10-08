@@ -26,9 +26,14 @@ if str(_SCRIPTS_DIR) not in sys.path:
     sys.path.insert(0, str(_SCRIPTS_DIR))
 import execution_control as ec  # noqa: E402 任务级控制面（同目录，标准库）
 import prompt_contract as pc  # noqa: E402 三入口共享九节契约（标准库，不反向导入本模块）
+import dispatch_pool as dp  # noqa: E402 跨会话并发容量池（同目录，标准库 sqlite3）
 
 DEFAULT_CONFIG = _SCRIPTS_DIR / 'local-entry.json'
-DEFAULT_MODEL = 'Qwen3.8-Flash'
+# argparse 缺省模型 = 并发容量池指定的 qoder 主力组合 Qwen3.8-Max（每会话持久 1:1 两名）。
+# 不传 --model 的自主派工即请求主力 Max；Qwen3.8-Flash 在池里是溢出组合，仅当主力满员时
+# 由容量池按溢出策略改道。控制面回归 tests/test_execution_control.py 的 fixture 已同步为
+# Max（该文件在本轮编辑白名单内），dispatch-plan 的 model 逐项比对与缺省一致。
+DEFAULT_MODEL = 'Qwen3.8-Max'
 # 契约单点定义在 prompt_contract；此处再导出同名常量，保持既有引用（analyze_report、
 # codebuddy/zcode 复用本模块的分析器）与 test_parallel_execution 的 qd.SECTION_HEADERS 不变。
 REPORT_START = pc.REPORT_START
@@ -393,6 +398,28 @@ def main():
                          'own active_tasks; otherwise the plan snapshot is used, so a '
                          'parallel plan that omits it is refused rather than treated as '
                          '"nothing in flight".')
+    ap.add_argument('--task-id', dest='task_id', default=None,
+                    help='Stable task identity for cross-chat capacity dedup. Defaults '
+                         'to the dispatch-plan task_id when a plan is given, else --stage.')
+    ap.add_argument('--dispatch-store', dest='dispatch_store', default=None,
+                    help='Explicit dispatch-pool sqlite path. Defaults to the stable '
+                         'shared pool (env BRAIN_WORKER_DISPATCH_STORE or '
+                         '~/.brain-worker/dispatch-pool.sqlite3). Tests must pass a '
+                         'temporary store.')
+    ap.add_argument('--dispatch-claim', dest='dispatch_claim', default=None,
+                    help='A capacity claim token pre-reserved via dispatch_pool. When '
+                         'given it is validated against task/runtime/model/workspace/'
+                         'prompt and consumed before Popen; any drift is refused. When '
+                         'omitted the entry performs an atomic route selection and, if '
+                         'this entry is not the selected combo, returns routing_required '
+                         'with sent=false instead of submitting the wrong model.')
+    ap.add_argument('--chat-id', dest='chat_id', default=None,
+                    help='Chat/conversation identity for capacity dedup and claim scope. '
+                         'When a pre-reserved claim was reserved with an explicit chat_id '
+                         'in its scope, the consuming entry MUST pass the same --chat-id '
+                         'or the claim is refused as drift (zero Popen). Never fabricated: '
+                         'omit it when the host has no verified chat context, in which case '
+                         'the auto path records chat_id=None rather than inventing one.')
     args = ap.parse_args()
     if not args.stage or not args.stage.strip():
         ap.error('--stage is required and must be non-empty')
@@ -451,51 +478,151 @@ def main():
                               'exit_code': 2, 'reasons': result['reasons'],
                               'plan_hash': result['plan_hash']}, ensure_ascii=False))
             return 2
+        plan_task_id = plan.get('task_id')
+    else:
+        plan_task_id = None
 
-    out.mkdir(parents=True, exist_ok=False)  # refuse overwriting/replaying an existing invocation
-    # Two send channels must both be evidenced by real bytes: the task text goes to
-    # stdin, the full contract goes to the official --append-system-prompt argv. Save
-    # exactly what is handed to the child and read it back before recording evidence.
-    stdin_payload = prompt.encode('utf-8')
-    (out / 'sent-payload-stdin.bin').write_bytes(stdin_payload)
-    (out / 'sent-contract-system-prompt.txt').write_bytes(contract.encode('utf-8'))
-    stdin_readback = (out / 'sent-payload-stdin.bin').read_bytes()
-    contract_readback = (out / 'sent-contract-system-prompt.txt').read_bytes()
-    prompt_payload = pc.payload_evidence(
-        raw_prompt_bytes=prompt_bytes, sent_task_text=prompt, contract=contract,
-        sent_payload_bytes=stdin_payload,
-        newline_caliber='raw-file-bytes-preserving-decode; task=stdin, contract=argv system-prompt')
-    prompt_payload['readback_match'] = (
-        stdin_readback == stdin_payload and contract_readback == contract.encode('utf-8'))
-    prompt_payload['channels'] = {
-        'task_stdin_sha256': pc.sha256_hex(stdin_readback),
-        'system_prompt_argv_sha256': pc.sha256_hex(contract_readback),
-        'contract_present_in_argv': contract in argv,
-    }
-    request = {'started_at': datetime.now(timezone.utc).isoformat(),
-               'workspace': str(work), 'prompt_file': str(prompt_path),
-               'prompt_sha256': prompt_sha256,
-               'prompt_payload': prompt_payload,
-               'model_requested': args.model, 'tools': args.tools,
-               'allowed_tools': list(perms['allowed_tools']),
-               'disallowed_tools': list(perms['disallowed_tools']),
-               'add_dirs': list(perms['add_dirs']),
-               'stage': args.stage, 'resume_session_id': args.session_id,
-               'entry_config': str(Path(args.config).resolve()),
-               'runtime': {'node': cfg['node'], 'qodercli': cfg['qodercli']},
-               'argv': argv}
-    if plan_block is not None:
-        request['dispatch_plan'] = plan_block
-    (out / 'request.json').write_text(json.dumps(request, ensure_ascii=False, indent=2),
-                                      encoding='utf-8')
-    with (out / 'stdout.json').open('wb') as stdout, (out / 'stderr.log').open('wb') as stderr:
-        child = subprocess.Popen(argv, stdin=subprocess.PIPE, stdout=stdout, stderr=stderr)
-        (out / 'process.json').write_text(json.dumps({'pid': child.pid, 'state': 'running'}),
+    # ---- 跨会话并发容量门（所有路径，含不传 --dispatch-plan 的兼容路径）----
+    # Popen/建目录前原子消费一个容量 claim：给了 --dispatch-claim 就精确校验并 mark_running
+    # （漂移即拒），否则做原子路由选择；当前入口非被选中组合 → routing_required、sent=false、
+    # 退出 2、零输出目录，绝不先提交错模型、绝不浪费/重复占用分配名额。
+    dispatch_store = args.dispatch_store or str(dp.default_store_path())
+    task_id = args.task_id or plan_task_id or args.stage
+    # 真实调用者身份（Z2）：在 Popen 前用本进程真实 PID + 创建时刻锚定 owner，供
+    # bind_child/finish 校验——别人不能把子进程挂到不属于自己的 attempt，也不能凭一个终态
+    # 参数释放本 owner 尚未启动/未知的名额。全程复用同一身份，绝不伪造。
+    wrapper_pid = os.getpid()
+    wrapper_created = dp.process_identity(wrapper_pid).get('created')
+    pool_gate = dp.consume_for_entry(
+        dispatch_store, task_id=task_id, runtime='qoder', model=args.model,
+        workspace=str(work), prompt_sha256=prompt_sha256, stage=args.stage,
+        chat_id=args.chat_id, claim_token=args.dispatch_claim,
+        wrapper_pid=wrapper_pid, wrapper_created=wrapper_created)
+    if not pool_gate['allowed']:
+        print(json.dumps({'capacity_gate_rejected': True, 'sent': False, 'exit_code': 2,
+                          'routing_required': bool(pool_gate.get('routing_required')),
+                          'reason': pool_gate.get('reason'),
+                          'selected': pool_gate.get('selected'),
+                          'pool_key': pool_gate.get('pool_key'),
+                          'domestic_full': pool_gate.get('domestic_full'),
+                          'reasons': pool_gate['reasons']}, ensure_ascii=False))
+        return 2
+    claim_token = pool_gate['token']
+
+    def _release_claim(terminal, success=None):
+        """释放本 attempt 名额，带真实 owner 身份；返回 finish 结果供调用方核验，绝不在
+        释放失败时谎称已释放。释放异常不掩盖真实终态（容量对账由 reconcile 兜底）。"""
+        try:
+            return dp.finish(dispatch_store, claim_token, terminal=terminal,
+                             success=success, wrapper_pid=wrapper_pid,
+                             wrapper_created=wrapper_created)
+        except Exception as exc:  # noqa: BLE001
+            return {'settled': False, 'released': False, 'token': claim_token,
+                    'terminal': terminal, 'error': str(exc)}
+
+    try:
+        out.mkdir(parents=True, exist_ok=False)  # refuse overwriting/replaying an existing invocation
+    except OSError:
+        # 建目录失败发生在 claim 消费之后、Popen 之前：本 attempt 从未启动，带 owner 身份
+        # 安全释放（start_failed）再退出，绝不泄漏容量、绝不误抢别人的名额。
+        _release_claim('start_failed')
+        raise
+    # Popen 前的所有准备/序列化/落盘（载荷、契约、request.json）失败都属"已知未启动"：
+    # 统一带 owner 身份 settle start_failed、sent=false、零 Popen、只释放本占位，绝不泄漏。
+    try:
+        # Two send channels must both be evidenced by real bytes: the task text goes to
+        # stdin, the full contract goes to the official --append-system-prompt argv. Save
+        # exactly what is handed to the child and read it back before recording evidence.
+        stdin_payload = prompt.encode('utf-8')
+        (out / 'sent-payload-stdin.bin').write_bytes(stdin_payload)
+        (out / 'sent-contract-system-prompt.txt').write_bytes(contract.encode('utf-8'))
+        stdin_readback = (out / 'sent-payload-stdin.bin').read_bytes()
+        contract_readback = (out / 'sent-contract-system-prompt.txt').read_bytes()
+        prompt_payload = pc.payload_evidence(
+            raw_prompt_bytes=prompt_bytes, sent_task_text=prompt, contract=contract,
+            sent_payload_bytes=stdin_payload,
+            newline_caliber='raw-file-bytes-preserving-decode; task=stdin, contract=argv system-prompt')
+        prompt_payload['readback_match'] = (
+            stdin_readback == stdin_payload and contract_readback == contract.encode('utf-8'))
+        prompt_payload['channels'] = {
+            'task_stdin_sha256': pc.sha256_hex(stdin_readback),
+            'system_prompt_argv_sha256': pc.sha256_hex(contract_readback),
+            'contract_present_in_argv': contract in argv,
+        }
+        request = {'started_at': datetime.now(timezone.utc).isoformat(),
+                   'workspace': str(work), 'prompt_file': str(prompt_path),
+                   'prompt_sha256': prompt_sha256,
+                   'prompt_payload': prompt_payload,
+                   'model_requested': args.model, 'tools': args.tools,
+                   'allowed_tools': list(perms['allowed_tools']),
+                   'disallowed_tools': list(perms['disallowed_tools']),
+                   'add_dirs': list(perms['add_dirs']),
+                   'stage': args.stage, 'chat_id': args.chat_id,
+                   'resume_session_id': args.session_id,
+                   'entry_config': str(Path(args.config).resolve()),
+                   'runtime': {'node': cfg['node'], 'qodercli': cfg['qodercli']},
+                   'argv': argv}
+        if plan_block is not None:
+            request['dispatch_plan'] = plan_block
+        (out / 'request.json').write_text(json.dumps(request, ensure_ascii=False, indent=2),
                                           encoding='utf-8')
-        child.communicate(input=stdin_payload)
+    except (OSError, TypeError, ValueError) as exc:
+        rel = _release_claim('start_failed')
+        print(json.dumps({'dispatch_failed': True, 'sent': False,
+                          'capacity_released': bool(rel.get('released')),
+                          'reasons': [f'pre-start prep/write failed before Popen: {exc!r}']},
+                         ensure_ascii=False))
+        return 3
+    child = None
+    try:
+        with (out / 'stdout.json').open('wb') as stdout, (out / 'stderr.log').open('wb') as stderr:
+            child = subprocess.Popen(argv, stdin=subprocess.PIPE, stdout=stdout, stderr=stderr)
+            bind = dp.bind_child(dispatch_store, claim_token, child.pid,
+                                 wrapper_pid=wrapper_pid, wrapper_created=wrapper_created)
+            if not bind.get('bound'):
+                # 无法把真实子进程绑到本 attempt（owner 不符/已绑/不在途）：子进程确已启动且
+                # 存活未知——只标 unknown 继续占容量，绝不释放、绝不误抢、绝不杀其它任务，
+                # 交 reconcile/人工核验；如实上报，不谎称成功或已释放。
+                dp.mark_unknown(dispatch_store, claim_token)
+                print(json.dumps({'dispatch_failed': True, 'sent': True,
+                                  'terminal_state': 'unknown', 'capacity_held': True,
+                                  'reasons': [f'could not bind child to claim: '
+                                              f'{bind.get("reasons") or bind.get("reason")}']},
+                                 ensure_ascii=False))
+                return 3
+            (out / 'process.json').write_text(json.dumps({'pid': child.pid, 'state': 'running'}),
+                                              encoding='utf-8')
+            child.communicate(input=stdin_payload)
+    except KeyboardInterrupt:
+        # 中断时子进程存活未知：只标 unknown 继续占容量，绝不释放、绝不误抢，交由 reconcile。
+        dp.mark_unknown(dispatch_store, claim_token)
+        raise
+    except Exception as exc:
+        if child is None:
+            # Popen 本身失败（从未启动子进程）：带 owner 身份 settle start_failed，如实反映
+            # 是否真释放，绝不谎称已释放。
+            rel = _release_claim('start_failed')
+            print(json.dumps({'dispatch_failed': True, 'sent': False,
+                              'capacity_released': bool(rel.get('released')),
+                              'reasons': [f'child launch failed before start: {exc}']},
+                             ensure_ascii=False))
+            return 3
+        # 子进程已启动但终态无法确认（communicate 异常）：只标 unknown，保留占位，绝不释放。
+        dp.mark_unknown(dispatch_store, claim_token)
+        print(json.dumps({'dispatch_failed': True, 'sent': True, 'terminal_state': 'unknown',
+                          'capacity_held': True,
+                          'reasons': [f'subprocess terminal state could not be confirmed: {exc}']},
+                         ensure_ascii=False))
+        return 3
+    # 子进程真实结束 → 先释放容量名额（带 owner 身份、核验探针回读 child 已 dead），再解析
+    # JSON/报告/接续；即使随后保存失败也已释放。释放结果如实记录，未释放不谎称已释放。
+    rel = _release_claim('finished', success=(child.returncode == 0))
+    capacity_released = bool(rel.get('released'))
     summary = {'exit_code': child.returncode, 'finished_at': datetime.now(timezone.utc).isoformat(),
                'model_requested': args.model, 'protocol_success': False,
-               'business_verified': False, 'output_dir': str(out)}
+               'business_verified': False, 'output_dir': str(out),
+               'capacity_released': capacity_released,
+               'capacity_terminal': rel.get('terminal')}
     report_state = None
     try:
         result = json.loads((out / 'stdout.json').read_text(encoding='utf-8'))

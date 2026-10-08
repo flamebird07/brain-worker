@@ -23,6 +23,7 @@ backups/
 
 # Agent handoff and validation material should stay outside this Skill repo
 handoffs/
+handoff/
 validation/
 config.yaml
 
@@ -34,4 +35,9 @@ config.yaml
 scripts/local-entry.json
 scripts/zcode-entry.json
 scripts/codebuddy-entry.json
+scripts/quota-routes.json
 tests/*-run-*/
+
+# Private review inputs/outputs kept on the local machine only
+review-input/
+review-output/
