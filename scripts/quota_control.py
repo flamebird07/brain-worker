@@ -95,10 +95,46 @@ _RETRY_AFTER_HEADER_KEYS = ('Retry-After', 'retry-after')
 # 兼容 CodeBuddy 旧规则。
 AUTO_QUOTA_COOLDOWN_DISABLED_RUNTIMES = ('zcode',)
 
+# BW-AVAILABILITY-20261009-B2：ZCode 独立持久 availability/anti-repeat 状态（绝不复活
+# 旧 cooldowns 表）。真实 BigModel/Zhipu Coding Plan 渠道的 1308/1310 是硬额度事实；
+# 同一数字来自其它 provider 不泛化。窄的硬上限消息语义（服务器自己的文本）优先于
+# wrapper 派生的 rate_limit 标签——category=rate_limit 是旧 wrapper 只认识 1308 时
+# 派生的字段，不是服务器权威口径。
+ZCODE_HARD_QUOTA_PROVIDER_CODES = (1308, 1310)
+_TRUSTED_HARD_QUOTA_PROVIDER_RE = re.compile(r'bigmodel|zhipu', re.IGNORECASE)
+# BW-AVAILABILITY-20261009-B4 缺陷 2：硬上限消息语义只认服务器自己的周期性/套餐额度耗尽
+# 文本（使用上限 / 用量上限 / 额度用尽/耗尽/达到 / quota|usage|plan 明确耗尽），绝不把普通
+# 限流/频率上限（rate limit / 每分钟请求上限 / too many requests / limit reached|exceeded）
+# 升格为硬 hold——现场事故里 wrapper 派生的 category=rate_limit 只是旧字段，不是服务器权威。
+_HARD_LIMIT_MESSAGE_RE = re.compile(
+    r'(使用上限|用量上限|额度已?(用尽|耗尽|达到)|配额已?(用尽|耗尽|达到)'
+    r'|周期额度上限|quota (?:has been )?(?:exhausted|used up|drained)'
+    r'|(?:usage|plan) quota limit)', re.IGNORECASE)
+ZCODE_AVAILABILITY_STATES = ('backoff', 'hard_hold', 'recovery_unverified', 'healthy')
+# 探测失败/超时/取消后的再探测退避（秒）：base * 2^probe_failures，上限 CAP。
+ZCODE_PROBE_RETRY_BASE_SECONDS = 60
+ZCODE_PROBE_RETRY_CAP_SECONDS = 3600
+# ZCode availability 分类 kind（与旧 cooldowns 的 KNOWN_KINDS 完全分离）。
+ZCODE_AVAILABILITY_KINDS = ('hard_hold', 'hard_reset_window', 'backoff_until_window',
+                            'temporary_backoff')
+
 
 def _auto_quota_cooldown_disabled(runtime) -> bool:
     """真实 runtime 是否取消自动额度冷却（仅 ZCode）。固定策略，不可配置。"""
     return runtime in AUTO_QUOTA_COOLDOWN_DISABLED_RUNTIMES
+
+
+def is_trusted_hard_quota_provider(provider) -> bool:
+    """1308/1310 硬额度码只限真实 BigModel/Zhipu 渠道；其它 provider 不泛化。"""
+    return bool(provider) and bool(
+        _TRUSTED_HARD_QUOTA_PROVIDER_RE.search(str(provider)))
+
+
+def hard_limit_message(text) -> bool:
+    """窄的硬上限消息语义（服务器文本），优先于 rate_limit 标签。普通限流文本
+    （too many requests / rate limited / 频率限制）绝不命中。"""
+    return bool(text) and isinstance(text, str) and bool(
+        _HARD_LIMIT_MESSAGE_RE.search(text))
 
 _SCHEMA = """
 CREATE TABLE IF NOT EXISTS cooldowns(
@@ -133,6 +169,30 @@ CREATE TABLE IF NOT EXISTS channel_locks(
   acquired_at_utc TEXT NOT NULL,
   attempt TEXT NOT NULL DEFAULT '',
   note TEXT);
+CREATE TABLE IF NOT EXISTS zcode_availability(
+  channel_key TEXT PRIMARY KEY,
+  provider TEXT NOT NULL,
+  quota_group TEXT NOT NULL,
+  state TEXT NOT NULL CHECK(state IN ('backoff','hard_hold','recovery_unverified','healthy')),
+  epoch INTEGER NOT NULL DEFAULT 0,
+  kind TEXT,
+  blocked_until_utc TEXT,
+  probe_active INTEGER NOT NULL DEFAULT 0,
+  probe_attempt TEXT,
+  probe_failures INTEGER NOT NULL DEFAULT 0,
+  probe_blocked_until_utc TEXT,
+  backoff_attempts INTEGER NOT NULL DEFAULT 0,
+  last_provider_code INTEGER,
+  last_reason TEXT,
+  reset_hint_utc TEXT,
+  evidence_path TEXT,
+  evidence_sha256 TEXT,
+  manual_reset_at_utc TEXT,
+  manual_reset_evidence TEXT,
+  manual_reset_epoch INTEGER,
+  recovery_eligibility_consumed INTEGER NOT NULL DEFAULT 0,
+  recorded_at_utc TEXT,
+  updated_at_utc TEXT);
 """
 
 # 旧库（S1 结构）迁移：CREATE TABLE IF NOT EXISTS 不会给已有表补列。
@@ -143,6 +203,13 @@ _MIGRATIONS = (
      'ALTER TABLE cooldowns ADD COLUMN probe_attempt TEXT'),
     ('workspace_locks', 'attempt',
      'ALTER TABLE workspace_locks ADD COLUMN attempt TEXT NOT NULL DEFAULT \'\''),
+    # BW-AVAILABILITY-20261009-B4 缺陷 3：一次 recovery 资格持久消费 + 人工重置绑定
+    # 失败代际（防旧事件重放给新失败重造资格）。
+    ('zcode_availability', 'manual_reset_epoch',
+     'ALTER TABLE zcode_availability ADD COLUMN manual_reset_epoch INTEGER'),
+    ('zcode_availability', 'recovery_eligibility_consumed',
+     'ALTER TABLE zcode_availability ADD COLUMN recovery_eligibility_consumed '
+     'INTEGER NOT NULL DEFAULT 0'),
 )
 
 
@@ -182,6 +249,29 @@ def _connect(store_path) -> sqlite3.Connection:
             except sqlite3.OperationalError:
                 pass  # 并发迁移竞态：另一连接已补列
     return conn
+
+
+def _open_readonly(store_path) -> sqlite3.Connection:
+    """BW-AVAILABILITY-20261009-B4 缺陷 5：真正只读的取数连接——绝不 mkdir、绝不
+    DDL/迁移、绝不开 WAL、绝不建表。缺库/缺表时 SELECT 直接抛错（由调用方 fail-closed
+    当作"无记录"，而不是悄悄 healthy），且绝不落任何文件。:memory: 无法以 ro URI 打开，
+    故只读路径拒绝内存库（调用方本就要求真实持久文件才走只读诊断）。"""
+    path = Path(store_path)
+    if str(path) == ':memory:':
+        raise sqlite3.OperationalError('read-only availability lookup needs a real '
+                                       'persistent file, not an in-memory db')
+    if not path.is_file():
+        # 绝不 mkdir/建库：缺库直接返回"空"（调用方不产生任何副作用）。
+        raise FileNotFoundError(str(path))
+    uri = path.as_uri() + '?mode=ro'
+    conn = sqlite3.connect(uri, uri=True, timeout=30, isolation_level=None)
+    conn.row_factory = sqlite3.Row
+    return conn
+
+
+def _table_present(conn, name) -> bool:
+    return conn.execute("SELECT 1 FROM sqlite_master WHERE type='table' AND name=?",
+                        (name,)).fetchone() is not None
 
 
 # ---------------------------------------------------------------- 路由解析
@@ -241,24 +331,29 @@ def _independent_confirmed_groups(routes) -> set:
 def parse_reset_datetime(texts) -> datetime | None:
     """从错误结构文本提取带时区的服务器 reset 时间并换算 UTC。只认带明确时区
     （UTC+8 / +08:00 等）的形式；无时区或非法日期（如 13 月 45 日）返回 None，
-    不猜、不用固定值替代。"""
+    不猜、不用固定值替代。
+
+    BW-AVAILABILITY-20261009-B2：多个 reset 时**跳过非法项、取最晚的合法值**（最严格
+    服务端下限），绝不因首个非法/无时区项就丢弃后续合法值，也绝不返回早于其它合法值的
+    首个匹配。全非法才返回 None。"""
+    latest = None
     for text in texts or []:
         if not isinstance(text, str):
             continue
-        m = _RESET_DT_RE.search(text)
-        if not m:
-            continue
-        year, month, day, hour, minute, second, sign, tzh, tzm = m.groups()
-        try:
-            offset = timedelta(hours=int(tzh), minutes=int(tzm or 0))
-            if sign == '-':
-                offset = -offset
-            dt = datetime(int(year), int(month), int(day), int(hour), int(minute),
-                          int(second), tzinfo=timezone(offset))
-        except ValueError:
-            return None
-        return dt.astimezone(timezone.utc)
-    return None
+        for m in _RESET_DT_RE.finditer(text):
+            year, month, day, hour, minute, second, sign, tzh, tzm = m.groups()
+            try:
+                offset = timedelta(hours=int(tzh), minutes=int(tzm or 0))
+                if sign == '-':
+                    offset = -offset
+                dt = datetime(int(year), int(month), int(day), int(hour), int(minute),
+                              int(second), tzinfo=timezone(offset))
+            except ValueError:
+                continue  # 非法日期（如 13 月 45 日）：跳过，继续看后续候选
+            dt_utc = dt.astimezone(timezone.utc)
+            if latest is None or dt_utc > latest:
+                latest = dt_utc
+    return latest
 
 
 def parse_retry_after(value, now=None) -> datetime | None:
@@ -341,10 +436,21 @@ def _failure_texts(errors, errors_info) -> list:
 
 
 def _has_quota_category(errors_info) -> bool:
+    """BW-AVAILABILITY-20261009-B2 同条目绑定修正：category=quota 只有与 429
+    status/code 出现在**同一条真实错误条目**里才算数——另一条不带 429 的 quota 条目
+    绝不能污染普通 429（否则普通限流会被误升格成 24h 无窗口冷却）。"""
     if isinstance(errors_info, list):
         for item in errors_info:
-            if isinstance(item, dict) and item.get('category') in QUOTA_CATEGORIES:
+            if not isinstance(item, dict) or item.get('category') not in QUOTA_CATEGORIES:
+                continue
+            if item.get('status') == 429 or item.get('response_status') == 429:
                 return True
+            for key in ('code', 'provider_code'):
+                value = item.get(key)
+                if isinstance(value, int) and not isinstance(value, bool) and value == 429:
+                    return True
+                if isinstance(value, str) and value.strip() == '429':
+                    return True
     return False
 
 
@@ -394,6 +500,710 @@ def classify_quota_failure(errors, errors_info, retry_after=None, now=None) -> d
     base['reason'] = ('explicit temporary 429 without any window; capped exponential '
                       'backoff with jitter (scheduler-level, single layer)')
     return base
+
+
+# ------------------------------------------------- ZCode 独立 availability 状态
+# BW-AVAILABILITY-20261009-B2：全新的 ZCode 可用性/防重复状态，与旧 cooldowns 表完全
+# 分离（旧冷却不复活、ZCode 失败也绝不写 cooldowns）。channel_key 绑定真实 provider +
+# 受信任 quota_group：配置别名不能拆分同一真实通道；routes 缺失/更名不能借新别名绕过
+# （保守匹配：同 provider 或同 group 的任一未清行都参与判定）。
+def zcode_channel_key(provider, quota_group) -> str:
+    return f'{provider}|{quota_group}'
+
+
+def _as_429_int(value):
+    if isinstance(value, bool):
+        return None
+    if isinstance(value, int):
+        return value
+    if isinstance(value, str) and value.strip().lstrip('-').isdigit():
+        return int(value.strip())
+    return None
+
+
+def classify_zcode_availability(errors, errors_info, *, provider, retry_after=None,
+                                now=None) -> dict:
+    """ZCode availability 事件分类（与旧 classify_quota_failure 口径分离）。
+
+    - 只认**同一条真实错误条目内绑定**的 status/provider/code/message 429 事实：
+      另一条不带 429 的 quota 条目不能污染普通 429；报告正文里的 429 数字、取消退出码
+      都不进入本分类（调用方只在结构化失败信封上调用，且入口对取消码另有守卫）。
+    - 硬额度只限真实 BigModel/Zhipu 渠道的 1308/1310，或窄的硬上限消息语义（服务器
+      自己的文本，优先于 wrapper 派生的 rate_limit 标签）；同一数字来自其它 provider
+      不泛化。
+    - reset/Retry-After 取最晚的合法下限（跳过非法/无时区项，绝不猜）。
+    - 结果只记录状态与原因，绝不宣称真实额度/账务/免费。"""
+    now = now or utcnow()
+    base = {'is_trusted_429': False, 'hard_quota': False, 'kind': None,
+            'provider_code': None, 'blocked_until_utc': None, 'reason': None,
+            'reset_window_utc': None, 'retry_after_until_utc': None,
+            'retry_after_raw': None, 'provider': provider, 'bound_entry': None}
+    entries = []
+    for container in (errors, errors_info):
+        if isinstance(container, list):
+            for item in container:
+                if isinstance(item, (dict, str)):
+                    entries.append(item)
+    chosen = None
+    windows = []
+    for item in entries:
+        if isinstance(item, dict):
+            is429 = ec.explicit_429(None, [item])
+        else:
+            is429 = ec.explicit_429([item], None)
+        if not is429:
+            continue
+        if isinstance(item, dict):
+            texts = [item.get(k) for k in ('message', 'details', 'reason')
+                     if isinstance(item.get(k), str)]
+            entry_provider = item.get('provider') or provider
+            pcode = (_as_429_int(item.get('provider_code'))
+                     or _as_429_int(item.get('code')))
+            ra_raw = extract_retry_after(None, [item], now=now)
+        else:
+            texts = [item]
+            entry_provider = provider
+            pcode = None
+            ra_raw = extract_retry_after([item], None, now=now)
+        # BW-AVAILABILITY-20261009-B4 缺陷 2：硬额度只认**核验过的请求 provider**（受信任
+        # BigModel/Zhipu 或显式可信别名）在同一条 429 载体里携带 1308/1310；条目里自报
+        # provider 冒充受信任但核验请求来自其它渠道，一律不泛化为硬额度。
+        hard_by_code = (pcode in ZCODE_HARD_QUOTA_PROVIDER_CODES
+                        and is_trusted_hard_quota_provider(provider))
+        hard_by_msg = any(hard_limit_message(t) for t in texts)
+        hard = bool(hard_by_code or hard_by_msg)
+        reset_dt = parse_reset_datetime(texts)
+        ra_dt = parse_retry_after(ra_raw, now=now) if ra_raw is not None else None
+        for dt in (reset_dt, ra_dt):
+            if dt is not None:
+                windows.append(dt)
+        cand = {'hard': hard, 'hard_by_code': hard_by_code, 'hard_by_msg': hard_by_msg,
+                'provider_code': pcode, 'entry_provider': entry_provider,
+                'reset_dt': reset_dt, 'ra_dt': ra_dt, 'ra_raw': ra_raw,
+                'category': item.get('category') if isinstance(item, dict) else None,
+                'status': (item.get('status', item.get('response_status'))
+                           if isinstance(item, dict) else None)}
+        # 硬额度条目优先作为事实来源；同类取首个。
+        if chosen is None or (hard and not chosen['hard']):
+            chosen = cand
+    if chosen is None:
+        base['reason'] = ('no explicit 429 status/code bound inside a single real error '
+                          'entry; report-body 429 digits, separate non-429 quota entries '
+                          'and cancel exit codes never trigger availability recording')
+        return base
+    base['is_trusted_429'] = True
+    base['hard_quota'] = chosen['hard']
+    base['provider_code'] = chosen['provider_code']
+    base['bound_entry'] = {'status': chosen['status'], 'provider': chosen['entry_provider'],
+                           'provider_code': chosen['provider_code'],
+                           'category': chosen['category'],
+                           'note': 'status/provider/code/message were bound in the SAME '
+                                   'real error entry'}
+    until = max(windows) if windows else None
+    if until is not None:
+        base['blocked_until_utc'] = _iso(until)
+        base['reset_window_utc'] = _iso(chosen['reset_dt']) \
+            if chosen['reset_dt'] is not None else None
+        base['retry_after_until_utc'] = _iso(chosen['ra_dt']) \
+            if chosen['ra_dt'] is not None else None
+        base['retry_after_raw'] = chosen['ra_raw'] if chosen['ra_dt'] is not None else None
+    if chosen['hard']:
+        if until is None:
+            base['kind'] = 'hard_hold'
+            base['reason'] = ('hard quota limit (trusted provider code '
+                              f'{chosen["provider_code"]} or hard-limit message semantics '
+                              'which override the wrapper-derived rate_limit label) with '
+                              'NO trusted tz-aware window: hold awaiting an explicit user '
+                              'reset or new recovery evidence; no guessed 24h, no fixed '
+                              'short cycle, no claim about actual quota/billing')
+        else:
+            base['kind'] = 'hard_reset_window'
+            base['reason'] = ('hard quota limit with a trusted server window; hold until '
+                              'the latest valid floor, then a single bounded probe must '
+                              'verify recovery (never auto-declared healthy)')
+    else:
+        if until is None:
+            base['kind'] = 'temporary_backoff'
+            base['reason'] = ('ordinary temporary 429 without any window; bounded '
+                              'exponential backoff with jitter (never a hard hold)')
+        else:
+            base['kind'] = 'backoff_until_window'
+            base['reason'] = ('ordinary temporary 429 with a trusted server window; '
+                              'bounded until the latest valid floor')
+    return base
+
+
+def _availability_row_effective(conn, row, now):
+    """把行推进到当前有效状态（事务内）：hard_hold 到期 → recovery_unverified（恢复点
+    到了也只"可核验"，不自动 healthy）。返回 (state, blocked_until_dt)。"""
+    state = row['state']
+    until = (datetime.fromisoformat(row['blocked_until_utc'])
+             if row['blocked_until_utc'] else None)
+    if state == 'hard_hold' and until is not None and until <= now:
+        conn.execute('UPDATE zcode_availability SET state=?, updated_at_utc=? '
+                     'WHERE channel_key=? AND state=?',
+                     ('recovery_unverified', _iso(now), row['channel_key'], 'hard_hold'))
+        state = 'recovery_unverified'
+    return state, until
+
+
+def zcode_blocking_rows(store_path, now=None) -> list:
+    """当前对完整派工构成阻断的 ZCode availability 行（供 dispatch_pool 资格过滤）。
+    healthy 与已到期的 backoff 不阻断；recovery_unverified 阻断完整派工（只放行单次
+    有界 probe，由 gate 判定）。只读，不改状态。BW-AVAILABILITY-20261009-B4 缺陷 5：
+    走真正只读连接，绝不建库/建表/迁移；缺库或缺表视为"无任何 availability 记录"
+    （返回空），其它读取错误直接抛出，由调用方 fail-closed（绝不因读失败当 healthy）。"""
+    now = now or utcnow()
+    out = []
+    try:
+        conn = _open_readonly(store_path)
+    except FileNotFoundError:
+        return []
+    try:
+        with closing(conn):
+            if not _table_present(conn, 'zcode_availability'):
+                return []
+            for row in conn.execute('SELECT * FROM zcode_availability').fetchall():
+                state = row['state']
+                until = (datetime.fromisoformat(row['blocked_until_utc'])
+                         if row['blocked_until_utc'] else None)
+                if state == 'healthy':
+                    continue
+                if state == 'backoff' and until is not None and until <= now:
+                    continue
+                out.append({'channel_key': row['channel_key'], 'provider': row['provider'],
+                            'quota_group': row['quota_group'], 'state': state,
+                            'epoch': row['epoch'],
+                            'blocked_until_utc': row['blocked_until_utc'],
+                            'last_reason': row['last_reason'],
+                            'last_provider_code': row['last_provider_code']})
+    except sqlite3.Error:
+        # 只读连接损坏/锁定：绝不静默当无阻断，向上抛给调用方 fail-closed。
+        raise
+    return out
+
+
+def zcode_availability_gate(store_path, *, provider, routes_path=None, identity=None,
+                            purpose='dispatch', now=None) -> dict:
+    """ZCode 入口在 Popen 前的权威 availability 原子门（与旧 cooldowns 门完全独立）：
+    - hard_hold（无窗口=无限期，有窗口=到恢复点）→ 拒绝完整派工；恢复点到了转
+      recovery_unverified，只放行**单次有界无副作用 probe**（CAS 单赢家）；
+    - backoff 未到期 → 拒绝；到期即可正常派工；
+    - probe 失败/超时/取消后 probe_blocked_until 之内不能立即再 probe；
+    - 保守跨别名匹配：同 provider 或同 group 的任一未清行都阻断（配置别名/routes 更名
+      不能拆分或绕过）；
+    - 只记录状态/原因，绝不宣称真实额度/账务/免费。"""
+    if purpose not in ('dispatch', 'probe'):
+        raise ValueError("purpose must be 'dispatch' or 'probe'")
+    now = now or utcnow()
+    routes = load_routes(routes_path)
+    ident = dict(identity or {})
+    ident.setdefault('provider', provider)
+    resolution = resolve_group(routes, 'zcode', ident)
+    group = resolution['quota_group']
+    key = zcode_channel_key(provider, group)
+    attempt_id = uuid.uuid4().hex
+    with closing(_connect(store_path)) as conn:
+        conn.execute('BEGIN IMMEDIATE')
+        try:
+            rows = conn.execute('SELECT * FROM zcode_availability').fetchall()
+            matching = [r for r in rows
+                        if r['provider'] == provider or r['quota_group'] == group]
+            reasons = []
+            block_until = []
+            probe_candidate = None
+            for row in matching:
+                state, until = _availability_row_effective(conn, row, now)
+                if state == 'healthy':
+                    continue
+                if state == 'backoff':
+                    if until is not None and until <= now:
+                        continue  # 有界退避到期：可正常派工
+                    reasons.append(f'zcode channel {row["channel_key"]} is in bounded '
+                                   f'backoff until {row["blocked_until_utc"]} (ordinary '
+                                   f'temporary 429; reason={row["last_reason"]})')
+                    block_until.append(row['blocked_until_utc'])
+                    continue
+                if state == 'hard_hold':
+                    reasons.append(
+                        f'zcode channel {row["channel_key"]} is under a HARD quota hold '
+                        f'(provider_code={row["last_provider_code"]}, '
+                        f'blocked_until={row["blocked_until_utc"] or "indefinite"}): '
+                        f'awaiting an explicit user reset or new recovery evidence via '
+                        f'the narrow manual reset entry; no guessed recovery, no auto '
+                        f'retry (reason={row["last_reason"]})')
+                    if row['blocked_until_utc']:
+                        block_until.append(row['blocked_until_utc'])
+                    continue
+                # recovery_unverified
+                probe_blocked = row['probe_blocked_until_utc']
+                if probe_blocked and datetime.fromisoformat(probe_blocked) > now:
+                    reasons.append(f'zcode channel {row["channel_key"]} recovery probe '
+                                   f'failed/timed out/cancelled; cannot immediately '
+                                   f're-probe until {probe_blocked}')
+                    block_until.append(probe_blocked)
+                    continue
+                # BW-AVAILABILITY-20261009-B4 缺陷 3：唯一一次 recovery 资格已被真实失败/
+                # 超时/取消消耗（consumed=1）时，退避窗口到期也绝不再凭空发定时 probe——
+                # 必须由新的 manual reset（推进 epoch、重置 consumed）重新取得资格。
+                if row['recovery_eligibility_consumed'] and not row['probe_active']:
+                    reasons.append(
+                        f'zcode channel {row["channel_key"]} already consumed its single '
+                        f'recovery eligibility on a failed probe; a bounded timed re-probe '
+                        f'without NEW recovery evidence is never granted — reset again '
+                        f'with fresh evidence to re-arm one probe')
+                    continue
+                if purpose == 'dispatch':
+                    reasons.append(f'zcode channel {row["channel_key"]} recovery is '
+                                   f'unverified; a single bounded no-side-effect probe '
+                                   f'must pass first (manual reset makes it verifiable, '
+                                   f'NOT healthy); full dispatch refused')
+                    continue
+                if row['probe_active']:
+                    reasons.append(f'zcode channel {row["channel_key"]} already has a '
+                                   f'recovery probe in flight; only one bounded probe '
+                                   f'at a time')
+                    continue
+                if probe_candidate is None or row['channel_key'] == key:
+                    probe_candidate = row
+            if reasons:
+                conn.execute('ROLLBACK')
+                return {'allowed': False, 'sent': False, 'provider': provider,
+                        'quota_group': group, 'channel_key': key,
+                        'resolution': resolution, 'purpose': purpose,
+                        'state': 'blocked', 'reasons': reasons,
+                        'blocked_until_utc': max(block_until) if block_until else None}
+            granted_epoch = 0
+            probe_granted = False
+            state_now = None
+            # BW-AVAILABILITY-20261009-B4 缺陷 1：attempt 必须携带并结算 CAS 实际授予的
+            # 那一行的真实 row key（同 provider 配置别名/组更名时 probe 可能在旧组行上授予，
+            # 却按新组 key 返回→结算找不到行→旧行 probe_active 永远 true）。这里回传
+            # 授予行的 channel_key/quota_group/provider，供入口按精确行 CAS 结算。
+            granted_channel_key = key
+            granted_group = group
+            granted_provider = provider
+            if probe_candidate is not None:
+                conn.execute('UPDATE zcode_availability SET probe_active=1, '
+                             'probe_attempt=?, updated_at_utc=? WHERE channel_key=? '
+                             "AND state='recovery_unverified' AND probe_active=0",
+                             (attempt_id, _iso(now), probe_candidate['channel_key']))
+                probe_granted = True
+                granted_epoch = probe_candidate['epoch']
+                state_now = 'recovery_unverified'
+                granted_channel_key = probe_candidate['channel_key']
+                granted_group = probe_candidate['quota_group']
+                granted_provider = probe_candidate['provider']
+            else:
+                exact = conn.execute('SELECT * FROM zcode_availability WHERE '
+                                     'channel_key=?', (key,)).fetchone()
+                if exact is not None:
+                    granted_epoch = exact['epoch']
+                    state_now = exact['state']
+                else:
+                    # 无行的普通/新渠道：给一个明确的初始代际 0（绝非 None），使任何
+                    # 迟到/正常成功都必须匹配代际，不能凭空清除后来的失败代际。
+                    granted_epoch = 0
+                    state_now = 'available'
+            conn.execute('COMMIT')
+        except Exception:
+            try:
+                conn.execute('ROLLBACK')
+            except sqlite3.Error:
+                pass
+            raise
+    return {'allowed': True, 'sent': False, 'provider': provider, 'quota_group': group,
+            'channel_key': granted_channel_key, 'granted_channel_key': granted_channel_key,
+            'granted_quota_group': granted_group, 'granted_provider': granted_provider,
+            'resolution': resolution, 'purpose': purpose,
+            'attempt_id': attempt_id, 'availability_epoch': granted_epoch,
+            'probe_granted': probe_granted, 'state': state_now or 'available',
+            'reasons': [],
+            'note': 'independent ZCode availability state; makes no claim about actual '
+                    'quota, billing, or free availability'}
+
+
+def zcode_probe_ticket_valid(store_path, *, provider, channel_key, attempt_id,
+                             epoch=None, now=None) -> bool:
+    """BW-AVAILABILITY-20261009-B4 缺陷 4：容量门核验一张**真正绑定**的 recovery probe
+    票据（绝不信任可自报的 `probe=true` 布尔）。只读查库，行必须：
+    - channel_key 精确匹配（CAS 授予的那一行）；
+    - state='recovery_unverified'；
+    - probe_active=1 且 probe_attempt==attempt_id（本次授予的唯一在飞 probe）；
+    - 给了 epoch 就必须等于行代际（防旧票据对后来的失败代际冒充有效）。
+    任一不符 → False（正常派工照旧被拒）。缺库/缺表/读取错误一律 False（fail-closed）。"""
+    if not attempt_id or not channel_key:
+        return False
+    now = now or utcnow()
+    try:
+        conn = _open_readonly(store_path)
+    except (FileNotFoundError, sqlite3.OperationalError):
+        return False
+    try:
+        with closing(conn):
+            if not _table_present(conn, 'zcode_availability'):
+                return False
+            row = conn.execute('SELECT * FROM zcode_availability WHERE channel_key=?',
+                               (channel_key,)).fetchone()
+    except sqlite3.Error:
+        return False
+    if row is None:
+        return False
+    if row['state'] != 'recovery_unverified' or not row['probe_active']:
+        return False
+    if row['probe_attempt'] != attempt_id:
+        return False
+    if epoch is not None and row['epoch'] != epoch:
+        return False
+    return True
+
+
+def record_zcode_unavailability(store_path, *, provider, quota_group, classification,
+                                attempt_id=None, source=None, evidence_path=None,
+                                evidence_sha256=None, now=None) -> dict:
+    """把一次**受信任 429** 终态落进独立 availability 状态（ZCode 入口在错误证据确认
+    后、接续冻结/终态结算之前调用——即使随后冻结失败或终态未知，不可用事实也已保存）。
+    - epoch 单调递增；迟到成功靠 epoch+attempt CAS，绝不能清除更新的失败 epoch；
+    - 硬额度无窗口 → hard_hold 无限期（等显式用户重置/新恢复证据，不猜 24h）；
+    - 普通临时 429 → 有界指数退避；
+    - 单调下限：已有更晚的 blocked_until 不被更早事件缩短，无限期 hold 不被有限窗口替换；
+    - 若本次正是失败 probe 的结算（attempt 匹配）→ probe 占位结算 + 失败退避窗口，
+      失败/超时/取消后不能立即再 probe。"""
+    now = now or utcnow()
+    if not classification.get('is_trusted_429'):
+        return {'recorded': False,
+                'reasons': ['classification is not a trusted 429 availability event']}
+    kind = classification.get('kind')
+    if kind not in ZCODE_AVAILABILITY_KINDS:
+        return {'recorded': False, 'reasons': [f'unknown availability kind {kind!r}']}
+    key = zcode_channel_key(provider, quota_group)
+    new_until = (datetime.fromisoformat(classification['blocked_until_utc'])
+                 if classification.get('blocked_until_utc') else None)
+    new_state = 'hard_hold' if kind in ('hard_hold', 'hard_reset_window') else 'backoff'
+    with closing(_connect(store_path)) as conn:
+        conn.execute('BEGIN IMMEDIATE')
+        try:
+            row = conn.execute('SELECT * FROM zcode_availability WHERE channel_key=?',
+                               (key,)).fetchone()
+            epoch = (row['epoch'] + 1) if row is not None else 1
+            backoff_attempts = (row['backoff_attempts'] if row is not None else 0)
+            probe_failures = (row['probe_failures'] if row is not None else 0)
+            probe_blocked = (row['probe_blocked_until_utc'] if row is not None else None)
+            kept_later = False
+            if kind == 'temporary_backoff':
+                delay = min(TEMP_BACKOFF_BASE_SECONDS * (2 ** backoff_attempts),
+                            TEMP_BACKOFF_CAP_SECONDS)
+                delay = delay * (1 + random.uniform(0, TEMP_BACKOFF_JITTER))
+                candidate_until = now + timedelta(seconds=delay)
+                backoff_attempts += 1
+            elif kind == 'hard_hold':
+                candidate_until = None
+                backoff_attempts = 0
+            else:
+                candidate_until = new_until
+                backoff_attempts = 0 if new_state == 'hard_hold' else backoff_attempts
+            state = new_state
+            if row is not None:
+                existing_until = (datetime.fromisoformat(row['blocked_until_utc'])
+                                  if row['blocked_until_utc'] else None)
+                if row['state'] == 'hard_hold' and existing_until is None:
+                    # 已有无限期硬 hold：任何有限窗口都不缩短它，除非新事件也是无限期。
+                    state = 'hard_hold'
+                    candidate_until = None
+                    kept_later = True
+                elif candidate_until is None:
+                    state = 'hard_hold'
+                elif existing_until is not None and existing_until > candidate_until:
+                    candidate_until = existing_until
+                    kept_later = True
+                    if row['state'] == 'hard_hold':
+                        state = 'hard_hold'
+            probe_settled = False
+            if attempt_id is not None and row is not None \
+                    and row['probe_attempt'] == attempt_id:
+                probe_settled = True
+                probe_failures += 1
+                retry_delay = min(ZCODE_PROBE_RETRY_BASE_SECONDS * (2 ** probe_failures),
+                                  ZCODE_PROBE_RETRY_CAP_SECONDS)
+                probe_blocked = _iso(now + timedelta(seconds=retry_delay))
+            # BW-AVAILABILITY-20261009-B5：这次落库若正是在飞 recovery probe 的真实失败
+            # 结算（attempt 匹配），就原子消费该代际唯一一次核验资格——清 probe_active 同时
+            # 置 consumed=1。否则 settle 之后（probe_attempt 已清、settle 不再认 owner）到
+            # probe_blocked 到期时，同一恢复依据会被 gate 再次放行，等于用固定退避反复试硬额度。
+            consume_elig = 1 if probe_settled else 0
+            conn.execute(
+                'INSERT INTO zcode_availability(channel_key, provider, quota_group, '
+                'state, epoch, kind, blocked_until_utc, probe_active, probe_attempt, '
+                'probe_failures, probe_blocked_until_utc, backoff_attempts, '
+                'last_provider_code, last_reason, reset_hint_utc, evidence_path, '
+                'evidence_sha256, recorded_at_utc, updated_at_utc, '
+                'recovery_eligibility_consumed) '
+                'VALUES(?,?,?,?,?,?,?,0,NULL,?,?,?,?,?,?,?,?,?,?,?) '
+                'ON CONFLICT(channel_key) DO UPDATE SET state=excluded.state, '
+                'epoch=excluded.epoch, kind=excluded.kind, '
+                'blocked_until_utc=excluded.blocked_until_utc, probe_active=0, '
+                'probe_attempt=NULL, probe_failures=excluded.probe_failures, '
+                'probe_blocked_until_utc=COALESCE(excluded.probe_blocked_until_utc, '
+                'zcode_availability.probe_blocked_until_utc), '
+                'backoff_attempts=excluded.backoff_attempts, '
+                'last_provider_code=excluded.last_provider_code, '
+                'last_reason=excluded.last_reason, reset_hint_utc=excluded.reset_hint_utc, '
+                'evidence_path=excluded.evidence_path, '
+                'evidence_sha256=excluded.evidence_sha256, '
+                'recovery_eligibility_consumed=MAX(zcode_availability.'
+                'recovery_eligibility_consumed, excluded.recovery_eligibility_consumed), '
+                'updated_at_utc=excluded.updated_at_utc',
+                (key, provider, quota_group, state, epoch, kind,
+                 _iso(candidate_until) if candidate_until is not None else None,
+                 probe_failures, probe_blocked, backoff_attempts,
+                 classification.get('provider_code'), 
+                 (classification.get('reason') or '') + (f' | source: {source}'
+                  if source else ''),
+                 classification.get('blocked_until_utc'), evidence_path,
+                 evidence_sha256, _iso(now), _iso(now), consume_elig))
+            conn.execute('COMMIT')
+        except Exception:
+            try:
+                conn.execute('ROLLBACK')
+            except sqlite3.Error:
+                pass
+            raise
+    return {'recorded': True, 'channel_key': key, 'provider': provider,
+            'quota_group': quota_group, 'state': state, 'kind': kind, 'epoch': epoch,
+            'hard_quota': bool(classification.get('hard_quota')),
+            'provider_code': classification.get('provider_code'),
+            'blocked_until_utc': _iso(candidate_until) if candidate_until else None,
+            'monotonic_kept_later': kept_later, 'probe_settled': probe_settled,
+            'note': 'independent ZCode availability/anti-repeat state; the legacy '
+                    'cooldowns table is never touched (no revived cooldowns); records '
+                    'state/reason only, never claims actual quota/billing/free'}
+
+
+def settle_zcode_attempt(store_path, *, provider, quota_group=None, attempt_id, epoch,
+                         success, executed=True, channel_key=None, now=None) -> dict:
+    """ZCode attempt 终态对 availability 状态的结算（epoch+attempt CAS）：
+    - success=True 且 epoch 匹配（probe 还需 attempt 匹配）→ 转 healthy（核验通过才
+      恢复；manual reset 只到 recovery_unverified，"可核验"≠healthy）；
+    - 迟到成功（epoch 已被更新失败推进）→ 绝不清除新失败 epoch，只结算自己的 probe 占位；
+    - success=False → 绝不写 healthy；executed=True 的真实 probe 失败/超时/取消结算
+      占位并设再探测退避窗口；executed=False（Popen 前被拒，probe 从未执行）只归还
+      probe 资格，不算失败。
+    BW-AVAILABILITY-20261009-B4 缺陷 1：优先结算 attempt 携带的**精确 CAS 授予行 key**
+    （别名/组更名时授予行与重算 key 可能不同）；epoch 一律按代际比较（None 归一为初始代
+    际 0），绝不因 epoch 为 None 就跳过比较、让迟到/普通成功清除更新失败。"""
+    now = now or utcnow()
+    key = channel_key or zcode_channel_key(provider, quota_group)
+    attempt_epoch = 0 if epoch is None else epoch
+    with closing(_connect(store_path)) as conn:
+        conn.execute('BEGIN IMMEDIATE')
+        try:
+            row = conn.execute('SELECT * FROM zcode_availability WHERE channel_key=?',
+                               (key,)).fetchone()
+            if row is None:
+                conn.execute('COMMIT')
+                return {'settled': False, 'cleared': False,
+                        'reasons': ['no availability state recorded for this channel']}
+            owns_probe = row['probe_attempt'] is not None \
+                and row['probe_attempt'] == attempt_id
+            if success:
+                if attempt_epoch != row['epoch']:
+                    if owns_probe:
+                        conn.execute('UPDATE zcode_availability SET probe_active=0, '
+                                     'probe_attempt=NULL, updated_at_utc=? '
+                                     'WHERE channel_key=?', (_iso(now), key))
+                    conn.execute('COMMIT')
+                    return {'settled': True, 'cleared': False, 'epoch': row['epoch'],
+                            'reasons': [
+                                f'stale success: availability epoch is {row["epoch"]} but '
+                                f'this attempt observed {attempt_epoch}; a late success must '
+                                'not clear a newer failure epoch (two legal parallel tasks on '
+                                'the same provider keep the newer failure)']}
+                if row['probe_active'] and not owns_probe:
+                    conn.execute('COMMIT')
+                    return {'settled': True, 'cleared': False, 'epoch': row['epoch'],
+                            'reasons': ['a different recovery probe is in flight; this '
+                                        'success does not match it and clears nothing']}
+                conn.execute('UPDATE zcode_availability SET state=?, '
+                             'blocked_until_utc=NULL, probe_active=0, probe_attempt=NULL, '
+                             'probe_blocked_until_utc=NULL, backoff_attempts=0, '
+                             'recovery_eligibility_consumed=0, '
+                             'updated_at_utc=? WHERE channel_key=?',
+                             ('healthy', _iso(now), key))
+                conn.execute('COMMIT')
+                return {'settled': True, 'cleared': True, 'state': 'healthy',
+                        'epoch': row['epoch'],
+                        'note': 'probe/dispatch success verified against epoch+attempt; '
+                                'provider-side quota state remains provider-managed and '
+                                'is not claimed'}
+            if owns_probe:
+                if executed:
+                    probe_failures = row['probe_failures'] + 1
+                    retry_delay = min(
+                        ZCODE_PROBE_RETRY_BASE_SECONDS * (2 ** probe_failures),
+                        ZCODE_PROBE_RETRY_CAP_SECONDS)
+                    # BW-AVAILABILITY-20261009-B4 缺陷 3：一次 recovery 资格真实失败/超时/
+                    # 取消即消耗（consumed=1），此后即便退避窗口到期也不再凭空重发定时 probe，
+                    # 必须由**新的**人工恢复证据（manual reset，推进 epoch 并重置 consumed）
+                    # 才能重新取得唯一一次资格——绝不无新证据地反复 probe。
+                    conn.execute('UPDATE zcode_availability SET probe_active=0, '
+                                 'probe_attempt=NULL, probe_failures=?, '
+                                 'probe_blocked_until_utc=?, '
+                                 'recovery_eligibility_consumed=1, updated_at_utc=? '
+                                 'WHERE channel_key=?',
+                                 (probe_failures,
+                                  _iso(now + timedelta(seconds=retry_delay)),
+                                  _iso(now), key))
+                else:
+                    # pre-start refusal：probe 从未执行，只归还本次未执行的资格，不计失败、
+                    # 不消耗 recovery 资格（executed=False）。
+                    conn.execute('UPDATE zcode_availability SET probe_active=0, '
+                                 'probe_attempt=NULL, updated_at_utc=? WHERE channel_key=?',
+                                 (_iso(now), key))
+            conn.execute('COMMIT')
+            return {'settled': True, 'cleared': False, 'state': row['state'],
+                    'reasons': ['failure/timeout/cancel never writes healthy; probe '
+                                'placeholder settled' + ('' if executed else
+                                ' (pre-start refusal; probe eligibility restored)')]}
+        except Exception:
+            try:
+                conn.execute('ROLLBACK')
+            except sqlite3.Error:
+                pass
+            raise
+
+
+def zcode_manual_reset(store_path, *, provider, quota_group=None, routes_path=None,
+                       evidence_ref=None, epoch=None, now=None) -> dict:
+    """窄的幂等人工重置入口（绑定 epoch + 证据引用）：把 hard_hold/backoff 转为
+    recovery_unverified——"可核验"≠healthy：仍必须由单次有界无副作用 probe 成功核验。
+    - evidence_ref 必填（用户重置/新恢复证据的引用路径）；
+    - 给了 epoch 就必须匹配当前行（防止把更新的失败 epoch 重置掉）；
+    - probe 在飞时拒绝；同 epoch+同证据重复调用幂等；
+    - 重置推进 epoch，使重置前在飞的迟到成功无法清除重置后状态；
+    - 绝不宣称真实额度/账务/免费。"""
+    now = now or utcnow()
+    if not evidence_ref or not str(evidence_ref).strip():
+        return {'reset': False,
+                'reasons': ['evidence_ref is required: the manual reset must bind the '
+                            'explicit user reset / new recovery evidence reference']}
+    group = quota_group
+    if group is None:
+        routes = load_routes(routes_path)
+        group = resolve_group(routes, 'zcode', {'provider': provider})['quota_group']
+    key = zcode_channel_key(provider, group)
+    with closing(_connect(store_path)) as conn:
+        conn.execute('BEGIN IMMEDIATE')
+        try:
+            row = conn.execute('SELECT * FROM zcode_availability WHERE channel_key=?',
+                               (key,)).fetchone()
+            if row is None:
+                conn.execute('ROLLBACK')
+                return {'reset': False, 'channel_key': key,
+                        'reasons': ['no availability state recorded for this channel; '
+                                    'nothing to reset']}
+            # BW-AVAILABILITY-20261009-B5：重复/重放判定必须先于通用 epoch 比较——同一绑定
+            # 证据重放它自己创建的那一代 reset 必须**稳定幂等**返回，绝不因把 epoch 参数
+            # 传成“重置前的旧代际”（如首次 reset(epoch=1,E) 已把行推进到 2）而在下面 epoch
+            # 不匹配处被误判为 stale、既不返回新授权也不推进 epoch。
+            prior_bound = (row['manual_reset_evidence'] == str(evidence_ref)
+                           and row['manual_reset_epoch'] is not None)
+            # 旧事件重放：该证据当初绑定的是更老的失败代际，行已被更新失败推进 → 绝不能
+            # 给新失败重造资格或把新失败重置掉（即便省略 epoch 参数）。
+            if prior_bound and row['epoch'] > row['manual_reset_epoch']:
+                conn.execute('ROLLBACK')
+                return {'reset': False, 'channel_key': key, 'epoch': row['epoch'],
+                        'reasons': [f'stale reset replay: this evidence was bound to '
+                                    f'failure generation {row["manual_reset_epoch"]} but '
+                                    f'channel is now at epoch {row["epoch"]} (a newer '
+                                    'failure); an old reset event can never re-arm '
+                                    'eligibility for or wipe out a later failure']}
+            # 同证据 + 行代际正是该证据当初创建的那一代，且仍处 recovery_unverified 或已
+            # 由合法 probe 成功核验为 healthy → 幂等确认（BW-AVAILABILITY-20261009-B6）：
+            # 返回**实际**状态，绝不推进 epoch、绝不重开核验资格。B4/B5 此处只认
+            # recovery_unverified，导致 healthy 代际的同证据重放误落入下面的新 reset（推进
+            # epoch、把已核验通道重开成 recovery_unverified），故一并覆盖 healthy。
+            if prior_bound and row['epoch'] == row['manual_reset_epoch'] \
+                    and row['state'] in ('recovery_unverified', 'healthy'):
+                conn.execute('COMMIT')
+                return {'reset': True, 'idempotent': True, 'channel_key': key,
+                        'state': row['state'], 'epoch': row['epoch'],
+                        'note': ('idempotent repeat of the same bound reset; already '
+                                 'verified healthy — epoch not advanced, eligibility not '
+                                 're-armed'
+                                 if row['state'] == 'healthy' else
+                                 'idempotent repeat of the same bound reset; still '
+                                 'probe-eligible only, NOT healthy')}
+            # 通用 epoch 守卫（非重放路径）：显式给了 epoch 就必须匹配当前行，防止把更新的
+            # 失败代际重置掉。
+            if epoch is not None and row['epoch'] != epoch:
+                conn.execute('ROLLBACK')
+                return {'reset': False, 'channel_key': key, 'epoch': row['epoch'],
+                        'reasons': [f'stale reset: current epoch is {row["epoch"]} but '
+                                    f'the request bound {epoch}; refusing to reset a '
+                                    'newer failure state']}
+            if row['probe_active']:
+                conn.execute('ROLLBACK')
+                return {'reset': False, 'channel_key': key,
+                        'reasons': ['a recovery probe is in flight; settle it first']}
+            new_epoch = row['epoch'] + 1
+            conn.execute('UPDATE zcode_availability SET state=?, blocked_until_utc=NULL, '
+                         'probe_blocked_until_utc=NULL, epoch=?, manual_reset_at_utc=?, '
+                         'manual_reset_evidence=?, manual_reset_epoch=?, '
+                         'recovery_eligibility_consumed=0, updated_at_utc=? '
+                         'WHERE channel_key=?',
+                         ('recovery_unverified', new_epoch, _iso(now),
+                          str(evidence_ref), new_epoch, _iso(now), key))
+            conn.execute('COMMIT')
+        except Exception:
+            try:
+                conn.execute('ROLLBACK')
+            except sqlite3.Error:
+                pass
+            raise
+    return {'reset': True, 'idempotent': False, 'channel_key': key,
+            'state': 'recovery_unverified', 'epoch': new_epoch,
+            'note': 'manual reset makes the channel probe-verifiable, NOT healthy; a '
+                    'single bounded no-side-effect probe must succeed before normal '
+                    'dispatch; no claim about actual quota/billing/free'}
+
+
+def zcode_availability_status(store_path, now=None) -> dict:
+    """只读诊断（BW-AVAILABILITY-20261009-B4 缺陷 5）：绝不建库/建表/迁移，缺库或缺表
+    返回空 dict（无任何 availability 记录），其它读取错误抛出交由调用方处理。"""
+    now = now or utcnow()
+    try:
+        conn = _open_readonly(store_path)
+    except FileNotFoundError:
+        return {}
+    try:
+        with closing(conn):
+            if not _table_present(conn, 'zcode_availability'):
+                return {}
+            rows = conn.execute('SELECT * FROM zcode_availability').fetchall()
+    except sqlite3.Error:
+        raise
+    channels = {}
+    for row in rows:
+        until = (datetime.fromisoformat(row['blocked_until_utc'])
+                 if row['blocked_until_utc'] else None)
+        channels[row['channel_key']] = {
+            'provider': row['provider'], 'quota_group': row['quota_group'],
+            'state': row['state'], 'epoch': row['epoch'], 'kind': row['kind'],
+            'blocked_until_utc': row['blocked_until_utc'],
+            'blocked_expired': bool(until is not None and until <= now),
+            'probe_active': bool(row['probe_active']),
+            'probe_failures': row['probe_failures'],
+            'probe_blocked_until_utc': row['probe_blocked_until_utc'],
+            'recovery_eligibility_consumed': bool(row['recovery_eligibility_consumed']),
+            'last_provider_code': row['last_provider_code'],
+            'last_reason': row['last_reason'],
+            'evidence_path': row['evidence_path'],
+            'evidence_sha256': row['evidence_sha256'],
+            'manual_reset_at_utc': row['manual_reset_at_utc'],
+            'manual_reset_evidence': row['manual_reset_evidence'],
+            'manual_reset_epoch': row['manual_reset_epoch'],
+            'recorded_at_utc': row['recorded_at_utc']}
+    return channels
 
 
 # ---------------------------------------------------------------- 进程存活（只读）
@@ -519,7 +1329,8 @@ def get_status(store_path, quota_group=None, now=None) -> dict:
             'cooldown_expired': until <= now}
     return {'store': str(store_path), 'now_utc': _iso(now), 'cooldowns': cooldowns,
             'workspace_locks': [dict(lock) for lock in locks],
-            'channel_locks': [dict(lock) for lock in channels]}
+            'channel_locks': [dict(lock) for lock in channels],
+            'zcode_availability': zcode_availability_status(store_path, now=now)}
 
 
 def _effective_state(conn, group, now) -> sqlite3.Row | None:
@@ -1188,10 +1999,41 @@ def main(argv=None) -> int:
                     help='Operator asserts the recorded owner pid has reached a '
                          'verified terminal state (checked against summary/process '
                          'evidence); a pid that still appears alive is never released')
+    zs = sub.add_parser('zcode-status')
+    zs.add_argument('--store', default=argparse.SUPPRESS)
+    zs.add_argument('--provider', default=None,
+                    help='Optional filter: only show the availability row of channels '
+                         'whose provider matches this string')
+    zr = sub.add_parser('zcode-reset')
+    zr.add_argument('--store', default=argparse.SUPPRESS)
+    zr.add_argument('--provider', required=True)
+    zr.add_argument('--quota-group', dest='quota_group', default=None,
+                    help='Explicit quota group; resolved from --routes when omitted')
+    zr.add_argument('--evidence-ref', dest='evidence_ref', required=True,
+                    help='Reference to the explicit user reset / new recovery evidence '
+                         'binding this reset (required, never fabricated)')
+    zr.add_argument('--epoch', type=int, default=None,
+                    help='Optional epoch the reset is bound to; a stale epoch is refused')
     args = ap.parse_args(argv)
     if args.command == 'status':
         print(json.dumps(get_status(args.store, args.group), ensure_ascii=False, indent=2))
         return 0
+    if args.command == 'zcode-status':
+        channels = zcode_availability_status(args.store)
+        if args.provider:
+            channels = {k: v for k, v in channels.items()
+                        if v.get('provider') == args.provider}
+        print(json.dumps({'store': str(args.store), 'zcode_availability': channels},
+                         ensure_ascii=False, indent=2))
+        return 0
+    if args.command == 'zcode-reset':
+        result = zcode_manual_reset(args.store, provider=args.provider,
+                                    quota_group=args.quota_group,
+                                    routes_path=args.routes,
+                                    evidence_ref=args.evidence_ref,
+                                    epoch=args.epoch)
+        print(json.dumps(result, ensure_ascii=False, indent=2))
+        return 0 if result['reset'] else 2
     if args.command == 'import':
         identity = json.loads(args.identity)
         result = import_terminal(args.store, args.terminal, runtime=args.runtime,

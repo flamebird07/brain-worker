@@ -8,7 +8,7 @@
 
 后续规划、任务分解、执行器接入和范围判断均以这一核心为依据，避免项目偏离节省 GPT 额度的主旨。
 
-执行器范围（2026-10-08 用户决定，同日最新追加）：WorkBuddy 与独立 CodeBuddy CLI 均改为 human-relay only，不再从当前 Skill/CLI/控制面提交新的直接派发调用；选择它们时只生成完整可复制提示词，由客户人工交给外部 Agent，生成提示词不记成已派发。当前直连派发只保留 Qoder 与 ZCode，默认仍为 ZCode 优先、Qoder 沿用现有唯一模型及入口兜底。不再启动 WorkBuddy 的认证或测试。历史能力、原错误与模型信息与测试证据保留，仅作为离线证据回放/档案，不作为重新启用授权。
+执行器范围（2026-10-08 用户决定，同日最新追加）：WorkBuddy 与独立 CodeBuddy CLI 均改为 human-relay only，不再从当前 Skill/CLI/控制面提交新的直接派发调用；选择它们时只生成完整可复制提示词，由客户人工交给外部 Agent，生成提示词不记成已派发。当前直连派发只保留 Qoder 与 ZCode，默认按可用主力 `zcode:GLM-5.3`/`qoder:Qwen3.8-Max` 的 1:1 轮换、明确 executor+model 组合授权优先，主力不可用时改用溢出 Flash 或已授权接续（不再表述为“ZCode 默认优先、Qoder 唯一模型”）。不再启动 WorkBuddy 的认证或测试。历史能力、原错误与模型信息与测试证据保留，仅作为离线证据回放/档案，不作为重新启用授权。
 
 ### 持久额度冷却与路由门禁（2026-10-08，BW-QUOTA-20261008-S1）
 
@@ -18,9 +18,21 @@ CodeBuddy/ZCode 的所有真实派发在 Popen 前经过 `scripts/quota_control.
 
 所有会话共享同一持久并发容量池 `scripts/dispatch_pool.py`（纯标准库 sqlite3，默认 `~/.brain-worker/dispatch-pool.sqlite3`，`BRAIN_WORKER_DISPATCH_STORE` 覆盖）：主力 `zcode:GLM-5.3` 与 `qoder:Qwen3.8-Max` 各最多 2 个真实在途执行器、按 committed 计数做 **best-effort 1:1** 轮换（非严格均衡）；溢出 `qoder:Qwen3.8-Flash` 最多 2 个，**只有两主力池都满**才允许；国内合计 6。Luna（`luna:native`）只做救援、**无数量上限**：只有六名额全满、宿主真的问过用户、且 300 秒无回复后，经 `claim-due` 原子竞争裁决才可由宿主原生调用（等待超时≠默认无限授权；国内名额释放优先国内并原子取消同 task 的 pending 票据，不双派；原生工具启动后崩溃在写出 agentID 前 → `launch_unknown` 待人工核验、绝不自动重复启动）。Qoder/ZCode 入口在建输出目录、Popen 前**必须消费/校验一个容量 claim**（不能靠提示词或传入布尔跳过），非被选中组合 → `routing_required`/`sent=false`/退出 2、零证据目录、不计轮次；子进程真实结束立即释放名额，存活未知不释放、不被抢占，PID 复用绑定创建时刻。**容量并发 ≠ 额度冷却**：额度门禁仍在 `quota_control`。CodeBuddy/WorkBuddy 已退休为 human-relay only、不进池，生产 `codebuddy_direct` 已彻底移除可执行传输（不再 `import subprocess`/`dispatch_core`），真实传输管线整体迁到仅测试的 `tests/offline_codebuddy_harness.py::replay_dispatch`。详见 [global-dispatch](references/global-dispatch.md)。
 
+### ZCode 独立 availability 与执行器资格路由（2026-10-09，BW-AVAILABILITY-20261009-B2）
+
+现场事故（真实 SDK HTTP 429、BigModel Coding Plan、`provider_code=1310`、wrapper 派生 `category=rate_limit`，但服务器真实文本“已达到每周/每月使用上限”且 reset **无时区**）后，ZCode 新增与旧 `cooldowns` **完全独立**的持久 `zcode_availability` 状态（`record_zcode_unavailability` 绝不触碰旧冷却表，CodeBuddy 冷却与 ZCode availability 互不污染）：稳定通道键 `{provider}|{quota_group}`；硬额度只认**同一条真实错误条目内绑定**的 `(受信任 provider bigmodel|zhipu 且 code∈{1308,1310})` 或窄硬上限消息语义（优先于泛化 `rate_limit` 标签），非受信任渠道同码不泛化，报告正文 429/另一条非 429 quota 条目/取消退出码都不触发；硬额度无可信窗口 → **无限期 `hard_hold`**（等显式用户重置或新恢复证据，绝不猜 24h、不复用旧冷却），reset/Retry-After **取最晚合法下限、跳过非法/无时区项**；窄幂等 `zcode-reset`（必须 `--provider`+`--evidence-ref`）只置 `recovery_unverified`（**“可核验”≠healthy**），恢复点/新证据只**原子放行单次有界无副作用 probe**（CAS 单赢家、失败/超时/取消设再探测退避、成功须 `epoch`+`attempt` 双匹配才 `healthy`、迟到成功绝不清除更新失败 epoch），记录**永不宣称真实额度/账务/免费**。ZCode 入口在**容量门之前**过 `zcode_availability_gate`（权威最后原子闸，被拒退出 2/零建目录；证据确认但接续冻结失败/终态未知时仍存不可用事实、不释放活体锁）。`dispatch_pool` 新增 `executor`(auto|qoder|zcode)+`quota_store`/`quota_routes`：**先过滤合格候选再在可用主力间 1:1**，availability 过滤仅在显式传 `quota_store` 时生效（读取异常 fail-closed），显式 Qoder 有空位直接 claim Max、**绝不因历史 committed 计数被改道到 ZCode**，auto 不清库、消费 token 前复检并释放本任务自己的 reserved 占位（不泄漏）。Luna 回复状态机收紧（`domestic` 任何时刻绝不启动 Luna、重复 ask 不重置既有回复/scope/deadline、scope 损坏 fail-closed、未满 6 但 availability 不足时允许带独立客观理由的降级票据且非 capacity 超时不替代显式授权）。离线回归 `tests/test_availability_routing.py`（每用例临时 SQLite、合成 stub、`sent=false`/零模型调用），Windows/Linux CI 矩阵都跑。详见 [quota-routing §3b](references/quota-routing.md)、[global-dispatch](references/global-dispatch.md)、[luna-native](references/luna-native.md)。
+
+### availability 闭环加固与 combo 硬约束（2026-10-09，BW-AVAILABILITY-20261009-B4）
+
+在 B2 语义/额度统计范围/不宣称真实额度不变的前提下，B4 收口 7 个 reproduced 缺口并加受信任主脑的明确 `executor+runtime+model` combo 硬约束（含本阶段真实执行的 `qoder:Qwen3.8-Flash`）：gate 回传被授予行精确 `granted_channel_key`/`availability_epoch`（无行代际 `0` 不再 `None`）、settle 按该键总比较代际杜绝迟到成功误清 healthy；硬额度绑定已核验请求 provider、`_HARD_LIMIT_MESSAGE_RE` 收窄频率语义；新增 `recovery_eligibility_consumed` 使一个真实执行的失败 probe 消耗该代际唯一恢复资格（退避到期不再同 epoch 自动再探、须新证据），`zcode-reset` 绑 `manual_reset_epoch` 幂等且拒旧事件回放、只到 `recovery_unverified`；容量门不接受自报 `probe=true`，改由 `zcode_direct` 的 `probe_ticket` 经 `zcode_probe_ticket_valid` 只读绑定核验才放行唯一一次 probe 启动；`zcode_blocking_rows`/`zcode_availability_status` 改 `_open_readonly`（缺库/缺表返回空、绝不建表/迁移/WAL、读错 fail-closed 绝不静默 healthy），quota_store 统一 param-or-env 使 AUTO 无需额外参数即过滤不可用 ZCode；`zcode_direct` 确认 429 后**先记不可用、后释放容量**、`_preclaim_reconcile` 要求 child+wrapper 双死且创建身份匹配、auto 回收只放执行容量不清 availability；`claim_due` 用 `_scope_allowed_candidates` 尊重原 scope combo（绑 Qoder 只回收 QMax/Flash、绑 ZCode 被阻断保持 pending 绝不 Luna）、已授权组合不因别的候选有空位而被拒；`reply` 保护 settled/claimed/cancelled/launch_unknown、settled 不被迟到/重复回复重开，`ask_record` capacity 降级客观核验、**物理六满与合格候选耗尽分列**、误报不自动 Luna。默认 AUTO 主力优先/容量/1:1、Z2/Max2/Flash2 与 CodeBuddy/WorkBuddy 人工中转策略均不变（并发 2/4 是 Skill 政策、非已核实 Qoder 进程上限）。负例先于修复固化、修复后全绿，离线回归同 `tests/test_availability_routing.py`。详见 [quota-routing §3c](references/quota-routing.md) 及 global-dispatch/zcode-direct/qoder-direct/luna-native。
+
+### availability B5 收口（2026-10-09，BW-AVAILABILITY-20261009-B5）
+
+B5 只把 B4 仍 reproduced 的 7 个必要缺口用集中回归固化后最小收口（临时 SQLite + mock、零真实库/网络/Git、不改 registry/可信 runner/台账）：**默认持久来源统一**经 `_resolve_quota_store`（显式参数 → `BRAIN_WORKER_QUOTA_STORE` → `default_store_path()`），默认 AUTO 无需额外参数即读共享 availability 过滤不可用 ZCode，只读回核绝不建库/建表/迁移或写额度库、缺库=可用、读错 fail-closed，Q 入口走 env/同一默认源；**唯一恢复资格**：失败 probe 落受信任 429 时 `record_zcode_unavailability`/`settle_zcode_attempt` 原子 `consumed=1`，同代际已过期 reset 重放判 stale 绝不重造资格，仅新的显式 reset 再授一次；**真实 probe 启动异常**：Popen 抛错/child=None 对本次绑定 row/epoch/attempt 以 `executed=False` 结算、归还 `probe_active` 不消耗资格、绝不假称恢复，完整 mock 入口证明一次真实有界 probe=恰好一次启动；**自动回收统一 wrapper 身份**：`reconcile`/`_preclaim_reconcile` 要求 `wrapper_pid`+`wrapper_created` 齐备且 child 与 wrapper 双确认死亡且创建身份匹配才 `reconciled_exit`，缺身份/仍活/PID 复用一律保守保留；**终态冻结→释放**：429 事实先提交、容量名额释放推迟到接续冻结/原错误与输入 hash 保存完成之后，冻结期间持同 workspace writer guard，冻结抛错保留占位标 `placeholders_retained`、绝不 `capacity_released` 与 `placeholders_retained` 同时为真；**combo 用 executor+model**（runtime 非必需）：`scope={executor:qoder, model:Qwen3.8-Flash}` 无 runtime，六满+释放一个 Max 后 reply domestic/`claim_due` 只回收 Flash、绝不误选 Max，select/reserve/consume/ask/reclaim 同一 combo，冲突/未知 model fail-closed，非容量类 Luna 绝不凭超时自动接替。旧“无时区不猜 UTC+8、不复用 24h 当恢复窗口”仍指**旧 `cooldowns`** 历史冷却政策，绝不写成取消新真实失败反重放机制；Qoder 并发 2/4 是本 Skill 政策非官方已核实 CLI 上限。负例先固化、修复后全绿，离线回归同 `tests/test_availability_routing.py`。
+
 ### GPT-6 Luna 原生子 Agent（可选）
 
-GPT-6 Luna（模型标识 `gpt-6-luna`）是可选执行端，通过所在宿主实际提供的原生子 Agent 工具调用。本机未另行指定时 ZCode 优先；Qoder 沿用现有唯一模型及入口配置兜底。Luna 不自动接替任何在途任务，也不改变适用任务/在途任务已有的执行选择；GPT/Luna 的工程实施须用户事先明确同意，不自动代做。
+GPT-6 Luna（模型标识 `gpt-6-luna`）是可选执行端，通过所在宿主实际提供的原生子 Agent 工具调用。本机未另行指定时按可用主力 1:1 轮换、明确 executor+model 授权组合优先，主力不可用时改用溢出 Flash 或已授权接续；Qoder 沿用其既有入口配置。Luna 不自动接替任何在途任务，也不改变适用任务/在途任务已有的执行选择；非容量类 Luna 需明确授权、绝不凭超时自动接替；GPT/Luna 的工程实施须用户事先明确同意，不自动代做。
 
 每次考虑调用 Luna 时，检查当前环境工具是否提供该模型、当前用户授权及审批要求，并遵循当次生效的 custom rule 与平台规则；需要审批时取得对应批准后才启动。能力登记、历史启动成功或工具存在都不是后续调用授权；不把动态规则、过去批准或某次测试参数固化为永久授权或默认参数。
 
@@ -54,9 +66,9 @@ Skill 使用与执行派发分别记录：`brain_worker=used/not-used`；外部�
 
 目标仍是 GPT 主脑负责必要推导、规划与验收，国内执行器承担具体执行，以节省 GPT 额度。用户在本机并行推进的多条链路（例如某业务任务与 brain-worker/CodeBuddy 修复链路）经父线程互传已验证结果，业务不等待适配器修复；具体的任务标识与台账路径由用户当次指定，本仓库不固化任何单一任务、目录或授权。
 
-用户指定的业务任务顺序（2026-10-08 最新决定）：小范围只读定位一类任务若选 CodeBuddy，则改为生成完整可复制提示词由客户人工交外部 Agent，不再从入口直接派发；ZCode 优先直接派工作为主路径，Qoder 沿用唯一模型兜底。ZCode/Qoder 的模型按各自档案与授权核对。切换先确认原调用终态，或明确停止并核对副作用；未知状态先查，不把"立即接续"变成同一目标的重复在途派发。成功与失败的原件保留。历史曾由独立 CodeBuddy CLI 用 GLM 5.3 Flash 先做定位、故障后 ZCode 接续，该直连步骤已停用、仅存档。
+用户指定的业务任务顺序（2026-10-08 最新决定）：小范围只读定位一类任务若选 CodeBuddy，则改为生成完整可复制提示词由客户人工交外部 Agent，不再从入口直接派发；按可用主力 1:1 轮换、明确 executor+model 授权组合优先作主路径，主力不可用时改用溢出 Flash 或已授权接续。ZCode/Qoder 的模型按各自档案与授权核对。切换先确认原调用终态，或明确停止并核对副作用；未知状态先查，不把"立即接续"变成同一目标的重复在途派发。成功与失败的原件保留。历史曾由独立 CodeBuddy CLI 用 GLM 5.3 Flash 先做定位、故障后 ZCode 接续，该直连步骤已停用、仅存档。
 
-执行端角色（2026-10-07 用户补充，2026-10-08 更新）：本机未另行指定执行者时 ZCode 优先（用户付费套餐，用户反馈有额度且速度快，未独立核实账单或剩余额度）；Qoder 沿用现有唯一模型及入口配置兜底，不覆盖配置、不新增或替换模型，也不重复询问模型名称；用户反馈当前活动无消耗，尚未独立核实，不当作免费事实。明确用户选择与在途任务不替换：选择变更只应用于验收后的下一轮。GPT 主脑可做规划、推理、确定性输入准备和独立验收；GPT/Luna 工程实施须用户事先明确同意，不自动代做。外派被授权校验、自动审批或环境限制拦住时报告原拒绝，不改成 GPT 代做，也不换执行器或其他入口绕过；普通已终态执行失败是否兜底，按已授权顺序决定。WorkBuddy/CodeBuddy 不再直接派发，只做提示词人工转交；历史 Flash-only 模型口径仅适用于旧 CodeBuddy 直连档案，不强制其他执行端切换 Flash。
+执行端角色（2026-10-07 用户补充，2026-10-08 更新）：本机未另行指定执行者时按可用主力 1:1 轮换（用户付费套餐，用户反馈有额度且速度快，未独立核实账单或剩余额度）、明确 executor+model 授权组合优先，主力不可用时改用溢出 Flash 或已授权接续；Qoder 沿用其既有入口配置，不覆盖配置、不新增或替换模型，也不重复询问模型名称；用户反馈当前活动无消耗，尚未独立核实，不当作免费事实。明确用户选择与在途任务不替换：选择变更只应用于验收后的下一轮。GPT 主脑可做规划、推理、确定性输入准备和独立验收；GPT/Luna 工程实施须用户事先明确同意，不自动代做。外派被授权校验、自动审批或环境限制拦住时报告原拒绝，不改成 GPT 代做，也不换执行器或其他入口绕过；普通已终态执行失败是否兜底，按已授权顺序决定。WorkBuddy/CodeBuddy 不再直接派发，只做提示词人工转交；历史 Flash-only 模型口径仅适用于旧 CodeBuddy 直连档案，不强制其他执行端切换 Flash。
 
 牛马修复链路按错误证据是否到达分级处置，不预设“当前没有新报告”这一状态：若本阶段确有新的真实错误证据，据其定位适配器/Skill 缺口，在独立范围内准备、验收后经父线程反馈；若此刻尚无新的错误报告，则等待父线程转交，不凭历史 429 或猜测重跑测试，不重复调用适用任务，也不修改适用任务占用的文件、工作区或运行对象。修复仅针对报告所证实的适配器/Skill 缺口；双方成果互推，但不把一方未验收状态当作另一方成功基线。
 
@@ -219,8 +231,8 @@ CodeBuddy 一律改为 human-relay only：选择它们执行时**只**输出完�
 对 CodeBuddy/WorkBuddy 计划同样拒绝；无 plan、带 plan、resume、probe、配置存在/缺失都不能
 绕过，也不提供重新启用参数或隐藏入口。生成提示词不记成已派发/已验收。
 
-本机开发任务未指定执行者时 ZCode 优先（用户付费套餐，未独立核实账单/额度）；Qoder 沿用现有
-唯一模型及入口配置兜底，不覆盖配置、不新增或替换模型。CodeBuddy 支持个人国内站登录、
+本机开发任务未指定执行者时按可用主力 1:1 轮换、明确 executor+model 授权组合优先（用户付费套餐，未独立核实账单/额度），
+主力不可用时改用溢出 Flash 或已授权接续；Qoder 沿用其既有入口配置，不覆盖配置、不新增或替换模型。CodeBuddy 支持个人国内站登录、
 `glm-5.3-flash` 显式传模型 ID、原事件流与九节报告验收等**历史能力与解析口径**保留在
 [CodeBuddy 历史直连档案](references/codebuddy-direct.md)，仅供离线证据回放，不再是当前可直接
 执行的派发指引。机器配置、登录数据及调用日志不入库，cost=0 不作为免费证明。

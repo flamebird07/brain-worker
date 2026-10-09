@@ -420,6 +420,19 @@ def main():
                          'or the claim is refused as drift (zero Popen). Never fabricated: '
                          'omit it when the host has no verified chat context, in which case '
                          'the auto path records chat_id=None rather than inventing one.')
+    ap.add_argument('--quota-store', dest='quota_store', default=None,
+                    help='Persistent quota/availability store. The Qoder entry reads the '
+                         'same persistent ZCode availability state so an explicit Qoder '
+                         'start is never 1:1 rerouted back to an unavailable ZCode. When '
+                         'omitted it resolves through the formal default source in order: '
+                         'explicit --quota-store -> env BRAIN_WORKER_QUOTA_STORE -> the '
+                         'trusted default persistent file '
+                         '(~/.brain-worker/quota-state.sqlite3), so the default path also '
+                         'filters an unavailable ZCode. Read-only only: it never creates a '
+                         'db/table, never writes the quota store, and a read error fails '
+                         'closed (never claiming recovery/free/balance).')
+    ap.add_argument('--quota-routes', dest='quota_routes', default=None,
+                    help='Optional quota routes file for ZCode availability resolution.')
     args = ap.parse_args()
     if not args.stage or not args.stage.strip():
         ap.error('--stage is required and must be non-empty')
@@ -487,17 +500,22 @@ def main():
     # （漂移即拒），否则做原子路由选择；当前入口非被选中组合 → routing_required、sent=false、
     # 退出 2、零输出目录，绝不先提交错模型、绝不浪费/重复占用分配名额。
     dispatch_store = args.dispatch_store or str(dp.default_store_path())
+    quota_store = args.quota_store or os.environ.get('BRAIN_WORKER_QUOTA_STORE')
     task_id = args.task_id or plan_task_id or args.stage
     # 真实调用者身份（Z2）：在 Popen 前用本进程真实 PID + 创建时刻锚定 owner，供
     # bind_child/finish 校验——别人不能把子进程挂到不属于自己的 attempt，也不能凭一个终态
     # 参数释放本 owner 尚未启动/未知的名额。全程复用同一身份，绝不伪造。
     wrapper_pid = os.getpid()
     wrapper_created = dp.process_identity(wrapper_pid).get('created')
+    # executor='qoder'：可信主脑显式指定 Qoder 入口——有空位的 Qwen3.8-Max 一律直接 claim，
+    # 绝不因历史 committed 计数被 1:1 改派到 ZCode；同一持久 ZCode availability 状态只用于
+    # 保证不会被绕回不可用的 ZCode。
     pool_gate = dp.consume_for_entry(
         dispatch_store, task_id=task_id, runtime='qoder', model=args.model,
         workspace=str(work), prompt_sha256=prompt_sha256, stage=args.stage,
         chat_id=args.chat_id, claim_token=args.dispatch_claim,
-        wrapper_pid=wrapper_pid, wrapper_created=wrapper_created)
+        wrapper_pid=wrapper_pid, wrapper_created=wrapper_created,
+        executor='qoder', quota_store=quota_store, quota_routes=args.quota_routes)
     if not pool_gate['allowed']:
         print(json.dumps({'capacity_gate_rejected': True, 'sent': False, 'exit_code': 2,
                           'routing_required': bool(pool_gate.get('routing_required')),

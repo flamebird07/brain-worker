@@ -13,7 +13,7 @@
 | --- | --- | --- | --- |
 | 主力 | `zcode:GLM-5.3` | 2 | 与 Qoder 主力 **1:1** 轮换 |
 | 主力 | `qoder:Qwen3.8-Max` | 2 | 与 ZCode 主力 **1:1** 轮换 |
-| 溢出 | `qoder:Qwen3.8-Flash` | 2 | **只有两主力池都满**才允许使用 |
+| 溢出 | `qoder:Qwen3.8-Flash` | 2 | 默认 AUTO：两主力池都无合格可用槽才用；用户明确指定已授权 Flash 组合时按其真实容量独立派发（不受“两主力满”限制） |
 | 救援 | `luna:native` | 无上限 | 只经 `claim-due` 竞争裁决，绝不被自动选中 |
 
 - **国内合计上限 = 6**（`DOMESTIC_TOTAL_CAPACITY`）：主力 2×2 + 溢出 2。
@@ -23,24 +23,84 @@
 
 ## 1:1 主力轮换是 best-effort，不是严格均衡
 
-`select_and_claim` 在无显式 claim 时做**原子路由选择**：
+`select_and_claim` 在无显式 claim 时做**原子路由选择**，顺序如下：
 
+0. **前置安全与资格过滤（对所有入口适用）**：先做任务/工作区安全守卫（同 `task_id` 在途去重、同
+   真实 workspace 单写入）、票据 scope 与原 scope 绑定核验，再按 §执行器约束 的持久 availability
+   **只读**资格过滤，把被阻断的 ZCode 通道从合格候选集合剔除；之后才进入下面的选择。受信任主脑明确
+   绑定的 `executor+model` 组合是**硬约束**：只按该组合自身的真实容量与安全门 claim/`routing_required`，
+   **绝不因历史 committed 比例或别的组合有空而被改道**（该路径直接走组合约束判定，不套用第 3、4 步）。
 1. 同 `task_id` 已有在途 attempt → `duplicate_task_in_flight` 拒绝（一个任务绝不双启动）。
-2. 请求 Luna → `luna_requires_ticket` 拒绝（Luna 只经票据竞争裁决）。
-3. 请求溢出 `Qwen3.8-Flash`：
-   - 主力仍有空位 → `routing_required` 到某主力组合（主力有空不用 Flash）；
-   - 两主力都满且 Flash 有空位 → 允许 claim Flash；
-   - Flash 也满 → `capacity_full`（六名额全满）。
-4. 请求主力：按 `committed` 计数轮换选目标——**committed 少者优先；平票时优先请求的组合**。
+2. 请求 Luna → `luna_requires_ticket` 拒绝（Luna 只经票据竞争裁决，绝不被自动派生）。
+3. **（仅默认 AUTO 且未明确绑定 `executor+model` 组合时）** 请求溢出 `Qwen3.8-Flash`：
+   - 合格可用主力仍有空位 → `routing_required` 到某主力组合（默认 AUTO 主力优先，不无故用 Flash）；
+   - 无合格可用主力且 Flash 有合格空槽 → 允许 claim Flash；
+   - Flash 也满 → `capacity_full`。
+4. **（仅默认 AUTO 且未明确绑定组合时）** 请求主力：在**合格可用**主力之间按 `committed` 计数轮换选
+   目标——**committed 少者优先；平票时优先请求的组合**。
    - 目标就是当前入口且有容量 → claim；
-   - 目标是**另一个**主力组合 → `routing_required`（当前入口不是被选中组合，**不先提交错
+   - 目标是**另一个**合格主力组合 → `routing_required`（当前入口不是被选中组合，**不先提交错
      模型、不浪费或重复占用名额**，改由被选中入口继续）；
-   - 两主力都满 → 有空位则 `routing_required` 到溢出 Flash，否则 `capacity_full`。
+   - 无合格可用主力而 Flash 有合格空槽 → 回退 `routing_required` 到溢出 Flash；**所有候选均无可用槽
+     不等于物理六满**，降级原因与是否授权按 §执行器约束 及后文区分处理。
 
 轮换按**已提交计数**（`rotation.committed_zcode` / `committed_qoder`）驱动，是尽力而为的
 1:1，不保证任意时刻两池在途数严格相等：历史提交、单侧释放都会造成短暂偏差，这是设计允许的。
-文档不宣称严格均衡。`reserve` 与 `select_and_claim` 共用同一套统一国内策略（`_domestic_policy`），
-**都不绕过轮换**。
+文档不宣称严格均衡。`reserve` 与 `select_and_claim` 共用同一套统一国内策略（`_domestic_policy`）：
+**默认 AUTO 不绕过 1:1 轮换**；但**受信任主脑明确给出的 executor/已授权 executor+model 组合是硬
+约束**，优先于历史 committed 比例（见 §执行器约束 与 §B4 加固）——有空位的指定 Qoder/Flash 绝不因
+比例被改道。
+
+## 执行器约束与 availability 资格过滤（BW-AVAILABILITY-20261009-B2）
+
+`select_and_claim`/`reserve`/`consume_for_entry`/`claim_due` 新增可选 `executor`
+（`auto`|`qoder`|`zcode`，缺省 `auto`）与 `quota_store`/`quota_routes` 透传。**先过滤合格候选，
+再在可用主力之间做 1:1**：
+
+- **availability 资格过滤走 param-or-env 的正式默认持久源**：解析顺序为显式 `quota_store` →
+  环境变量 `BRAIN_WORKER_QUOTA_STORE` → 受信任默认持久文件 `qc.default_store_path()`（即
+  `~/.brain-worker/quota-state.sqlite3`），使**默认 AUTO 无需额外参数即过滤不可用 ZCode**。缺库/
+  缺表按只读回核当作“无记录（可用）”，读取异常一律 **fail-closed**（当作被阻断，绝不因读失败放行）；
+  解析所得路径**只读**、绝不建库/建表、绝不在 pool 事务里写 quota 库。（历史旧说明：“只在显式传入
+  `quota_store` 时才过滤、未传不读真实目录”已由 BW-AVAILABILITY-20261009-B5 缺陷 5 统一为默认持久源。）
+  传入时读 §3b 的 `zcode_availability`（[quota-routing](quota-routing.md)）：被阻断的 ZCode 通道
+  从可用主力集合里剔除。
+- **`executor='qoder'`（受信任主脑显式选择）**：有空位直接 claim `qoder:Qwen3.8-Max`，Max 满则按
+  溢出策略改道 Flash；**绝不因历史 committed 计数被 1:1 改道到 ZCode**。请求组合与 executor 冲突
+  （如 executor=qoder 却请求 zcode 组合）→ `executor_conflict` 拒绝。
+- **`executor='zcode'`**：ZCode 被 availability 阻断 → `zcode_unavailable` 拒绝（**不改道到别的
+  主力、不落 Flash**）；有空位则 claim，满则 `capacity_full`（无 Flash 回退）。
+- **`executor='auto'`（缺省）**：保留历史 committed 计数与 1:1 公平轮换，只在**合格**主力间轮换；
+  请求 ZCode 但其被阻断 → 改道到可用主力/溢出或 `capacity_full`，**绝不改道回不可用的 ZCode**。
+  **不清库、不重置轮换计数**。
+- **消费 token 前复检**：`consume_for_entry` 走 `--dispatch-claim` token 路径时，在同一事务里
+  **重新校验 ZCode availability**；若预留后通道转为不可用，则释放**本次自己**的 reserved 占位
+  （`reserved→start_failed`，`capacity_released=True`，reason `zcode_unavailable`），**不泄漏本任务
+  的占位**、不误释放别人的名额。
+- **默认 AUTO 下 Flash 只在无合格可用主力时**才用（用户明确指定已授权 Flash 组合时按其真实容量
+  独立受控派发，不受此限）；`claim_due` 的国内 reclaim 同样用合格主力集合（被阻断的 ZCode
+  不被重新选中）。
+
+### B4 加固（BW-AVAILABILITY-20261009-B4）
+
+- **combo 硬约束**：`executor`+`runtime`+`model` 明确组合（含 `qoder:Qwen3.8-Flash`）贯穿
+  `reserve/select_and_claim/consume_for_entry/claim_due`，作为候选集合硬边界——受信任主脑明确
+  已授权的组合**不因别的候选有空位而被拒绝**；默认 AUTO 主力优先/容量/1:1 与 Z2/Max2/Flash2
+  容量不变（并发 2/4 为 Skill 政策、非已核实 Qoder 进程上限）。
+- **国内回收尊重原 scope**：`claim_due` 用 `_scope_allowed_candidates` 依原 scope 组合/executor
+  收窄候选（绑 Qoder 只回收 QMax/Flash，绝不因 ZCode 有空位改派 ZCode）；绑 ZCode 且被阻断 →
+  保持 pending，**绝不改派或降级 Luna**。
+- **probe 走真实绑定票据**：容量门不接受自报 `probe=true`；`zcode_direct` 把 availability 授予的
+  `probe_ticket`（provider/channel_key/attempt_id/epoch）经 `_probe_allowed`→
+  `zcode_probe_ticket_valid` 只读核验后才放行唯一一次启动，读取异常 fail-closed（详见
+  [quota-routing](quota-routing.md) §3c）。
+- **只读诊断与统一默认**：pool 的 `_zcode_availability_blocked` 与状态查询改用只读连接（缺库/缺表
+  不建、读错 fail-closed、绝不静默 healthy）；quota_store 走 param-or-env，使 AUTO 无需额外参数
+  即过滤不可用 ZCode；派工写事务内不调用写额度 helper。
+- **竞态与 Luna 保护**：429 事实**先于**可再派空槽发布（`_preclaim_reconcile` 要求 child+wrapper
+  双死且创建身份匹配，auto 回收只放执行容量不清 availability）；`reply`/`claim_due` 保护
+  claimed/settled/cancelled/launch_unknown，settled 票据不被迟到/重复回复重开；物理六满与
+  “合格候选耗尽”分列报告，误报不自动 Luna。
 
 ## 入口在 Popen 前的唯一容量门
 
@@ -118,6 +178,22 @@ Luna 是**救援**通道，无数量上限，但绝不无条件启动。流程�
    拒绝重复 claim。
 7. Luna **沿用原任务的文件/命令/副作用范围**，不能借救援绕过权限拒绝、额度错误或部署审批。
 
+### 回复状态机与降级票据（BW-AVAILABILITY-20261009-B2）
+
+- **回复 `domestic`**：`claim_due` **任何时刻（0s/299s/300s/301s）都绝不启动 Luna**，只在票据
+  scope 内等待国内空位或**原子 reclaim** 一个合格国内主力；**回复 `external_agent`** → 停止自动
+  裁决、交人工外部交接；**回复 `cancel`** → 停止，票据终态，后续不复活。
+- **重复 ask 绝不重置**已 `replied`/`cancelled`/`settled`/`claimed` 的原始回复、scope 或 deadline：
+  `ask_record` 对**任何已存在票据**直接拒绝并回读 `state`/`deadline_utc`/`reply_choice`（纯 INSERT，
+  无 `ON CONFLICT` 重置）；`pending` 不重置计时器。
+- **票据 scope 损坏/缺失 → fail-closed**（`scope_corrupt=True`，绝不据损坏数据启动 Luna 或 reclaim）。
+- **可用性不足的降级决策**：当**国内名额未满 6** 但因 availability 不足以正常派工时，允许一次新的
+  降级 `ask_record`，须带**独立、客观的降级理由** `degradation_reason ∈ {quota, auth, capacity}` +
+  `degradation_detail`；`quota` 理由必须由 §3b availability 的客观证据支撑
+  （`_zcode_availability_blocked`），无证据则拒绝。降级票据**绕过“六名额全满”前提**，但
+  **非 capacity 的超时绝不可替代显式授权**：只有用户显式回复 `luna` 才 claim Luna；等待超时
+  ≠ 授权（`degraded && reply != luna` → 拒绝）。**六名额全满 + 300s + 用户授权**的既有规则不变。
+
 ## 与额度门禁的边界（quota ≠ concurrency）
 
 - `dispatch_pool` 只管“同时几个真实执行器在跑”。
@@ -137,18 +213,23 @@ Luna 是**救援**通道，无数量上限，但绝不无条件启动。流程�
 ```text
 python scripts/dispatch_pool.py --store <abs.sqlite3> status
 python scripts/dispatch_pool.py --store <abs> reserve --task-id T --runtime zcode \
-  --model GLM-5.3 --workspace <abs ws> --prompt-sha256 <64hex> [--stage S] [--token K]
+  --model GLM-5.3 --workspace <abs ws> --prompt-sha256 <64hex> [--stage S] [--token K] \
+  [--executor auto|qoder|zcode] [--quota-store <db>] [--quota-routes <json>]
 python scripts/dispatch_pool.py --store <abs> select-and-claim --task-id T --runtime qoder \
-  --model Qwen3.8-Max --workspace <abs ws> --prompt-sha256 <64hex>
+  --model Qwen3.8-Max --workspace <abs ws> --prompt-sha256 <64hex> \
+  [--executor auto|qoder|zcode] [--quota-store <db>] [--quota-routes <json>]
 python scripts/dispatch_pool.py --store <abs> validate --token K [--task-id T] [--runtime R] \
   [--model M] [--workspace W] [--prompt-sha256 H]
 python scripts/dispatch_pool.py --store <abs> bind-child --token K --child-pid 1234
 python scripts/dispatch_pool.py --store <abs> finish --token K --terminal finished --success true
 python scripts/dispatch_pool.py --store <abs> reconcile
 python scripts/dispatch_pool.py --store <abs> ask-record --task-id T [--scope S] \
-  [--ask-message-id M] [--deadline-seconds 300]
+  [--ask-message-id M] [--deadline-seconds 300] \
+  [--degradation-reason quota|auth|capacity --degradation-detail D] \
+  [--quota-store <db>] [--quota-routes <json>]
 python scripts/dispatch_pool.py --store <abs> reply --task-id T --choice external_agent [--note N]
-python scripts/dispatch_pool.py --store <abs> claim-due --task-id T
+python scripts/dispatch_pool.py --store <abs> claim-due --task-id T \
+  [--quota-store <db>] [--quota-routes <json>]
 python scripts/dispatch_pool.py --store <abs> mark-launch-unknown --task-id T
 python scripts/dispatch_pool.py --store <abs> cancel-pending --task-id T [--reason R]
 ```

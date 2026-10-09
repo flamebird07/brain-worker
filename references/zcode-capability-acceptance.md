@@ -202,8 +202,13 @@ def init_plan_deny(plan: dict, tools: list) -> dict:
 
 ## 七、当前默认路由（与 SKILL/zcode-direct/README 对齐）
 
-- 本机未另行指定时 **ZCode 优先**；**Qoder 沿用现有唯一模型及入口兜底**，不覆盖配置、不新增或
-  替换模型。普通终态失败按已授权路由处理，**只影响该任务**，其它独立任务继续。
+- 直连候选 **ZCode / GLM-5.3** 与 **Qoder / Qwen3.8-Max** 在**合格可用**候选间尽力 **1:1**；用户明确
+  给出的已授权 **executor+model 组合是硬约束、优先于历史比例**，有空位的指定 Qoder 绝不因 committed
+  比例被改道 ZCode。默认 AUTO 主力优先，两主力均无合格可用槽时可走溢出 Qwen3.8-Flash，用户明确指定
+  已授权 Flash 时按其真实容量独立受控派发（主力各 2、Flash 2、国内合计 6 属 Skill 策略，非官方 Qoder
+  已知并发上限）。不覆盖配置、不新增或替换模型，模型/权限/工作区/同任务安全守卫一律保留。普通终态
+  失败按已授权路由处理，**只影响该任务**，其它独立任务继续。（历史：早期曾表述为“本机未另行指定时
+  ZCode 优先、Qoder 沿用现有唯一模型兜底”，现按 BW-AVAILABILITY-20261009-B5/B6 统一为上述规则。）
 - 当 ZCode 的 **Bash 现场能力尚未被独立验收放行**，或审批/闸门未就绪时：在**计划阶段**显式把该
   任务限定为 ZCode **只做读写**（Read/Glob/Grep/Edit/Write），把需要精确登记测试的原样命令**串行**
   交给现有 Qoder 执行并保留其结果；`approval_client_ready`/`controlled_pre_exec_gate_ready` 为

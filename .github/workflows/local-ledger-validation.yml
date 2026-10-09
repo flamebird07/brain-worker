@@ -150,6 +150,19 @@ jobs:
       - name: Quota control persistent gate offline regression
         run: python tests/test_quota_control.py
 
+      # BW-AVAILABILITY-20261009-B2：ZCode 独立持久 availability/防重复状态 + 资格过滤
+      # 路由（显式 Qoder 不被历史计数改道、auto 只在可用主力间 1:1）+ Luna 降级/回复
+      # 状态机 + 真实入口接入（合成 stub，sent=false / 零模型调用）的离线回归。全部使用
+      # 每用例独立临时 SQLite（setUp 自断言 store != default_store_path()）与随包固定合成
+      # stub，绝不读写真实 ~/.brain-worker 或 offline-state 池；Windows/Linux 矩阵都跑。
+      # BW-AVAILABILITY-20261009-B4：同文件补齐 7 缺口加固回归（CAS 授予行精确键、
+      # 单次恢复资格消耗、probe 绑定票据容量闸、只读诊断不建库、429 先记后释放竞态、
+      # executor+runtime+model combo 硬约束贯穿 reserve/select/consume/claim_due、
+      # settled 票据不被迟到回复重开、物理六满与合格候选耗尽分列）；先补能在当前 B2 失败的
+      # 负例、修复后全绿，命令与矩阵不变。
+      - name: Availability routing and Luna state machine offline regression (temp SQLite, no real pool)
+        run: python -m unittest discover -s tests -p "test_availability_routing.py" -v
+
       - name: ZCode execution evidence offline regression
         run: python tests/test_zcode_execution_evidence.py
 

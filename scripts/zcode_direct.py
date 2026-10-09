@@ -378,8 +378,10 @@ _WRAPPER_QUOTA_FIELDS = ('provider', 'response_status', 'provider_code', 'messag
                          'reset_timezone', 'source_stderr_sha256', 'original_source')
 
 
-# 实际额度耗尽事实的白名单 provider code（结构化，非正文扫描）：仅这些数值码算 quota。
-_QUOTA_PROVIDER_CODES = {1308}
+# 实际额度耗尽事实的白名单 provider code（结构化，非正文扫描）：仅这些数值码算 quota，
+# 且必须绑定真实 BigModel/Zhipu 渠道（qc.is_trusted_hard_quota_provider）——同一数字来自
+# 其它 provider 不泛化。BW-AVAILABILITY-20261009-B2：新增 1310（现场真实硬上限码）。
+_QUOTA_PROVIDER_CODES = {1308, 1310}
 
 
 def _numeric_provider_code(value):
@@ -393,7 +395,7 @@ def _numeric_provider_code(value):
     return None
 
 
-def _wrapper_quota_error(envelope):
+def _wrapper_quota_error(envelope, provider=None):
     """ZCode 包装层异常的额度信号提取（缺陷 B / 需求 1）。
 
     只在**已知失败结构**（envelope 的 quota_error/wrapper_error 字段，或 errors 列表里
@@ -403,10 +405,12 @@ def _wrapper_quota_error(envelope):
     原始 stderr 字节、绝不扫描正常报告正文里的 429/数字。无 429 结构即返回 None。
     reset 时区只透传原引用的判定（如 unverified），本函数不猜 UTC 偏移。
 
-    S4 缺陷 3 修正：不再无条件把任何 429 归成 category=quota。只有实际额度事实
-    （纯数字 provider_code ∈ {1308}、显式 category=quota，或来自 quota_error 字段）
-    才标 quota；无耗尽/无窗口的普通 429 标 rate_limit，交给分类走 temporary_backoff
-    （保留结构化 Retry-After 下限），绝不误落 24h 无窗口冷却。"""
+    S4 缺陷 3 修正：不再无条件把任何 429 归成 category=quota。BW-AVAILABILITY-20261009-B2：
+    实际额度事实 = （纯数字 provider_code ∈ {1308,1310} **且**绑定真实 BigModel/Zhipu 渠道）
+    或窄的硬上限消息语义（qc.hard_limit_message，服务器自己的文本，优先于 wrapper 派生的
+    rate_limit 标签）或显式 category=quota/quota_error 字段；无耗尽/无窗口的普通 429 标
+    rate_limit，交给分类走 temporary_backoff（保留结构化 Retry-After 下限），绝不误落
+    24h 无窗口冷却。硬/软的最终判定在 qc.classify_zcode_availability 内按同条目绑定复算。"""
     if not isinstance(envelope, dict):
         return None
     candidates = []
@@ -422,19 +426,25 @@ def _wrapper_quota_error(envelope):
             continue
         raw_code = item.get('provider_code')
         provider_num = _numeric_provider_code(raw_code)
-        is_quota = (provider_num in _QUOTA_PROVIDER_CODES
+        entry_provider = item.get('provider') or provider
+        message = item.get('message')
+        hard_by_code = (provider_num in _QUOTA_PROVIDER_CODES
+                        and qc.is_trusted_hard_quota_provider(entry_provider))
+        hard_by_msg = qc.hard_limit_message(message) if isinstance(message, str) else False
+        is_quota = (hard_by_code or hard_by_msg
                     or item.get('category') == 'quota' or field == 'quota_error')
         entry = {'status': 429, 'category': 'quota' if is_quota else 'rate_limit'}
+        if entry_provider is not None:
+            entry['provider'] = entry_provider
         if isinstance(raw_code, str) and raw_code.strip():
             entry['code'] = raw_code.strip()
         if provider_num is not None:
-            entry['provider_code'] = provider_num  # 保留数值（1308），非只 str
-        message = item.get('message')
+            entry['provider_code'] = provider_num  # 保留数值（1308/1310），非只 str
         if isinstance(message, str):
             entry['details'] = message
             entry['message'] = message
         for key in _WRAPPER_QUOTA_FIELDS:
-            if key in ('response_status', 'provider_code', 'message'):
+            if key in ('response_status', 'provider_code', 'message', 'provider'):
                 continue
             value = item.get(key)
             if value is not None:
@@ -480,13 +490,14 @@ def _provider_business_error_from_stderr(stderr_bytes, provider=None):
             provider_num = int(c)
             provider_str = c
             break
-    is_quota = provider_num in _QUOTA_PROVIDER_CODES
+    is_quota = (provider_num in _QUOTA_PROVIDER_CODES
+                and qc.is_trusted_hard_quota_provider(provider))
     entry = {'status': 429, 'provider': provider,
              'category': 'quota' if is_quota else 'rate_limit'}
     if wrapper_code is not None:
         entry['wrapper_code'] = wrapper_code
     if provider_str is not None:
-        entry['code'] = provider_str           # 内层真实数字码（1308），非外层
+        entry['code'] = provider_str           # 内层真实数字码（1308/1310），非外层
     if provider_num is not None:
         entry['provider_code'] = provider_num   # 数值保留，非只 str
     first_line = frame.splitlines()[0] if frame.splitlines() else _PB_ERROR_KEYWORD
@@ -494,6 +505,12 @@ def _provider_business_error_from_stderr(stderr_bytes, provider=None):
     if msg:
         entry['details'] = msg
         entry['message'] = msg
+    # BW-AVAILABILITY-20261009-B2：真实硬上限消息语义优先于 wrapper 派生的 rate_limit
+    # 标签——现场 1310 帧 category 被包装层标成 rate_limit，但消息明确"已达到每周/每月
+    # 使用上限"。命中窄硬上限消息即升为 quota（服务器自己的文本，绝不用泛化标签覆盖）。
+    if qc.hard_limit_message(msg):
+        entry['category'] = 'quota'
+        entry['hard_limit_message'] = True
     # reset 时间只有带明确时区才可核验；SDK 帧 message 无时区 → 保守 unverified，不猜。
     entry['reset_timezone'] = 'unverified: stderr error frame carried no timezone'
     entry['source_stderr_sha256'] = hashlib.sha256(stderr_bytes).hexdigest()
@@ -505,7 +522,7 @@ def _zcode_failure_facts(summary: dict, envelope, events: list,
                          stderr_bytes=None, provider=None) -> dict:
     errors = (envelope or {}).get('errors') or []
     errors_info = (envelope or {}).get('errors_info')
-    wrapper_quota = _wrapper_quota_error(envelope)
+    wrapper_quota = _wrapper_quota_error(envelope, provider)
     # 真实 SDK 失败链（S4 缺陷 11）：未改的 zcode_sdk_runner 只在 envelope.errors 里放
     # **字符串**错误，真正的 status/code 元数据在该次子进程**自己写出的 stderr**里，表现
     # 为已知 ProviderBusinessError 错误帧。这里对本次 out/'stderr.log' 字节做安全、有限、
@@ -845,6 +862,55 @@ def main():
             print(json.dumps({'continuation_drift_refused': True, 'sent': False,
                               'exit_code': 2, 'reasons': drift}, ensure_ascii=False))
             return 2
+    # ---- ZCode 独立持久 availability 门（BW-AVAILABILITY-20261009-B2；权威最后原子门）----
+    # 与旧 cooldowns 完全独立、绝不复活旧冷却。Popen/建目录前查持久 availability 状态：
+    # hard_hold（无限期或到恢复点）/ backoff 未到期 / recovery_unverified（未过单次有界
+    # probe）→ 拒绝，sent=false、退出 2、零输出目录，绝不把不可用的 ZCode 复活派工。
+    # --preflight-only 不提交、不触碰 provider → 豁免。recovery probe（--quota-probe）走
+    # purpose='probe' 的单次有界无副作用 CAS 单赢家路径。绝不宣称真实额度/账务/免费。
+    availability_gate = None
+    availability_attempt_id = None
+    availability_epoch = None
+    availability_group = None
+    availability_channel_key = None
+    if not args.preflight_only:
+        availability_gate = qc.zcode_availability_gate(
+            quota_store, provider=args.provider, routes_path=args.quota_routes,
+            identity={'provider': args.provider},
+            purpose='probe' if args.quota_probe else 'dispatch')
+        if not availability_gate['allowed']:
+            print(json.dumps({'refused_before_dispatch': True, 'sent': False,
+                              'exit_code': 2, 'zcode_availability_rejected': True,
+                              'reasons': availability_gate['reasons'],
+                              'channel_key': availability_gate.get('channel_key'),
+                              'quota_group': availability_gate.get('quota_group'),
+                              'blocked_until_utc': availability_gate.get('blocked_until_utc')},
+                             ensure_ascii=False))
+            return 2
+        availability_attempt_id = availability_gate.get('attempt_id')
+        availability_epoch = availability_gate.get('availability_epoch')
+        availability_group = availability_gate.get('quota_group')
+        # 缺陷 1：结算必须命中 CAS 实际授予的那一行 key（别名/组更名时可能与按 provider+group
+        # 重算的 key 不同），否则旧行 probe_active 永远 true。record 仍按请求 provider+group
+        # 落到该请求语义渠道；两者由不同参数分别承载。
+        availability_channel_key = availability_gate.get('granted_channel_key')
+
+    def _settle_availability(executed, success=False):
+        """结算本次 availability attempt 占位（epoch+attempt CAS）：executed=False 表示
+        从未真实提交（门前被拒/Popen 前失败）→ 只归还 probe 资格、不计失败退避；
+        executed=True 为真实终态结算。成功必须匹配 epoch（+probe attempt）才清 healthy，
+        迟到成功绝不清除更新的失败 epoch。绝不宣称真实额度/账务/免费。"""
+        if availability_gate is None or availability_group is None:
+            return None
+        try:
+            return qc.settle_zcode_attempt(
+                quota_store, provider=args.provider, quota_group=availability_group,
+                attempt_id=availability_attempt_id, epoch=availability_epoch,
+                success=success, executed=executed,
+                channel_key=availability_channel_key)
+        except Exception as exc:  # noqa: BLE001
+            return {'settled': False, 'error': str(exc)}
+
     # ---- 跨会话并发容量门（普通派工路径；--preflight-only 不提交、不建会话，豁免）----
     # Popen/建目录前原子消费一个容量 claim：给了 --dispatch-claim 就精确校验并 mark_running
     # （漂移即拒），否则做原子路由选择；当前入口非被选中组合 → routing_required、sent=false、
@@ -862,12 +928,21 @@ def main():
     pool_gate = None
     quota_verified_claim = None
     if not args.preflight_only:
+        probe_ticket = None
+        if args.quota_probe and availability_gate is not None:
+            probe_ticket = {'provider': args.provider,
+                            'channel_key': availability_channel_key,
+                            'attempt_id': availability_attempt_id,
+                            'epoch': availability_epoch}
         pool_gate = dp.consume_for_entry(
             dispatch_store, task_id=task_id, runtime='zcode', model=args.model,
             workspace=str(work), prompt_sha256=prompt_sha256, stage=args.stage,
             chat_id=args.chat_id, claim_token=args.dispatch_claim,
-            wrapper_pid=wrapper_pid, wrapper_created=wrapper_created)
+            wrapper_pid=wrapper_pid, wrapper_created=wrapper_created,
+            executor='zcode', quota_store=quota_store, quota_routes=args.quota_routes,
+            probe_ticket=probe_ticket)
         if not pool_gate['allowed']:
+            _settle_availability(executed=False)
             print(json.dumps({'refused_before_dispatch': True, 'capacity_gate_rejected': True,
                               'sent': False, 'exit_code': 2,
                               'routing_required': bool(pool_gate.get('routing_required')),
@@ -906,7 +981,9 @@ def main():
         routes_path=args.quota_routes,
         verified_pool_claim=quota_verified_claim)
     if not quota_gate['allowed']:
-        # 额度门拒绝：释放刚拿到的容量名额（若有，带 owner 身份），零输出目录、零 Popen。
+        # 额度门拒绝：释放刚拿到的容量名额（若有，带 owner 身份）+ 归还 availability probe
+        # 资格（executed=False，从未真实提交），零输出目录、零 Popen。
+        _settle_availability(executed=False)
         _release_capacity('start_failed')
         print(json.dumps({'refused_before_dispatch': True, 'sent': False,
                           'quota_gate_rejected': True,
@@ -923,6 +1000,8 @@ def main():
         payload = dict(payload)
         payload['quota_settlement'] = qc.settle_attempt(
             quota_store, quota_gate, terminal='start_failed')
+        # Popen 前失败：availability probe 从未真实执行 → 只归还 probe 资格（executed=False）。
+        payload['zcode_availability_settled'] = _settle_availability(executed=False)
         if claim_token is not None:
             rel = _release_capacity('start_failed')
             # 如实反映是否真释放（owner 未核验/child 状态未知时可能未释放），绝不谎称。
@@ -1136,12 +1215,17 @@ def main():
     except Exception as exc:
         if child is None:
             # Popen 本身失败（从未启动子进程）：带 owner 身份 settle start_failed，如实反映
-            # 是否真释放，绝不谎称已释放。
+            # 是否真释放，绝不谎称已释放。BW-AVAILABILITY-20261009-B5：既然已拿到合法
+            # recovery probe 资格却在 Popen 前抛错、从未真正启动，就必须对**本次实际绑定的
+            # row/epoch/attempt** 结算**未执行**资格（executed=False）——归还 probe_active、
+            # 绝不留 active、绝不假称恢复；无子进程不算真实失败，也不消耗该代际唯一一次资格。
+            _settle_availability(executed=False)
             rel = _release_capacity('start_failed')
             settlement = qc.settle_attempt(quota_store, quota_gate,
                                           terminal='start_failed')
             print(json.dumps({'dispatch_failed': True, 'sent': False,
                               'capacity_released': bool(rel.get('released')),
+                              'availability_settled_unexecuted': True,
                               'reasons': [f'child launch failed before start: {exc}'],
                               'quota_settlement': settlement}, ensure_ascii=False))
             return 3
@@ -1161,11 +1245,12 @@ def main():
                                                   'exit_code': child.returncode,
                                                   'finished_at_utc': _now()}),
                                       encoding='utf-8')
-    # 子进程真实结束 → 先释放容量名额（带 owner 身份、核验探针回读 child 已 dead），即使
-    # 随后的 envelope 解析/报告绑定/接续保存失败容量也已释放；原始工作区/任务保护与额度
-    # 终态结算仍独立按下面既有逻辑处理。释放结果如实记录，未释放不谎称已释放。
-    capacity_release = _release_capacity('finished', success=(child.returncode == 0))
-    capacity_released = bool(capacity_release.get('released'))
+    # 子进程真实结束。BW-AVAILABILITY-20261009-B4 缺陷 6：容量名额的释放推迟到把受信任
+    # 429 不可用事实发布进持久 availability 状态之后（见下方 record 块）——绝不能先把槽
+    # 变回可再派生、再事后补记不可用，否则并发 AUTO 会在空窗里把不可用的 ZCode 复活派工。
+    # 释放结果仍如实记录，未释放不谎称已释放。
+    capacity_release = None
+    capacity_released = False
 
     envelope, parse_error = _read_envelope(out / 'stdout.json')
     summary = {'exit_code': child.returncode, 'finished_at_utc': _now(),
@@ -1177,7 +1262,7 @@ def main():
                'resume_session_id': args.session_id,
                'preflight_only': args.preflight_only,
                'capacity_released': capacity_released,
-               'capacity_terminal': capacity_release.get('terminal'),
+               'capacity_terminal': None,
                'protocol_success': False, 'business_verified': False,
                'free_quota_verified': False,
                # BW-ZCODE-MANUAL-QUOTA-20261008-S1：明确标识 ZCode 自动额度冷却已禁用，
@@ -1319,6 +1404,14 @@ def main():
         classification = qc.classify_quota_failure(
             raw_errors or [], merged_errors_info,
             retry_after=qc.extract_retry_after(raw_errors or [], merged_errors_info))
+    # BW-AVAILABILITY-20261009-B2：独立 availability 事件分类（与旧 cooldown 分类分离，
+    # 只认同条目内绑定的受信任 429；硬额度限真实 BigModel/Zhipu 的 1308/1310 或窄硬上限
+    # 消息语义优先于 wrapper 派生的 rate_limit 标签）。取消码/正文 429/独立非 429 quota 不触发。
+    availability_classification = None
+    if summary['protocol_success'] is not True and facts.get('quota_429') and not timed_out:
+        availability_classification = qc.classify_zcode_availability(
+            raw_errors or [], merged_errors_info, provider=args.provider,
+            retry_after=qc.extract_retry_after(raw_errors or [], merged_errors_info))
     # S6 缺陷 2：本次原始错误载体判定（与接续/结算共用一份，先于任何提前 return 落定）。
     # ZCode 的结构化失败信封（S2 同形 string-only errors）落在**本次 out/stdout.json**；
     # SDK ProviderBusinessError 帧落在**本次 out/stderr.log**。二者都属真实失败载体：
@@ -1358,6 +1451,32 @@ def main():
                 'category': sdk_stderr_frame.get('category'),
                 'reset_timezone': sdk_stderr_frame.get('reset_timezone', 'unverified')}
         summary['original_error_reference'] = ref
+    # BW-AVAILABILITY-20261009-B2：错误证据确认后、接续冻结/终态结算之前，把受信任 429
+    # 不可用事实落进独立持久 availability 状态——即使随后接续冻结失败或终态未知，不可用
+    # 事实也已保存（活调用锁不因冻结失败而释放）。取消退出码（4294967295 / -1）不是真实
+    # 额度终态，绝不记录；报告正文 429、独立非 429 quota 条目、非受信任渠道的 1308/1310
+    # 都不触发（分类只认同一条目内绑定的受信任 429）。绝不宣称真实额度/账务/免费。
+    _CANCEL_EXIT_CODES = (4294967295, -1)
+    if (availability_classification is not None
+            and availability_classification.get('is_trusted_429')
+            and availability_group is not None
+            and child.returncode not in _CANCEL_EXIT_CODES):
+        _oer = summary.get('original_error_reference') or {}
+        summary['zcode_availability_recorded'] = qc.record_zcode_unavailability(
+            quota_store, provider=args.provider, quota_group=availability_group,
+            classification=availability_classification,
+            attempt_id=availability_attempt_id,
+            source='zcode_direct terminal envelope',
+            evidence_path=_oer.get('path'), evidence_sha256=_oer.get('sha256'))
+    # 缺陷 6（B4）：不可用事实已发布（或本次不是受信任 429、无需发布）之后才允许把槽变回
+    # 可再派生。BW-AVAILABILITY-20261009-B5：容量名额的释放**再推迟到接续冻结/原错误与输入
+    # hash 保存完成之后**——在整个 cc.evaluate/build_handoff 期间必须一直持有同 workspace
+    # writer guard（dp attempt 仍未 finish），否则冻结窗口里另一执行器的同 workspace Qoder
+    # consume 会被放行，与仍在写终态副本的原 owner 争同一目录；且冻结若抛错，summary 不能
+    # 同时谎称 capacity_released=true 又 placeholders_retained=true。availability 事实先于名额
+    # 复用的口径保持不变；两库仍各走独立短事务。释放只在此处之后由显式调用完成。
+    capacity_release = None
+    capacity_released = False
     # 保全优先于结算（S4 缺陷 4/6）：仍在持有工作区占位时，先落盘当前原始报告/失败错误，
     # 冻结终态源副本+回读、生成接续包，随后再做原子额度结算+释放。这样另一执行器在冻结
     # 阶段看不到被过早释放的空窗。当前报告引用只从 out 固定路径派生（response.md 存在与否
@@ -1422,6 +1541,15 @@ def main():
             return 3
     else:
         summary['continuation_status'] = 'unverified_no_contract'
+    # BW-AVAILABILITY-20261009-B5 缺陷 4：接续冻结/原错误与输入 hash 保存已在此处之前完成
+    # （成功落盘 continuation.json 或无接续契约），或走了无契约分支。此刻才允许释放容量名额、
+    # 打开同 workspace writer guard。冻结抛错的分支已在上面 return 3 保留占位、绝不释放，
+    # 因此这里执行到时必然代表冻结已完成或本无契约——capacity_released 与 placeholders_retained
+    # 从此互斥，不会同时为真。availability 429 事实已先行发布（见上），名额复用永远晚于事实落地。
+    capacity_release = _release_capacity('finished', success=(child.returncode == 0))
+    capacity_released = bool(capacity_release.get('released'))
+    summary['capacity_released'] = capacity_released
+    summary['capacity_terminal'] = capacity_release.get('terminal')
     # 额度终态结算（缺陷 C/E/F）：确认终态 → 同一事务原子写冷却/清除 + 释放占位。非 429
     # 失败/取消/probe 超时 → 只结算占位，既不写冷却也绝不写 healthy。迟到成功不得覆盖新冷却。
     settlement = qc.settle_attempt(
@@ -1436,6 +1564,12 @@ def main():
                                    'released': settlement.get('released'),
                                    'terminal_state': settlement.get('terminal_state'),
                                    'purpose': quota_gate.get('purpose')}
+    # BW-AVAILABILITY-20261009-B2：availability 终态结算（executed=True，子进程已真实结束）。
+    # 成功且 epoch(+probe attempt) 匹配才转 healthy；失败/超时/取消绝不写 healthy，只结算
+    # probe 占位并设再探测退避窗口（失败/超时后不能立即再 probe）。迟到成功不清新失败 epoch。
+    summary['zcode_availability_settled'] = _settle_availability(
+        executed=True,
+        success=bool(summary['protocol_success'] is True and not args.preflight_only))
     if timed_out:
         summary['quota_probe_timed_out'] = True
     if wrapper is not None:

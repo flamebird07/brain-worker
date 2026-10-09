@@ -773,15 +773,26 @@ class TestAdoptLegacyRealSpawnLifecycleZ4(_SpawnMixin, unittest.TestCase):
                            (out['token'],))[0]['state'], 'running')
             self.assertEqual(
                 dp.status(self.store)['pools']['zcode:GLM-5.3']['active'], 1)
-            # 真实退出 → reconcile 立即 reconciled_exit 释放（结束即空名额）。
+            # 真实退出：BW-AVAILABILITY-20261009-B5 Gap3（安全强化，非弱化旧断言）——
+            # adopt-legacy 行没有记录任何 wrapper 身份，auto/public reclaim（reconcile）
+            # 缺身份一律保守 unknown 保留，绝不凭 child 已死自动释放；只有原身份齐备且
+            # 双方确认死亡才自动 reconciled_exit。释放仍由 owner 显式 finish 走（亲证已绑定
+            # child 真实退出），保证名额最终归还，但不再有“缺身份自动放行新 writer”的空窗。
             alive.set()
             child.join(timeout=JOIN_TIMEOUT)
             self.assertFalse(child.is_alive())
             rec = dp.reconcile(self.store, now=None)
-            self.assertIn(out['token'], rec['released'])
+            self.assertNotIn(out['token'], rec['released'])
             self.assertEqual(
                 self._rows("SELECT state FROM attempts WHERE token=?",
-                           (out['token'],))[0]['state'], 'reconciled_exit')
+                           (out['token'],))[0]['state'], 'unknown')
+            # owner 显式 finish（真实探针见 child 已死）→ 释放，名额最终归零。
+            fin = dp.finish(self.store, out['token'], terminal='finished',
+                            success=False, now=None)
+            self.assertTrue(fin['released'], fin)
+            self.assertEqual(
+                self._rows("SELECT state FROM attempts WHERE token=?",
+                           (out['token'],))[0]['state'], 'finished')
             self.assertEqual(
                 dp.status(self.store)['pools']['zcode:GLM-5.3']['active'], 0)
             # 退出后再 adopt 同 PID 票据 → 明确拒绝，绝不复活/双计。

@@ -128,12 +128,119 @@ S2 停摆来自 ZCode 独立套餐 HTTP 429 / provider_code 1308（非“共享 
   （后者只是独立格式诊断）。
 - 历史引用分离保存；SDK runner（`zcode_sdk_runner.mjs`）不改。
 
+## 3b. ZCode 独立持久 availability 状态（BW-AVAILABILITY-20261009-B2）
+
+现场事故（2026-10-09 03:25:56Z）：真实 SDK `ProviderBusinessError`，HTTP 429，BigModel
+Coding Plan，`provider_code=1310`，wrapper 派生 `category=rate_limit`，但服务器真实文本是
+“已达到每周/每月使用上限”，且 reset 时间**无时区**。旧口径把它当 `temporary_backoff`（甚至
+`quota_no_window` 保守 24h）都是错的：泛化的 `rate_limit` 标签**不得覆盖**真实硬上限语义，
+无时区**不得猜** UTC+8，也**不得复用**旧 24h 冷却当恢复窗口。
+
+为此新增一张与旧 `cooldowns` **完全独立**的持久表 `zcode_availability`（同库不同表，
+`record_zcode_unavailability` 绝不触碰 `cooldowns`，CodeBuddy 冷却行与 ZCode availability
+互不污染）。要点：
+
+- **稳定通道键** `channel_key = {provider}|{quota_group}`；`quota_group` 仍只来自受信任
+  路由（§2），配置别名不能拆分同一通道，routes 缺失/更名落入 `unknown-shared` 时**保守连带
+  阻断**（改配置不能绕过历史 hold）。
+- **硬额度判定**（`classify_zcode_availability`）只认**同一条真实错误条目内绑定**的
+  status/provider/code/message：`(受信任 provider 正则 bigmodel|zhipu 且 code∈{1308,1310})`
+  **或**窄的硬上限消息语义（`使用上限/用量上限/额度已用尽/…/usage limit/quota limit/limit
+  reached|exceeded`），后者优先于 wrapper 派生的 `rate_limit` 标签。同一数字来自非受信任渠道
+  **不泛化**为硬额度。报告正文里的 429 数字、另一条不带 429 的 quota 条目、取消退出码
+  （`4294967295`/`-1`）**都不触发**记录。
+- **availability kind**：`hard_hold`（硬额度且无可信窗口 → `blocked_until_utc=None` 无限期
+  持有，等待显式用户重置或新恢复证据，绝不猜 24h/固定短周期）、`hard_reset_window`（硬额度
+  且有可信带时区窗口）、`backoff_until_window`（普通 429 + 可信窗口）、`temporary_backoff`
+  （普通 429 无窗口 → `min(30s·2^n,1800s)` + 0-25% jitter）。reset/Retry-After **取最晚的
+  合法下限**、跳过非法/无时区项（`parse_reset_datetime` latest-valid-wins），绝不返回更早的首个
+  匹配。
+- **状态机** `backoff / hard_hold / recovery_unverified / healthy`，`epoch` 单调递增。
+  窄的幂等手动重置入口 `zcode-reset`（必须 `--provider` + `--evidence-ref`，可选
+  `--quota-group`/`--epoch`）把状态置为 `recovery_unverified`——**“可核验”≠healthy**，仍阻断
+  完整派工。恢复点到达或新重置证据只**原子放行单次、无副作用的有界 probe**
+  （`zcode_availability_gate(purpose='probe')` CAS 单赢家）；probe 失败/超时/取消设再探测退避
+  窗口（`min(60s·2^n,3600s)`），不能立即重探；probe 成功必须 `epoch`+`attempt` 双匹配才转
+  `healthy`。**迟到成功绝不清除更新失败的 epoch**（`settle_zcode_attempt` 只结算自己的 probe
+  占位）。availability 记录**永不宣称真实额度/账务/免费**，只记状态与原因。
+- **入口接入**：`zcode_direct.main` 在**容量门禁之前**、任何 Popen 之前调用
+  `zcode_availability_gate`（权威最后一道原子闸），被拒打印 `zcode_availability_rejected`
+  并退出 2、零建目录；只有受信任 429 且非取消码才在证据引用落定后 `record_zcode_unavailability`。
+  证据已确认但接续冻结失败/终态未知时**仍保存不可用事实、且不释放活体调用锁**（fail-closed）。
+  `qoder_direct` 读同一持久 availability：`dispatch_pool` 的资格过滤把被阻断的 ZCode 通道从
+  可用主力里剔除，Qoder **不会被改道回不可用的 ZCode**，显式 Qoder（有空位）也**不因历史
+  committed 计数被改道**（见 [global-dispatch](global-dispatch.md)）。
+
+## 3c. availability 闭环加固（BW-AVAILABILITY-20261009-B4）
+
+> B4 在不改动 §3b 语义、不扩大额度统计范围、不新增宣称真实额度/账务/免费的前提下，
+> 把 B2 落地时 reproduced 的 7 个实现缺口逐一收口，并用 `tests/test_availability_routing.py`
+> 的先失败后修复回归固化。全部离线确定性、显式临时 sqlite + 临时 routes，绝不触碰真实
+> `~/.brain-worker` 或共享池。
+
+- **代际/CAS 与真实行键（缺陷 1）**：`zcode_availability_gate` 无论命中现有行还是无行 stateless
+  默认，都回传**被授予行的精确 `granted_channel_key`/`granted_quota_group`/`granted_provider`**
+  与 `availability_epoch`（无行时明确为代际 `0`，不再返回 `None`）；`settle_zcode_attempt` 接受
+  `channel_key=` 并**总是按代际比较**（`attempt_epoch != row['epoch']` 即拒），因此 A 落 429
+  推进 epoch=1 后，B 的迟到成功（代际 0）绝不把 A 的新失败清成 healthy。同 provider 的配置别名/
+  group 改名映射到同一 `channel_key`，不分裂限制；healthy 保留代际单调性防 ABA。
+- **provider 与分类（缺陷 2）**：硬额度判定绑定**已核验的请求 provider**（`is_trusted_hard_quota_provider`），
+  不再凭条目自报的 provider_code 泛化；`_HARD_LIMIT_MESSAGE_RE` 收窄到周期/套餐真实耗尽语义
+  （“使用上限/用量上限/额度用尽/配额耗尽/周期额度上限/quota exhausted”），普通“Rate limit exceeded”
+  “每分钟请求上限”等频率 429 → `temporary_backoff`。1308/1310 仅在该真实渠道 + 同一 429 载体内生效；
+  非受信任渠道、报告正文 429、独立非 429 quota 条目、取消退出码一律不升格。
+- **单次恢复资格与幂等重置（缺陷 3）**：新增持久列 `recovery_eligibility_consumed`——一个失败
+  probe 真实执行（`executed=True`）即消耗掉**该代际唯一的一次恢复资格**（失败/超时/取消也消耗），
+  退避窗口到期不再在同一 epoch 放行第二个定时 probe；要再探必须有**新恢复证据**。`zcode_manual_reset`
+  绑定 `manual_reset_epoch`：同证据重放**它自己创建的那一代** reset 幂等——无论该行现处
+  `recovery_unverified` 还是已被合法 probe 成功核验为 `healthy`，都幂等返回**实际**状态、不推进
+  epoch、不重开核验资格（BW-AVAILABILITY-20261009-B6：早期只对 `recovery_unverified` 幂等，
+  healthy 代际的同证据省略-epoch 重放会误落入下面的新 reset，把已核验通道重开并推进 epoch）；旧事件
+  回放（`row.epoch>manual_reset_epoch`）被拒、省略 epoch 不能重置更新的失败；重置只到
+  `recovery_unverified`（可核验），**永不直接 healthy**，幂等重放也绝不把非 healthy 谎称 healthy。
+  未启动即被拒/异常的 attempt（`executed=False`）只清自己的 `probe_active`、不消耗资格，也不让无限重放复活。
+- **正式 probe 入口与容量闸特殊资格（缺陷 4）**：capacity 门不再信任可自报的 `probe=true`；
+  `zcode_direct` 在拿到 availability 授予后组装**精确绑定的 `probe_ticket`**
+  （provider/channel_key/attempt_id/epoch），经 `dispatch_pool` 的 `_probe_allowed`→
+  `zcode_probe_ticket_valid`（只读、任一读取错误 fail-closed）核验真实 CAS 授予行，才放行这**唯一**
+  一次 `Popen`；普通派工仍被拒，workspace/容量/任务去重/模型+工具边界不变，显式预留 token 消费前再核验。
+- **真只读与统一默认状态（缺陷 5）**：`zcode_blocking_rows`/`zcode_availability_status` 改用
+  `_open_readonly`（`mode=ro` URI）——缺库/缺表返回空、**绝不 mkdir/建表/迁移/WAL**，其它读错误抛出
+  交由调用方 fail-closed，绝不静默 healthy。pool 的 `_zcode_availability_blocked` 与 CLI 默认
+  quota_store 统一走 param-or-env（Q 入口传参或 `BRAIN_WORKER_QUOTA_STORE`，Z 入口缺省
+  `qc.default_store_path()`），使 AUTO 无需额外参数即过滤不可用 ZCode；派工写事务内绝不调用会写额度的
+  helper，杜绝双库嵌套反向写锁。
+- **终态发布与容量释放竞态（缺陷 6）**：`zcode_direct` 在**确认受信任 429 之后、可再派空槽复用之前**
+  立即 `record_zcode_unavailability`（接续冻结失败也保事实），随后才做容量释放——
+  `capacity_release`/`capacity_released` 移到记录块之后，state 已提交而容量释放失败**绝不伪造 healthy**。
+  `pool._preclaim_reconcile` 现在要求 child 死亡**且** wrapper 死亡**且** wrapper_created 与当前创建匹配
+  （PID 复用则跳过），auto 回收只释放执行容量、**绝不清 availability**；原 owner 显式 finish 仍可释放；
+  两库各自独立短事务。
+- **执行器+模型 combo 硬约束（B4 场景）**：受信任主脑的明确 `executor+runtime+model` 组合
+  （含本次 `qoder:Qwen3.8-Flash`）贯穿 `reserve/select_and_claim/consume_for_entry/claim_due`，
+  作为候选集合的硬边界——**不因别的候选有空位而拒绝明确已授权组合**；默认 AUTO 主力优先/容量/1:1
+  轮换、Z2/Max2/Flash2 容量、CodeBuddy/WorkBuddy 人工中转策略均不变（并发 2/4 是 Skill 政策，
+  非已核实的 Qoder 进程上限）。`claim_due` 的国内回收严格遵循原 scope 组合：绑 ZCode 且被阻断→
+  保持 pending（绝不改派/降级 Luna）；绑 Qoder 即便 ZCode 有空位也只回收 QMax/Flash。
+- **物理满 vs 合格耗尽分列（缺陷 7）**：`ask_record` 的 capacity 降级改用
+  `_scope_allowed_candidates(scope, zcode_blocked)` 客观核验**受信任候选是否真的排空**，不再仅凭
+  auth/capacity 字符串+detail 就把全部授权候选判为不可用；物理六名额满与“合格候选耗尽”**分开报告**，
+  误报不自动 Luna；非容量降级仍需显式 Luna 授权 + 六真满 300s 规则；domestic 回复**永不 Luna**，
+  external/cancel 不自动 Luna。`reply` 保护 claimed/settled/cancelled/launch_unknown，只接受合法
+  首次回复、重复确认幂等，settled 票据绝不因迟到/重复回复重开。
+
 ## 4. 到期恢复：recovery_unverified + 单次有界 probe
 
 > **ZCode 政策例外（见 §1）**：ZCode 取消自动额度冷却，因此**不存在“到期→必须先 probe”
 > 的门禁**：`gate_dispatch(runtime='zcode')` 直接跳过本节的冷却/到期/probe 判定，普通 ZCode
 > 派工**永不要求 recovery probe**。`--quota-recovery-probe` 仅作为可选的有界只读核验入口保留
 > （边界同下），不得变成 ZCode 派工前置条件。本节规则继续适用于 CodeBuddy 及其它 runtime。
+>
+> **区分（BW-AVAILABILITY-20261009-B2）**：本节讲的是**旧 `cooldowns` 表**的到期/probe 门禁，
+> 对 ZCode 已取消。§3b 的 `zcode_availability` 是**另一套独立状态**：它不复活旧冷却，但对
+> 真实受信任硬额度/429 事实做无限期或有窗口的 hold，并以 `zcode-reset` + 单次有界 probe 核验
+> 恢复。两者互不写对方的表；ZCode 派工同时受 §3b availability 闸（`zcode_availability_gate`）
+> 约束，与旧冷却门禁是否跳过无关。
 
 冷却到期只是 `recovery_unverified`，不代表恢复。完整重派被拒；只允许单次、无副作用、
 有界的核验占位（入口 `--quota-recovery-probe` + 调度提供的最小提示词；同组同时最多一个
@@ -200,6 +307,10 @@ python scripts/quota_control.py import --store <db> --terminal <redacted.json> \
     --runtime codebuddy --identity '{"entry_cli": "C:/.../codebuddy-cli.js"}'
 python scripts/quota_control.py release-lock --store <db> --workspace <realpath> \
     --owner-pid <pid> --confirm-owner-terminal
+# §3b 独立 ZCode availability（与旧 cooldowns 完全分离）：
+python scripts/quota_control.py zcode-status --store <db> [--provider <id>]
+python scripts/quota_control.py zcode-reset --store <db> --provider <id> \
+    --evidence-ref <ref> [--quota-group <g>] [--epoch <n>]
 ```
 
 测试一律传显式临时 store/routes（`BRAIN_WORKER_QUOTA_STORE`/`BRAIN_WORKER_QUOTA_ROUTES`），

@@ -79,6 +79,26 @@ python <技能目录>/scripts/zcode_direct.py --workspace <项目绝对路径> -
 `dp.validate_claim(...)['ok']`），同 workspace 单写入与 unknown/在途保护不变，不删通道行、不禁用门禁、
 不伪造 claim。
 
+入口在**容量门之前**、任何 Popen 之前还要先过 §3b 的 **ZCode availability 权威闸**
+（`quota_control.zcode_availability_gate`，见 [quota-routing](quota-routing.md)）：稳定通道键
+`{provider}|{quota_group}` 被 `hard_hold`/`backoff`/`recovery_unverified` 阻断时，打印
+`zcode_availability_rejected`/`sent:false`/退出 2、**零证据目录**；`--quota-recovery-probe` 走
+`purpose='probe'` 的 CAS 单次有界放行。被拒/额度门拒/准备阶段中止都会 `_settle_availability(executed=False)` 归还本次
+probe 占位（不算失败）。只有**受信任 429**（同一条真实错误条目内绑定的 status/provider/code/message，
+非取消退出码 `4294967295`/`-1`）才在证据引用落定后 `record_zcode_unavailability`，写入
+`summary['zcode_availability_recorded']`；真实终态再 `settle_zcode_attempt`
+（`summary['zcode_availability_settled']`）。**证据已确认但接续冻结失败/终态未知时仍保存不可用事实、
+且不释放活体调用锁**（fail-closed）。可选 `--quota-store`（默认 `BRAIN_WORKER_QUOTA_STORE`）、
+`--quota-routes`。availability 记录**永不宣称真实额度/账务/免费**。
+
+> **B4 加固（BW-AVAILABILITY-20261009-B4）**：`settle_zcode_attempt` 按 gate 回传的
+> `granted_channel_key` 精确结算被授权行（不分裂别名/改名，代际不匹配一律拒）；一个真实执行的
+> 失败 probe 消耗掉该代际**唯一一次**恢复资格（`recovery_eligibility_consumed`），退避到期不再同
+> epoch 自动放行第二个定时 probe。`--quota-recovery-probe` 把 availability 授予的 `probe_ticket`
+> （provider/channel_key/attempt_id/epoch）交给 `dispatch_pool` 容量门做**只读绑定核验**，取代可自报的
+> `probe=true`——只有 CAS 授予的精确票据才放行这唯一一次启动。终态处理顺序收口：确认受信任 429 后
+> **先 `record_zcode_unavailability`、后做容量释放**（state 已提交而容量释放失败绝不伪造 healthy）。
+
 ## 模型选择预检：不允许回落
 
 runner 依次核对：注册表里 provider 与 model 是否存在 → `validateSelection` →

@@ -164,6 +164,7 @@ CAPACITY = {
 MAIN_FORCE_KEYS = tuple(f'{r}:{m}' for r, m in MAIN_FORCE_POOLS)
 OVERFLOW_KEYS = tuple(f'{r}:{m}' for r, m in OVERFLOW_POOLS)
 LUNA_KEY = f'{LUNA_RUNTIME}:{LUNA_MODEL}'
+QMAX_POOL_KEY = 'qoder:Qwen3.8-Max'
 
 # attempt 状态机：在途（占容量）与已释放（不占容量）。
 ACTIVE_STATES = ('reserved', 'running', 'unknown')
@@ -210,6 +211,8 @@ CREATE TABLE IF NOT EXISTS luna_tickets(
   claimed_token TEXT,
   launch_state TEXT,
   agent_id TEXT,
+  degradation_reason TEXT,
+  degradation_detail TEXT,
   updated_at_utc TEXT);
 """
 
@@ -308,6 +311,13 @@ def _migrate(conn):
             conn.execute('ALTER TABLE attempts ADD COLUMN adopt_evidence TEXT')
         except sqlite3.OperationalError:
             pass
+    # BW-AVAILABILITY-20261009-B2：Luna 降级决策独立原因/明细列（无破坏性追加）。
+    for col in ('degradation_reason', 'degradation_detail'):
+        if cols and col not in cols:
+            try:
+                conn.execute(f'ALTER TABLE luna_tickets ADD COLUMN {col} TEXT')
+            except sqlite3.OperationalError:
+                pass
 
 
 def capacity_for(pk) -> int | None:
@@ -578,13 +588,139 @@ def status(store_path=None, now=None) -> dict:
 
 
 # ------------------------------------------------------------------ 统一国内策略
-def _select_main_force(conn, requested_pk, now):
+ZCODE_POOL_KEY = 'zcode:GLM-5.3'
+
+
+def _resolve_quota_store(quota_store=None):
+    """BW-AVAILABILITY-20261009-B5 缺陷 5：把"显式参数 → 环境变量 BRAIN_WORKER_QUOTA_STORE
+    → 受信任默认持久文件"统一成一处，供**正式 API 与 CLI 默认**共用，使默认 AUTO 也会读取
+    共享 availability 过滤不可用 Z，而不是只有显式传参才过滤。qc 缺席则不查询（保持旧 dp
+    行为，绝不假装可用/不可用）。解析得到的路径只用于**只读**回核，绝不建库/建表/迁移、绝不在
+    pool 事务里写 quota 库。"""
+    if quota_store:
+        return quota_store
+    if qc is None:
+        return None
+    try:
+        return qc.default_store_path()
+    except Exception:  # noqa: BLE001 - 无法确定默认路径：保守不查询（不建库、不误判）
+        return None
+
+
+def _zcode_availability_blocked(quota_store=None, now=None, routes_path=None):
+    """只读查询持久 ZCode availability 状态：ZCode:GLM-5.3 是否当前不可用。
+    - BW-AVAILABILITY-20261009-B5：quota_store 未显式给出时，经 `_resolve_quota_store`
+      解析 env/默认持久路径（qc 缺席或无法解析才不查询）；缺库/缺表由只读回核当作"无记录"
+      （可用），绝不建库/建表；
+    - qc 缺席 → 不查询（dp 层旧行为保留）；查询异常 → fail-closed（保守视为不可用）；
+    - 有 blocking 行（backoff 未到期 / hard_hold / recovery_unverified）→ 不可用。
+    绝不写 availability 状态（写入只发生在真实 ZCode 入口的终态结算）。"""
+    store = _resolve_quota_store(quota_store)
+    if store is None or qc is None:
+        return None
+    try:
+        rows = qc.zcode_blocking_rows(store, now=now)
+    except Exception as exc:  # noqa: BLE001 - fail-closed, never assume available
+        return {'blocked': True, 'fail_closed': True,
+                'reasons': ['zcode availability lookup failed; treating ZCode as '
+                            f'unavailable (fail-closed): {exc!r}']}
+    if rows:
+        return {'blocked': True, 'fail_closed': False, 'channels': rows,
+                'reasons': [f'{r.get("channel_key")}: state={r.get("state")} '
+                            f'kind={r.get("kind")} until={r.get("blocked_until_utc")}'
+                            for r in rows]}
+    return None
+
+
+def _probe_allowed(quota_store, probe_ticket, now=None):
+    """缺陷 4：容量门只放行**经真实 CAS 状态核验过**的 bound recovery probe 票据，绝不
+    信任调用方自报的 probe 布尔。probe_ticket 必须携带精确授予行 key 与 attempt_id/epoch，
+    由 qc.zcode_probe_ticket_valid 只读回核。任一不符 → False（正常派工照旧被拒）。"""
+    if not probe_ticket or qc is None:
+        return False
+    store = _resolve_quota_store(quota_store)
+    if store is None:
+        return False
+    try:
+        return bool(qc.zcode_probe_ticket_valid(
+            store, provider=probe_ticket.get('provider'),
+            channel_key=probe_ticket.get('channel_key'),
+            attempt_id=probe_ticket.get('attempt_id'),
+            epoch=probe_ticket.get('epoch'), now=now))
+    except Exception:  # noqa: BLE001 - fail-closed: never trust an unverifiable ticket
+        return False
+
+
+def _eligible_main_forces(zcode_blocked):
+    """可用主力集合：ZCode 被持久 availability 阻断时从主力中剔除，Qwen3.8-Max 恒在。
+    先过滤合格候选，再在可用主力间做 1:1（绝不把名额分给不可用的 ZCode）。"""
+    if zcode_blocked:
+        return {k for k in MAIN_FORCE_KEYS if k != ZCODE_POOL_KEY}
+    return set(MAIN_FORCE_KEYS)
+
+
+def _scope_combo_from_scope(scope):
+    """BW-AVAILABILITY-20261009-B5 缺陷 6：受信任 combo 用 **executor + model** 表达；
+    runtime 可被接受但绝不成为必需的冗余字段——scope={executor:qoder, model:Qwen3.8-Flash}
+    _without_ 额外 runtime 也必须解析成唯一的 qoder:Qwen3.8-Flash。返回 (combo_or_None,
+    conflict)：
+    - 同时给了 runtime 与 executor 且前缀不一致 → (None, True)（冲突，调用方 fail-closed，
+      绝不猜一个池放行）；
+    - 给了 model 且能定出唯一池前缀（executor 优先，其次 runtime）→ 该 pool_key；若该 combo
+      不在已知池内（未知/矛盾 model）→ (None, True)（fail-closed，绝不臆造池）；
+    - 只有 executor 无 model（或纯 auto）→ (None, False)，交由候选集合按执行器展开。"""
+    executor = (scope or {}).get('executor')
+    runtime = (scope or {}).get('runtime')
+    model = (scope or {}).get('model')
+    exec_runtime = {'qoder': 'qoder', 'zcode': 'zcode'}.get(executor)
+    if runtime and exec_runtime and str(runtime) != exec_runtime:
+        return None, True
+    combo_runtime = exec_runtime or (str(runtime) if runtime else None)
+    if model:
+        if combo_runtime is None:
+            # 只给了 model、既无 executor 也无 runtime：无法定出唯一 combo，交由候选过滤；
+            # 但若该 model 不属于任何已知池，仍在候选层自然排空（不臆造）。
+            return None, False
+        combo = pool_key(combo_runtime, str(model))
+        if combo not in CAPACITY:
+            return None, True
+        return combo, False
+    return None, False
+
+
+def _scope_allowed_candidates(scope, zcode_blocked):
+    """按票据 scope 的执行器/combo 硬约束给出该任务真正受信任的候选池（优先顺序：
+    主力在前、溢出 Flash 在后）。scope 明确只要 ZCode 而 ZCode 当前不可用 → 返回空
+    （受信任候选已排空，可正当化降级/待援）；只要 Qoder 时 ZCode 空位不算该任务的候选。
+    BW-AVAILABILITY-20261009-B5：combo 以 executor+model 表达（runtime 非必需）；combo 与
+    执行器冲突或未知 model 一律 fail-closed 返回空候选，绝不改派到别的池。"""
+    executor = (scope or {}).get('executor')
+    combo, conflict = _scope_combo_from_scope(scope)
+    if conflict:
+        return []
+    if combo is not None:
+        if combo == ZCODE_POOL_KEY and zcode_blocked:
+            return []
+        return [combo]
+    if executor == 'zcode':
+        return [] if zcode_blocked else [ZCODE_POOL_KEY]
+    if executor == 'qoder':
+        return [QMAX_POOL_KEY, OVERFLOW_KEYS[0]]
+    mains = [k for k in MAIN_FORCE_KEYS
+             if not (k == ZCODE_POOL_KEY and zcode_blocked)]
+    return mains + [OVERFLOW_KEYS[0]]
+
+
+def _select_main_force(conn, requested_pk, now, eligible=None):
     """主力 1:1 目标选择：committed 少者优先；平票时优先请求的组合（best-effort，
-    非严格均衡，见 references/global-dispatch.md）。返回 (target_pk, reason)。"""
+    非严格均衡，见 references/global-dispatch.md）。eligible 给出时只在可用主力间选择
+    （先过滤合格候选，绝不把名额分给被 availability 阻断的 ZCode）。返回 (target_pk, reason)。"""
     rot = _rotation_row(conn)
     committed = {'zcode:GLM-5.3': rot['committed_zcode'],
                  'qoder:Qwen3.8-Max': rot['committed_qoder']}
     order = list(MAIN_FORCE_KEYS)
+    if eligible is not None:
+        order = [k for k in order if k in eligible]
     if requested_pk in committed:
         order.sort(key=lambda k: (committed[k], 0 if k == requested_pk else 1))
     else:
@@ -596,32 +732,76 @@ def _select_main_force(conn, requested_pk, now):
     return None, 'main_force_full'
 
 
-def _domestic_policy(conn, requested_pk, now):
+def _domestic_policy(conn, requested_pk, now, executor='auto', eligible=None,
+                     zcode_blocked=None, probe_allowed=False):
     """reserve 与 select-and-claim 共用的统一国内裁决（语义集中，无测试后门）：
-    返回 ('claim', pk) / ('routing', target_pk) / ('full', None)。
+    返回 ('claim', pk) / ('routing', target_pk) / ('full', None) /
+    ('zcode_unavailable', None) / ('executor_conflict', None) / ('reject_luna', None) /
+    ('unknown_pool', None)。
     - Luna 永不在此自动放行（只能经 claim-due 票据裁决）；
-    - Flash：任一主力仍有空位 → routing 到该主力（主力有空不用 Flash）；
-    - 主力（Z2 修订）：一律先按持久 committed 计数选主力（1:1），平票才优先请求组合，
-      本池有空也不绕过轮转；选中组合≠请求组合 → routing；两主力都满 → Flash 有空也只
-      能 routing 到 Flash（绝不替模型偷换组合落库），Flash 也满才 full。"""
+    - executor='qoder'（可信主脑显式指定 Qoder 入口）：有空位的 Qwen3.8-Max 一律直接
+      claim，绝不因历史 committed 计数被改派到 ZCode；Max 满才 routing 到 Flash；
+      提交非 qoder 组合 → executor_conflict；
+    - executor='zcode'（ZCode 入口，最后的权威原子门）：ZCode 不可用 → zcode_unavailable；
+      有空位 → claim；满 → full（绝不回落 Flash/其它池）；提交非 ZCode 组合 → executor_conflict；
+    - executor='auto'：先过滤合格候选（ZCode 不可用则剔除），再在可用主力间按持久
+      committed 计数做 1:1，平票才优先请求组合；本池有空也不绕过轮转；选中≠请求 → routing；
+      两主力都（不可用或满）→ Flash 有空只 routing 到 Flash，Flash 也满才 full。"""
     if requested_pk == LUNA_KEY:
         return 'reject_luna', None
+    elig = eligible if eligible is not None else set(MAIN_FORCE_KEYS)
+
+    if executor == 'qoder':
+        if requested_pk == 'qoder:Qwen3.8-Max':
+            cap = capacity_for(requested_pk)
+            if cap is not None and _count_active(conn, requested_pk) < cap:
+                return 'claim', requested_pk
+            ovf = OVERFLOW_KEYS[0]
+            if capacity_for(ovf) is not None and _count_active(conn, ovf) < capacity_for(ovf):
+                return 'routing', ovf
+            return 'full', None
+        if requested_pk in OVERFLOW_KEYS:
+            cap = capacity_for(requested_pk)
+            if cap is not None and _count_active(conn, requested_pk) < cap:
+                return 'claim', requested_pk
+            return 'full', None
+        return 'executor_conflict', None
+
+    if executor == 'zcode':
+        if requested_pk != ZCODE_POOL_KEY:
+            return 'executor_conflict', None
+        if zcode_blocked and not probe_allowed:
+            return 'zcode_unavailable', None
+        # 缺陷 4：持有效验过的真实 bound probe 票据时，即便渠道处于 recovery_unverified
+        # （availability 门刚授予本次唯一在飞 probe）也放行这一次有界无副作用 probe 落到
+        # 真实 ZCode 池（受容量/工作区/去重照常约束）；正常派工仍走上面的 zcode_unavailable。
+        cap = capacity_for(requested_pk)
+        if cap is not None and _count_active(conn, requested_pk) < cap:
+            return 'claim', requested_pk
+        return 'full', None
+
+    # executor == 'auto'
     if requested_pk in MAIN_FORCE_KEYS:
-        # 修订 Z2：任意新主力分配一律先按持久 committed 计数选主力（跨聊天 1:1），
-        # 平票才优先请求的组合；本池有空也不再绕过轮转直接 claim。
-        target, _ = _select_main_force(conn, requested_pk, now)
+        if requested_pk == ZCODE_POOL_KEY and zcode_blocked:
+            # 请求 ZCode 但被持久 availability 阻断：改派到可用主力/溢出，绝不复活 ZCode。
+            target, _ = _select_main_force(conn, requested_pk, now, eligible=elig)
+            if target is not None:
+                return 'routing', target
+            ovf = OVERFLOW_KEYS[0]
+            if capacity_for(ovf) is not None and _count_active(conn, ovf) < capacity_for(ovf):
+                return 'routing', ovf
+            return 'full', None
+        target, _ = _select_main_force(conn, requested_pk, now, eligible=elig)
         if target is not None:
             if target == requested_pk:
                 return 'claim', requested_pk
             return 'routing', target
         ovf = OVERFLOW_KEYS[0]
         if capacity_for(ovf) is not None and _count_active(conn, ovf) < capacity_for(ovf):
-            # 修订 Z2：两主力满时请求 Z/Max 只能 routing 到 Flash 入口，绝不替模型
-            # 偷换组合落库（attempts.pool_key 必须等于 runtime+':'+model）。
             return 'routing', ovf
         return 'full', None
     if requested_pk in OVERFLOW_KEYS:
-        target, _ = _select_main_force(conn, requested_pk, now)
+        target, _ = _select_main_force(conn, requested_pk, now, eligible=elig)
         if target is not None:
             return 'routing', target
         cap = capacity_for(requested_pk)
@@ -632,9 +812,14 @@ def _domestic_policy(conn, requested_pk, now):
 
 
 def _preclaim_reconcile(conn, now):
-    """每次新 claim 前的安全对账：只处理有真实 PID 记录的国内 attempt，且只在
-    已绑定 child 经只读探针确认已死亡时释放（自动复用已结束容量）。任何探测失败、
-    无 PID 记录、存活/未知一律不动（交给显式 reconcile 保守处理）。"""
+    """每次新 claim 前的安全对账：BW-AVAILABILITY-20261009-B4 缺陷 6 收紧——
+    只有当已绑定 child **且**原 wrapper 都经只读探针确认已死亡、且 wrapper 创建身份
+    与记录一致时才自动回收执行容量（reconciled_exit）。任一未知一律不动：
+    - child 存活/未知 → 保留占位；
+    - wrapper 仍在世（还在做原生 finish/终态处理）→ 保留，交给显式 finish，绝不抢；
+    - wrapper PID 被复用（当前 created 与记录 wrapper_created 不符）→ 视为未知，保留；
+    - 无 PID 记录 / 探针失败 → 保守保留（交给显式 reconcile）。
+    自动回收只释放执行容量，绝不清除 availability（额度可用性由 quota 侧独立状态管理）。"""
     rows = conn.execute(
         'SELECT * FROM attempts WHERE state IN (%s) AND pool_key != ? '
         'AND child_pid IS NOT NULL' % ','.join('?' * len(ACTIVE_STATES)),
@@ -645,12 +830,29 @@ def _preclaim_reconcile(conn, now):
             ident = process_identity(int(row['child_pid']))
         except Exception:
             continue
-        if ident.get('state') == 'dead':
-            conn.execute("UPDATE attempts SET state='reconciled_exit', "
-                         "terminal='reconciled_exit', ended_at_utc=? WHERE token=? "
-                         "AND state IN (%s)" % ','.join('?' * len(ACTIVE_STATES)),
-                         (_iso(now), row['token'], *ACTIVE_STATES))
-            released.append(row['token'])
+        if ident.get('state') != 'dead':
+            continue  # child 存活/未知：保守保留
+        # wrapper（真实调用者）身份必须齐备才能自动回收。BW-AVAILABILITY-20261009-B5：
+        # 缺 wrapper_pid 或缺 wrapper_created → 无法确认原调用已结束，保守保留（交显式
+        # finish/reconcile），绝不在空窗放行同 workspace 新 writer。
+        wpid = row['wrapper_pid']
+        recorded_created = row['wrapper_created'] if 'wrapper_created' in row.keys() else None
+        if wpid is None or recorded_created is None:
+            continue  # 无原记录身份/创建时刻：保守保留
+        try:
+            wident = process_identity(int(wpid))
+        except Exception:
+            continue
+        if wident.get('state') != 'dead':
+            continue  # 原 wrapper 仍活着，可能正写终态
+        if wident.get('created') and \
+                str(recorded_created) != str(wident.get('created')):
+            continue  # PID 复用：创建身份不符，视为未知，保守保留
+        conn.execute("UPDATE attempts SET state='reconciled_exit', "
+                     "terminal='reconciled_exit', ended_at_utc=? WHERE token=? "
+                     "AND state IN (%s)" % ','.join('?' * len(ACTIVE_STATES)),
+                     (_iso(now), row['token'], *ACTIVE_STATES))
+        released.append(row['token'])
     return released
 
 
@@ -688,7 +890,8 @@ def select_and_claim(store_path=None, *, task_id, runtime, model, workspace,
                      prompt_sha256, stage=None, chat_id=None, token=None,
                      now=None, origin='select-and-claim',
                      wrapper_pid=None, wrapper_created=None,
-                     _preclaim=True) -> dict:
+                     executor='auto', quota_store=None, quota_routes=None,
+                     probe_ticket=None, _preclaim=True) -> dict:
     """无显式 claim 时的原子路由选择（与 reserve 共用 _domestic_policy，语义集中）：
     - 请求 Luna → 拒绝（Luna 只经 claim-due 竞争裁决，绝不自动派生）；
     - 请求溢出 Flash：主力仍有空位 → routing_required 到该主力；
@@ -731,7 +934,14 @@ def select_and_claim(store_path=None, *, task_id, runtime, model, workspace,
             if busy is not None:
                 conn.execute('ROLLBACK')
                 return _workspace_busy_reject(task_id, pk, busy)
-            verdict, target = _domestic_policy(conn, pk, now)
+            zcode_blocked = _zcode_availability_blocked(quota_store, now=now,
+                                                        routes_path=quota_routes)
+            eligible = _eligible_main_forces(zcode_blocked)
+            probe_allowed = _probe_allowed(quota_store, probe_ticket, now=now)
+            verdict, target = _domestic_policy(conn, pk, now, executor=executor,
+                                               eligible=eligible,
+                                               zcode_blocked=zcode_blocked,
+                                               probe_allowed=probe_allowed)
             domestic_full = _domestic_active(conn) >= DOMESTIC_TOTAL_CAPACITY
             if verdict == 'unknown_pool':
                 conn.execute('ROLLBACK')
@@ -741,6 +951,19 @@ def select_and_claim(store_path=None, *, task_id, runtime, model, workspace,
                                 f'qoder:Qwen3.8-Max, overflow qoder:Qwen3.8-Flash, '
                                 f'rescue luna:native); refusing to dispatch an '
                                 f'unsanctioned combo'])
+            if verdict == 'zcode_unavailable':
+                conn.execute('ROLLBACK')
+                return _reject('zcode_unavailable', task_id, pk,
+                               ['ZCode:GLM-5.3 is unavailable per the persistent ZCode '
+                                'availability state (hard-quota hold / bounded backoff / '
+                                'recovery-unverified); the ZCode entry is the authoritative '
+                                'last atomic gate and is never routed back to an '
+                                'unavailable ZCode'] + (zcode_blocked.get('reasons') or []))
+            if verdict == 'executor_conflict':
+                conn.execute('ROLLBACK')
+                return _reject('executor_conflict', task_id, pk,
+                               [f'executor {executor!r} may not submit combo {pk}; the '
+                                'explicit executor constraint forbids this runtime/model'])
             if verdict == 'reject_luna':
                 conn.execute('ROLLBACK')
                 return _reject('luna_requires_ticket', task_id, pk,
@@ -789,7 +1012,8 @@ def select_and_claim(store_path=None, *, task_id, runtime, model, workspace,
 
 def reserve(store_path=None, *, task_id, runtime, model, workspace, prompt_sha256,
             stage=None, chat_id=None, token=None, now=None, origin='reserve',
-            _preclaim=True) -> dict:
+            executor='auto', quota_store=None, quota_routes=None,
+            probe_ticket=None, _preclaim=True) -> dict:
     """为确切 (runtime, model) 预留一个 claim。修订后与 select-and-claim 共用统一国内
     策略（_domestic_policy）：空库/主力有空时 reserve Flash 一律 routing_required 到
     主力（不保留任何绕过主力顺序的口子）；reserve Luna 一律拒绝（只能经 ask 票据 +
@@ -824,11 +1048,28 @@ def reserve(store_path=None, *, task_id, runtime, model, workspace, prompt_sha25
             if busy is not None:
                 conn.execute('ROLLBACK')
                 return _workspace_busy_reject(task_id, pk, busy)
-            verdict, target = _domestic_policy(conn, pk, now)
+            zcode_blocked = _zcode_availability_blocked(quota_store, now=now,
+                                                        routes_path=quota_routes)
+            eligible = _eligible_main_forces(zcode_blocked)
+            probe_allowed = _probe_allowed(quota_store, probe_ticket, now=now)
+            verdict, target = _domestic_policy(conn, pk, now, executor=executor,
+                                               eligible=eligible,
+                                               zcode_blocked=zcode_blocked,
+                                               probe_allowed=probe_allowed)
             if verdict == 'unknown_pool':
                 conn.execute('ROLLBACK')
                 return _reject('unknown_pool', task_id, pk,
                                [f'{runtime!r}/{model!r} is not a sanctioned pool'])
+            if verdict == 'zcode_unavailable':
+                conn.execute('ROLLBACK')
+                return _reject('zcode_unavailable', task_id, pk,
+                               ['ZCode:GLM-5.3 is unavailable per the persistent ZCode '
+                                'availability state; reserve never hands out a slot on an '
+                                'unavailable ZCode'] + (zcode_blocked.get('reasons') or []))
+            if verdict == 'executor_conflict':
+                conn.execute('ROLLBACK')
+                return _reject('executor_conflict', task_id, pk,
+                               [f'executor {executor!r} may not reserve combo {pk}'])
             if verdict == 'reject_luna':
                 conn.execute('ROLLBACK')
                 return _reject('luna_requires_ticket', task_id, pk,
@@ -927,7 +1168,9 @@ def validate_claim(store_path, token, *, task_id=None, runtime=None, model=None,
 
 def consume_for_entry(store_path=None, *, task_id, runtime, model, workspace,
                       prompt_sha256, stage=None, chat_id=None, claim_token=None,
-                      wrapper_pid=None, wrapper_created=None, now=None) -> dict:
+                      wrapper_pid=None, wrapper_created=None, now=None,
+                      executor='auto', quota_store=None, quota_routes=None,
+                      probe_ticket=None) -> dict:
     """入口在 Popen 前的唯一容量门：
     - 给了 --dispatch-claim → 同一 `BEGIN IMMEDIATE` 事务内先精确校验（含 stage/chat）
       再 CAS reserved→running；重复/并发消费只有一个 allowed（一槽绝不双 Popen）；
@@ -960,6 +1203,34 @@ def consume_for_entry(store_path=None, *, task_id, runtime, model, workspace,
                             'reason': 'claim_invalid', 'pool_key': pool_key(runtime, model),
                             'task_id': task_id, 'reasons': check['reasons'],
                             'drift': check['drift']}
+                # BW-AVAILABILITY-20261009-B2：消费已预留 token 前，对 ZCode 组合再核验
+                # 一次持久 availability（预留与消费之间 ZCode 可能刚被真实终态判为不可用）。
+                # 不可用 → 在同一事务内把本 attempt 自己预留的占位（state=reserved）释放为
+                # start_failed（绝不泄漏本任务占位、绝不误抢别人的名额），拒绝启动。
+                if runtime == 'zcode':
+                    zcode_blocked = _zcode_availability_blocked(
+                        quota_store, now=now, routes_path=quota_routes)
+                    # 缺陷 4：消费预留 token 前，若携带经真实 CAS 状态核验过的 bound probe
+                    # 票据，则这次是唯一的有界无副作用 probe，即便 recovery_unverified 也放行
+                    # （不按 unavailable 释放）；正常派工仍按不可用释放本占位。
+                    if zcode_blocked and not _probe_allowed(quota_store, probe_ticket,
+                                                            now=now):
+                        conn.execute(
+                            "UPDATE attempts SET state='start_failed', "
+                            "terminal='start_failed', ended_at_utc=? WHERE token=? "
+                            "AND state='reserved'", (_iso(now), claim_token))
+                        conn.execute('COMMIT')
+                        return {'allowed': False, 'sent': False, 'claimed': False,
+                                'token': None, 'routing_required': False,
+                                'reason': 'zcode_unavailable',
+                                'pool_key': pool_key(runtime, model), 'task_id': task_id,
+                                'capacity_released': True,
+                                'reasons': ['ZCode availability re-check before consuming '
+                                            'the reserved token found ZCode unavailable; '
+                                            'released this attempt\'s own reserved '
+                                            'placeholder (never leaked, never preempting '
+                                            'another task) and refused the start']
+                                + (zcode_blocked.get('reasons') or [])}
                 # Z4：同 task 原消费除外；别的 task 已在同真实 workspace 在途写入则拒。
                 busy = _workspace_conflict(conn, workspace, own_token=claim_token)
                 if busy is not None:
@@ -998,7 +1269,9 @@ def consume_for_entry(store_path=None, *, task_id, runtime, model, workspace,
     return select_and_claim(store_path, task_id=task_id, runtime=runtime, model=model,
                             workspace=workspace, prompt_sha256=prompt_sha256,
                             stage=stage, chat_id=chat_id, now=now, origin='entry-auto',
-                            wrapper_pid=wrapper_pid, wrapper_created=wrapper_created)
+                            wrapper_pid=wrapper_pid, wrapper_created=wrapper_created,
+                            executor=executor, quota_store=quota_store,
+                            quota_routes=quota_routes, probe_ticket=probe_ticket)
 
 
 def mark_running(store_path, token, *, wrapper_pid=None, wrapper_created=None, now=None):
@@ -1226,6 +1499,38 @@ def reconcile(store_path=None, *, now=None, prober=None, platform=None) -> dict:
                     cident = prober(int(row['child_pid'])) or {'state': 'unknown',
                                                                'created': None}
                     if cident.get('state') == 'dead':
+                        # BW-AVAILABILITY-20261009-B5：child 死亡不足以自动释放。缺原记录
+                        # wrapper 身份、wrapper 仍活/未知、或 PID 被复用（创建身份不符）都必须
+                        # 保留占位——否则原 owner 尚在写终态/接续时被空窗放行同 workspace 新
+                        # writer。只有原身份齐备且 child+wrapper 双方确认死亡、创建身份匹配才
+                        # 自动 reconciled_exit；owner 显式 finish 仍走各自路径正常释放。
+                        wpid = row['wrapper_pid']
+                        recorded_created = row['wrapper_created'] if \
+                            'wrapper_created' in row.keys() else None
+                        if wpid is None or recorded_created is None:
+                            conn.execute("UPDATE attempts SET state='unknown', "
+                                         "terminal='unknown' WHERE token=?", (tok,))
+                            held.append({'token': tok, 'why': 'child dead but no recorded '
+                                       'wrapper identity/creation to confirm the owning '
+                                       'call has finished; held conservatively'})
+                            continue
+                        wident = prober(int(wpid)) or {'state': 'unknown',
+                                                        'created': None}
+                        if wident.get('state') != 'dead':
+                            conn.execute("UPDATE attempts SET state='unknown', "
+                                         "terminal='unknown' WHERE token=?", (tok,))
+                            held.append({'token': tok, 'why': 'child dead but wrapper '
+                                       'alive/unknown (owner may still be finalizing); '
+                                       'held conservatively'})
+                            continue
+                        if wident.get('created') and \
+                                str(recorded_created) != str(wident.get('created')):
+                            conn.execute("UPDATE attempts SET state='unknown', "
+                                         "terminal='unknown' WHERE token=?", (tok,))
+                            held.append({'token': tok, 'why': 'child dead but wrapper PID '
+                                       'reused (creation identity mismatch); held '
+                                       'conservatively'})
+                            continue
                         conn.execute("UPDATE attempts SET state='reconciled_exit', "
                                      "terminal='reconciled_exit', ended_at_utc=? "
                                      "WHERE token=?", (_iso(now), tok))
@@ -1309,30 +1614,52 @@ def _normalize_scope(scope):
 
 
 def ask_record(store_path=None, *, task_id, scope=None, ask_message_id=None,
-               now=None, deadline_seconds=LUNA_ASK_TIMEOUT_SECONDS) -> dict:
+               now=None, deadline_seconds=LUNA_ASK_TIMEOUT_SECONDS,
+               degradation_reason=None, degradation_detail=None,
+               quota_store=None, quota_routes=None) -> dict:
     """记录一次真实的“问用户（外部 agent 或 Luna）”票据并开始 300 秒计时。
     修订后的硬校验：
     - ask_message_id 必须非空（真实询问回执标识；本函数绝不假装已经问过）；
     - scope 必须完整绑定原 task/stage/chat/workspace/promptSHA，且 scope.task_id 与
       task_id 一致；
-    - 六个国内名额必须确实全满（未满时优先国内，不该升级询问）；
+    - 六个国内名额必须确实全满（未满时优先国内，不该升级询问）；**除非**给出可信的
+      降级决策（degradation_reason ∈ quota/auth/capacity + degradation_detail）：ZCode
+      持久不可用（quota）等导致“可用主力不足”时，允许在六未满时记录一次降级询问；
+      quota 降级必须带客观证据（持久 ZCode availability 阻断行），绝不凭空降级；
     - 等待固定 LUNA_ASK_TIMEOUT_SECONDS=300 秒：更短的 deadline_seconds 直接拒绝，
       更长也按固定 300 落库（任务不能任意缩短/自定义）。
-    同一 task 只能有一个 pending/claimed 票据；重启不重置 deadline（持久化）。
+    同一 task 只能有一个票据：任何已存在的票据（pending/claimed/replied/cancelled/
+    settled）都拒绝重复记录——重复询问绝不重置原回复/计时/scope；重启不重置 deadline。
+    降级票据（degradation_reason 非空）绝不由超时授权 Luna：claim-due 要求用户明确
+    reply luna 才放行（非容量类超时不得替代明确授权）。
     now 参数仅供确定性函数测试注入；宿主生产路径（CLI）始终使用真实 UTC。"""
     now = now or utcnow()
     ok, parsed_scope, scope_reasons = _normalize_scope(scope)
+    if degradation_reason is not None and degradation_reason not in ('quota', 'auth', 'capacity'):
+        return {'recorded': False, 'task_id': task_id,
+                'reasons': [f'degradation_reason must be one of quota/auth/capacity; '
+                            f'got {degradation_reason!r}']}
+    degraded = degradation_reason is not None
+    if degraded and (not degradation_detail or not str(degradation_detail).strip()):
+        return {'recorded': False, 'task_id': task_id,
+                'reasons': ['degradation_detail is required for a degradation ask: the '
+                            'independent objective reason (quota/auth/capacity) must be '
+                            'recorded, never fabricated']}
     with closing(connect(store_path)) as conn:
         conn.execute('BEGIN IMMEDIATE')
         try:
             row = conn.execute('SELECT * FROM luna_tickets WHERE task_id=?',
                                (task_id,)).fetchone()
-            if row is not None and row['state'] in ('pending', 'claimed'):
+            if row is not None:
+                # 任何已存在的票据（含 replied/cancelled/settled/claimed）一律拒绝重复
+                # 记录：重复询问绝不重置原回复、计时或 scope。
                 conn.execute('ROLLBACK')
                 return {'recorded': False, 'task_id': task_id, 'state': row['state'],
                         'deadline_utc': row['deadline_utc'],
-                        'reasons': ['an ask ticket is already pending/claimed for this '
-                                    'task; it is never reset by a restart']}
+                        'reply_choice': row['reply_choice'],
+                        'reasons': ['an ask ticket already exists for this task '
+                                    f'(state={row["state"]!r}); a repeated ask never '
+                                    'resets the original reply, timer, or scope']}
             reasons = []
             if not ask_message_id or not str(ask_message_id).strip():
                 reasons.append('ask_message_id is required: a real ask receipt '
@@ -1346,7 +1673,37 @@ def ask_record(store_path=None, *, task_id, scope=None, ask_message_id=None,
                 reasons.append(f'deadline_seconds={deadline_seconds} is below the fixed '
                                f'{LUNA_ASK_TIMEOUT_SECONDS}s wait; a task may never '
                                'shorten the user-response window')
-            if _domestic_active(conn) < DOMESTIC_TOTAL_CAPACITY:
+            if degraded:
+                # 降级询问允许在六未满时记录，但 quota 降级必须带客观持久 ZCode 不可用证据。
+                if degradation_reason == 'quota':
+                    zcode_blocked = _zcode_availability_blocked(
+                        quota_store, now=now, routes_path=quota_routes)
+                    if not zcode_blocked:
+                        reasons.append('quota degradation requires objective evidence: '
+                                       'the persistent ZCode availability state must '
+                                       'actually block ZCode; a non-capacity timeout or '
+                                       'an unverified hunch is never a quota degradation')
+                elif degradation_reason == 'capacity':
+                    # 缺陷 7：capacity 降级不能只凭一句字符串+detail 就宣称"所有受信任候选
+                    # 都不可用"——必须客观核验受信任候选池是否真的排空。仍有受信任候选有空位
+                    # 时优先用国内候选，绝不升级到问用户/待援。候选集合按票据 scope 的执行器/
+                    # combo 收窄：scope 明确只要 Qoder 时，ZCode 空位不是该任务的受信任候选。
+                    zcode_blocked = _zcode_availability_blocked(
+                        quota_store, now=now, routes_path=quota_routes)
+                    allowed_c = _scope_allowed_candidates(parsed_scope, zcode_blocked)
+                    free_candidate = None
+                    for k in allowed_c:
+                        cap = capacity_for(k)
+                        if cap is not None and _count_active(conn, k) < cap:
+                            free_candidate = k
+                            break
+                    if free_candidate is not None:
+                        reasons.append(
+                            f'capacity degradation refused: an eligible domestic candidate '
+                            f'{free_candidate} still has a free slot; prioritize the real '
+                            'capacity instead of escalating to an ask (a capacity claim '
+                            'must not fabricate exhaustion of authorized candidates)')
+            elif _domestic_active(conn) < DOMESTIC_TOTAL_CAPACITY:
                 reasons.append('domestic slots are not full; prioritize domestic '
                                'capacity instead of escalating to an ask')
             if reasons:
@@ -1355,21 +1712,21 @@ def ask_record(store_path=None, *, task_id, scope=None, ask_message_id=None,
             asked = _iso(now)
             deadline = _iso(now + timedelta(seconds=LUNA_ASK_TIMEOUT_SECONDS))
             scope_json = json.dumps(parsed_scope, ensure_ascii=False, sort_keys=True)
+            # 纯 INSERT（已确认无同 task 票据）：绝不用 ON CONFLICT DO UPDATE 覆盖任何
+            # 既有回复/计时/scope。
             conn.execute(
                 'INSERT INTO luna_tickets(task_id, state, scope, ask_message_id, '
-                'asked_at_utc, deadline_utc, agent_id, updated_at_utc) '
-                'VALUES(?,?,?,?,?,?,?,?) '
-                'ON CONFLICT(task_id) DO UPDATE SET state=?, scope=?, ask_message_id=?, '
-                'asked_at_utc=?, deadline_utc=?, reply_choice=NULL, reply_note=NULL, '
-                'replied_at_utc=NULL, claimed_token=NULL, launch_state=NULL, agent_id=NULL, '
-                'updated_at_utc=?',
+                'asked_at_utc, deadline_utc, agent_id, degradation_reason, '
+                'degradation_detail, updated_at_utc) '
+                'VALUES(?,?,?,?,?,?,?,?,?,?)',
                 (task_id, 'pending', scope_json, str(ask_message_id), asked, deadline,
-                 None, asked,
-                 'pending', scope_json, str(ask_message_id), asked, deadline, asked))
+                 None, degradation_reason, degradation_detail, asked))
             conn.execute('COMMIT')
             return {'recorded': True, 'task_id': task_id, 'state': 'pending',
                     'asked_at_utc': asked, 'deadline_utc': deadline,
-                    'deadline_seconds': LUNA_ASK_TIMEOUT_SECONDS}
+                    'deadline_seconds': LUNA_ASK_TIMEOUT_SECONDS,
+                    'degradation_reason': degradation_reason,
+                    'degradation_detail': degradation_detail}
         except Exception:
             conn.execute('ROLLBACK')
             raise
@@ -1394,7 +1751,18 @@ def reply(store_path=None, *, task_id, choice, note=None, now=None) -> dict:
             if row['state'] == 'claimed':
                 conn.execute('ROLLBACK')
                 return {'recorded': False, 'task_id': task_id, 'state': 'claimed',
-                        'reasons': ['ticket already claimed; reply recorded too late']}
+                        'launch_state': row['launch_state'],
+                        'reasons': ['ticket already claimed; reply recorded too late' +
+                                    (f' (launch_state={row["launch_state"]}); a claimed '
+                                     'or launch_unknown ticket is never reopened by a late '
+                                     'reply' if row['launch_state'] else '')]}
+            if row['state'] == 'settled':
+                # 缺陷 7：已原生结算(settled)的票据绝不能被迟到/重复 reply 重新打开。
+                conn.execute('ROLLBACK')
+                return {'recorded': False, 'task_id': task_id, 'state': 'settled',
+                        'reply_choice': row['reply_choice'],
+                        'reasons': ['ticket already settled natively; a late or repeated '
+                                    'reply never reopens a settled ticket']}
             if row['state'] == 'replied':
                 conn.execute('ROLLBACK')
                 return {'recorded': False, 'task_id': task_id, 'state': 'replied',
@@ -1417,6 +1785,7 @@ def reply(store_path=None, *, task_id, choice, note=None, now=None) -> dict:
 
 
 def claim_due(store_path=None, *, task_id, now=None, scope=None,
+              quota_store=None, quota_routes=None,
               _preclaim=True) -> dict:
     """到期裁决（同一 `BEGIN IMMEDIATE` 事务内的竞争，修订后无丢槽竞态）：
     - 票据 pending 且已过 deadline 且未回复（或用户已明确 reply luna）时：
@@ -1473,12 +1842,17 @@ def claim_due(store_path=None, *, task_id, now=None, scope=None,
                                         'reply stops auto-Luna']}
             # Z2：先做票据原 scope 解析与（若传入）一致性核验——两个分支（国内回收与
             # Luna）都必须与原 scope 完全一致，任一字段漂移即拒。
+            # BW-AVAILABILITY-20261009-B2：损坏/缺失的票据 scope 一律 fail-closed 拒绝，
+            # 绝不在无法绑定原始事实时悄悄继续（既不国内回收也不 Luna）。
             ticket_scope = row['scope']
-            parsed_ticket_scope = None
-            if ticket_scope:
-                ok_ts, parsed_ticket_scope, _ = _normalize_scope(ticket_scope)
-                if not ok_ts:
-                    parsed_ticket_scope = None
+            ok_ts, parsed_ticket_scope, ts_reasons = _normalize_scope(ticket_scope)
+            if not ok_ts:
+                conn.execute('ROLLBACK')
+                return {'claimed': False, 'task_id': task_id, 'state': row['state'],
+                        'scope_corrupt': True,
+                        'reasons': ['the ticket scope is corrupt or missing; refusing to '
+                                    'adjudicate without the original binding facts '
+                                    f'(fail-closed): {ts_reasons}']}
             if scope is not None:
                 ok, parsed, scope_reasons = _normalize_scope(scope)
                 if not ok:
@@ -1494,17 +1868,69 @@ def claim_due(store_path=None, *, task_id, now=None, scope=None,
             # 先看国内是否已恢复空位（不必等到期：30 秒内释放也立即国内回收）；只有六
             # 仍满才判断 300 秒 deadline 或用户明确 reply luna。
             reply_luna = row['state'] == 'replied' and row['reply_choice'] == 'luna'
+            reply_domestic = row['state'] == 'replied' and row['reply_choice'] == 'domestic'
+            degraded = bool(row['degradation_reason']) if 'degradation_reason' in row.keys() else False
+            zcode_blocked = _zcode_availability_blocked(quota_store, now=now,
+                                                        routes_path=quota_routes)
+            eligible = _eligible_main_forces(zcode_blocked)
+            # BW-AVAILABILITY-20261009-B4 缺陷 7 + B4 combo：国内回收必须真正遵守票据原
+            # scope 携带的执行器 + 模型 combo 硬约束（受信任主脑的明确授权，含本次 Flash），
+            # 绝不因为别的候选有空位就把 scope=qoder 的任务改派成 ZCode。scope 若声明
+            # executor/model，则候选池被收窄到该 combo；combo 无空位就保持 pending 等待，
+            # 绝不降级 Luna（domestic 任何时刻都不是 Luna）。
+            scope_executor = parsed_ticket_scope.get('executor')
+            scope_model = parsed_ticket_scope.get('model')
+            scope_combo, scope_combo_conflict = _scope_combo_from_scope(parsed_ticket_scope)
             if not reply_luna and _domestic_active(conn) < DOMESTIC_TOTAL_CAPACITY:
-                target, _ = _select_main_force(conn, None, now)
-                if target is None:
+                allowed = None
+                if scope_combo_conflict:
+                    # executor/runtime 冲突或未知 model：fail-closed，无受信任候选，保持
+                    # pending，绝不猜池回收、绝不 Luna。
+                    allowed = set()
+                elif scope_combo is not None:
+                    allowed = {scope_combo}
+                elif scope_executor == 'qoder':
+                    allowed = {QMAX_POOL_KEY, OVERFLOW_KEYS[0]}
+                elif scope_executor == 'zcode':
+                    allowed = {ZCODE_POOL_KEY}
+                if allowed is not None and ZCODE_POOL_KEY in allowed and zcode_blocked:
+                    # 原 scope 只要 ZCode，但 ZCode 当前不可用：不回收、不 Luna，保持 pending。
+                    conn.execute('ROLLBACK')
+                    return {'claimed': False, 'task_id': task_id, 'state': row['state'],
+                            'reasons': ['the original scope pins this task to ZCode but '
+                                        'ZCode is currently unavailable per persistent '
+                                        'availability; a domestic reclaim never reroutes a '
+                                        'ZCode-bound scope to another executor and never '
+                                        'escalates to Luna — it stays pending waiting for a '
+                                        'restored ZCode slot']
+                                    + (zcode_blocked.get('reasons') or [])}
+                eligible2 = eligible if allowed is None else (eligible & allowed)
+                target, _ = _select_main_force(conn, scope_combo, now, eligible=eligible2)
+                if target is None and allowed is not None:
+                    for k in allowed:
+                        if k not in MAIN_FORCE_KEYS and capacity_for(k) is not None \
+                                and _count_active(conn, k) < capacity_for(k):
+                            target = k
+                            break
+                if target is None and scope_combo is not None \
+                        and scope_combo in MAIN_FORCE_KEYS \
+                        and capacity_for(scope_combo) is not None \
+                        and _count_active(conn, scope_combo) < capacity_for(scope_combo):
+                    target = scope_combo
+                if target is None and allowed is None:
                     ovf = OVERFLOW_KEYS[0]
                     if (_count_active(conn, ovf) < capacity_for(ovf)):
                         target = ovf
                 if target is None:
+                    # combo/执行器约束收窄后没有可用国内空位（别的候选有空位也不算）：
+                    # 保持 pending 等待满足原约束的槽，绝不为图省事改派或降级 Luna。
                     conn.execute('ROLLBACK')
                     return {'claimed': False, 'task_id': task_id, 'state': row['state'],
-                            'reasons': ['no domestic slot could be atomically reserved '
-                                        'despite a free count; retry']}
+                            'reasons': ['no domestic slot satisfies the original scope '
+                                        f'constraint (executor={scope_executor!r}, '
+                                        f'combo={scope_combo!r}); the ticket stays pending '
+                                        '— a slot for another candidate never satisfies it '
+                                        'and domestic is never Luna']}
                 dup = _active_task(conn, task_id)
                 if dup is not None:
                     conn.execute("UPDATE luna_tickets SET state='cancelled', "
@@ -1560,6 +1986,46 @@ def claim_due(store_path=None, *, task_id, now=None, scope=None,
                                     'no lost slot)']}
             # 六仍满：未到期（不重置 deadline）一律拒绝；到期未回复或明确 reply luna
             # 才允许 Luna。
+            # BW-AVAILABILITY-20261009-B2：用户明确 reply domestic → 永不 Luna（只能等国内
+            # 或原子回收；六仍满也绝不降级 Luna）。
+            if reply_domestic:
+                conn.execute('ROLLBACK')
+                return {'claimed': False, 'task_id': task_id, 'state': 'replied',
+                        'reply_choice': 'domestic',
+                        'reasons': ['the user explicitly replied domestic; a domestic '
+                                    'reply never escalates to Luna — wait for a domestic '
+                                    'slot or an atomic domestic reclaim, never Luna']}
+            # BW-AVAILABILITY-20261009-B5 缺陷 6：票据原 scope 若把任务钉在某个国内 combo
+            # （executor+model，如 qoder:Qwen3.8-Flash），六仍满时**只等该 combo 的国内空位**，
+            # 绝不因超时自动升级到 Luna（Luna 是不同执行器，从不满足国内 combo 约束）。只有用户
+            # 明确 reply luna（已授权接续）才放行；executor/runtime 冲突或未知 model 同样
+            # fail-closed 保持 pending，绝不猜池、绝不 Luna。
+            if (scope_combo_conflict
+                    or (scope_combo is not None and scope_combo != LUNA_KEY
+                        and not reply_luna)):
+                conn.execute('ROLLBACK')
+                return {'claimed': False, 'task_id': task_id, 'state': row['state'],
+                        'reasons': ['the original ticket scope pins this task to a domestic '
+                                    f'combo (executor={scope_executor!r}, '
+                                    f'model={scope_model!r}'
+                                    + (f', combo={scope_combo!r}' if scope_combo else '')
+                                    + ('; the combo is ambiguous/unknown so nothing is '
+                                       'guessed (fail-closed)' if scope_combo_conflict else
+                                       '')
+                                    + '); when all six domestic slots are full it waits for '
+                                    'that combo to free — a wait timeout never escalates a '
+                                    'domestic-combo scope to Luna; only an explicit user '
+                                    'reply luna (an authorized continuation) may proceed']}
+            # 降级票据（<6 满时凭独立 quota/auth/capacity 证据记录）绝不由超时授权 Luna：
+            # 非容量类超时不得替代明确授权，必须用户明确 reply luna 才放行。
+            if degraded and not reply_luna:
+                conn.execute('ROLLBACK')
+                return {'claimed': False, 'task_id': task_id, 'state': row['state'],
+                        'degradation_reason': row['degradation_reason'],
+                        'reasons': ['this is a degradation ask recorded without six-full '
+                                    'domestic slots; a wait timeout is never an implicit '
+                                    'authorization — the user must explicitly reply luna '
+                                    'before Luna may be claimed']}
             if row['state'] == 'pending':
                 deadline = _parse(row['deadline_utc'])
                 if deadline is not None and now < deadline:
@@ -2257,6 +2723,16 @@ def build_parser() -> argparse.ArgumentParser:
     p.add_argument('--scope', default=None,
                    help='JSON object binding task_id/stage/chat_id/workspace/prompt_sha256')
     p.add_argument('--ask-message-id', dest='ask_message_id', default=None)
+    p.add_argument('--degradation-reason', dest='degradation_reason', default=None,
+                   choices=['quota', 'auth', 'capacity'],
+                   help='Independent degradation reason allowing an ask with fewer than '
+                        'six-full domestic slots; quota requires objective persistent '
+                        'ZCode unavailability evidence')
+    p.add_argument('--degradation-detail', dest='degradation_detail', default=None,
+                   help='Required objective detail for a degradation ask')
+    p.add_argument('--quota-store', dest='quota_store', default=None,
+                   help='Persistent availability store consulted for quota degradation evidence')
+    p.add_argument('--quota-routes', dest='quota_routes', default=None)
 
     p = sub.add_parser('reply', help='record the user reply choice')
     p.add_argument('--task-id', dest='task_id', required=True)
@@ -2268,6 +2744,10 @@ def build_parser() -> argparse.ArgumentParser:
     p.add_argument('--task-id', dest='task_id', required=True)
     p.add_argument('--scope', default=None,
                    help='JSON object matching the original ticket scope (for reclaim)')
+    p.add_argument('--quota-store', dest='quota_store', default=None,
+                   help='Persistent availability store used to filter the domestic '
+                        'reclaim target away from an unavailable ZCode')
+    p.add_argument('--quota-routes', dest='quota_routes', default=None)
 
     p = sub.add_parser('mark-launch-unknown', help='record a non-idempotent launch_unknown')
     p.add_argument('--task-id', dest='task_id', required=True)
@@ -2330,6 +2810,23 @@ def _add_claim_args(p):
     p.add_argument('--stage', default=None)
     p.add_argument('--chat-id', dest='chat_id', default=None)
     p.add_argument('--token', default=None)
+    p.add_argument('--executor', default='auto', choices=['auto', 'qoder', 'zcode'],
+                   help='Explicit executor constraint from a trusted brain caller: '
+                        'qoder honors a free Qwen3.8-Max slot without 1:1 rerouting to '
+                        'ZCode; zcode is the authoritative last gate (unavailable → '
+                        'refused); auto keeps historical committed-count fairness')
+    p.add_argument('--quota-store', dest='quota_store', default=None,
+                   help='Persistent ZCode availability store consulted for availability '
+                        'filtering. When omitted it resolves through the formal default '
+                        'source in order: explicit --quota-store -> env '
+                        'BRAIN_WORKER_QUOTA_STORE -> the trusted default persistent file '
+                        '(~/.brain-worker/quota-state.sqlite3), so the default path DOES '
+                        'filter an unavailable ZCode. Resolution is READ-ONLY only: it '
+                        'never creates a db/table and never writes the quota store inside '
+                        'a pool transaction; a read error fails closed (treated as '
+                        'unavailable), never claiming recovery/free/balance.')
+    p.add_argument('--quota-routes', dest='quota_routes', default=None,
+                   help='Optional quota routes file for ZCode availability resolution')
 
 
 def main(argv=None) -> int:
@@ -2342,12 +2839,16 @@ def main(argv=None) -> int:
     elif args.command == 'reserve':
         out = reserve(store, task_id=args.task_id, runtime=args.runtime, model=args.model,
                       workspace=args.workspace, prompt_sha256=args.prompt_sha256,
-                      stage=args.stage, chat_id=args.chat_id, token=args.token, now=now)
+                      stage=args.stage, chat_id=args.chat_id, token=args.token, now=now,
+                      executor=args.executor, quota_store=args.quota_store,
+                      quota_routes=args.quota_routes)
     elif args.command == 'select-and-claim':
         out = select_and_claim(store, task_id=args.task_id, runtime=args.runtime,
                                model=args.model, workspace=args.workspace,
                                prompt_sha256=args.prompt_sha256, stage=args.stage,
-                               chat_id=args.chat_id, token=args.token, now=now)
+                               chat_id=args.chat_id, token=args.token, now=now,
+                               executor=args.executor, quota_store=args.quota_store,
+                               quota_routes=args.quota_routes)
     elif args.command == 'validate':
         out = validate_claim(store, args.token, task_id=args.task_id, runtime=args.runtime,
                              model=args.model, workspace=args.workspace,
@@ -2365,11 +2866,15 @@ def main(argv=None) -> int:
         out = reconcile(store, now=now)
     elif args.command == 'ask-record':
         out = ask_record(store, task_id=args.task_id, scope=args.scope,
-                         ask_message_id=args.ask_message_id, now=now)
+                         ask_message_id=args.ask_message_id, now=now,
+                         degradation_reason=args.degradation_reason,
+                         degradation_detail=args.degradation_detail,
+                         quota_store=args.quota_store, quota_routes=args.quota_routes)
     elif args.command == 'reply':
         out = reply(store, task_id=args.task_id, choice=args.choice, note=args.note, now=now)
     elif args.command == 'claim-due':
-        out = claim_due(store, task_id=args.task_id, now=now, scope=args.scope)
+        out = claim_due(store, task_id=args.task_id, now=now, scope=args.scope,
+                        quota_store=args.quota_store, quota_routes=args.quota_routes)
     elif args.command == 'mark-launch-unknown':
         out = mark_launch_unknown(store, task_id=args.task_id, now=now)
     elif args.command == 'record-agent-id':

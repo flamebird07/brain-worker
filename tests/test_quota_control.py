@@ -1331,14 +1331,18 @@ class ZCodeEntryReplayTests(unittest.TestCase):
                 mock.patch.object(zd.subprocess, 'Popen', side_effect=_popen):
             with contextlib.redirect_stdout(buf):
                 code = zd.main()
-        summary = json.loads((Path(out) / 'summary.json').read_text(encoding='utf-8'))
+        summary_path = Path(out) / 'summary.json'
+        summary = (json.loads(summary_path.read_text(encoding='utf-8'))
+                   if summary_path.is_file() else None)
         return code, summary, buf.getvalue()
 
-    def test_entry_reports_1308_without_auto_cooldown_allows_next_dispatch(self):
-        # 新政策（BW-ZCODE-MANUAL-QUOTA-20261008-S1）：ZCode 手动额度、取消自动冷却。
-        # 完整入口回放 429/1308 → 失败退出、原始数字码 1308、错误载体 SHA 仍真，但**不落
-        # 本组冷却**；随后独立新 output 仍可派工（不被冷却挡），一次 main 恰好一次 mock
-        # 进程、不自动重试。
+    def test_entry_reports_1308_without_auto_cooldown_records_availability_hold(self):
+        # BW-AVAILABILITY-20261009-B2 新政策：ZCode 取消自动额度冷却（旧 cooldowns 表仍不落），
+        # 但真实受信任 429/1308 硬上限（"已达到…使用上限"命中窄硬上限消息语义，优先于 wrapper
+        # 派生的 rate_limit 标签；reset 文本无时区 → 不猜窗口）落进**独立持久 availability 状态**
+        # 为无限期 hard_hold。完整入口回放 429/1308 → 失败退出、原始数字码 1308、错误载体 SHA
+        # 仍真、不落本组冷却；随后独立新 output 被 availability 门挡住（sent=false、退出 2、零
+        # Popen、零输出目录），一次 main 恰好一次 mock 进程、不自动重试。
         counter = {'n': 0}
         env = {'carrier': 'zcode-sdk', 'ok': False, 'preflight_ok': True,
                'errors': ['ProviderBusinessError: [1308][已达到 5 小时的使用上限。'
@@ -1358,6 +1362,13 @@ class ZCodeEntryReplayTests(unittest.TestCase):
         outcome = summary['quota_outcome']
         self.assertTrue(outcome['auto_cooldown_disabled'])
         self.assertFalse(outcome.get('recorded'))
+        # 独立持久 availability：真实 1308 硬上限落 hard_hold（无限期，无窗口猜测）。
+        recorded = summary['zcode_availability_recorded']
+        self.assertTrue(recorded['recorded'], recorded)
+        self.assertEqual(recorded['state'], 'hard_hold')
+        self.assertTrue(recorded['hard_quota'])
+        self.assertEqual(recorded['provider_code'], 1308)
+        self.assertIsNone(recorded['blocked_until_utc'])
         # 原始数字码 1308（内层），外层 wrapper 码区分保留；无时区 reset→unverified 不猜。
         ref = summary['quota_wrapper_reference']
         self.assertEqual(ref['provider_code'], 1308)
@@ -1377,13 +1388,15 @@ class ZCodeEntryReplayTests(unittest.TestCase):
         # 缺原始报告如实保留：无 response.md → 不宣称 bound，不补写报告。
         self.assertFalse(summary['report_bound'])
         self.assertFalse((out1 / 'response.md').exists())
-        # 第二次独立新 output 不再被冷却挡住：正常派工、mock 进程发生、仍不落冷却。
+        # 第二次独立新 output 被 availability hard_hold 挡住：sent=false、退出 2、零 Popen
+        # （counter 不变）、零输出目录（不写 summary.json）。绝不复活不可用的 ZCode。
         out2 = self.tmp / 'out-1308-again'
-        code2, summary2, _ = self._run(out2, stdout_bytes, self.REAL_STDERR_FRAME,
-                                       5, counter)
-        self.assertEqual(counter['n'], 2)  # 第二次确实派工（一次 main 仍只一次 Popen）
-        self.assertEqual(code2, 3)         # 本次运行因模型 429 失败，非门禁 sent=false
-        self.assertTrue(summary2['quota_auto_cooldown_disabled'])
+        code2, _, stdout2 = self._run(out2, stdout_bytes, self.REAL_STDERR_FRAME,
+                                      5, counter)
+        self.assertEqual(counter['n'], 1)  # 第二次未派工：availability 门在 Popen 前拒绝
+        self.assertEqual(code2, 2)         # 门禁拒绝退出码（sent=false），非模型 429 的 3
+        self.assertIn('zcode_availability_rejected', stdout2)
+        self.assertFalse((out2 / 'summary.json').exists())
         self.assertNotIn(qc.UNKNOWN_SHARED_GROUP, qc.get_status(self.store)['cooldowns'])
 
     def test_structured_stdout_429_empty_stderr_binds_stdout_envelope(self):

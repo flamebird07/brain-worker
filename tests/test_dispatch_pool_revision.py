@@ -295,22 +295,54 @@ class TestReconcile(TempStoreMixin, unittest.TestCase):
                           wrapper_created='w' if wrapper_state else None)
         return wrapper_state
 
-    def test_wrapper_alive_child_dead_released(self):
+    def test_wrapper_alive_child_dead_is_retained_not_auto_released(self):
+        # BW-AVAILABILITY-20261009-B5 Gap3（安全强化，非弱化旧断言）：child 死亡不足以
+        # 自动释放。原 wrapper 仍活（owner 可能还在写终态/接续）时，任何 auto/public
+        # reclaim 路径都必须保留占位——否则同 workspace 新 writer 会在原 owner 空窗被放行。
+        # 只有原身份齐备且 child+wrapper 双方确认死亡、创建身份匹配才自动 reconciled_exit；
+        # owner 显式 finish（亲证已绑定 child 真实退出）仍正常释放。
         self._mk('a', wrapper_state=True, child_pid=101, child_created='c101',
                  recorded_created='c101')
         prober = lambda pid: ({'pid': pid, 'state': 'alive', 'created': 'w'}
                               if pid == 900 else
                               {'pid': pid, 'state': 'dead', 'created': None})
         out = dp.reconcile(self.store, now=T0, prober=prober)
-        self.assertIn('a', out['released'])
-        self.assertEqual(self.row('attempts', 'token', 'a')['state'], 'reconciled_exit')
+        self.assertNotIn('a', out['released'])
+        self.assertEqual(self.row('attempts', 'token', 'a')['state'], 'unknown')
+        # owner 显式 finish：已绑定 child 探针确认已退出 → 仍可释放（不影响原释放能力）。
+        fin = dp.finish(self.store, 'a', terminal='start_failed', now=T0,
+                        prober=lambda pid: {'pid': pid, 'state': 'dead', 'created': None},
+                        wrapper_pid=900, wrapper_created='w')
+        self.assertTrue(fin['released'], fin)
+        self.assertEqual(self.row('attempts', 'token', 'a')['state'], 'start_failed')
 
-    def test_real_dead_pid_created_none_released(self):
+    def test_dead_child_no_wrapper_identity_is_retained_not_auto_released(self):
+        # BW-AVAILABILITY-20261009-B5 Gap3：缺原记录 wrapper 身份时，即便 child 已死也
+        # 不得 auto-release（无身份无法证明 owner 调用已结束）→ 保守 unknown 保留。
+        # 真实死 PID 探针回读 created=None 属正常，但“缺身份”仍触发保留；owner 显式
+        # finish（亲证 child 真退出）仍是合法释放出口。
         self._mk('b', wrapper_state=False, child_pid=102, child_created='c102',
                  recorded_created='c102')
         out = dp.reconcile(self.store, now=T0,
                            prober=_probe('dead', None))
-        self.assertIn('b', out['released'])
+        self.assertNotIn('b', out['released'])
+        self.assertEqual(self.row('attempts', 'token', 'b')['state'], 'unknown')
+        fin = dp.finish(self.store, 'b', terminal='start_failed', now=T0,
+                        prober=lambda pid: {'pid': pid, 'state': 'dead', 'created': None})
+        self.assertTrue(fin['released'], fin)
+        self.assertEqual(self.row('attempts', 'token', 'b')['state'], 'start_failed')
+
+    def test_both_dead_full_identity_reconciled_exit(self):
+        # Gap3 唯一自动释放出口：原身份齐备（wrapper 记录在案）且 child+wrapper 双方
+        # 确认死亡、创建身份匹配 → reconcile 自动 reconciled_exit（证明保留规则不过度收紧）。
+        self._mk('g', wrapper_state=True, child_pid=106, child_created='c106',
+                 recorded_created='c106')
+        prober = lambda pid: ({'pid': pid, 'state': 'dead', 'created': 'w'}
+                              if pid == 900 else
+                              {'pid': pid, 'state': 'dead', 'created': None})
+        out = dp.reconcile(self.store, now=T0, prober=prober)
+        self.assertIn('g', out['released'])
+        self.assertEqual(self.row('attempts', 'token', 'g')['state'], 'reconciled_exit')
 
     def test_child_alive_birth_match_kept(self):
         self._mk('c', wrapper_state=True, child_pid=103, child_created='c103',

@@ -10,6 +10,14 @@ python <技能目录>/scripts/qoder_direct.py --workspace <项目绝对路径> -
 
 入口在**建输出目录、Popen 之前**必须消费或校验一个跨会话共享的**并发容量 claim**（`scripts/dispatch_pool.py`，见 [global-dispatch](global-dispatch.md)）：给了 `--dispatch-claim <token>` 就精确校验（task/runtime/model/workspace/prompt_sha256 任一漂移即拒），没给就走 `select_and_claim` 原子路由；非被选中组合 → `routing_required`/`sent=false`/退出 2、零证据目录、不计轮次。可选 `--task-id`、`--dispatch-store`（默认 `BRAIN_WORKER_DISPATCH_STORE` 或 `~/.brain-worker/dispatch-pool.sqlite3`）、`--dispatch-claim`。子进程真实结束立即释放名额；存活未知不释放、不被抢占。**容量并发 ≠ 额度冷却**。
 
+BW-AVAILABILITY-20261009-B2：Qoder 入口以 `executor='qoder'` 消费/claim，并读**同一持久 ZCode availability**（可选 `--quota-store`，默认 `BRAIN_WORKER_QUOTA_STORE`；`--quota-routes`）——`dispatch_pool` 的资格过滤把被阻断的 ZCode 通道剔除，因此 **Qoder 绝不会被改道回不可用的 ZCode**；显式 Qoder 有空位时**不因历史 committed 计数被 1:1 改道**（见 [global-dispatch](global-dispatch.md) 的执行器约束与 availability 资格过滤）。
+
+BW-AVAILABILITY-20261009-B4：受信任主脑明确授权的 **`executor='qoder'` + `--model` 组合硬约束**贯穿
+`consume_for_entry`——含本阶段真实执行的 `Qwen3.8-Flash`——有空位即直接 claim 该精确组合，
+**绝不因别的候选有空位而拒绝已授权组合**；ZCode availability 状态仅用于保证不会被绕回不可用的 ZCode，
+不参与 Qoder 组合选择。默认 AUTO 主力优先/容量/1:1 与 Z2/Max2/Flash2 容量不变（并发 2/4 是 Skill
+政策、非已核实的 Qoder 进程上限）。
+
 ## 统一契约与哈希口径
 
 - 当前直连入口（Qoder/ZCode）调用前使用 `scripts/prompt_contract.py` 的完整九节契约，含精确标题、阶段/路径同一行、首末独占标记和结语。任务经 stdin，完整契约经官方 `--append-system-prompt`，两个通道各自留证。契约不能保证模型服从；原始响应照存，不合格仍保留 `bound=false`，不裁剪、不代写。
