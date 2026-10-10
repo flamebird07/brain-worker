@@ -621,6 +621,20 @@ class AdapterDispatchPlanTests(unittest.TestCase):
         self.entry.write_text(json.dumps(
             {'node': sys.executable, 'qodercli': str(STUB_QODER)}), encoding='utf-8')
         self.stage = 'BW-PLAN-TEST-01'
+        # BW-MAX-WINDOW-20261010-S2：计划默认用内置 Qwen3.8-Max（主力时段门约束），真实入口
+        # 在子进程用墙钟判定 → 白天会如实拒绝。本组只验 dispatch plan 预检/Popen 链路，故用
+        # 测试创建的临时 wrapper 把 dispatch_pool.utcnow 固定到主力时段内（北京 23:00）再原样
+        # 运行 qoder_direct 入口；时钟控制仅在此离线夹具，生产入口不加 --now/环境开关。
+        self.runner = self.ws / 'qd_in_window_runner.py'
+        self.runner.write_text(
+            'import sys\n'
+            f'sys.path.insert(0, {str(REPO / "scripts")!r})\n'
+            'from datetime import datetime, timezone\n'
+            'import dispatch_pool as dp\n'
+            'dp.utcnow = lambda: datetime(2026, 10, 8, 15, 0, 0, tzinfo=timezone.utc)\n'
+            'import qoder_direct\n'
+            'sys.exit(qoder_direct.main())\n',
+            encoding='utf-8')
 
     def tearDown(self):
         self._tmp.cleanup()
@@ -656,7 +670,7 @@ class AdapterDispatchPlanTests(unittest.TestCase):
         # 跨会话并发容量池隔离：每个测试方法用 self.ws 下的临时 store，绝不读写真实
         # ~/.brain-worker 池，也不继承全局 BRAIN_WORKER_DISPATCH_STORE 的在途名额。
         env['BRAIN_WORKER_DISPATCH_STORE'] = str(self.ws / 'dispatch-pool.sqlite3')
-        cmd = [sys.executable, str(REPO / 'scripts' / 'qoder_direct.py'),
+        cmd = [sys.executable, str(self.runner),
                '--workspace', str(self.ws), '--prompt-file', str(self._prompt),
                '--output-dir', str(out_dir), '--stage', self.stage,
                '--config', str(self.entry), '--dispatch-plan', str(plan_path)]

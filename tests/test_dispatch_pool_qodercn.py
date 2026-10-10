@@ -34,7 +34,7 @@ try:
 except Exception:  # noqa: BLE001 - 隔离树无 quota_control 时跳过 Z-hold 子例
     qc = None
 
-T0 = datetime(2026, 10, 8, 12, 0, 0, tzinfo=timezone.utc)
+T0 = datetime(2026, 10, 8, 15, 0, 0, tzinfo=timezone.utc)  # 北京时间 23:00（主力时段内）
 CN = 'qodercn:DeepSeek-Flash'  # 已 retired：capacity=0，任何新派一律 unknown_pool
 CN_MAX = 'qodercn:Qwen3.8-Max'
 CN_FLASH = 'qodercn:Qwen3.8-Flash'
@@ -94,12 +94,14 @@ class _Store(unittest.TestCase):
 
 
 class CapacityAndRotationTests(_Store):
-    def test_cn_capacity_and_total_eight(self):
-        # 五池真实布局：CN 内置 Max=1、CN Flash=2；retired DeepSeek capacity=0。
+    def test_cn_capacity_and_total_ten(self):
+        # BW-MAX-WINDOW-20261010-S2 六池真实布局：CN 内置 Max=1、CN 自定义 Max=2、
+        # CN Flash=2；retired DeepSeek capacity=0。
         self.assertEqual(dp.capacity_for(CN), 0)
         self.assertEqual(dp.capacity_for(CN_MAX), 1)
+        self.assertEqual(dp.capacity_for('qodercn:Qwen-3.8-Max'), 2)
         self.assertEqual(dp.capacity_for(CN_FLASH), 2)
-        self.assertEqual(dp.DOMESTIC_TOTAL_CAPACITY, 8)
+        self.assertEqual(dp.DOMESTIC_TOTAL_CAPACITY, 10)
         # ZCode / 国际组合容量原样不变。
         self.assertEqual(dp.capacity_for(ZCODE), 2)
         self.assertEqual(dp.capacity_for(QMAX), 1)
@@ -116,18 +118,21 @@ class CapacityAndRotationTests(_Store):
         self.assertEqual(c['reason'], 'capacity_full')
         self.assertEqual(self.active(CN_FLASH), 2)
 
-    def test_auto_prefers_main_then_flash_then_full_at_eight(self):
-        # 真实目标：主力优先 → 同级 Flash 兜底 → 8 满才物理满。
+    def test_auto_prefers_main_then_flash_then_full_at_ten(self):
+        # 真实目标：主力优先 → 同级 Flash 兜底 → 10 满才物理满。
         first = dp.select_and_claim(self.store, task_id='p0', runtime='zcode',
                                     model='GLM-5.3', workspace=self.ws('p0'),
                                     prompt_sha256='p', executor='auto', now=T0,
                                     _preclaim=False)
         self.assertTrue(first['allowed'], first)
         self.assertEqual(first['pool_key'], ZCODE)
-        # 用明确 executor 约束填满其余七槽（Z 第 2 + 两区 Max 各 1 + 两区 Flash 各 2）→ 总 8。
+        # 用明确 executor 约束填满其余九槽（Z 第 2 + 两区内置 Max 各 1 + CN 自定义 Max 2
+        # + 两区 Flash 各 2）→ 总 10。
         fill = [('z1', 'zcode', 'GLM-5.3', 'zcode'),
                 ('q0', 'qoder', 'Qwen3.8-Max', 'qoder'),
                 ('c0', 'qodercn', 'Qwen3.8-Max', 'qodercn'),
+                ('cu0', 'qodercn', 'Qwen-3.8-Max', 'qodercn'),
+                ('cu1', 'qodercn', 'Qwen-3.8-Max', 'qodercn'),
                 ('fl0', 'qoder', 'Qwen3.8-Flash', 'qoder'),
                 ('fl1', 'qoder', 'Qwen3.8-Flash', 'qoder'),
                 ('cf0', 'qodercn', 'Qwen3.8-Flash', 'qodercn'),
@@ -138,10 +143,10 @@ class CapacityAndRotationTests(_Store):
                                     executor=ex, now=T0, _preclaim=False)
             self.assertTrue(r['allowed'], (tid, r))
         st = dp.status(self.store, now=T0)
-        self.assertEqual(st['domestic']['active'], 8)
+        self.assertEqual(st['domestic']['active'], 10)
         self.assertTrue(st['domestic']['full'])
         self.assertEqual(self.active(CN_FLASH), 2)
-        # 8 满：AUTO 请求主力 → 物理 capacity_full。
+        # 10 满：AUTO 请求主力 → 物理 capacity_full。
         full = dp.select_and_claim(self.store, task_id='all-full', runtime='zcode',
                                    model='GLM-5.3', workspace=self.ws('all-full'),
                                    prompt_sha256='p', executor='auto', now=T0,
@@ -243,8 +248,9 @@ class TerminalReleaseTests(_Store):
         self.assertEqual(self.active(CN_MAX), 0)
 
     def test_cn_counts_toward_domestic_full_for_luna_threshold(self):
-        # 用明确 executor 约束逐次核验 allowed 占满六槽，再补两 CN Flash → 总 8 满；
-        # Luna 阈值随总 8 更新（6/8 不算 full，8/8 才满）。
+        # BW-MAX-WINDOW-20261010-S2：用明确 executor 约束逐次核验 allowed 占满六槽（Z2+两内置
+        # Max+国际 Flash2），再补 CN 自定义 Max 2 + 两 CN Flash → 总 10 满；Luna 阈值随总 10
+        # 更新（6/10 不算 full，10/10 才满）。
         fill = [('f0', 'zcode', 'GLM-5.3', 'zcode'), ('f1', 'qoder', 'Qwen3.8-Max', 'qoder'),
                 ('f2', 'zcode', 'GLM-5.3', 'zcode'), ('f3', 'qodercn', 'Qwen3.8-Max', 'qodercn'),
                 ('f4', 'qoder', 'Qwen3.8-Flash', 'qoder'),
@@ -256,21 +262,30 @@ class TerminalReleaseTests(_Store):
             self.assertTrue(r['allowed'], (tid, r))
         st = dp.status(self.store, now=T0)['domestic']
         self.assertEqual(st['active'], 6)
-        self.assertFalse(st['full'])  # 6/8 不算满
+        self.assertFalse(st['full'])  # 6/10 不算满
+        # 补齐 CN 自定义 Max 2（不受时段约束，正常 executor='qodercn' claim）。
+        for tid in ('cu0', 'cu1'):
+            r = dp.select_and_claim(self.store, task_id=tid, runtime='qodercn',
+                                    model='Qwen-3.8-Max', workspace=self.ws(tid),
+                                    prompt_sha256='p', executor='qodercn', now=T0,
+                                    _preclaim=False)
+            self.assertTrue(r['allowed'], (tid, r))
         self.assertTrue(self.cn_flash('fc0')['allowed'])
         self.assertTrue(self.cn_flash('fc1')['allowed'])
         st = dp.status(self.store, now=T0)['domestic']
-        self.assertTrue(st['full'])  # 8/8 才满
+        self.assertTrue(st['full'])  # 10/10 才满
 
 
 class DomesticReclaimTests(_Store):
-    def test_reclaim_after_eight_full_prefers_cn_not_luna(self):
-        # 八槽真实占满后记录真实 ask；仅释放 1 个 CN Flash 名额 → 国内恢复空位 → claim_due
+    def test_reclaim_after_ten_full_prefers_cn_not_luna(self):
+        # 十槽真实占满后记录真实 ask；仅释放 1 个 CN Flash 名额 → 国内恢复空位 → claim_due
         # 原子 domestic_reclaim 复用既有候选顺序选中该 CN Flash，绝不因未满而错误升级 Luna。
         fill = [('r0', 'zcode', 'GLM-5.3', 'zcode'),
                 ('r1', 'zcode', 'GLM-5.3', 'zcode'),
                 ('r2', 'qoder', 'Qwen3.8-Max', 'qoder'),
                 ('r3', 'qodercn', 'Qwen3.8-Max', 'qodercn'),
+                ('r3a', 'qodercn', 'Qwen-3.8-Max', 'qodercn'),
+                ('r3b', 'qodercn', 'Qwen-3.8-Max', 'qodercn'),
                 ('r4', 'qoder', 'Qwen3.8-Flash', 'qoder'),
                 ('r5', 'qoder', 'Qwen3.8-Flash', 'qoder'),
                 ('r6', 'qodercn', 'Qwen3.8-Flash', 'qodercn'),
@@ -283,21 +298,21 @@ class DomesticReclaimTests(_Store):
             self.assertTrue(r.get('allowed') and r.get('token'), (tid, r))
             toks[tid] = r['token']
         st = dp.status(self.store, now=T0)['domestic']
-        self.assertEqual(st['active'], 8)
+        self.assertEqual(st['active'], 10)
         self.assertTrue(st['full'])
         scope = {'task_id': 'ask-rc', 'stage': 's1', 'chat_id': 'c1',
                  'workspace': self.ws('ask-rc'), 'prompt_sha256': 'a' * 64}
         ask = dp.ask_record(self.store, task_id='ask-rc', scope=scope,
                             ask_message_id='m-ask', now=T0)
         self.assertTrue(ask['recorded'], ask)
-        # 仅释放一个 CN Flash 名额（其余 7 仍占用）→ 国内已恢复空位。
+        # 仅释放一个 CN Flash 名额（其余 9 仍占用）→ 国内已恢复空位。
         rel = dp.finish(self.store, toks['r6'], terminal='cancelled', now=T0)
         self.assertTrue(rel['released'], rel)
         self.assertEqual(self.active(CN_FLASH), 1)
-        out = dp.claim_due(self.store, task_id='ask-rc', now=T0)
-        self.assertTrue(out['claimed'], out)
+        out = dp.claim_due(self.store, task_id='ask-rc', scope=scope, now=T0)
+        self.assertTrue(out.get('claimed'), out)
+        self.assertEqual(out['pool_key'], CN_FLASH, out)
         self.assertEqual(out['mode'], 'domestic_reclaim')
-        self.assertEqual(out['pool_key'], CN_FLASH)
         # 未满时不错误 Luna：Luna 零在途，票据被原子取消（无丢槽、无双派）。
         self.assertEqual(dp.status(self.store, now=T0)['pools'][dp.LUNA_KEY]['active'], 0)
 

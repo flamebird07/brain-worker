@@ -12,11 +12,19 @@ python <技能目录>/scripts/qoder_direct.py --workspace <项目绝对路径> -
 
 BW-AVAILABILITY-20261009-B2：Qoder 入口以 `executor='qoder'` 消费/claim，并读**同一持久 ZCode availability**（可选 `--quota-store`，默认 `BRAIN_WORKER_QUOTA_STORE`；`--quota-routes`）——`dispatch_pool` 的资格过滤把被阻断的 ZCode 通道剔除，因此 **Qoder 绝不会被改道回不可用的 ZCode**；显式 Qoder 有空位时**不因历史 committed 计数被 1:1 改道**（见 [global-dispatch](global-dispatch.md) 的执行器约束与 availability 资格过滤）。
 
+BW-MAX-WINDOW-20261010-S1（用户可理解的分配规则）：Qoder 国际内置 `Qwen3.8-Max` **只在北京时间
+22:00（含）至次日 08:00（不含）作为主力**。这段时间以外：`AUTO` 新派工自动跳过国际 Max（改走
+仍合格的 ZCode 主力，ZCode 也不可用/满时落到同级 `Qwen3.8-Flash`）；主脑显式把新任务 `reserve`
+到国际 Max → `dispatch_pool` 如实拒绝 `main_force_window_closed`，**绝不偷偷换成别的模型**。
+若 Max 曾在时段内预留、到启动时已跨过 08:00，`consume_for_entry` 会把该 reserved 占位真实释放为
+`start_failed`（只释放本任务自己那份，不泄漏、不抢别人），已 `running`/`unknown` 的旧在途绝不误
+释放。北京时间按固定 UTC+8 折算、与运行机器本地时区无关；时段门只套两内置 `Qwen3.8-Max`，国内合计已由 BW-MAX-WINDOW-20261010-S2 升为 10，CN 自定义主力 `qodercn:Qwen-3.8-Max`（2 槽、不套时段、复用限额判定）与 Flash/ZCode/自定义模型一样不受该时段门影响。详见 [global-dispatch](global-dispatch.md) §“牛马主力时段门”。
+
 BW-AVAILABILITY-20261009-B4：受信任主脑明确授权的 **`executor='qoder'` + `--model` 组合硬约束**贯穿
 `consume_for_entry`——含本阶段真实执行的 `Qwen3.8-Flash`——有空位即直接 claim 该精确组合，
 **绝不因别的候选有空位而拒绝已授权组合**；ZCode availability 状态仅用于保证不会被绕回不可用的 ZCode，
 不参与 Qoder 组合选择。默认 AUTO 主力优先/容量/1:1 与 Z2/Max2/Flash2 容量不变（并发 2/4 是 Skill
-政策、非已核实的 Qoder 进程上限）。（注：此处 “Z2/Max2/Flash2” 是 B4 当时口径；已由 BW-POOL-SPLIT-20261010-S2/S3 定型为五池 Z2/国际 Max1/CN Max1/两区 Flash 各 2、合计 8，当前口径见 [global-dispatch](global-dispatch.md) §11。）
+政策、非已核实的 Qoder 进程上限）。（注：此处 “Z2/Max2/Flash2” 是 B4 当时口径；已由 BW-POOL-SPLIT-20261010-S2/S3 定型为五池 Z2/国际内置 Max1/CN 内置 Max1/两区 Flash 各 2、合计 8，并由 BW-MAX-WINDOW-20261010-S2 加 CN 自定义主力 `qodercn:Qwen-3.8-Max`=2 升为六池、合计 10，当前口径见 [global-dispatch](global-dispatch.md) §11。）
 
 ## 统一契约与哈希口径
 
@@ -122,12 +130,12 @@ python tests/test_qoder_direct_permissions_offline.py
 
 ## 明确限额落标与识别（2026-10-10，BW-POOL-SPLIT-20261010-S5）
 
-**只有两个 Qoder Max 池可承载明确限额标记**：`qoder:Qwen3.8-Max`、`qodercn:Qwen3.8-Max`。ZCode 走 `quota_control` 的 `zcode_availability` 独立口径；任一 Flash、退休 DeepSeek、Luna 永不落标，绝不误挡 Flash、绝不动 ZCode 既有 availability 规则。
+**只有三个 Qoder 主力 Max 池可承载明确限额标记**：`qoder:Qwen3.8-Max`、`qodercn:Qwen3.8-Max`、CN 自定义主力 `qodercn:Qwen-3.8-Max`（BW-MAX-WINDOW-20261010-S2 并入；三池各自 pool_key 独立落标、互不连带，绝不因自定义落标误伤两内置 Max）。ZCode 走 `quota_control` 的 `zcode_availability` 独立口径；任一 Flash、退休 DeepSeek、Luna 永不落标，绝不误挡 Flash、绝不动 ZCode 既有 availability 规则。
 
 - **失败识别只扫结构化载体**：`_explicit_quota_limit_hit(summary)` 只读 `summary['result_errors']` / `summary['result_errors_info']`（真实 CLI 原始 envelope 的失败字段），绝不扫报告正文、`response.md` 或请求历史消息；`ec.explicit_429(errors, errors_info)` 命中或 `_hard_quota_limit_text` 命中任一 marker 才算真限额。识别大小写不敏感。
 - **硬限额 markers**（`_QUOTA_HARD_LIMIT_MARKERS`）：`credits exhausted / out of credits / credit exhausted / credits depleted / insufficient credits / insufficient balance / no credits left / quota exhausted / credit usage limit / 积分用尽 / 积分不足 / 余额不足 / 额度用尽 / 额度不足`。用户真实失败文案 **"You've reached your credit usage limit."** 必识别。
 - **不当限额的情况**（绝不误伤）：正文里 429 / 单独 `quota` 标签 / `permission_denials` 与 `No permission client configured for Bash` / `401` `invalid api key` / `unauthorized` / 成功终态 / 取消退出码 `4294967295`（`-1`）—— 分类器均返 `hit=False`。
-- **`_qoder_max_pool_key(runtime, model)`**：只有 `model == 'Qwen3.8-Max'` 且 `runtime in ('qoder', 'qodercn')` 才返回对应 pool_key；其他 runtime 或任一 Flash / GLM / DeepSeek / 自定义名一律 `None`，绝不偷偷落标。
+- **`_qoder_max_pool_key(runtime, model)`**：内置 `model == 'Qwen3.8-Max'` 时按 runtime 返回 `qoder:Qwen3.8-Max`（`qoder`）或 `qodercn:Qwen3.8-Max`（`qodercn`）；BW-MAX-WINDOW-20261010-S2 新增——自定义 `model == 'Qwen-3.8-Max'` 且 `runtime == 'qodercn'` 返回 `qodercn:Qwen-3.8-Max`；国际 `qoder` 请求该自定义名、任一 Flash / GLM / DeepSeek / 其他自定义名一律 `None`，绝不偷偷落标。真实 `--model` 仍走既有私有 `model_ids` 映射解析，本入口从不读取或打印私有配置内容/真实 UUID。
 - **落标时序**（真实失败终态）：`main()` 在 `try` 内解析 stdout → 若 `not protocol_success` 且命中硬限额且 `_qoder_max_pool_key` 非 None → `ev_sha = sha256(stdout_bytes).hexdigest()` → `dp.record_main_force_limit(dispatch_store, pk, task_id=…, attempt_token=claim_token, evidence_path=str(out/'stdout.json'), evidence_sha256=ev_sha)`；随后才在 `finally` 里 `_release_claim('finished', success=child.returncode==0)`。**先落标后释放**，杜绝槽释放后另一 chat 立刻重复提交；`record_main_force_limit` 抛错被 `except Exception` 兜住只落 `limit_rec={'recorded': False, 'error': str(exc)}`，**绝不阻断真实终态释放**（不泄漏锁）。
 - **绑定校验（`record_main_force_limit` 侧）**：`dispatch_pool` 事务内回核 attempt 行存在、`pool_key` 与 `task_id` 与传入一致；`evidence_path` 指向真实文件且 `_file_sha256` 匹配 `evidence_sha256`。任一漂移或缺字段 → `recorded=False / drift=True` 拒写；同池重复落标只刷新证据/时间戳并清空旧的 `released_at/release_note`。
 - **consume 前查限额**：`consume_for_entry` 在同一事务内若本 attempt 的 pool 已 limited → 只把**本 token** CAS `reserved→start_failed`（`capacity_released=True`），`sent=False / reason='main_force_limited'`；不动其他 task 的 reserved，不泄漏本次占位。

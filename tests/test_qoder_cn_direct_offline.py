@@ -115,13 +115,22 @@ class InternationalArgvTests(unittest.TestCase):
 class ResolveModelIdTests(_NoPopen):
     def test_resolve_cn_model_id_maps_and_missing(self):
         cfg = {'cli': 'x', 'config_dir': 'y',
-               'model_ids': {'DeepSeek-Flash': 'real-id-123'}}
+               'model_ids': {'DeepSeek-Flash': 'real-id-123',
+                             'Qwen-3.8-Max': 'synthetic-cn-max-real-id'}}
         # 自定义 Token Plan：必须走 model_ids 映射到真实服务端 ID（保留客户端自定义）。
         self.assertEqual(qd.resolve_cn_model_id(cfg, 'DeepSeek-Flash'), 'real-id-123')
         # CN 内置官方 Qwen 白名单：字面串直传即合法成功路径（不查 model_ids、不猜 UUID、
         # 不把内置名当自定义）。这是 S2/S3 的 CN 主力/兜底组合。
         self.assertEqual(qd.resolve_cn_model_id(cfg, 'Qwen3.8-Max'), 'Qwen3.8-Max')
         self.assertEqual(qd.resolve_cn_model_id(cfg, 'Qwen3.8-Flash'), 'Qwen3.8-Flash')
+        # BW-MAX-WINDOW-20261010-S2：自定义友好名 Qwen-3.8-Max（短横线）**不是**内置白名单，
+        # 必须经私有 model_ids 映射到合成真实 ID；绝不因名字像 Qwen 就当内置直传。
+        self.assertNotIn('Qwen-3.8-Max', qd.CN_BUILTIN_MODELS)
+        self.assertEqual(qd.resolve_cn_model_id(cfg, 'Qwen-3.8-Max'),
+                         'synthetic-cn-max-real-id')
+        # 缺映射时该自定义名一律 None（零 Popen），绝不回落到内置同名 Qwen3.8-Max 或猜 UUID。
+        self.assertIsNone(qd.resolve_cn_model_id(
+            {'cli': 'x', 'config_dir': 'y', 'model_ids': {}}, 'Qwen-3.8-Max'))
         # 未映射的非内置名仍拒绝（None → 调用方零 Popen），绝不猜同名内建/Qwen。
         self.assertIsNone(qd.resolve_cn_model_id(cfg, 'Bogus-Not-Mapped'))
         self.assertIsNone(qd.resolve_cn_model_id(cfg, 'GLM-5.3'))
@@ -154,26 +163,54 @@ class CnMainRefusalTests(_NoPopen):
         # 以“无 model_ids 映射”拒绝（旧口径已改）。用记录型假 Popen 证明它通过映射门、消费了
         # CN claim、真正到达 Popen，且 --model 下发的是内置字面串（非友好名映射、非猜 UUID）。
         # 绝不真跑 CLI：假 Popen 立即抛哨兵，main 捕获后安全释放本占位（start_failed）。
-        cfg = self.write_cn_config({'DeepSeek-Flash': 'real-id-123'})
-        ws, pf = self.make_prompt()
-        out_dir = self.tmp / 'out-builtin-default'
-        captured = {}
+        # BW-MAX-WINDOW-20261010-S2：内置 Max 只在主力时段放行；本例只验映射门，故把时钟
+        # 固定在时段内（离线测试夹具唯一允许的时间控制），使容量门照常 claim 到到达 Popen。
+        from datetime import datetime, timezone
+        real_utcnow = qd.dp.utcnow
+        qd.dp.utcnow = lambda: datetime(2026, 10, 8, 15, 0, 0, tzinfo=timezone.utc)
+        try:
+            cfg = self.write_cn_config({'DeepSeek-Flash': 'real-id-123'})
+            ws, pf = self.make_prompt()
+            out_dir = self.tmp / 'out-builtin-default'
+            captured = {}
 
-        def recording_popen(argv, *a, **k):
-            captured['argv'] = argv
-            raise RuntimeError('sentinel: reached Popen (mapping gate passed)')
+            def recording_popen(argv, *a, **k):
+                captured['argv'] = argv
+                raise RuntimeError('sentinel: reached Popen (mapping gate passed)')
 
-        qd.subprocess.Popen = recording_popen
-        rc = self._run_main([
-            '--runtime', 'qodercn', '--cn-config', str(cfg),
-            '--workspace', str(ws), '--prompt-file', str(pf),
-            '--output-dir', str(out_dir), '--stage', 'BW-CN-TEST'])
+            qd.subprocess.Popen = recording_popen
+            rc = self._run_main([
+                '--runtime', 'qodercn', '--cn-config', str(cfg),
+                '--workspace', str(ws), '--prompt-file', str(pf),
+                '--output-dir', str(out_dir), '--stage', 'BW-CN-TEST'])
+        finally:
+            qd.dp.utcnow = real_utcnow
         # 不是映射门拒绝（rc != 2）；确实到达 Popen；--model 为内置 Qwen3.8-Max 字面串。
         self.assertNotEqual(rc, 2, rc)
         self.assertIn('argv', captured)
         argv = captured['argv']
         self.assertEqual(qd.DEFAULT_MODEL, 'Qwen3.8-Max')
         self.assertEqual(argv[argv.index('--model') + 1], qd.DEFAULT_MODEL)
+
+    def test_builtin_default_model_daytime_capacity_gate_refuses_zero_popen(self):
+        # BW-MAX-WINDOW-20261010-S2：时段外（北京白天）原生 CN 入口缺省内置 Max 必须被容量门
+        # 如实拒绝（rc=2、main_force_window_closed、0 Popen），绝不静默换成 Flash 或自定义。
+        from datetime import datetime, timezone
+        real_utcnow = qd.dp.utcnow
+        qd.dp.utcnow = lambda: datetime(2026, 10, 8, 4, 0, 0, tzinfo=timezone.utc)  # 北京 12:00
+        try:
+            cfg = self.write_cn_config({'DeepSeek-Flash': 'real-id-123'})
+            ws, pf = self.make_prompt()
+            out_dir = self.tmp / 'out-builtin-daytime'
+            rc = self._run_main([
+                '--runtime', 'qodercn', '--cn-config', str(cfg),
+                '--workspace', str(ws), '--prompt-file', str(pf),
+                '--output-dir', str(out_dir), '--stage', 'BW-CN-TEST'])
+        finally:
+            qd.dp.utcnow = real_utcnow
+        self.assertEqual(rc, 2, rc)
+        self.assertEqual(self.calls, [])  # 0 Popen
+        self.assertFalse(out_dir.exists())  # 零证据目录
 
     def test_cn_resume_without_verifiable_source_rejected(self):
         cfg = self.write_cn_config({'DeepSeek-Flash': 'real-id-123'})
@@ -291,12 +328,19 @@ class ExplicitQuotaLimitHitTests(unittest.TestCase):
         # 明确包含需求 2 的关键片段
         self.assertIn('credit usage limit', qd._QUOTA_HARD_LIMIT_MARKERS)
 
-    def test_qoder_max_pool_key_only_for_two_built_in_max_pools(self):
-        """非 Max 模型 / 未知 runtime 一律 None，绝不偷偷给 Flash/ZCode/自定义落标。"""
+    def test_qoder_max_pool_key_for_max_pools_only(self):
+        """只有三个 Qoder Max 主力池（两内置 + CN 自定义）可承载限额标记；非 Max 模型 /
+        未知 runtime / 国际自定义名一律 None，绝不偷偷给 Flash/ZCode 落标、也不把自定义
+        误映射到内置池。"""
         self.assertEqual(qd._qoder_max_pool_key(qd.RUNTIME_INTERNATIONAL, 'Qwen3.8-Max'),
                          'qoder:Qwen3.8-Max')
         self.assertEqual(qd._qoder_max_pool_key(qd.RUNTIME_CN, 'Qwen3.8-Max'),
                          'qodercn:Qwen3.8-Max')
+        # CN 自定义友好名（短横线）→ CN 自定义 Max 池，独立于内置池。
+        self.assertEqual(qd._qoder_max_pool_key(qd.RUNTIME_CN, 'Qwen-3.8-Max'),
+                         'qodercn:Qwen-3.8-Max')
+        # 国际侧无自定义 Qwen-3.8-Max 池：绝不误映射为内置国际 Max。
+        self.assertIsNone(qd._qoder_max_pool_key(qd.RUNTIME_INTERNATIONAL, 'Qwen-3.8-Max'))
         for model in ('Qwen3.8-Flash', 'GLM-5.3', 'DeepSeek-Flash', 'some-custom'):
             for rt in (qd.RUNTIME_INTERNATIONAL, qd.RUNTIME_CN, 'zcode', 'codebuddy'):
                 with self.subTest(rt=rt, model=model):

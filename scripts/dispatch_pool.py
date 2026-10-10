@@ -155,23 +155,27 @@ except ImportError:  # isolated revision tree / standalone tests
     qc = None
 
 # ------------------------------------------------------------------ 池定义
-# BW-POOL-SPLIT-20261010-S2 用户 2026-10-10 最终分配决策：调度总数仍 8，五池布局：
-#   主力（三池共 4 槽）：zcode:GLM-5.3=2、qoder:Qwen3.8-Max=1、qodercn:Qwen3.8-Max=1；
+# BW-POOL-SPLIT-20261010-S2 + BW-MAX-WINDOW-20261010-S2 用户 2026-10-10 最新分配：
+#   六池布局、调度总数 10：
+#   主力（四池共 6 槽，同属 best-effort 1:1 的两个组）：
+#     zcode:GLM-5.3=2（Z 组）、qoder:Qwen3.8-Max=1、qodercn:Qwen3.8-Max=1（国际/CN 内置
+#     Max，属 Qoder 组，仅北京时间 22:00 含至次日 08:00 不含作主力）、
+#     qodercn:Qwen-3.8-Max=2（CN 自定义友好名 Qwen-3.8-Max（有短横线），属 Qoder 组主力，
+#     **不受内置 Max 时段门约束**，复用既有私有 model_ids 映射下发真实 ID）；
 #   兜底（同级两池共 4 槽）：qoder:Qwen3.8-Flash=2、qodercn:Qwen3.8-Flash=2；
-#   CN 独立补充池（qodercn:DeepSeek-Flash）从正常候选池移除；客户端自定义 model_ids
-#   配置不动，仅不再 AUTO/新点单向该组合派工。已存在的 DeepSeek 在途 attempt 依真实
-#   终态释放，不伪造结束（LEGACY_RETIRED_POOL_KEYS 保留池名与容量条目，capacity=0）。
-# 主力之间 best-effort 1:1：Z2 与两地区 Qwen Max（qoder:Qwen3.8-Max + qodercn:
-# Qwen3.8-Max 合计 2 槽）之间按 committed 计数平衡，两地区 Max 之间以当前真实在途数
-# 决定优先区域；仅对合格可用候选平衡，绝不因历史轮换拦有空位的候选（`_select_main_force`
-# 先按 capacity/active 过滤再排序）。不新增历史记分系统，复用 rotation 两列 committed_zcode
-# / committed_qoder 与 `_count_active` 即足够。
+#   CN 独立补充池（qodercn:DeepSeek-Flash）仍在正常候选池移除（capacity=0，仅旧在途释放）。
+# 主力之间 best-effort 1:1：Z2 与 Qoder 主力组（两内置 Max + 自定义 Max 合计 4 槽）之间按
+# committed 计数平衡，组内以当前真实在途数决定优先；仅对合格可用候选平衡，绝不因历史轮换
+# 拦有空位的候选（`_select_main_force` 先按 capacity/active 过滤再排序）。不新增记分系统，
+# 复用 rotation 两列 committed_zcode / committed_qoder 与 `_count_active` 即足够。
 MAIN_FORCE_POOLS = (('zcode', 'GLM-5.3'),
                     ('qoder', 'Qwen3.8-Max'),
-                    ('qodercn', 'Qwen3.8-Max'))
+                    ('qodercn', 'Qwen3.8-Max'),
+                    ('qodercn', 'Qwen-3.8-Max'))
 MAIN_FORCE_CAPACITY = {'zcode:GLM-5.3': 2,
                        'qoder:Qwen3.8-Max': 1,
-                       'qodercn:Qwen3.8-Max': 1}
+                       'qodercn:Qwen3.8-Max': 1,
+                       'qodercn:Qwen-3.8-Max': 2}
 OVERFLOW_POOLS = (('qoder', 'Qwen3.8-Flash'), ('qodercn', 'Qwen3.8-Flash'))
 OVERFLOW_CAPACITY = {'qoder:Qwen3.8-Flash': 2, 'qodercn:Qwen3.8-Flash': 2}
 # BW-POOL-SPLIT-20261010-S2：CN DeepSeek-Flash 从正常池退出，但保留池名与 0 容量条目，
@@ -182,7 +186,7 @@ LUNA_RUNTIME = 'luna'
 LUNA_MODEL = 'native'
 LUNA_ASK_TIMEOUT_SECONDS = 300
 DOMESTIC_TOTAL_CAPACITY = (sum(MAIN_FORCE_CAPACITY.values())
-                           + sum(OVERFLOW_CAPACITY.values()))  # 4 + 4 = 8
+                           + sum(OVERFLOW_CAPACITY.values()))  # 6 + 4 = 10
 
 # pool_key -> capacity（None 表示无上限，仅 Luna；0 表示已退出正常池但保留历史真实在途）。
 CAPACITY = {}
@@ -200,17 +204,22 @@ CN_RUNTIME = 'qodercn'
 CN_MODEL = 'Qwen3.8-Max'
 CN_POOL_KEY = f'{CN_RUNTIME}:{CN_MODEL}'  # 现指向 CN 主力 Qwen3.8-Max（正常池新组合）
 CN_MAX_POOL_KEY = f'{CN_RUNTIME}:Qwen3.8-Max'
+# BW-MAX-WINDOW-20261010-S2：CN 自定义 Qoder 主力友好名（短横线 Qwen-3.8-Max），真实 --model
+# 经既有私有 model_ids 映射下发，池名以友好名为准，属 Qoder 主力组、不受内置 Max 时段门约束。
+CN_CUSTOM_MAX_POOL_KEY = f'{CN_RUNTIME}:Qwen-3.8-Max'
+CN_CUSTOM_MAX_MODEL = 'Qwen-3.8-Max'
 CN_FLASH_POOL_KEY = f'{CN_RUNTIME}:Qwen3.8-Flash'
 QMAX_POOL_KEY = 'qoder:Qwen3.8-Max'
 QFLASH_POOL_KEY = 'qoder:Qwen3.8-Flash'
 DEEPSEEK_RETIRED_KEY = 'qodercn:DeepSeek-Flash'
 LUNA_KEY = f'{LUNA_RUNTIME}:{LUNA_MODEL}'
-# BW-POOL-SPLIT-20261010-S3：可承载“明确限额”最小标记的主力池——只有两个 Qoder Max
-# （国际 qoder:Qwen3.8-Max 与 CN 内置 qodercn:Qwen3.8-Max）。ZCode 走既有 quota_control
-# availability/hard_hold（本轮不改），两地区 Flash 兜底永不被限额标记误挡。标记只是布尔
-# 不可用 + pool_key + 真实 attempt + 错误证据路径/哈希，绝不查余额、不带定时器/期限/
+# BW-POOL-SPLIT-20261010-S3 + BW-MAX-WINDOW-20261010-S2：可承载“明确限额”最小标记的主力池——
+# 两个 Qoder 内置 Max（qoder:Qwen3.8-Max / qodercn:Qwen3.8-Max）与 CN 自定义 Qoder Max
+# （qodercn:Qwen-3.8-Max）。ZCode 走既有 quota_control availability/hard_hold（本轮不改），
+# 两地区 Flash 兜底永不被限额标记误挡；自定义 Max 与内置 Max 各自独立落标、互不连坐。标记只是
+# 布尔不可用 + pool_key + 真实 attempt + 错误证据路径/哈希，绝不查余额、不带定时器/期限/
 # 自动恢复探针/评分/新服务/外部 API；恢复只由用户明确额度恢复/重置后人工解除。
-QUOTA_LIMITABLE_POOLS = (QMAX_POOL_KEY, CN_MAX_POOL_KEY)
+QUOTA_LIMITABLE_POOLS = (QMAX_POOL_KEY, CN_MAX_POOL_KEY, CN_CUSTOM_MAX_POOL_KEY)
 
 # attempt 状态机：在途（占容量）与已释放（不占容量）。
 ACTIVE_STATES = ('reserved', 'running', 'unknown')
@@ -295,6 +304,43 @@ def _parse(ts):
     if not ts:
         return None
     return datetime.fromisoformat(ts)
+
+
+# ------------------------------------------------------------------ 主力时段（北京时间）
+# BW-MAX-WINDOW-20261010-S1：两个 Qoder 内置 Max（国际 qoder:Qwen3.8-Max 与 CN 内置
+# qodercn:Qwen3.8-Max）只在北京时间 22:00（含）至次日 08:00（不含）作为主力新派工；其它
+# 时间新 reserve/consume 自动跳过该两池。北京时间固定按 UTC+8 计算，绝不依赖宿主系统时区：
+# 把注入的 now（缺省 utcnow）折算到 +08:00 再取小时，与本地钟点无关。22:00 可选、08:00 不
+# 可选（左闭右开跨午夜窗口）。ZCode 主力、两地区 Flash 兜底、Luna、已 retired DeepSeek 的
+# 时段一律不受本窗口限制。
+BEIJING_UTC_OFFSET = timedelta(hours=8)
+MAIN_FORCE_WINDOW_START_HOUR = 22  # 北京时间 22:00 含
+MAIN_FORCE_WINDOW_END_HOUR = 8      # 北京时间 08:00 不含
+# 仅这两个 Qoder 内置 Max 主力受时段门约束。
+WINDOW_GATED_MAIN_FORCES = (QMAX_POOL_KEY, CN_MAX_POOL_KEY)
+
+
+def _beijing_hour(now) -> int:
+    """把注入的 now 先归一到 UTC，再按固定 +08:00 偏移折算北京时间小时；now 为 naive 时按
+    UTC 理解，绝不读取宿主本地时区。返回 0..23。"""
+    if now is None:
+        now = utcnow()
+    if now.tzinfo is None:
+        base = now.replace(tzinfo=timezone.utc)
+    else:
+        base = now.astimezone(timezone.utc)
+    return (base + BEIJING_UTC_OFFSET).hour
+
+
+def _main_force_window_open(now) -> bool:
+    """北京时间主力可选窗口：h>=22（22:00 含）或 h<8（08:00 不含）→ 可选。"""
+    h = _beijing_hour(now)
+    return h >= MAIN_FORCE_WINDOW_START_HOUR or h < MAIN_FORCE_WINDOW_END_HOUR
+
+
+def _max_window_blocks(pk, now) -> bool:
+    """该池是否被主力时段门挡下：仅两个 Qoder 内置 Max 在非窗口时间被挡；其它池永不挡。"""
+    return pk in WINDOW_GATED_MAIN_FORCES and not _main_force_window_open(now)
 
 
 def default_store_path() -> Path:
@@ -602,16 +648,17 @@ def _rotation_row(conn):
 
 
 def _bump_rotation(conn, pk, now):
-    """committed 计数语义（BW-POOL-SPLIT-20261010-S2）：
+    """committed 计数语义（BW-POOL-SPLIT-20261010-S2 + BW-MAX-WINDOW-20261010-S2）：
     - `zcode:GLM-5.3` → committed_zcode +1（Z2 组）；
-    - `qoder:Qwen3.8-Max` 与 `qodercn:Qwen3.8-Max` **合起来**记入 committed_qoder（Qoder
-      Max 组，两地区共享一列历史计数，代表 1:1 对侧），两地区之间用真实在途数平衡；
+    - `qoder:Qwen3.8-Max`、`qodercn:Qwen3.8-Max`（两内置 Max）与 `qodercn:Qwen-3.8-Max`
+      （CN 自定义 Qoder Max）**合起来**记入 committed_qoder（Qoder 主力组，共享一列历史计数，
+      代表 1:1 对侧 Z2），组内以真实在途数平衡；不新造轮换算法，自定义 Max 只是 Qoder 组新成员；
     - Flash/兜底、Luna、已退出正常池的 DeepSeek 均不再新增 rotation 记录。"""
     row = _rotation_row(conn)
     if pk == 'zcode:GLM-5.3':
         conn.execute('UPDATE rotation SET committed_zcode=committed_zcode+1, '
                      'updated_at_utc=? WHERE pool_group=?', (_iso(now), 'main'))
-    elif pk in ('qoder:Qwen3.8-Max', 'qodercn:Qwen3.8-Max'):
+    elif pk in ('qoder:Qwen3.8-Max', 'qodercn:Qwen3.8-Max', CN_CUSTOM_MAX_POOL_KEY):
         conn.execute('UPDATE rotation SET committed_qoder=committed_qoder+1, '
                      'updated_at_utc=? WHERE pool_group=?', (_iso(now), 'main'))
 
@@ -861,19 +908,25 @@ def _probe_allowed(quota_store, probe_ticket, now=None):
         return False
 
 
-def _eligible_main_forces(conn, zcode_blocked):
-    """可用主力集合（BW-POOL-SPLIT-20261010-S3）：三主力明确限额都自动跳过、不查询余额。
+def _eligible_main_forces(conn, zcode_blocked, now=None):
+    """可用主力集合（BW-POOL-SPLIT-20261010-S3 + BW-MAX-WINDOW-20261010-S1）：三主力明确
+    限额都自动跳过、不查询余额；两个 Qoder 内置 Max 还受北京时间主力时段门约束。
     - ZCode:GLM-5.3 被持久 availability 阻断（hard_hold / bounded backoff /
       recovery_unverified）时剔除——保持既有 quota_control 口径不变；
     - 两个 Qoder Max（国际 qoder:Qwen3.8-Max 与 CN 内置 qodercn:Qwen3.8-Max）被
       `_main_force_limit_active` 明确限额标记命中时剔除（同一事务内只读回核）；
-    - 两地区 Flash 兜底不是主力、永不被限额标记误挡。
-    先过滤合格候选，再在可用主力间做 best-effort 平衡（绝不把名额分给不可用/已限额的主力）。"""
+    - BW-MAX-WINDOW-20261010-S1：同一两 Qoder Max 在北京时间非 22:00（含）至 08:00
+      （不含）时段的**新派工候选**里剔除（`_max_window_blocks`）；ZCode 主力不受时段约束，
+      两地区 Flash 兜底永不被时段/限额误挡。
+    先过滤合格候选，再在可用主力间做 best-effort 平衡（绝不把名额分给不可用/已限额/
+    非时段的主力）。"""
     eligible = set()
     for k in MAIN_FORCE_KEYS:
         if k == ZCODE_POOL_KEY and zcode_blocked:
             continue
         if _main_force_limit_active(conn, k):
+            continue
+        if _max_window_blocks(k, now):
             continue
         eligible.add(k)
     return eligible
@@ -928,7 +981,7 @@ def _scope_allowed_candidates(scope, zcode_blocked):
     if executor == 'qoder':
         return [QMAX_POOL_KEY, QFLASH_POOL_KEY]
     if executor == CN_RUNTIME:
-        return [CN_MAX_POOL_KEY, CN_FLASH_POOL_KEY]
+        return [CN_MAX_POOL_KEY, CN_CUSTOM_MAX_POOL_KEY, CN_FLASH_POOL_KEY]
     mains = [k for k in MAIN_FORCE_KEYS
              if not (k == ZCODE_POOL_KEY and zcode_blocked)]
     # 默认/auto 受信任候选：三主力在前、两地区 Flash 同级兜底在后；已 retired 的 CN
@@ -1013,25 +1066,29 @@ def _domestic_policy(conn, requested_pk, now, executor='auto', eligible=None,
       任何分支的候选；已存在的真实在途 attempt 由 finish/reconcile 独立释放，与本策略无关；
     - executor='qoder'（可信主脑显式指定 Qoder 入口）：有空位且**未被明确限额**的
       qoder:Qwen3.8-Max 一律直接 claim，绝不因历史 committed 计数被改派到 ZCode 或 CN；
+      国际内置 Max **仅北京时间 22:00（含）~次日 08:00（不含）做主力**，时段外一律
+      `main_force_window_closed` 如实拒绝（不新启动、绝不静默换成同区 Flash）；
       Max 满**或 Max 被明确限额标记命中** → routing 到自身 qoder:Qwen3.8-Flash（同级
       Max→Flash 兜底，sent=false 明示改道、绝不偷偷提交限额 Max）；Flash 也满 → full；
       绝不跨执行器；提交非 qoder 组合 → executor_conflict；
     - executor='qodercn'（受信任主脑显式指定 CN 原生入口）：有空位且未被明确限额的
-      qodercn:Qwen3.8-Max 直接 claim；Max 满或被明确限额 → routing 到 qodercn:Qwen3.8-Flash；
-      Flash 也满 → full；绝不跨执行器；提交非 CN 组合 → executor_conflict；
+      qodercn:Qwen3.8-Max 直接 claim，同样**仅主力时段**、时段外 `main_force_window_closed`
+      拒绝；自定义 qodercn:Qwen-3.8-Max（不套时段、仍复用限额判定）有空且未限额 → 直接
+      claim；Max 满或被明确限额 → routing 到 qodercn:Qwen3.8-Flash；Flash 也满 → full；
+      绝不跨执行器；提交非 CN 组合 → executor_conflict；
     - executor='zcode'（ZCode 入口，最后的权威原子门）：ZCode 不可用 → zcode_unavailable；
       有空位 → claim；满 → full（绝不回落 Flash/其它池）；提交非 ZCode 组合 → executor_conflict；
-    - executor='auto'：先过滤合格候选（ZCode 不可用或被明确限额的 Qoder Max 剔除），再在
-      可用主力之间按现有 rotation committed + 真实在途数做 best-effort 平衡；本池有空也不
-      绕过轮转；选中≠请求 → routing；三主力都不可用/已满/已限额 → 两地区 Flash 同级兜底；
+    - executor='auto'：先过滤合格候选（ZCode 不可用、时段外的两内置 Max、被明确限额的主力剔除），
+      再在可用主力之间按现有 rotation committed + 真实在途数做 best-effort 平衡；本池有空也不
+      绕过轮转；选中≠请求 → routing；主力都不可用/已满/已限额 → 两地区 Flash 同级兜底；
       两 Flash 也满才 full。
-    - 迁移债务总额守卫：真实国内在途（含在途 retired DeepSeek 与超额旧 Max）已达总 8 时，
-      即便某新池按各自容量看似有空也一律 full，绝不派第 9 个。"""
+    - 迁移债务总额守卫：真实国内在途（含在途 retired DeepSeek 与超额旧 Max）已达总 10 时，
+      即便某新池按各自容量看似有空也一律 full，绝不派第 11 个。"""
     if requested_pk == LUNA_KEY:
         return 'reject_luna', None
     if requested_pk in LEGACY_RETIRED_POOL_KEYS:
         return 'unknown_pool', None
-    # 迁移债务总额守卫（BW-POOL-SPLIT-20261010-S3）：总在途已满 8 → 任何新国内 claim 都
+    # 迁移债务总额守卫（BW-POOL-SPLIT-20261010-S3）：总在途已满 10 → 任何新国内 claim 都
     # 不得放行（减少容量不杀老任务，老任务真实终态自然释放后计数才下降）。
     if _domestic_active(conn) >= DOMESTIC_TOTAL_CAPACITY:
         return 'full', None
@@ -1039,6 +1096,11 @@ def _domestic_policy(conn, requested_pk, now, executor='auto', eligible=None,
 
     if executor == 'qoder':
         if requested_pk == QMAX_POOL_KEY:
+            # BW-MAX-WINDOW-20261010-S2：国际内置 Max 仅北京 22:00（含）~次日 08:00（不含）
+            # 做主力。时段外无论 reserve/select_and_claim/consume 一律如实拒绝新启动（0 提交），
+            # 绝不静默换成同区 Flash，也不为旧测试放宽生产规则。AUTO 改派另由 eligible 过滤。
+            if _max_window_blocks(QMAX_POOL_KEY, now):
+                return 'main_force_window_closed', None
             if not _main_force_limit_active(conn, QMAX_POOL_KEY):
                 cap = capacity_for(requested_pk)
                 if cap is not None and _count_active(conn, requested_pk) < cap:
@@ -1057,11 +1119,27 @@ def _domestic_policy(conn, requested_pk, now, executor='auto', eligible=None,
 
     if executor == CN_RUNTIME:
         if requested_pk == CN_MAX_POOL_KEY:
+            # BW-MAX-WINDOW-20261010-S2：CN 内置 Max 同样仅主力时段可用；时段外无论
+            # reserve/select_and_claim/consume 一律如实拒绝新启动，绝不静默换成同区 CN Flash。
+            if _max_window_blocks(CN_MAX_POOL_KEY, now):
+                return 'main_force_window_closed', None
             if not _main_force_limit_active(conn, CN_MAX_POOL_KEY):
                 cap = capacity_for(requested_pk)
                 if cap is not None and _count_active(conn, requested_pk) < cap:
                     return 'claim', requested_pk
             # CN 内置 Max 被明确限额或已满 → CN Flash 兜底（Max→Flash），绝不误挡 Flash。
+            if capacity_for(CN_FLASH_POOL_KEY) is not None \
+                    and _count_active(conn, CN_FLASH_POOL_KEY) < capacity_for(CN_FLASH_POOL_KEY):
+                return 'routing', CN_FLASH_POOL_KEY
+            return 'full', None
+        if requested_pk == CN_CUSTOM_MAX_POOL_KEY:
+            # BW-POOL-SPLIT-20261010-S2：自定义 CN Max（Qwen-3.8-Max）不套内置时段，
+            # 但复用既有明确限额判定；有空位且未限额 → 直接 claim；已限额或已满 → CN Flash
+            # 兜底，绝不误挡 Flash、绝不跨执行器。
+            if not _main_force_limit_active(conn, CN_CUSTOM_MAX_POOL_KEY):
+                cap = capacity_for(requested_pk)
+                if cap is not None and _count_active(conn, requested_pk) < cap:
+                    return 'claim', requested_pk
             if capacity_for(CN_FLASH_POOL_KEY) is not None \
                     and _count_active(conn, CN_FLASH_POOL_KEY) < capacity_for(CN_FLASH_POOL_KEY):
                 return 'routing', CN_FLASH_POOL_KEY
@@ -1244,7 +1322,7 @@ def select_and_claim(store_path=None, *, task_id, runtime, model, workspace,
                 return _workspace_busy_reject(task_id, pk, busy)
             zcode_blocked = _zcode_availability_blocked(quota_store, now=now,
                                                         routes_path=quota_routes)
-            eligible = _eligible_main_forces(conn, zcode_blocked)
+            eligible = _eligible_main_forces(conn, zcode_blocked, now)
             probe_allowed = _probe_allowed(quota_store, probe_ticket, now=now)
             verdict, target = _domestic_policy(conn, pk, now, executor=executor,
                                                eligible=eligible,
@@ -1274,6 +1352,14 @@ def select_and_claim(store_path=None, *, task_id, runtime, model, workspace,
                 return _reject('executor_conflict', task_id, pk,
                                [f'executor {executor!r} may not submit combo {pk}; the '
                                 'explicit executor constraint forbids this runtime/model'])
+            if verdict == 'main_force_window_closed':
+                conn.execute('ROLLBACK')
+                return _reject('main_force_window_closed', task_id, pk,
+                               ['the explicitly requested Qoder built-in Qwen3.8-Max is '
+                                'only a main force during the Beijing-time window '
+                                '22:00 (inclusive) to 08:00 (exclusive); it is now '
+                                'outside that window, so a new dispatch is honestly '
+                                'refused and never silently swapped to another model'])
             if verdict == 'reject_luna':
                 conn.execute('ROLLBACK')
                 return _reject('luna_requires_ticket', task_id, pk,
@@ -1364,7 +1450,7 @@ def reserve(store_path=None, *, task_id, runtime, model, workspace, prompt_sha25
                 return _workspace_busy_reject(task_id, pk, busy)
             zcode_blocked = _zcode_availability_blocked(quota_store, now=now,
                                                         routes_path=quota_routes)
-            eligible = _eligible_main_forces(conn, zcode_blocked)
+            eligible = _eligible_main_forces(conn, zcode_blocked, now)
             probe_allowed = _probe_allowed(quota_store, probe_ticket, now=now)
             verdict, target = _domestic_policy(conn, pk, now, executor=executor,
                                                eligible=eligible,
@@ -1384,6 +1470,14 @@ def reserve(store_path=None, *, task_id, runtime, model, workspace, prompt_sha25
                 conn.execute('ROLLBACK')
                 return _reject('executor_conflict', task_id, pk,
                                [f'executor {executor!r} may not reserve combo {pk}'])
+            if verdict == 'main_force_window_closed':
+                conn.execute('ROLLBACK')
+                return _reject('main_force_window_closed', task_id, pk,
+                               ['the explicitly reserved Qoder built-in Qwen3.8-Max is '
+                                'only a main force during the Beijing-time window '
+                                '22:00 (inclusive) to 08:00 (exclusive); it is now '
+                                'outside that window, so the reserve is honestly refused '
+                                'and never silently swapped to another model'])
             if verdict == 'reject_luna':
                 conn.execute('ROLLBACK')
                 return _reject('luna_requires_ticket', task_id, pk,
@@ -1580,6 +1674,45 @@ def consume_for_entry(store_path=None, *, task_id, runtime, model, workspace,
                                         'attempt\'s own reserved placeholder to '
                                         'start_failed (never leaked, never preempting '
                                         'another task) and refused the start']}
+                # BW-MAX-WINDOW-20261010-S1：消费已预留 token 前，若本 attempt 落在两个
+                # Qoder 内置 Max 而当前已不在北京时间主力时段（22:00 含至 08:00 不含）——
+                # 即预留发生在窗口内、真正启动时已跨过 08:00——在同一事务内把本次 reserved
+                # 释放为 start_failed（真实释放本任务自己那份占位，绝不泄漏、绝不抢占别人的
+                # 名额），拒绝启动。running/unknown 旧在途绝不假释放，只拒绝重复启动。
+                if _max_window_blocks(row['pool_key'], now):
+                    cur = conn.execute(
+                        "UPDATE attempts SET state='start_failed', "
+                        "terminal='start_failed', ended_at_utc=? WHERE token=? "
+                        "AND state='reserved'", (_iso(now), claim_token))
+                    if cur.rowcount != 1:
+                        # 本 token 已不在 reserved（running/unknown 旧在途）：CAS 命中 0 行，
+                        # 绝不谎称释放；保留原状态与占位，只拒绝重复启动。
+                        conn.execute('ROLLBACK')
+                        return {'allowed': False, 'sent': False, 'claimed': False,
+                                'token': None, 'routing_required': False,
+                                'reason': 'main_force_window_closed',
+                                'pool_key': row['pool_key'], 'task_id': task_id,
+                                'capacity_released': False,
+                                'reasons': ['this attempt reserved into a Qoder built-in '
+                                            'Qwen3.8-Max during the main-force window, but '
+                                            'the Beijing-time window (22:00 inclusive to '
+                                            '08:00 exclusive) has closed before the start '
+                                            'and this attempt is no longer reserved (state='
+                                            + str(row['state']) + '); its original state and '
+                                            'in-flight placeholder are preserved and the '
+                                            'duplicate start is refused (no false release)']}
+                    conn.execute('COMMIT')
+                    return {'allowed': False, 'sent': False, 'claimed': False,
+                            'token': None, 'routing_required': False,
+                            'reason': 'main_force_window_closed',
+                            'pool_key': row['pool_key'], 'task_id': task_id,
+                            'capacity_released': True,
+                            'reasons': ['this reserved attempt could not start before the '
+                                        'Beijing-time main-force window (22:00 inclusive to '
+                                        '08:00 exclusive) for Qwen3.8-Max closed; released '
+                                        'this attempt\'s own reserved placeholder to '
+                                        'start_failed (real release, never leaked, never '
+                                        'preempting another task) and refused the start']}
                 # Z4：同 task 原消费除外；别的 task 已在同真实 workspace 在途写入则拒。
                 busy = _workspace_conflict(conn, workspace, own_token=claim_token)
                 if busy is not None:
@@ -2221,7 +2354,7 @@ def claim_due(store_path=None, *, task_id, now=None, scope=None,
             degraded = bool(row['degradation_reason']) if 'degradation_reason' in row.keys() else False
             zcode_blocked = _zcode_availability_blocked(quota_store, now=now,
                                                         routes_path=quota_routes)
-            eligible = _eligible_main_forces(conn, zcode_blocked)
+            eligible = _eligible_main_forces(conn, zcode_blocked, now)
             # BW-AVAILABILITY-20261009-B4 缺陷 7 + B4 combo：国内回收必须真正遵守票据原
             # scope 携带的执行器 + 模型 combo 硬约束（受信任主脑的明确授权，含本次 Flash），
             # 绝不因为别的候选有空位就把 scope=qoder 的任务改派成 ZCode。scope 若声明
@@ -2243,10 +2376,10 @@ def claim_due(store_path=None, *, task_id, now=None, scope=None,
                 elif scope_executor == 'zcode':
                     allowed = {ZCODE_POOL_KEY}
                 elif scope_executor == CN_RUNTIME:
-                    # CN-bound ticket reclaims only the CN Max/Flash pools, never
-                    # international/ZCode, never Luna; retired DeepSeek-Flash is not a
+                    # CN-bound ticket reclaims only the CN Max (built-in + custom)/Flash pools,
+                    # never international/ZCode, never Luna; retired DeepSeek-Flash is not a
                     # reclaim candidate either.
-                    allowed = {CN_MAX_POOL_KEY, CN_FLASH_POOL_KEY}
+                    allowed = {CN_MAX_POOL_KEY, CN_CUSTOM_MAX_POOL_KEY, CN_FLASH_POOL_KEY}
                 if allowed is not None and ZCODE_POOL_KEY in allowed and zcode_blocked:
                     # 原 scope 只要 ZCode，但 ZCode 当前不可用：不回收、不 Luna，保持 pending。
                     conn.execute('ROLLBACK')
@@ -2269,6 +2402,7 @@ def claim_due(store_path=None, *, task_id, now=None, scope=None,
                 if target is None and scope_combo is not None \
                         and scope_combo in MAIN_FORCE_KEYS \
                         and not _main_force_limit_active(conn, scope_combo) \
+                        and not _max_window_blocks(scope_combo, now) \
                         and capacity_for(scope_combo) is not None \
                         and _count_active(conn, scope_combo) < capacity_for(scope_combo):
                     target = scope_combo
@@ -2290,10 +2424,14 @@ def claim_due(store_path=None, *, task_id, now=None, scope=None,
                     # 恢复/重置解除标记后才有该 combo 的空位。
                     scope_combo_limited = (scope_combo is not None
                                            and _main_force_limit_active(conn, scope_combo))
+                    scope_combo_window_closed = (scope_combo is not None
+                                                 and _max_window_blocks(scope_combo, now))
                     conn.execute('ROLLBACK')
                     return {'claimed': False, 'task_id': task_id, 'state': row['state'],
                             'sent': False,
-                            'model_unavailable': bool(scope_combo_limited),
+                            'model_unavailable': bool(scope_combo_limited
+                                                       or scope_combo_window_closed),
+                            'main_force_window_closed': bool(scope_combo_window_closed),
                             'reasons': ['no domestic slot satisfies the original scope '
                                         f'constraint (executor={scope_executor!r}, '
                                         f'combo={scope_combo!r}'
@@ -2301,6 +2439,12 @@ def claim_due(store_path=None, *, task_id, now=None, scope=None,
                                            'so it is never silently swapped to another '
                                            'model (model_unavailable)'
                                            if scope_combo_limited else '')
+                                        + ('; the pinned Qoder built-in Qwen3.8-Max is only '
+                                           'a main force during Beijing time 22:00 '
+                                           '(inclusive) to 08:00 (exclusive) and is outside '
+                                           'that window now, so it is never silently '
+                                           'swapped to another model'
+                                           if scope_combo_window_closed else '')
                                         + '); the ticket stays pending '
                                         '— a slot for another candidate never satisfies it '
                                         'and domestic is never Luna']}

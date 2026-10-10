@@ -30,6 +30,7 @@ import sys
 import tempfile
 import unittest
 from contextlib import closing
+from datetime import datetime, timezone
 from pathlib import Path
 
 REPO = Path(__file__).resolve().parent.parent
@@ -43,6 +44,13 @@ import dispatch_pool as dp  # noqa: E402  真实容量池：并发入口 Popen �
 QODER_ENTRY = SCRIPTS / 'qoder_direct.py'
 CODEBUDDY_ENTRY = SCRIPTS / 'codebuddy_direct.py'
 ZCODE_ENTRY = SCRIPTS / 'zcode_direct.py'
+# BW-MAX-WINDOW-20261010-S2：内置 Qwen3.8-Max 只在主力时段（北京 22:00含–08:00不含）放行，
+# 时段外 reserve/consume 一律如实拒绝（见 dispatch_pool._domestic_policy）。并行演练要占
+# 用国际内置 Max 名额，必须让“预留（父进程）”与“消费（子进程入口）”同处时段内。真实入口
+# 在子进程读墙钟，白天会拒绝；故时钟控制只在离线夹具里做：预留传 now=WINDOW_T0，子进程用
+# 测试创建的临时 wrapper 先导入 dispatch_pool 把 utcnow 固定到同一时刻（北京 23:00）再原样
+# 运行 qoder_direct.main()。生产入口绝不加 --now/环境开关/绕时段通道。
+WINDOW_T0 = datetime(2026, 10, 8, 15, 0, 0, tzinfo=timezone.utc)  # 北京 23:00，时段内
 # CodeBuddy/WorkBuddy 直连已退休为 human-relay only：生产 CODEBUDDY_ENTRY main() 硬停。
 # 旧 CB 真实 stub 传输链（429/限流/冷却/解析）改由测试专用离线 harness 调用
 # codebuddy_direct.dispatch_core 在隔离合成 stub 下回放，不参与生产直连派发。
@@ -224,6 +232,24 @@ class ParallelRehearsalTests(unittest.TestCase):
         ws.mkdir()
         return ws
 
+    def _qoder_runner(self) -> str:
+        # BW-MAX-WINDOW-20261010-S2：并行演练占用国际内置 Qwen3.8-Max 主力名额，而入口
+        # 在子进程读墙钟判时段——白天会如实拒绝。真实 fake-CLI/barrier/drift 断言不变，
+        # 只把“运行原 qoder_direct 入口”换成经测试创建的离线 wrapper：先导入 dispatch_pool
+        # 并把 utcnow 固定到时段内（同 WINDOW_T0/北京 23:00），再原样 sys.exit(main())。
+        # 时钟控制仅此离线夹具；生产入口未加 --now/环境开关/猴子补丁。
+        runner = self.base / 'qd_in_window_runner.py'
+        runner.write_text(
+            'import sys\n'
+            f'sys.path.insert(0, {str(SCRIPTS)!r})\n'
+            'from datetime import datetime, timezone\n'
+            'import dispatch_pool as dp\n'
+            f'dp.utcnow = lambda: datetime(2026, 10, 8, 15, 0, 0, tzinfo=timezone.utc)\n'
+            'import qoder_direct\n'
+            'sys.exit(qoder_direct.main())\n',
+            encoding='utf-8', newline='\n')
+        return str(runner)
+
     def _write(self, name: str, text: str) -> Path:
         p = self.base / name
         # newline='\n' 强制 LF：Windows 默认 write_text 会译成 CRLF，使入口 read_text→
@@ -285,7 +311,8 @@ class ParallelRehearsalTests(unittest.TestCase):
                        encoding='utf-8')
         # --model 必须与 plan.model 一致（preflight 双向比对）；--dispatch-claim 精确
         # 消费事先 reserve 的容量名额，--dispatch-store 指向本测试独立临时池。
-        return [sys.executable, str(QODER_ENTRY), '--workspace', str(ws),
+        # 经离线 wrapper 运行原入口，使内置 Max 时段判定落在时段内（见 _qoder_runner）。
+        return [sys.executable, self._qoder_runner(), '--workspace', str(ws),
                 '--prompt-file', str(prompt), '--output-dir', str(out), '--stage', stage,
                 '--model', model, '--tools', 'Read', '--config', str(cfg),
                 '--dispatch-plan', str(plan), '--dispatch-store', str(self.dispatch_store),
@@ -300,7 +327,7 @@ class ParallelRehearsalTests(unittest.TestCase):
         res = dp.reserve(self.dispatch_store, task_id=task_id, runtime=runtime,
                          model=model, workspace=str(ws),
                          prompt_sha256=hashlib.sha256(prompt_path.read_bytes()).hexdigest(),
-                         stage=stage, executor=runtime)
+                         stage=stage, executor=runtime, now=WINDOW_T0)
         self.assertTrue(res['allowed'], res)
         return res['token']
 
@@ -721,7 +748,7 @@ class ParallelRehearsalTests(unittest.TestCase):
         res = dp.reserve(self.dispatch_store, task_id='T-CHAT', runtime='qoder',
                          model='Qwen3.8-Max', workspace=str(ws),
                          prompt_sha256=hashlib.sha256(prompt.read_bytes()).hexdigest(),
-                         stage=stage, chat_id='C-ORIG')
+                         stage=stage, chat_id='C-ORIG', executor='qoder', now=WINDOW_T0)
         self.assertTrue(res['allowed'], res)
         out = ws / 'out'
         cmd = self._qoder_cmd(ws, prompt, out, stage, plan, 'Qwen3.8-Max', res['token'])

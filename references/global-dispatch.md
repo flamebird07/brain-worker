@@ -5,24 +5,53 @@
 > `quota_control` 的**额度冷却门禁**是两回事：容量并发 ≠ 额度。落地口径以本文件为准，实现以
 > `scripts/dispatch_pool.py` 为准，二者不一致时以代码为准并回修文档。
 
-## 分配决策（当前有效，BW-POOL-SPLIT-20261010-S2/S3 五池定型）
+## 分配决策（当前有效，BW-POOL-SPLIT-20261010-S2/S3 + BW-MAX-WINDOW-20261010-S2 六池定型）
 
 所有会话共享同一个持久池，绝不各自为政：
 
 | 角色 | 组合（`runtime:model`） | 每组合真实在途上限 | 说明 |
 | --- | --- | --- | --- |
 | 主力 | `zcode:GLM-5.3` | 2 | 与其他主力按 committed 做 best-effort 1:1 轮换 |
-| 主力 | `qoder:Qwen3.8-Max` | 1 | 国际 Max 主力；明确限额命中时经 `main_force_limits` 自动跳过，不查余额 |
-| 主力 | `qodercn:Qwen3.8-Max` | 1 | CN Max 主力；独立池，不受国际 Max 标记影响，限额规则同国际 Max |
+| 主力 | `qoder:Qwen3.8-Max` | 1 | 国际 Max 主力；明确限额命中时经 `main_force_limits` 自动跳过，不查余额；**BW-MAX-WINDOW-20261010-S1：作为主力仅北京时间 22:00（含）至次日 08:00（不含）参与新派工，其余时段 AUTO 自动跳过、主脑显式 `reserve` 如实拒绝** |
+| 主力 | `qodercn:Qwen3.8-Max` | 1 | CN 内置 Max 主力；独立池，不受国际 Max 标记影响，限额规则同国际 Max；**BW-MAX-WINDOW-20261010-S1：主力时段门同国际 Max（北京时间 22:00 含至 08:00 不含）** |
+| 主力 | `qodercn:Qwen-3.8-Max` | 2 | CN 自定义主力（友好名带连字符 `Qwen-3.8-Max`，与内置 `Qwen3.8-Max` 不同）；属 Qoder 主力组、复用既有 committed 1:1 轮换；**BW-MAX-WINDOW-20261010-S2：不套时段门（全天可新派），但复用 `main_force_limits` 限额判定，各自 pool_key 独立落标、对两内置 Max 无连带** |
 | 兜底 | `qoder:Qwen3.8-Flash` | 2 | 与 CN Flash **同级**；`AUTO` 在合格可用主力均不可用或已满时从两区 Flash 选（可跨国际/CN），明确 `executor='qoder'` 时按本地区约束 |
 | 兜底 | `qodercn:Qwen3.8-Flash` | 2 | 与 `qoder:Qwen3.8-Flash` 同级；`AUTO` 可跨区选，明确 `executor='qodercn'` 时按本地区约束 |
 | 退休 | `qodercn:DeepSeek-Flash` | 0 | 新派发退休（`LEGACY_RETIRED_POOL_KEYS`，`_domestic_policy` 返 `unknown_pool`），仅供已存在旧在途 attempt 按真实 runtime/model 计入总数并真实终态释放 |
 | 救援 | `luna:native` | 无上限 | 只经 `claim-due` 竞争裁决，绝不被自动选中 |
 
-- **国内合计上限 = 8**（`DOMESTIC_TOTAL_CAPACITY=8`，`_domestic_active ≥ 8` 时任何新国内 claim 一律 `full`、不派第 9 个）：`zcode:GLM-5.3`=2 + 国际 Max=1 + CN Max=1 + 国际 Flash=2 + CN Flash=2。退休 DeepSeek 新派发不占额度但既有在途仍计入总数。（历史：本表旧版曾记为“国际 Max 各 2 + CN DeepSeek 补充 2、合计 6→8”，已由 S2/S3 五池口径取代，详见 §11。）
+- **国内合计上限 = 10**（`DOMESTIC_TOTAL_CAPACITY=10`，`_domestic_active ≥ 10` 时任何新国内 claim 一律 `full`、不派第 11 个）：`zcode:GLM-5.3`=2 + 国际内置 Max=1 + CN 内置 Max=1 + CN 自定义主力=2 + 国际 Flash=2 + CN Flash=2。退休 DeepSeek 新派发不占额度但既有在途仍计入总数。（历史：本表旧版曾记为“国际 Max 各 2 + CN DeepSeek 补充 2、合计 6→8”，S2/S3 收为五池总 8，BW-MAX-WINDOW-20261010-S2 加入 CN 自定义主力升为六池总 10，详见 §11。）
 - **Luna 无数量上限**，但它不计入国内名额，也永远不在正常路由里被派生。
 - 未列入本表的组合（例如 `qoder:GLM-5.3`、`zcode:Qwen3.8-Max`、任意未授权模型）容量为 0，
   `reserve`/`select_and_claim` 一律以 `unknown_pool` 拒绝，绝不派发未授权组合。
+
+## 牛马主力时段门（BW-MAX-WINDOW-20261010-S1）
+
+用户 2026-10-10 锁定：Qoder 国际内置 `Qwen3.8-Max` 与 Qoder CN 内置 `Qwen3.8-Max` **只在
+北京时间 22:00（含）至次日 08:00（不含）作为主力**参与新派工；其余时间新派工自动跳过。
+实现口径（全部在 `dispatch_pool.py`，复用既有注入的 `now`/UTC，绝不依赖宿主系统时区）：
+
+- **北京时间固定按 UTC+8 折算**：`_beijing_hour(now)` 先把 `now` 归一到 UTC 再加 8 小时取
+  小时；`_main_force_window_open` 判 `h≥22 或 h<8`——22:00 可选、08:00 不可选（左闭右开）。
+- **只门控这两个 Qoder 内置 Max**（`WINDOW_GATED_MAIN_FORCES = (qoder:Qwen3.8-Max, qodercn:Qwen3.8-Max)`）；`zcode:GLM-5.3` 主力、CN 自定义主力 `qodercn:Qwen-3.8-Max`、两地区
+  `Qwen3.8-Flash` 兜底、`luna:native` 救援、已退休 `qodercn:DeepSeek-Flash` 一律不受时段约束。
+- **AUTO 白天自动跳过**：`_eligible_main_forces(conn, zcode_blocked, now)` 在非时段把两个 Max
+  从合格主力里剔除，`_select_main_force` 只在剩余主力（ZCode）里 best-effort 轮换，ZCode 也不可用
+  /已满时才落到同级 Flash；两 Max 被跳过后绝不新落。
+- **主脑显式预留如实拒绝、绝不静默换模型**：`reserve(..., executor='qoder'/'qodercn',
+  model='Qwen3.8-Max', now=白天)` → `main_force_window_closed`（`sent=false`、非
+  `routing_required`），绝不偷偷换成同区 Flash。原生入口自身的 select/consume（同一 owner lane）
+  不因该时段门被硬拒，保持既有行为不依赖墙钟；真正的时段约束落在“候选过滤 + 主脑预留 + 启动前再检查”。
+- **预留启动前再检查（跨 08:00 真实释放）**：`consume_for_entry` 消费已预留 token 前，若本 attempt
+  落在受门控 Max 而当前已离开时段：`reserved` 在同事务内真实释放为 `start_failed`（只释放本任务
+  自己的占位、绝不泄漏、绝不抢占别人名额）；`running`/`unknown` 旧在途绝不假释放，只拒绝重复启动。
+- **降级 `claim_due` 使用同一候选过滤**：国内回收经同一 `_eligible_main_forces` 过滤，钉住 Max 的原
+  scope 在非时段保持 pending（如实 `main_force_window_closed`/`model_unavailable`），绝不回收 Max、
+  绝不改派别的模型、绝不当作 Luna。
+- 活任务不追杀：本门只影响**新** `reserve`/`consume`/`claim_due`，已 running/unknown 占位与真实终态
+  释放逻辑完全不变。时段门只套两内置 `Qwen3.8-Max`；BW-MAX-WINDOW-20261010-S2 后续新增的 CN 自定义主力
+  `qodercn:Qwen-3.8-Max`（国内合计由 8 升为 10）不套时段门、但复用限额判定，与自定义模型/Flash/ZCode 一样不受时段约束；
+  不加定时器/余额查询/数据库表/后台任务。
 
 ## 1:1 主力轮换是 best-effort，不是严格均衡
 
@@ -48,7 +77,7 @@
    - 无合格可用主力时按两区 Flash **同级**选（`AUTO` 可跨国际/CN 选合格候选），任一区 Flash 仍有
      空槽即 `routing_required` 指向该区（调用入口已是该区 Flash 则直接 claim），**不因其中一区
      Flash 满就报整池 full**；
-   - 三主力与两区 Flash 均满（**总 8 全满**）才 `capacity_full`。**候选均无可用槽不等于物理满**，
+   - 各主力（`zcode` + 两内置 Max + CN 自定义 Max）与两区 Flash 均满（**总 10 全满**）才 `capacity_full`。**候选均无可用槽不等于物理满**，
      降级原因与是否授权按 §执行器约束 及后文区分处理。
 
 轮换按**已提交计数**（`rotation.committed_zcode` / `committed_qoder`）驱动，是尽力而为的
@@ -78,8 +107,8 @@
 - **`executor='zcode'`**：ZCode 被 availability 阻断 → `zcode_unavailable` 拒绝（**不改道到别的
   主力、不落 Flash**）；有空位则 claim，满则 `capacity_full`（无 Flash 回退）。
 - **`executor='auto'`（缺省）**：保留历史 committed 计数与 1:1 公平轮换，只在**合格**主力间轮换；
-  请求 ZCode 但其被阻断 → 改道到可用主力/同级 Flash；三主力与国际 Flash 都满而 CN Flash 有空槽 →
-  改道 CN Flash（入口已是 CN Flash 则 claim），**两区 Flash 也满（总 8 全满）才 `capacity_full`**，**绝不改道回不可用的
+  请求 ZCode 但其被阻断 → 改道到可用主力/同级 Flash；各主力与国际 Flash 都满而 CN Flash 有空槽 →
+  改道 CN Flash（入口已是 CN Flash 则 claim），**两区 Flash 也满（总 10 全满）才 `capacity_full`**，**绝不改道回不可用的
   ZCode**，也**不改道回别的池去互换明确指定的组合**。**不清库、不重置轮换计数**、不新增评分/额度逻辑。
 - **消费 token 前复检**：`consume_for_entry` 走 `--dispatch-claim` token 路径时，在同一事务里
   **重新校验 ZCode availability**；若预留后通道转为不可用，则释放**本次自己**的 reserved 占位
@@ -93,8 +122,9 @@
 
 - **combo 硬约束**：`executor`+`runtime`+`model` 明确组合（含 `qoder:Qwen3.8-Flash`）贯穿
   `reserve/select_and_claim/consume_for_entry/claim_due`，作为候选集合硬边界——受信任主脑明确
-  已授权的组合**不因别的候选有空位而被拒绝**；默认 AUTO 主力优先/容量/1:1 与 Z2/Max2/Flash2
-  容量不变（并发 2/4 为 Skill 政策、非已核实 Qoder 进程上限）。
+  已授权的组合**不因别的候选有空位而被拒绝**；默认 AUTO 主力优先/容量/1:1 与各池真实容量
+  （BW-MAX-WINDOW-20261010-S2 后为六池总 10：`zcode`=2、两内置 Max 各 1、CN 自定义 Max=2、两区 Flash 各 2）
+  为既定政策不变（并发 2/4 为 Skill 政策、非已核实 Qoder 进程上限）。
 - **国内回收尊重原 scope**：`claim_due` 用 `_scope_allowed_candidates` 依原 scope 组合/executor
   收窄候选（绑 Qoder 只回收 QMax/Flash，绝不因 ZCode 有空位改派 ZCode）；绑 ZCode 且被阻断 →
   保持 pending，**绝不改派或降级 Luna**。
@@ -107,7 +137,7 @@
   即过滤不可用 ZCode；派工写事务内不调用写额度 helper。
 - **竞态与 Luna 保护**：429 事实**先于**可再派空槽发布（`_preclaim_reconcile` 要求 child+wrapper
   双死且创建身份匹配，auto 回收只放执行容量不清 availability）；`reply`/`claim_due` 保护
-  claimed/settled/cancelled/launch_unknown，settled 票据不被迟到/重复回复重开；物理六满与
+  claimed/settled/cancelled/launch_unknown，settled 票据不被迟到/重复回复重开；物理满（总 10）与
   “合格候选耗尽”分列报告，误报不自动 Luna。
 
 ## 入口在 Popen 前的唯一容量门
@@ -167,7 +197,7 @@
 
 Luna 是**救援**通道，无数量上限，但绝不无条件启动。流程：
 
-1. 国内名额全满时（BW-QODER-CN-20261010-A2 起阈值随总 8 更新，含 Qoder CN 补充 2；判定走
+1. 国内名额全满时（BW-QODER-CN-20261010-A2 起阈值随总 8 更新，BW-MAX-WINDOW-20261010-S2 加入 CN 自定义主力后再升为总 10，含两内置 Max/自定义 Max/CN 补充；判定走
    `_domestic_active ≥ DOMESTIC_TOTAL_CAPACITY`），**宿主先真的问用户**“外部 agent 还是 Luna”。Python 只落库票据，
    **绝不谎称已经问过或已经派生 Luna**——真实提问与原生工具调用由宿主负责。
 2. `dp.ask_record(task_id, ...)` 记录一次真实提问票据，开始 **300 秒**计时
@@ -176,7 +206,7 @@ Luna 是**救援**通道，无数量上限，但绝不无条件启动。流程�
 3. 用户回复 → `dp.reply(task_id, choice)`（`luna`/`external_agent`/`domestic`/`cancel`）。
    **一旦回复，`claim_due` 不再自动裁决**——等待超时不当作默认无限授权。
 4. 到期竞争裁决 `dp.claim_due(task_id, now)`：只有票据 `pending`、已过 deadline、未回复、未
-   claim，**且国内总 8 名额（含 CN 补充候选）确实全满**（`_domestic_active ≥ DOMESTIC_TOTAL_CAPACITY`）时，
+   claim，**且国内总 10 名额（含自定义主力与 CN 补充候选）确实全满**（`_domestic_active ≥ DOMESTIC_TOTAL_CAPACITY`）时，
    才在同一 `BEGIN IMMEDIATE` 事务里创建一个 `luna:native`
    attempt 并把票据置 `claimed`，返回 `launch_state='host_must_call_native'`（**宿主仍须真实
    调用原生工具**，池只给竞争裁决与名额，不代跑）。
@@ -197,14 +227,14 @@ Luna 是**救援**通道，无数量上限，但绝不无条件启动。流程�
   `ask_record` 对**任何已存在票据**直接拒绝并回读 `state`/`deadline_utc`/`reply_choice`（纯 INSERT，
   无 `ON CONFLICT` 重置）；`pending` 不重置计时器。
 - **票据 scope 损坏/缺失 → fail-closed**（`scope_corrupt=True`，绝不据损坏数据启动 Luna 或 reclaim）。
-- **可用性不足的降级决策**：当**国内名额未满总 8（含 CN 补充候选）** 但因 availability 不足以正常派工时，允许一次新的
+- **可用性不足的降级决策**：当**国内名额未满总 10（含自定义主力与 CN 补充候选）** 但因 availability 不足以正常派工时，允许一次新的
   降级 `ask_record`，须带**独立、客观的降级理由** `degradation_reason ∈ {quota, auth, capacity}` +
   `degradation_detail`；`quota` 理由必须由 §3b availability 的客观证据支撑
   （`_zcode_availability_blocked`），无证据则拒绝；`capacity` 理由必须经 `_scope_allowed_candidates`
   客观核验受信任候选（含 CN 补充候选）确已排空——仍有空槽（例如 CN 还有位）时**拒绝降级、优先用国内候选**。
-  降级票据**绕过“总 8 全满”前提**，但
+  降级票据**绕过“总 10 全满”前提**，但
   **非 capacity 的超时绝不可替代显式授权**：只有用户显式回复 `luna` 才 claim Luna；等待超时
-  ≠ 授权（`degraded && reply != luna` → 拒绝）。**总 8 全满 + 真实提问 + 300s + 用户授权**的既有规则不变。
+  ≠ 授权（`degraded && reply != luna` → 拒绝）。**总 10 全满 + 真实提问 + 300s + 用户授权**的既有规则不变。
 
 ## 与额度门禁的边界（quota ≠ concurrency）
 
@@ -294,15 +324,15 @@ python scripts/dispatch_pool.py --store <abs> cancel-pending --task-id T [--reas
 > 绝不自动重派；worker 说"我结束了"不算终态，必须宿主回读原生回执；国内 attempt
 > 永不经过 settle-native 退出。
 
-## 11. 五池真实分配与主力明确限额（2026-10-10，BW-POOL-SPLIT-20261010-S2/S3/S5）
+## 11. 六池真实分配与主力明确限额（2026-10-10，BW-POOL-SPLIT-20261010-S2/S3/S5 + BW-MAX-WINDOW-20261010-S2）
 
-S2/S3 定型的国内五池真实容量：`zcode:GLM-5.3=2`、`qoder:Qwen3.8-Max=1`、`qodercn:Qwen3.8-Max=1`、`qoder:Qwen3.8-Flash=2`、`qodercn:Qwen3.8-Flash=2`；`qodercn:DeepSeek-Flash` 退休为 0（`LEGACY_RETIRED_POOL_KEYS`）但既有在途 attempt 仍计入 `_domestic_active` 总数、真实终态自然释放；`luna:native` 无上限、仅救援。`DOMESTIC_TOTAL_CAPACITY=8` 硬守卫不派第 9 个。CN 内置模型真实名 `Qwen3.8-Max`/`Qwen3.8-Flash`，**不是** `Qwen-3.8-*`。
+S2/S3 定型的国内真实容量经 BW-MAX-WINDOW-20261010-S2 加入 CN 自定义主力后为六池：`zcode:GLM-5.3=2`、国际内置 `qoder:Qwen3.8-Max=1`、CN 内置 `qodercn:Qwen3.8-Max=1`、CN 自定义 `qodercn:Qwen-3.8-Max=2`、`qoder:Qwen3.8-Flash=2`、`qodercn:Qwen3.8-Flash=2`；`qodercn:DeepSeek-Flash` 退休为 0（`LEGACY_RETIRED_POOL_KEYS`）但既有在途 attempt 仍计入 `_domestic_active` 总数、真实终态自然释放；`luna:native` 无上限、仅救援。`DOMESTIC_TOTAL_CAPACITY=10` 硬守卫不派第 11 个。CN 内置模型真实名 `Qwen3.8-Max`/`Qwen3.8-Flash`（**不是** `Qwen-3.8-*`）；自定义主力用带连字符的友好名 `Qwen-3.8-Max` 与内置区分。
 
-S5 增加两个 Qoder Max 池的**明确限额**闭环：
-- **限额承载范围**：`QUOTA_LIMITABLE_POOLS = (qoder:Qwen3.8-Max, qodercn:Qwen3.8-Max)`。ZCode 仍走 `quota_control` availability；任一 Flash、退休 DeepSeek、Luna 永不落标；绝不误挡 Flash、绝不动 ZCode 既有 availability 口径。
+S5 增加 Qoder Max 池的**明确限额**闭环（BW-MAX-WINDOW-20261010-S2 把自定义 CN 主力并入承载范围）：
+- **限额承载范围**：`QUOTA_LIMITABLE_POOLS = (qoder:Qwen3.8-Max, qodercn:Qwen3.8-Max, qodercn:Qwen-3.8-Max)`。自定义 CN 主力复用同一标记机制，各自 pool_key 独立落标、对两内置 Max 无连带。ZCode 仍走 `quota_control` availability；任一 Flash、退休 DeepSeek、Luna 永不落标；绝不误挡 Flash、绝不动 ZCode 既有 availability 口径。
 - **落标必须绑真实 attempt + 错误证据**：`record_main_force_limit(store, pk, task_id=…, attempt_token=…, evidence_path=…, evidence_sha256=…)` 在 `BEGIN IMMEDIATE` 事务内回核 attempt 行存在、`pool_key==pk`、`task_id==传入`；同时校验 `evidence_path` 指向的文件真实存在且 `_file_sha256` 与声明一致。任一漂移或缺字段 → `recorded=False / drift=True` 拒绝写入。同池重复落标只刷新证据/时间戳，清空旧的 `released_at/release_note`。
 - **consume 前查限额**：`consume_for_entry` 在同一事务内、`_workspace_conflict` 之前，若 `row['pool_key']` 命中 `main_force_limits.limited=1` → 只把**本 token** CAS `reserved→start_failed`（`capacity_released=True`），返回 `sent=False / allowed=False / reason='main_force_limited'`，**绝不泄漏本次占位、绝不越权释放其他 task 的 reserved**。人工 `release_main_force_limit(note=…)` 后同 reserved 可正常 consume 到 running。
 - **恢复只人工**：`release_main_force_limit` 只在用户明确额度恢复/重置后调用，附 `note`；绝不查余额、不加定时器/探针/评分/新服务、不靠成功旧日志自动清标记；不改 `quota_control.py`/`zcode_direct.py`。
 - **AUTO/executor 路由保留**：`executor='qoder'` 请求 QMax 且未落标 → 直接 claim；已落标或已满 → 同 executor 内 Flash 兜底（`routing_required` 选 `qoder:Qwen3.8-Flash`），绝不复活限额 Max、绝不跨地区换 CN。`executor='qodercn'` 同规则镜像 CN Max→CN Flash。Luna 侧不变：domestic 任何时刻都不启用 Luna、unknown 保占位、明确模型不偷偷换。
 - **qoder_direct 落标时序**：真实失败终态（`protocol_success=False`）经 `_explicit_quota_limit_hit` 命中 + `_qoder_max_pool_key` 返回非 None → **先** `record_main_force_limit`（写 `stdout.json` 原字节 sha256 为证据）→ **再** 真实终态释放；落标异常绝不阻断真实终态释放（不泄漏锁）。
-- **离线回归覆盖**：`tests/test_dispatch_pool.py::MainForceLimitTests`、`tests/test_qoder_cn_direct_offline.py::ExplicitQuotaLimitHitTests`、`tests/test_dispatch_pool_qodercn.py`（五池容量/退休 DeepSeek `unknown_pool`）、`tests/test_availability_routing.py`（回收/降级 combo 硬约束）、`tests/test_parallel_execution.py`（并发演练 qa Max + qb Flash）。Windows/Linux CI 矩阵都跑，零网络、零凭据、零真实额度查询。
+- **离线回归覆盖**：`tests/test_dispatch_pool.py::MainForceLimitTests`（含自定义 CN 主力 record/read/release、consume 只释放本次 reserved、对两内置 Max 无连带）、`tests/test_qoder_cn_direct_offline.py::ExplicitQuotaLimitHitTests`、`tests/test_dispatch_pool_qodercn.py`（六池容量/退休 DeepSeek `unknown_pool`）、`tests/test_availability_routing.py`（回收/降级 combo 硬约束）、`tests/test_parallel_execution.py`（并发演练 qa Max + qb Flash）。Windows/Linux CI 矩阵都跑，零网络、零凭据、零真实额度查询。

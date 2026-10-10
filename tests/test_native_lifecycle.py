@@ -33,7 +33,7 @@ sys.path.insert(0, str(Path(__file__).resolve().parent.parent / 'scripts'))
 
 import dispatch_pool as dp  # noqa: E402
 
-T0 = datetime(2026, 10, 8, 0, 0, 0, tzinfo=timezone.utc)
+T0 = datetime(2026, 10, 8, 15, 0, 0, tzinfo=timezone.utc)  # 北京时间 23:00（主力时段内）
 RECEIPT = {'source_tool': 'luna.getAgentStatus',
            'receipt_ref': 'native-run-0001',
            'sha256': 'a' * 64}
@@ -58,12 +58,14 @@ class NativeLifecycleTests(unittest.TestCase):
     # routing_required 拒绝（fixture 不能反向松生产轮转）；合法顺序 Z,Max,Z,Max,
     # Flash,Flash，每次独立 workspace 并逐一核验 allowed/token/pool_key。
     def _fill_domestic(self):
-        # BW-POOL-SPLIT-20261010-S3 五池 8 槽：zcode×2 + 两地区 Max 各 1 + 两地区 Flash 各 2。
-        # 全部经显式 executor 逐一确定性 claim（CN 内置只能 executor='qodercn'，AUTO 轮换
-        # 不保证落某特定主力），每次核验 allowed/token/pool_key。
+        # BW-MAX-WINDOW-20261010-S2 六池 10 槽：zcode×2 + 两内置 Max 各 1 + CN 自定义 Max×2
+        # + 两地区 Flash 各 2。全部经显式 executor 逐一确定性 claim（CN 池只能
+        # executor='qodercn'，AUTO 轮换不保证落某特定主力），每次核验 allowed/token/pool_key。
         plan = [('zcode', 'GLM-5.3', 'zcode'), ('zcode', 'GLM-5.3', 'zcode'),
                 ('qoder', 'Qwen3.8-Max', 'qoder'),
                 ('qodercn', 'Qwen3.8-Max', 'qodercn'),
+                ('qodercn', 'Qwen-3.8-Max', 'qodercn'),
+                ('qodercn', 'Qwen-3.8-Max', 'qodercn'),
                 ('qoder', 'Qwen3.8-Flash', 'qoder'),
                 ('qoder', 'Qwen3.8-Flash', 'qoder'),
                 ('qodercn', 'Qwen3.8-Flash', 'qodercn'),
@@ -79,9 +81,10 @@ class NativeLifecycleTests(unittest.TestCase):
         st = dp.status(self.store, now=T0)
         self.assertEqual(st['domestic']['active'], dp.DOMESTIC_TOTAL_CAPACITY,
                          st['domestic'])
-        # 2 个 zcode 记 committed_zcode；两地区 Qwen3.8-Max 合计记 committed_qoder。
+        # 2 个 zcode 记 committed_zcode；Qoder 主力组（两内置 Max + 自定义 Max 合计）记
+        # committed_qoder。
         self.assertEqual(st['rotation']['committed_zcode'], 2, st['rotation'])
-        self.assertEqual(st['rotation']['committed_qoder'], 2, st['rotation'])
+        self.assertEqual(st['rotation']['committed_qoder'], 4, st['rotation'])
         return tokens
 
     def _luna_claimed(self, task_id='task-luna', workspace='ws-luna',

@@ -61,7 +61,7 @@ if str(_SCRIPTS) not in sys.path:
     sys.path.insert(0, str(_SCRIPTS))
 import dispatch_pool as dp  # noqa: E402
 
-T0 = datetime(2026, 10, 8, 12, 0, 0, tzinfo=timezone.utc)
+T0 = datetime(2026, 10, 8, 15, 0, 0, tzinfo=timezone.utc)  # 北京时间 23:00（主力时段内）
 
 
 def _probe(state, created):
@@ -94,12 +94,12 @@ class TempStoreMixin:
                 (token, task_id, runtime, model, pool, state, child_pid, child_created,
                  wrapper_pid, wrapper_created))
 
-    def fill_domestic(self, prefix='seed', n=8):
-        # BW-POOL-SPLIT-20261010-S3 真实五池 8 槽：zcode×2 + 两地区 Max 各 1 + 两地区
-        # Flash 各 2（CN DeepSeek-Flash 已 retired，不再作为在途基线）。
+    def fill_domestic(self, prefix='seed', n=10):
+        # BW-MAX-WINDOW-20261010-S2 真实六池 10 槽：zcode×2 + 两内置 Max 各 1 + CN 自定义
+        # Max×2 + 两地区 Flash 各 2（CN DeepSeek-Flash 已 retired，不再作为在途基线）。
         pools = ['zcode:GLM-5.3'] * 2 + ['qoder:Qwen3.8-Max'] \
-            + ['qodercn:Qwen3.8-Max'] + ['qoder:Qwen3.8-Flash'] * 2 \
-            + ['qodercn:Qwen3.8-Flash'] * 2
+            + ['qodercn:Qwen3.8-Max'] + ['qodercn:Qwen-3.8-Max'] * 2 \
+            + ['qoder:Qwen3.8-Flash'] * 2 + ['qodercn:Qwen3.8-Flash'] * 2
         for i in range(n):
             self.seed_attempt(f'{prefix}-{i}', f'{prefix}-task-{i}', pools[i])
 
@@ -139,14 +139,16 @@ class TestUnifiedPolicy(TempStoreMixin, unittest.TestCase):
         self.assertFalse(out['allowed'])
         self.assertEqual(out['reason'], 'luna_requires_ticket')
 
-    def test_fill_eight_legit_then_ninth_rejected(self):
-        # BW-POOL-SPLIT-20261010-S3 真实五池 8 槽：经显式 executor 逐槽确定性 claim（各池
-        # 不超自身容量），每次 assert allowed；填满 8 后任何 AUTO 国内组合才 capacity_full
+    def test_fill_ten_legit_then_eleventh_rejected(self):
+        # BW-MAX-WINDOW-20261010-S2 真实六池 10 槽：经显式 executor 逐槽确定性 claim（各池
+        # 不超自身容量），每次 assert allowed；填满 10 后任何 AUTO 国内组合才 capacity_full
         # 且 domestic_full。Z4：不同 task 用独立 workspace 目录（真实单写入守卫）。
         fill = [('t0', 'zcode', 'GLM-5.3', 'zcode'),
                 ('t1', 'zcode', 'GLM-5.3', 'zcode'),
                 ('t2', 'qoder', 'Qwen3.8-Max', 'qoder'),
                 ('t3', 'qodercn', 'Qwen3.8-Max', 'qodercn'),
+                ('t3a', 'qodercn', 'Qwen-3.8-Max', 'qodercn'),
+                ('t3b', 'qodercn', 'Qwen-3.8-Max', 'qodercn'),
                 ('t4', 'qoder', 'Qwen3.8-Flash', 'qoder'),
                 ('t5', 'qoder', 'Qwen3.8-Flash', 'qoder'),
                 ('t6', 'qodercn', 'Qwen3.8-Flash', 'qodercn'),
@@ -156,8 +158,8 @@ class TestUnifiedPolicy(TempStoreMixin, unittest.TestCase):
                                       workspace=f'C:/w/{tid}', prompt_sha256='p' * 64,
                                       executor=ex, now=T0, _preclaim=False)
             self.assertTrue(out['allowed'], out)
-        self.assertEqual(dp.status(self.store, now=T0)['domestic']['active'], 8)
-        # 第八槽已满 → 第九次 AUTO 任意国内组合才 capacity_full 且 domestic_full。
+        self.assertEqual(dp.status(self.store, now=T0)['domestic']['active'], 10)
+        # 第十槽已满 → 第十一次 AUTO 任意国内组合才 capacity_full 且 domestic_full。
         out = dp.select_and_claim(self.store, task_id='t9', runtime='zcode',
                                   model='GLM-5.3', workspace='C:/w/t9',
                                   prompt_sha256='9' * 64, now=T0, _preclaim=False)
@@ -589,9 +591,10 @@ class TestOverflowNotSubstitutedZ2(TempStoreMixin, unittest.TestCase):
     """Z2-2：两主力满时请求 Z/Max 必须 routing_required，绝不偷换成 Flash 落库。"""
 
     def _fill_mains(self):
-        # 三主力填满：zcode×2 + 两地区 Max 各 1（BW-POOL-SPLIT-20261010-S3）。
+        # 全部主力填满：zcode×2 + 两内置 Max 各 1 + CN 自定义 Max×2（BW-MAX-WINDOW-20261010-S2）。
         for i, pool in enumerate(['zcode:GLM-5.3'] * 2 + ['qoder:Qwen3.8-Max']
-                                 + ['qodercn:Qwen3.8-Max']):
+                                 + ['qodercn:Qwen3.8-Max']
+                                 + ['qodercn:Qwen-3.8-Max'] * 2):
             self.seed_attempt(f'm-{i}', f'm-task-{i}', pool)
 
     def test_select_and_claim_main_full_routes_to_flash_no_substitution(self):

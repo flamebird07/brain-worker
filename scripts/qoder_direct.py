@@ -463,14 +463,19 @@ _QUOTA_HARD_LIMIT_MARKERS = (
 
 
 def _qoder_max_pool_key(runtime, model):
-    """只有两个 Qoder Max 主力池可承载明确限额标记；其它 runtime/model（含任一 Flash、
-    ZCode、自定义名）一律 None。绝不偷偷给 Flash/ZCode 落标。"""
-    if model != 'Qwen3.8-Max':
+    """只有三个 Qoder Max 主力池可承载明确限额标记：两个内置 Max（qoder/qodercn:Qwen3.8-
+    Max）与 CN 自定义 Max（qodercn:Qwen-3.8-Max，短横线友好名）。其它 runtime/model（含任一
+    Flash、ZCode、国际自定义名）一律 None。绝不偷偷给 Flash/ZCode 落标；自定义名只有 CN
+    runtime 才成池，绝不把自定义误映射到内置池或反之。"""
+    if model == 'Qwen3.8-Max':
+        if runtime == RUNTIME_INTERNATIONAL:
+            return 'qoder:Qwen3.8-Max'
+        if runtime == RUNTIME_CN:
+            return 'qodercn:Qwen3.8-Max'
         return None
-    if runtime == RUNTIME_INTERNATIONAL:
-        return 'qoder:Qwen3.8-Max'
-    if runtime == RUNTIME_CN:
-        return 'qodercn:Qwen3.8-Max'
+    if model == 'Qwen-3.8-Max' and runtime == RUNTIME_CN:
+        # CN 自定义友好名（短横线）→ CN 自定义 Max 池；国际侧无此池，绝不误映射。
+        return 'qodercn:Qwen-3.8-Max'
     return None
 
 

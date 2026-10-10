@@ -169,6 +169,21 @@ class _SubprocessBase(unittest.TestCase):
         # harness 回放前校验固定合成 CB stub 的内容哈希：声明值取自磁盘真实字节。
         self.cb_stub_sha = hashlib.sha256(
             (self.stub_dir / 'cb_stub.py').read_bytes()).hexdigest()
+        # BW-MAX-WINDOW-20261010-S2：qoder 载荷默认内置 Qwen3.8-Max，受主力时段门约束；真实
+        # 入口在子进程用墙钟判定 → 白天会如实拒绝、不建目录。本组只验 prompt 原字节/两通道
+        # 证据链路，故用测试创建的临时 wrapper 把 dispatch_pool.utcnow 固定到主力时段内
+        # （北京 23:00）再原样运行 qoder_direct 入口。时钟控制仅在此离线夹具，生产入口不加
+        # --now/环境开关，时段/容量/漂移/单写入断言完全不变。
+        self.qoder_runner = self.base / 'qd_in_window_runner.py'
+        self.qoder_runner.write_text(
+            'import sys\n'
+            f'sys.path.insert(0, {str(SCRIPTS)!r})\n'
+            'from datetime import datetime, timezone\n'
+            'import dispatch_pool as dp\n'
+            'dp.utcnow = lambda: datetime(2026, 10, 8, 15, 0, 0, tzinfo=timezone.utc)\n'
+            'import qoder_direct\n'
+            'sys.exit(qoder_direct.main())\n',
+            encoding='utf-8')
 
     def tearDown(self):
         self._tmp.cleanup()
@@ -239,7 +254,7 @@ class QoderSendEvidenceTests(_SubprocessBase):
                                    'qodercli': str(self.stub_dir / 'qoder_stub.py')}),
                        encoding='utf-8')
         stdin_file = self.base / 'qoder-recv-stdin.bin'
-        cmd = [sys.executable, str(QODER_ENTRY), '--workspace', str(self.ws),
+        cmd = [sys.executable, str(self.qoder_runner), '--workspace', str(self.ws),
                '--prompt-file', str(prompt_path), '--output-dir', str(out),
                '--stage', self.stage, '--model', self.model_qoder, '--tools', 'Read',
                '--config', str(cfg), '--dispatch-plan', str(plan)]

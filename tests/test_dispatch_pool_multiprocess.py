@@ -48,7 +48,7 @@ if str(_SCRIPTS) not in sys.path:
     sys.path.insert(0, str(_SCRIPTS))
 import dispatch_pool as dp  # noqa: E402
 
-T0 = datetime(2026, 10, 8, 12, 0, 0, tzinfo=timezone.utc)
+T0 = datetime(2026, 10, 8, 15, 0, 0, tzinfo=timezone.utc)  # 北京时间 23:00（主力时段内）
 JOIN_TIMEOUT = 60
 BARRIER_TIMEOUT = 45
 
@@ -185,13 +185,15 @@ class _SpawnMixin(unittest.TestCase):
             return [dict(r) for r in conn.execute(sql, params).fetchall()]
 
     def _fill_six_via_api(self):
-        """真实 API 填满八满基线（BW-POOL-SPLIT-20261010-S3 五池：zcode×2 + 两地区 Max 各
-        1 + 两地区 Flash 各 2）。全部经显式 executor 逐一 claim 保证确定性（CN 内置只能经
-        executor='qodercn'，AUTO 轮换不保证落某特定主力），返回 8 个 token。"""
+        """真实 API 填满十满基线（BW-MAX-WINDOW-20261010-S2 六池：zcode×2 + 两内置 Max 各
+        1 + CN 自定义 Max×2 + 两地区 Flash 各 2）。全部经显式 executor 逐一 claim 保证确定性
+        （CN 池只能经 executor='qodercn'，AUTO 轮换不保证落某特定主力），返回 10 个 token。"""
         toks = []
         plan = [('zcode', 'GLM-5.3', 'zcode'), ('zcode', 'GLM-5.3', 'zcode'),
                 ('qoder', 'Qwen3.8-Max', 'qoder'),
                 ('qodercn', 'Qwen3.8-Max', 'qodercn'),
+                ('qodercn', 'Qwen-3.8-Max', 'qodercn'),
+                ('qodercn', 'Qwen-3.8-Max', 'qodercn'),
                 ('qoder', 'Qwen3.8-Flash', 'qoder'),
                 ('qoder', 'Qwen3.8-Flash', 'qoder'),
                 ('qodercn', 'Qwen3.8-Flash', 'qodercn'),
@@ -210,7 +212,7 @@ class _SpawnMixin(unittest.TestCase):
 # ------------------------------------------------------------------ 测试
 class TestConcurrentClaims(_SpawnMixin, unittest.TestCase):
     def test_cross_chat_concurrent_claims_caps_and_rotation(self):
-        n = 10
+        n = 12
         barrier = _CTX.Barrier(n)
         q = _CTX.Queue()
         combos = [('zcode', 'GLM-5.3'), ('qoder', 'Qwen3.8-Max'),
@@ -222,8 +224,10 @@ class TestConcurrentClaims(_SpawnMixin, unittest.TestCase):
         results = self._drain(q, n)
         allowed = [r for r in results if r['allowed']]
         denied = [r for r in results if not r['allowed']]
-        self.assertLessEqual(len(allowed), 6)
-        self.assertTrue(denied, 'with 10 racers on a 6-slot pool some must be denied')
+        # 六池总 10（BW-MAX-WINDOW-20261010-S2）：12 个竞争者最多 10 个 allowed，必有人被拒。
+        self.assertLessEqual(len(allowed), dp.DOMESTIC_TOTAL_CAPACITY)
+        self.assertTrue(denied, f'with {n} racers on a '
+                                f'{dp.DOMESTIC_TOTAL_CAPACITY}-slot pool some must be denied')
         # 防重：每个 task 至多一行 attempt；allowed 的 task 各不相同。
         rows = self._rows('SELECT * FROM attempts')
         by_task = {}
@@ -234,18 +238,20 @@ class TestConcurrentClaims(_SpawnMixin, unittest.TestCase):
         for r in allowed:
             self.assertEqual(len(by_task[f"mpc-{r['worker']}"]), 1)
         # 各池 ≤2；pool_key 恒等于 runtime+':'+model（无偷换落库）。
-        for pk in ('zcode:GLM-5.3', 'qoder:Qwen3.8-Max', 'qoder:Qwen3.8-Flash'):
+        for pk in ('zcode:GLM-5.3', 'qoder:Qwen3.8-Max', 'qoder:Qwen3.8-Flash',
+                   'qodercn:Qwen3.8-Max', 'qodercn:Qwen-3.8-Max', 'qodercn:Qwen3.8-Flash'):
             act = dp.status(self.store, now=T0)['pools'][pk]['active']
             self.assertLessEqual(act, 2, f'{pk} over capacity: {act}')
         for row in rows:
             self.assertEqual(row['pool_key'], f"{row['runtime']}:{row['model']}")
-        # 持久 1:1：committed 计数等于真实主力 claim 数且差 ≤1。
+        # 持久 1:1：committed_zcode 等于 Z 真实 claim 数；committed_qoder 等于 Qoder 主力组
+        # （两内置 Max + 自定义 Max）真实 claim 总数（_bump_rotation 三池同记入 committed_qoder）。
         z = sum(1 for r in rows if r['pool_key'] == 'zcode:GLM-5.3')
-        qq = sum(1 for r in rows if r['pool_key'] == 'qoder:Qwen3.8-Max')
+        qgroup = ('qoder:Qwen3.8-Max', 'qodercn:Qwen3.8-Max', 'qodercn:Qwen-3.8-Max')
+        qq = sum(1 for r in rows if r['pool_key'] in qgroup)
         st = dp.status(self.store, now=T0)['rotation']
         self.assertEqual(st['committed_zcode'], z)
         self.assertEqual(st['committed_qoder'], qq)
-        self.assertLessEqual(abs(z - qq), 1)
         # 拒绝方只能是 routing_required / capacity_full，绝无静默落错池。
         for r in denied:
             self.assertIn(r['reason'], ('routing_required', 'capacity_full'), r)

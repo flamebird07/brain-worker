@@ -28,7 +28,7 @@ import dispatch_pool as dp  # noqa: E402
 import zcode_direct as zd  # noqa: E402
 import prompt_contract as pc  # noqa: E402
 
-T0 = datetime(2026, 10, 8, 12, 0, 0, tzinfo=timezone.utc)
+T0 = datetime(2026, 10, 8, 15, 0, 0, tzinfo=timezone.utc)  # 北京时间 23:00（主力时段内）
 PROVIDER = 'account:bigmodel-individual-coding-plan'      # 受信任（含 bigmodel）
 UNTRUSTED = 'account:some-other-vendor-plan'              # 非受信任渠道
 ZCODE = 'zcode:GLM-5.3'
@@ -90,10 +90,12 @@ class _TmpBase(unittest.TestCase):
         return dp.status(self.dispatch, now=T0)['pools'][pk]['active']
 
     def _fill_six(self):
-        # BW-POOL-SPLIT-20261010-S3 五池 8 槽：zcode×2 + 两地区 Max 各 1 + 两地区 Flash 各 2。
+        # BW-MAX-WINDOW-20261010-S2 六池 10 槽：zcode×2 + 两内置 Max 各 1 + CN 自定义 Max×2
+        # + 两地区 Flash 各 2。全部经显式 executor 逐一确定性 claim。
         toks = []
         combos = [('zcode', 'GLM-5.3'), ('zcode', 'GLM-5.3'),
                   ('qoder', 'Qwen3.8-Max'), ('qodercn', 'Qwen3.8-Max'),
+                  ('qodercn', 'Qwen-3.8-Max'), ('qodercn', 'Qwen-3.8-Max'),
                   ('qoder', 'Qwen3.8-Flash'), ('qoder', 'Qwen3.8-Flash'),
                   ('qodercn', 'Qwen3.8-Flash'), ('qodercn', 'Qwen3.8-Flash')]
         for i, (rt, md) in enumerate(combos):
@@ -362,9 +364,9 @@ class DispatchRoutingTests(_TmpBase):
 
     def test_reclaim_skips_blocked_zcode(self):
         # 降级票据（capacity）只在受信任候选确实排空时记录；claim_due 原子回收只选可用主力
-        # （跳过被 blocked 的 ZCode）。BW-POOL-SPLIT-20261010-S3：ZCode blocked 后合格候选
-        # 为两地区 Qwen3.8-Max（各 1）+ 两地区 Flash（各 2）——先把它们占满，再释放一个
-        # QMax 名额，回收才会原子落到 QMax，Z 始终保持 blocked。
+        # （跳过被 blocked 的 ZCode）。BW-MAX-WINDOW-20261010-S2：ZCode blocked 后合格候选
+        # 为两内置 Max（各 1）+ CN 自定义 Max（2）+ 两地区 Flash（各 2）——先把它们占满，再
+        # 释放一个 QMax 名额，回收才会原子落到 QMax，Z 始终保持 blocked。
         self._hold_zcode()
         toks = []
         r = dp.reserve(self.dispatch, task_id='q0', runtime='qoder',
@@ -377,6 +379,12 @@ class DispatchRoutingTests(_TmpBase):
                       prompt_sha256='p', stage='s1', now=T0, executor='qodercn')
         self.assertTrue(r.get('allowed') and r.get('token'), r)
         toks.append(r['token'])
+        for i in range(2):
+            r = dp.reserve(self.dispatch, task_id=f'cu{i}', runtime='qodercn',
+                           model='Qwen-3.8-Max', workspace=str(self._ws_for(f'cu{i}')),
+                           prompt_sha256='p', stage='s1', now=T0, executor='qodercn')
+            self.assertTrue(r.get('allowed') and r.get('token'), r)
+            toks.append(r['token'])
         for i in range(2):
             r = dp.reserve(self.dispatch, task_id=f'fl{i}', runtime='qoder',
                            model='Qwen3.8-Flash', workspace=str(self._ws_for(f'fl{i}')),
@@ -831,6 +839,23 @@ class ZCodeEntryAvailabilityTests(_TmpBase):
 class QoderEntryRoutingTests(_TmpBase):
     """真实 Qoder 入口 + 仓库固定合成 stub_qodercli.py（子进程，零模型/网络）。"""
 
+    def _runner(self):
+        # BW-MAX-WINDOW-20261010-S2：内置 Max 只在主力时段放行。真实入口在子进程里用墙钟
+        # 判定时段，白天会如实拒绝；本例只验显式 Qoder 不被 1:1 改派到 ZCode，故在测试创建
+        # 的临时 wrapper 里导入 dispatch_pool 并把 utcnow 固定到时段内（北京 23:00），再原样
+        # 运行 qoder_direct 入口——时钟控制只在此离线夹具，生产入口不加 --now/环境开关。
+        runner = self.tmp / 'qd_in_window_runner.py'
+        runner.write_text(
+            'import sys\n'
+            f'sys.path.insert(0, {str(SCRIPTS)!r})\n'
+            'from datetime import datetime, timezone\n'
+            'import dispatch_pool as dp\n'
+            'dp.utcnow = lambda: datetime(2026, 10, 8, 15, 0, 0, tzinfo=timezone.utc)\n'
+            'import qoder_direct\n'
+            'sys.exit(qoder_direct.main())\n',
+            encoding='utf-8')
+        return str(runner)
+
     def _report(self, stage, work):
         lines = ['WORKER_REPORT_START',
                  f'阶段编号与执行方式：{stage}；direct。',
@@ -861,7 +886,7 @@ class QoderEntryRoutingTests(_TmpBase):
         env = {**os.environ.copy(), 'STUB_MODE': 'ok',
                'STUB_REPORT_FILE': str(report), 'PYTHONUTF8': '1',
                'BRAIN_WORKER_DISPATCH_STORE': str(self.dispatch)}
-        cmd = [sys.executable, str(SCRIPTS / 'qoder_direct.py'),
+        cmd = [sys.executable, self._runner(),
                '--workspace', str(work), '--prompt-file', str(prompt),
                '--output-dir', str(out), '--config', str(cfg), '--stage', stage,
                '--model', 'Qwen3.8-Max', '--dispatch-store', str(self.dispatch),
