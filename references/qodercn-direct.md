@@ -2,7 +2,7 @@
 
 > 运行时 `runtime='qodercn'`：本机已登录的 Qoder CN **原生 CLI**（EXE），与既有国际
 > `qoder`（node + `qodercli.js` bundle）**并存、互不覆盖**。本轮落实最小可验收改动：
-> 独立配置、友好名→真实模型 ID 映射、独立 2 槽补充候选、跨区域并行/同区互斥、跨 runtime
+> 独立配置、友好名→真实模型 ID 映射、CN 五池容量（Max=1、与国际 Flash 同级的 Flash=2）、跨区域并行/同区互斥、跨 runtime
 > claim 隔离、真实终态释放、Z 限额自动跳过（复用既有 availability）。**真实 CN 隔离小读/写
 > 已由主脑独立验收**（见下节）；CN 后端权重/费用/真实模型 ID 身份仍未知，**本轮未做完整工程
 > 验收，也未安装/上线**。
@@ -60,15 +60,10 @@ python <技能目录>/scripts/qoder_direct.py --runtime qodercn --cn-config <绝
 
 ## 容量与并行（与 global-dispatch 一致）
 
-- `qodercn:DeepSeek-Flash` 固定 2 槽，是**独立补充候选**：既可经显式 `executor='qodercn'` 直接
-  claim 自身真实容量（**绝不因历史 committed 比例改道**、也绝不与国际/ZCode 互串），也作为
-  **`AUTO` 的最后补充候选**（BW-QODER-CN-20261010-A4）——`AUTO` 仍在原合格主力间做 best-effort
-  1:1、国际 Flash 溢出居中，只有**原合格主力与国际 Flash 都不可用或已满**时才把 CN 当补充候选：
-  此时 `AUTO` 返回 `routing_required` 选 CN（调用入口已是 CN 则直接允许 claim），**原 6 满 + CN
-  空绝不报整池 full，只有原 8 全满才物理 full**。`AUTO` 用 CN 不改道、不评分、不新增轮换状态或
-  额度逻辑；明确指定 `Qoder`/`ZCode`/`CN` 的任务约束不互换、不扩大。默认入口仍通过准确
+- CN 池当前有效容量（BW-POOL-SPLIT-20261010-S2/S3 五池定型）：主力 **`qodercn:Qwen3.8-Max=1`**（独立池、可跨区域并行、跨 runtime 绝不互串），同级兜底 **`qodercn:Qwen3.8-Flash=2`**（与 `qoder:Qwen3.8-Flash` 同级）。`qodercn:DeepSeek-Flash` 新派发退休为 0（`LEGACY_RETIRED_POOL_KEYS`，`_domestic_policy` 返 `unknown_pool`），仅供已存在旧在途 attempt 真实终态释放。（历史：BW-QODER-CN-20261010-A2/A4 阶段曾把 `qodercn:DeepSeek-Flash` 当固定 2 槽的独立/AUTO 最后补充候选、国际 Max 仍 2、合计 6→8，已由 S2/S3 五池口径取代。）
+- `AUTO` 在合格可用主力均不可用或已满时从两区 Flash **同级**选、可跨国际/CN 选合格候选；只有明确指定 `Qoder`/`ZCode`/`CN` 的 `executor`/`model` 约束才保持本地区、不互换、不扩大。默认入口仍通过准确
   runtime/model 选中的真正执行器提交，绝不伪装 Qwen 或改未授权模型。
-- **国内合计 8**：原 Z2 / 国际 Max2 / 国际 Flash2 **完全原样**，CN 补 2。Luna 阈值随总 8 更新，
+- **国内合计 8**：`zcode:GLM-5.3=2` + 国际 Max=1 + CN Max=1 + 国际 Flash=2 + CN Flash=2。Luna 阈值随总 8 更新，
   仍沿用既有 300 秒真实提问/用户回复/`claim-due` 竞争裁决状态机，**不扩 Luna 授权**；回复
   `domestic` 任何时刻都绝不启动 Luna。
 - CN 与国际可**同时经各自真实入口、在不同 workspace 并行**；同一真实 workspace 仍单写入（守卫与
@@ -103,3 +98,22 @@ python tests/test_dispatch_pool_qodercn.py      # CN2/总8、跨区域并行、�
 两者用本地假 Popen、临时 SQLite，绝不读写真实/共享池或额度库，不证明真实后端能力。CN 隔离小
 读/写真实验收已由主脑完成（见上节）；完整工程验收、安装版/仓库版与 GitHub/Obsidian 同步仍由主脑
 独立执行，本文件不声称已完成。
+
+## 五池真实分配与 CN 内置 Max 明确限额（2026-10-10，BW-POOL-SPLIT-20261010-S2/S3/S5）
+
+S2/S3 依用户明确指令重构国内池为**五池真实分配、总 8**：
+- 主力：`zcode:GLM-5.3=2`、`qoder:Qwen3.8-Max=1`、**`qodercn:Qwen3.8-Max=1`**（各池独立、可跨区域并行、跨 runtime 绝不互抢）。
+- 同级兜底 Flash：`qoder:Qwen3.8-Flash=2`、**`qodercn:Qwen3.8-Flash=2`**。两 Flash **同级**：`AUTO` 在合格可用主力均不可用或已满时从两区 Flash 选、可跨国际/CN 选合格候选；只有明确指定 `executor`/`model` 时才锁定本地区兜底（国际 Max→国际 Flash、CN Max→CN Flash），不跨区互换明确组合。
+- **CN 内置模型真实名**：`Qwen3.8-Max` / `Qwen3.8-Flash`（**不是** `Qwen-3.8-*`）。私有 `local-entry-cn.json` 的 `cli / config_dir / model_ids` 映射不改写、不覆盖、不新增评分或调度器；示例仅占位、绝不写死本机 UUID/真实 ID 到公共源码。
+- **DeepSeek-Flash 新派发退休为 0**：`LEGACY_RETIRED_POOL_KEYS = ('qodercn:DeepSeek-Flash',)`、`_domestic_policy` 返 `unknown_pool`；但既有在途 attempt 仍按真实 runtime/model 计入 `_domestic_active` 总数并做真实终态释放——不杀旧 Max/DeepSeek 进程、不因新池缩表误清活锁、不越总 8。
+
+S5 给 **CN 内置 Qwen3.8-Max** 加上与国际 QMax 同规格的**明确限额**闭环（承载池 `qodercn:Qwen3.8-Max` ∈ `QUOTA_LIMITABLE_POOLS`）：
+- **识别只扫结构化载体**：`_explicit_quota_limit_hit(summary)` 只读 `summary['result_errors']` / `summary['result_errors_info']`；用户真实文案 **"You've reached your credit usage limit."** 必识别（`_QUOTA_HARD_LIMIT_MARKERS` 含 `credit usage limit`，大小写不敏感）。绝不扫报告正文/response.md；裸 `quota`、正文 429、permission 拒绝、认证/401、成功、取消 exit `4294967295` 都不当限额。
+- **`_qoder_max_pool_key('qodercn', 'Qwen3.8-Max')` → `'qodercn:Qwen3.8-Max'`**；其他 CN 模型（Flash / DeepSeek / 自定义）一律 `None`，绝不误挡 Flash。
+- **落标必绑真实 attempt + 证据**：`record_main_force_limit(store, 'qodercn:Qwen3.8-Max', task_id=…, attempt_token=…, evidence_path=str(out/'stdout.json'), evidence_sha256=sha256(stdout_bytes))` 事务内回核 attempt 行存在、pool/task 一致、`_file_sha256(evidence_path)` 与声明 sha256 匹配；任一漂移或缺字段 → `recorded=False / drift=True` 拒写。同池重复落标只刷新证据/时间戳、清空 `released_at/release_note`。
+- **consume 前查限额**：`consume_for_entry` 在同一事务内若本 attempt pool 已 limited → 只把**本 token** CAS `reserved→start_failed`（`capacity_released=True`），`sent=False / reason='main_force_limited'`；不动其他 task 的 reserved，不泄漏本次占位。
+- **落标 → 释放时序**：`main()` 先 `record_main_force_limit`、后 `_release_claim('finished', …)`；落标异常被 `except Exception` 兜住不阻断真实终态释放（不泄漏锁）。
+- **恢复只人工**：`release_main_force_limit(store, pk, note=…)` 只在用户明确额度恢复/重置后调用；不查余额、不加定时器/探针/评分/新服务/外部 API、不改 `quota_control.py`/`zcode_direct.py`、绝不靠成功旧日志自动清。
+- **AUTO/executor 路由保留**：`executor='qodercn'` 请求 CN Max 且未落标 → 直接 claim；已落标或已满 → 同 executor 内 CN Flash 兜底（`routing_required` 选 `qodercn:Qwen3.8-Flash`），绝不复活限额 Max、绝不跨地区换国际池。ZCode availability 跳过路径不变。Luna 侧不变：domestic 任何时刻都不启用 Luna、unknown 保占位、明确模型不偷偷换。
+
+**离线回归**（每用例独立临时 SQLite，零网络）：`tests/test_dispatch_pool_qodercn.py`（五池容量/退休 DeepSeek `unknown_pool`/跨区域并行/跨 runtime 拒/终态释放/Z hold 跳过）、`tests/test_dispatch_pool.py::MainForceLimitTests`（record/read/release/read 往返 + drift 全拒 + `consume_for_entry` 只释放本次 reserved）、`tests/test_qoder_cn_direct_offline.py::ExplicitQuotaLimitHitTests`（真实文案命中 + 不误伤 + `_qoder_max_pool_key` 只两 Max 池非 None）。Windows/Linux CI 矩阵都跑。

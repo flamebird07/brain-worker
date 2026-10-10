@@ -33,9 +33,16 @@ DEFAULT_CN_CONFIG = _SCRIPTS_DIR / 'local-entry-cn.json'
 # 运行时名称（报告/池/预检共用口径）：国际 Node-bundle = 'qoder'；本机原生 CN = 'qodercn'。
 RUNTIME_INTERNATIONAL = 'qoder'
 RUNTIME_CN = 'qodercn'
-# CN 池里的**友好名**（pool 组合 qodercn:DeepSeek-Flash 用该名）；真正下发给原生 EXE 的
-# --model 是 config model_ids 映射出来的服务端模型 ID，绝不把友好名当 ID、也绝不冒充 Qwen。
-CN_MODEL = 'DeepSeek-Flash'
+# CN 池友好名（BW-POOL-SPLIT-20261010-S2）：正常池新组合是 **内置** Qwen3.8-Max /
+# Qwen3.8-Flash，官方 CLI `--list-models` 显示字面串与 SDK 直接下发的 `--model` 值一致，
+# 是内置模型而非自定义 Token Plan。为兼容既有引用名 CN_MODEL 指向主力组合 Qwen3.8-Max；
+# 自定义 DeepSeek-Flash 从正常池 retired（不再 AUTO/新点单派工），但保留客户端本机自定义
+# model_ids 映射，用于人工/显式已授权的历史任务，绝不删除配置。
+CN_MODEL = 'Qwen3.8-Max'
+# CN 内置官方 Qwen 白名单：argv `--model` 直接使用这两个字面串（不查 model_ids、绝不
+# 猜 UUID、也不把自定义名当成内置）。任何其它 CN 名字必须走 config.model_ids 映射，映射
+# 缺失即拒绝启动（零 Popen）。
+CN_BUILTIN_MODELS = ('Qwen3.8-Max', 'Qwen3.8-Flash')
 # argparse 缺省模型 = 并发容量池指定的 qoder 主力组合 Qwen3.8-Max（每会话持久 1:1 两名）。
 # 不传 --model 的自主派工即请求主力 Max；Qwen3.8-Flash 在池里是溢出组合，仅当主力满员时
 # 由容量池按溢出策略改道。控制面回归 tests/test_execution_control.py 的 fixture 已同步为
@@ -108,9 +115,17 @@ def load_cn_config(path=None) -> dict:
     return cfg
 
 
-def resolve_cn_model_id(cfg: dict, model: str) -> str | None:
-    """把 CN 友好模型名映射成真实模型 ID；缺映射返回 None（调用方拒绝启动、零 Popen）。
-    绝不猜同名的内建/Qwen 模型，绝不把友好名当 ID 直接下发。"""
+def resolve_cn_model_id(cfg: dict, model: str):
+    """返回要下发给原生 CN EXE 的 `--model` 值；两种合法来源，任一不满足返回 None（调用
+    方拒绝启动、零 Popen）：
+    - **内置官方 Qwen 白名单**（`CN_BUILTIN_MODELS`：Qwen3.8-Max / Qwen3.8-Flash）：
+      字面串直接作为 argv 值（官方 CLI `--list-models` 精确显示该名，SDK 直传合法），
+      不查 model_ids、不猜 UUID、不把内置名当成自定义；
+    - **自定义 Token Plan**：必须走 config.model_ids 映射到真实服务端 ID；缺映射返回
+      None（绝不猜同名的内建/Qwen 模型、也绝不把友好名当 ID 直发）。
+    任何其它值一律 None。"""
+    if isinstance(model, str) and model in CN_BUILTIN_MODELS:
+        return model
     return cfg['model_ids'].get(model)
 
 
@@ -432,6 +447,70 @@ def _qoder_failure_facts(summary: dict) -> dict:
                          'result_errors': summary.get('result_errors'),
                          'result_errors_info': summary.get('result_errors_info'),
                          'model_requested': summary.get('model_requested')}}
+
+
+# BW-POOL-SPLIT-20261010-S3：两个 Qoder Max 主力“明确限额”最小标记的判定与落标。
+# 只有真实终态的**结构化失败载体**（result_errors / errors_info）明确命中硬限额才落标；
+# 绝不扫描报告正文，绝不把 permission 拒绝 / 解析失败 / 取消退出码(4294967295) / 普通报告
+# 正文里的 429 / 单独 quota 标签误作限额。Flash、ZCode、自定义名永不落标（不误挡 Flash、
+# 不动 ZCode 既有 availability 口径）。
+_QUOTA_HARD_LIMIT_MARKERS = (
+    'credits exhausted', 'out of credits', 'credit exhausted', 'credits depleted',
+    'insufficient credits', 'insufficient balance', 'no credits left',
+    'quota exhausted', 'credit usage limit',
+    '积分用尽', '积分不足', '余额不足', '额度用尽', '额度不足',
+)
+
+
+def _qoder_max_pool_key(runtime, model):
+    """只有两个 Qoder Max 主力池可承载明确限额标记；其它 runtime/model（含任一 Flash、
+    ZCode、自定义名）一律 None。绝不偷偷给 Flash/ZCode 落标。"""
+    if model != 'Qwen3.8-Max':
+        return None
+    if runtime == RUNTIME_INTERNATIONAL:
+        return 'qoder:Qwen3.8-Max'
+    if runtime == RUNTIME_CN:
+        return 'qodercn:Qwen3.8-Max'
+    return None
+
+
+def _error_carrier_texts(errors, errors_info):
+    """只遍历结构化错误载体里的文本字段（绝不扫描报告正文/response.md）。"""
+    for container in (errors, errors_info):
+        if isinstance(container, list):
+            for item in container:
+                if isinstance(item, str):
+                    yield item
+                elif isinstance(item, dict):
+                    for key in ('details', 'message', 'reason', 'error', 'title'):
+                        val = item.get(key)
+                        if isinstance(val, str):
+                            yield val
+
+
+def _hard_quota_limit_text(errors, errors_info):
+    for text in _error_carrier_texts(errors, errors_info):
+        low = text.lower()
+        for marker in _QUOTA_HARD_LIMIT_MARKERS:
+            if marker in low or marker in text:
+                return text
+    return None
+
+
+def _explicit_quota_limit_hit(summary):
+    """判定真实终态失败载体是否明确命中“硬限额”。优先复用既有
+    execution_control.explicit_429（result_errors/errors_info 里结构化 status/code==429
+    或文本开头独立 429）；必要时识别明确的 credits exhausted / out of credits / 积分用尽
+    等硬限额文本。返回 (hit: bool, evidence: str|None)。只在失败终态有意义（调用方另行
+    以 protocol_success 把关），绝不由 exit code / 报告正文 / permission 拒绝推断。"""
+    errors = summary.get('result_errors')
+    errors_info = summary.get('result_errors_info')
+    if ec.explicit_429(errors, errors_info):
+        return True, 'explicit_429'
+    hard = _hard_quota_limit_text(errors, errors_info)
+    if hard is not None:
+        return True, hard
+    return False, None
 
 
 def main():
@@ -786,65 +865,88 @@ def main():
                           'reasons': [f'subprocess terminal state could not be confirmed: {exc}']},
                          ensure_ascii=False))
         return 3
-    # 子进程真实结束 → 先释放容量名额（带 owner 身份、核验探针回读 child 已 dead），再解析
-    # JSON/报告/接续；即使随后保存失败也已释放。释放结果如实记录，未释放不谎称已释放。
-    rel = _release_claim('finished', success=(child.returncode == 0))
-    capacity_released = bool(rel.get('released'))
+    # 子进程真实结束 → 先解析真实终态（原始错误/输出完整保留），判定是否明确限额；若明确
+    # 限额且真实为两个 Qoder Max 主力之一，则**先落限额标记，再释放本占位**。顺序保证：占位
+    # 未释放（槽仍占用）时先写标记，避免槽一释放另一个 chat 立刻向已知限额池重复提交；落标记
+    # 或任何后续保存失败也必须做真实终态释放（带 owner 身份、不泄漏锁、不谎称已释放）。
     summary = {'exit_code': child.returncode, 'finished_at': datetime.now(timezone.utc).isoformat(),
                'model_requested': args.model, 'protocol_success': False,
-               'business_verified': False, 'output_dir': str(out),
-               'capacity_released': capacity_released,
-               'capacity_terminal': rel.get('terminal')}
+               'business_verified': False, 'output_dir': str(out)}
     report_state = None
+    stdout_bytes = None
     try:
-        result = json.loads((out / 'stdout.json').read_text(encoding='utf-8'))
-        summary.update(protocol_success=(child.returncode == 0 and result.get('type') == 'result'
-                                         and result.get('subtype') == 'success' and result.get('is_error') is False
-                                         and result.get('stop_reason') == 'end_turn'),
-                       session_id=result.get('session_id'), stop_reason=result.get('stop_reason'),
-                       total_credits=result.get('total_credits'), model_usage=result.get('modelUsage'),
-                       permission_denials=result.get('permission_denials'),
-                       result_errors=result.get('errors'),
-                       result_errors_info=result.get('errors_info'))
-        response = result.get('result')
-        if isinstance(response, str):
-            (out / 'response.md').write_bytes(response.encode('utf-8'))
-            disk = (out / 'response.md').read_bytes()
-            digest = hashlib.sha256(disk).hexdigest()
-            summary['response_sha256'] = digest
-            readback_match = digest == hashlib.sha256(response.encode('utf-8')).hexdigest()
-            body = analyze_report(response, args.stage, str(work))
-            binding = finalize_binding(
-                body['body_ok'], body['reasons'],
-                protocol_success=summary['protocol_success'],
-                session_id=summary.get('session_id'),
-                requested_session_id=args.session_id,
-                readback_match=readback_match)
-            report_state = {**body, 'response_sha256': digest,
-                            'readback_match': readback_match,
-                            'protocol_success': summary['protocol_success'],
-                            'session_id': summary.get('session_id'),
-                            'requested_session_id': args.session_id,
-                            'binding': binding,
-                            'bound': binding['bound'],
-                            'reasons': binding['reasons']}
-        else:
+        try:
+            stdout_bytes = (out / 'stdout.json').read_bytes()
+            result = json.loads(stdout_bytes.decode('utf-8'))
+            summary.update(protocol_success=(child.returncode == 0 and result.get('type') == 'result'
+                                             and result.get('subtype') == 'success' and result.get('is_error') is False
+                                             and result.get('stop_reason') == 'end_turn'),
+                           session_id=result.get('session_id'), stop_reason=result.get('stop_reason'),
+                           total_credits=result.get('total_credits'), model_usage=result.get('modelUsage'),
+                           permission_denials=result.get('permission_denials'),
+                           result_errors=result.get('errors'),
+                           result_errors_info=result.get('errors_info'))
+            response = result.get('result')
+            if isinstance(response, str):
+                (out / 'response.md').write_bytes(response.encode('utf-8'))
+                disk = (out / 'response.md').read_bytes()
+                digest = hashlib.sha256(disk).hexdigest()
+                summary['response_sha256'] = digest
+                readback_match = digest == hashlib.sha256(response.encode('utf-8')).hexdigest()
+                body = analyze_report(response, args.stage, str(work))
+                binding = finalize_binding(
+                    body['body_ok'], body['reasons'],
+                    protocol_success=summary['protocol_success'],
+                    session_id=summary.get('session_id'),
+                    requested_session_id=args.session_id,
+                    readback_match=readback_match)
+                report_state = {**body, 'response_sha256': digest,
+                                'readback_match': readback_match,
+                                'protocol_success': summary['protocol_success'],
+                                'session_id': summary.get('session_id'),
+                                'requested_session_id': args.session_id,
+                                'binding': binding,
+                                'bound': binding['bound'],
+                                'reasons': binding['reasons']}
+            else:
+                report_state = {'bound': False, 'body_ok': False,
+                                'reasons': ['envelope result is not a text response'],
+                                'carrier_missing': True}
+        except (ValueError, OSError) as exc:
+            summary['parse_error'] = str(exc)
             report_state = {'bound': False, 'body_ok': False,
-                            'reasons': ['envelope result is not a text response'],
+                            'reasons': [f'stdout parse error: {exc}'],
                             'carrier_missing': True}
-    except (ValueError, OSError) as exc:
-        summary['parse_error'] = str(exc)
-        report_state = {'bound': False, 'body_ok': False,
-                        'reasons': [f'stdout parse error: {exc}'],
-                        'carrier_missing': True}
-    if report_state is not None:
-        report_state.setdefault('protocol_success', summary['protocol_success'])
-        report_state.setdefault('session_id', summary.get('session_id'))
-        (out / 'report-state.json').write_text(
-            json.dumps(report_state, ensure_ascii=False, indent=2), encoding='utf-8')
-        summary['report_bound'] = report_state.get('bound', False)
-        summary['report_state_file'] = str(out / 'report-state.json')
-    summary['diagnostics'] = ec.diagnose(_qoder_failure_facts(summary))
+        if report_state is not None:
+            report_state.setdefault('protocol_success', summary['protocol_success'])
+            report_state.setdefault('session_id', summary.get('session_id'))
+            (out / 'report-state.json').write_text(
+                json.dumps(report_state, ensure_ascii=False, indent=2), encoding='utf-8')
+            summary['report_bound'] = report_state.get('bound', False)
+            summary['report_state_file'] = str(out / 'report-state.json')
+        summary['diagnostics'] = ec.diagnose(_qoder_failure_facts(summary))
+        # 明确限额落标：只在**真实失败终态**（非协议成功）且结构化失败载体明确命中硬限额、
+        # 且 runtime/model 真实为两个 Qoder Max 主力之一时落标。先落标再释放占位，杜绝另一
+        # chat 在槽释放后立刻重复提交；落标异常绝不阻断真实终态释放（不泄漏锁）。
+        if not summary.get('protocol_success'):
+            hit, evidence = _explicit_quota_limit_hit(summary)
+            limited_pk = _qoder_max_pool_key(args.runtime, args.model) if hit else None
+            if limited_pk is not None:
+                ev_sha = hashlib.sha256(stdout_bytes).hexdigest() if stdout_bytes else None
+                try:
+                    limit_rec = dp.record_main_force_limit(
+                        dispatch_store, limited_pk, task_id=task_id,
+                        attempt_token=claim_token,
+                        evidence_path=str(out / 'stdout.json'), evidence_sha256=ev_sha)
+                except Exception as exc:  # noqa: BLE001 - 落标失败不得阻断真实终态释放
+                    limit_rec = {'recorded': False, 'pool_key': limited_pk, 'error': str(exc)}
+                limit_rec['evidence'] = evidence
+                summary['main_force_limit'] = limit_rec
+    finally:
+        # 无论解析/落标成功与否，都带 owner 身份做真实终态释放（核验探针回读 child 已 dead）。
+        rel = _release_claim('finished', success=(child.returncode == 0))
+        summary['capacity_released'] = bool(rel.get('released'))
+        summary['capacity_terminal'] = rel.get('terminal')
     (out / 'summary.json').write_text(json.dumps(summary, ensure_ascii=False, indent=2),
                                       encoding='utf-8')
     (out / 'process.json').write_text(json.dumps({'pid': child.pid, 'state': 'exited',

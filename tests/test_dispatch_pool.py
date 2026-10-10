@@ -102,41 +102,53 @@ class _PoolBase(unittest.TestCase):
                                    workspace=str(self._ws_for(task)), prompt_sha256='p',
                                    now=T0, _preclaim=False)
 
-    def fill_domestic(self):
-        """把八个国内名额填满：zcode、Max 交替各 2，主力满后 Flash 2，再由显式
-        executor='qodercn' 补 2 个 CN 补充候选（原 Z2/国际 Max2/国际 Flash2 容量不变）。
+    def reserve_exec(self, task, runtime, model, executor, pk=None):
+        """显式执行器入口的确定性 claim：CN 内置只能经 executor='qodercn' 单独 claim，
+        AUTO 永不自动选中 CN；每个显式 executor 都 assert allowed 后取真实 reserved token。"""
+        r = dp.reserve(self.store, task_id=task, runtime=runtime, model=model,
+                       workspace=str(self._ws_for(task)), prompt_sha256='p',
+                       executor=executor, now=T0, _preclaim=False)
+        self.assertClaimed(r, pk or dp.pool_key(runtime, model))
+        return r['token']
 
-        返回 token 列表，顺序为 [zcode, Max, zcode, Max, Flash, Flash, CN, CN]。每个 task
-        独立 workspace；CN 只能经显式 qodercn 入口 claim，AUTO 永不自动选中 CN。
+    def fill_domestic(self):
+        """把八个国内名额填满（BW-POOL-SPLIT-20261010-S3 真实五池 8 槽）：三主力
+        zcode:GLM-5.3=2、qoder:Qwen3.8-Max=1、qodercn:Qwen3.8-Max=1，同级兜底
+        qoder:Qwen3.8-Flash=2、qodercn:Qwen3.8-Flash=2。全部经显式 executor 逐一 claim
+        以保证确定性（CN 内置只能经 executor='qodercn' 入口，AUTO 永不自动选中 CN）。
+        返回 token 列表，顺序为
+        [zcode, zcode, qoderMax, cnMax, qoderFlash, qoderFlash, cnFlash, cnFlash]。
         """
-        seq = [('f0', 'zcode', 'GLM-5.3'), ('f1', 'qoder', 'Qwen3.8-Max'),
-               ('f2', 'zcode', 'GLM-5.3'), ('f3', 'qoder', 'Qwen3.8-Max'),
-               ('f4', 'qoder', 'Qwen3.8-Flash'), ('f5', 'qoder', 'Qwen3.8-Flash')]
-        toks = [self.reserve(t, rt, md) for (t, rt, md) in seq]
-        # 2 个 CN 补充候选（独立 workspace，显式 executor='qodercn'）。
-        for t in ('f6', 'f7'):
-            r = dp.reserve(self.store, task_id=t, runtime='qodercn',
-                           model='DeepSeek-Flash',
-                           workspace=str(self._ws_for(t)), prompt_sha256='p',
-                           executor='qodercn', now=T0, _preclaim=False)
-            self.assertClaimed(r, 'qodercn:DeepSeek-Flash')
-            toks.append(r['token'])
+        plan = [('f0', 'zcode', 'GLM-5.3', 'zcode'),
+                ('f1', 'zcode', 'GLM-5.3', 'zcode'),
+                ('f2', 'qoder', 'Qwen3.8-Max', 'qoder'),
+                ('f3', 'qodercn', 'Qwen3.8-Max', 'qodercn'),
+                ('f4', 'qoder', 'Qwen3.8-Flash', 'qoder'),
+                ('f5', 'qoder', 'Qwen3.8-Flash', 'qoder'),
+                ('f6', 'qodercn', 'Qwen3.8-Flash', 'qodercn'),
+                ('f7', 'qodercn', 'Qwen3.8-Flash', 'qodercn')]
+        toks = [self.reserve_exec(t, rt, md, ex) for (t, rt, md, ex) in plan]
         st = dp.status(self.store, now=T0)
         self.assertEqual(st['domestic']['active'], dp.DOMESTIC_TOTAL_CAPACITY)
         self.assertTrue(st['domestic']['full'])
         self.assertEqual(st['pools']['zcode:GLM-5.3']['active'], 2)
-        self.assertEqual(st['pools']['qoder:Qwen3.8-Max']['active'], 2)
+        self.assertEqual(st['pools']['qoder:Qwen3.8-Max']['active'], 1)
+        self.assertEqual(st['pools']['qodercn:Qwen3.8-Max']['active'], 1)
         self.assertEqual(st['pools']['qoder:Qwen3.8-Flash']['active'], 2)
-        self.assertEqual(st['pools']['qodercn:DeepSeek-Flash']['active'], 2)
+        self.assertEqual(st['pools']['qodercn:Qwen3.8-Flash']['active'], 2)
         return toks
 
 
 class CapacityAndKnownPoolTests(_PoolBase):
     def test_capacity_table_matches_allocation_decision(self):
+        # BW-POOL-SPLIT-20261010-S3 真实五池 8 槽：ZCode=2、两地区 Max 各 1、两地区 Flash 各 2；
+        # CN DeepSeek-Flash 已退出正常池，保留池名但 capacity=0（仅供真实旧在途到达终态释放）。
         self.assertEqual(dp.capacity_for('zcode:GLM-5.3'), 2)
-        self.assertEqual(dp.capacity_for('qoder:Qwen3.8-Max'), 2)
+        self.assertEqual(dp.capacity_for('qoder:Qwen3.8-Max'), 1)
+        self.assertEqual(dp.capacity_for('qodercn:Qwen3.8-Max'), 1)
         self.assertEqual(dp.capacity_for('qoder:Qwen3.8-Flash'), 2)
-        self.assertEqual(dp.capacity_for('qodercn:DeepSeek-Flash'), 2)
+        self.assertEqual(dp.capacity_for('qodercn:Qwen3.8-Flash'), 2)
+        self.assertEqual(dp.capacity_for('qodercn:DeepSeek-Flash'), 0)
         self.assertIsNone(dp.capacity_for('luna:native'))
         self.assertEqual(dp.capacity_for('qoder:Unknown-Model'), 0)
         self.assertEqual(dp.DOMESTIC_TOTAL_CAPACITY, 8)
@@ -205,10 +217,12 @@ class MainForceRotationTests(_PoolBase):
         self.assertClaimed(r, 'qoder:Qwen3.8-Max')
 
     def test_select_when_both_main_full_routes_to_overflow(self):
-        self.reserve('m0', 'zcode', 'GLM-5.3')
-        self.reserve('m1', 'qoder', 'Qwen3.8-Max')
-        self.reserve('m2', 'zcode', 'GLM-5.3')
-        self.reserve('m3', 'qoder', 'Qwen3.8-Max')
+        # 三主力填满（zcode×2 + 两地区 Max 各 1）后经显式 executor 确定性占位，AUTO select zcode
+        # 主力全满 → 同级 Flash 兜底，两区平票按 pool_key stable tie 选国际 Flash。
+        self.reserve_exec('m0', 'zcode', 'GLM-5.3', 'zcode')
+        self.reserve_exec('m1', 'zcode', 'GLM-5.3', 'zcode')
+        self.reserve_exec('m2', 'qoder', 'Qwen3.8-Max', 'qoder')
+        self.reserve_exec('m3', 'qodercn', 'Qwen3.8-Max', 'qodercn')
         r = self.select('of', 'zcode', 'GLM-5.3')
         self.assertRouting(r, 'qoder:Qwen3.8-Flash')
 
@@ -228,26 +242,27 @@ class OverflowRoutingTests(_PoolBase):
         self.assertIn(r['selected']['pool_key'], dp.MAIN_FORCE_KEYS)
 
     def test_flash_allowed_when_main_force_full(self):
-        self.reserve('m0', 'zcode', 'GLM-5.3')
-        self.reserve('m1', 'qoder', 'Qwen3.8-Max')
-        self.reserve('m2', 'zcode', 'GLM-5.3')
-        self.reserve('m3', 'qoder', 'Qwen3.8-Max')
+        # 三主力填满后，AUTO 直接请求国际 Flash → 主力满不再拦，同级 Flash 有空位即 claim。
+        self.reserve_exec('m0', 'zcode', 'GLM-5.3', 'zcode')
+        self.reserve_exec('m1', 'zcode', 'GLM-5.3', 'zcode')
+        self.reserve_exec('m2', 'qoder', 'Qwen3.8-Max', 'qoder')
+        self.reserve_exec('m3', 'qodercn', 'Qwen3.8-Max', 'qodercn')
         r = self.select('fok', 'qoder', 'Qwen3.8-Flash')
         self.assertClaimed(r, 'qoder:Qwen3.8-Flash')
 
     def test_flash_capacity_full_after_two(self):
-        self.reserve('m0', 'zcode', 'GLM-5.3')
-        self.reserve('m1', 'qoder', 'Qwen3.8-Max')
-        self.reserve('m2', 'zcode', 'GLM-5.3')
-        self.reserve('m3', 'qoder', 'Qwen3.8-Max')
-        self.reserve('f0', 'qoder', 'Qwen3.8-Flash')
-        self.reserve('f1', 'qoder', 'Qwen3.8-Flash')
-        # AUTO 入口请求 Flash：主力与 Flash 均满，但 CN 补充候选仍有空位 → 不再报整池 full，
-        # 而是 routing_required 选 CN（旧 6 满 + CN 空语义），且未真正占槽。
+        self.reserve_exec('m0', 'zcode', 'GLM-5.3', 'zcode')
+        self.reserve_exec('m1', 'zcode', 'GLM-5.3', 'zcode')
+        self.reserve_exec('m2', 'qoder', 'Qwen3.8-Max', 'qoder')
+        self.reserve_exec('m3', 'qodercn', 'Qwen3.8-Max', 'qodercn')
+        self.reserve_exec('f0', 'qoder', 'Qwen3.8-Flash', 'qoder')
+        self.reserve_exec('f1', 'qoder', 'Qwen3.8-Flash', 'qoder')
+        # AUTO 入口请求国际 Flash：三主力与国际 Flash 均满，CN Flash 同级兜底仍有空位 →
+        # routing_required 选 CN Flash（不因自身满就报整池 full），且未真正占槽。
         r = self.select('f2', 'qoder', 'Qwen3.8-Flash')
         self.assertFalse(r.get('allowed'), r)
         self.assertTrue(r.get('routing_required'), r)
-        self.assertEqual(r['selected']['pool_key'], dp.CN_POOL_KEY)
+        self.assertEqual(r['selected']['pool_key'], dp.CN_FLASH_POOL_KEY)
         self.assertFalse(r.get('domestic_full'), r)
         # 显式 executor='qoder'：Flash 满仍按该 combo 自身容量判满，绝不扩指定执行器到 CN。
         q = dp.reserve(self.store, task_id='fq', runtime='qoder', model='Qwen3.8-Flash',
@@ -782,6 +797,270 @@ class CliSmokeTests(_PoolBase):
                                   '--prompt-sha256', 'deadbeef']), 0)
         st = dp.status(self.store)
         self.assertEqual(st['pools']['zcode:GLM-5.3']['active'], 1)
+
+
+# ============================================================================
+# BW-POOL-SPLIT-20261010-S5 需求 1 回归：明确限额落标/读取/解除 + consume 前检查
+# ============================================================================
+class MainForceLimitTests(_PoolBase):
+    """record_main_force_limit 绑定真实 attempt + 错误证据；写读解再读全程往返；
+    drift（task/pool 漂移、证据 sha 不一致、attempt 缺失、非限额池）一律拒；
+    consume_for_entry 消费预留票据前先查限额并把本 reserved 释放为 start_failed。"""
+
+    QMAX = 'qoder:Qwen3.8-Max'
+    CNMAX = 'qodercn:Qwen3.8-Max'
+
+    def _evidence(self, name='stdout.json', payload='{"result_errors":["You\'ve reached '
+                                                        'your credit usage limit."]}\n'):
+        """写一个真实存在的证据文件并返回 (path_str, sha256_hex)。"""
+        import hashlib as _h
+        p = self.base / name
+        p.write_text(payload, encoding='utf-8', newline='\n')
+        return str(p), _h.sha256(p.read_bytes()).hexdigest()
+
+    def test_record_read_release_read_roundtrip(self):
+        """temp 库完整往返：record → main_force_limited/Limits → release → 再读恒 False。"""
+        tok = self.reserve_exec('rt', 'qoder', 'Qwen3.8-Max', 'qoder', pk=self.QMAX)
+        ev_path, ev_sha = self._evidence()
+        rec = dp.record_main_force_limit(self.store, self.QMAX, task_id='rt',
+                                         attempt_token=tok, evidence_path=ev_path,
+                                         evidence_sha256=ev_sha, now=T0)
+        self.assertTrue(rec['recorded'], rec)
+        self.assertTrue(rec['limited'], rec)
+        self.assertEqual(rec['pool_key'], self.QMAX)
+        self.assertEqual(rec['task_id'], 'rt')
+        self.assertEqual(rec['attempt_token'], tok)
+        self.assertEqual(rec['evidence_sha256'], ev_sha)
+        self.assertTrue(dp.main_force_limited(self.store, self.QMAX, now=T0))
+        # CN Max 独立池不受国际 QMAX 标记影响。
+        self.assertFalse(dp.main_force_limited(self.store, self.CNMAX, now=T0))
+        snaps = dp.main_force_limits(self.store, now=T0)
+        self.assertIn(self.QMAX, snaps)
+        self.assertEqual(snaps[self.QMAX]['limited'], 1)
+        rel = dp.release_main_force_limit(self.store, self.QMAX, note='user confirmed '
+                                          'credit refill', now=T0 + timedelta(minutes=5))
+        self.assertTrue(rel['released'], rel)
+        self.assertFalse(dp.main_force_limited(self.store, self.QMAX, now=T0))
+        # 保留历史行：main_force_limits 仍可见，limited=0 + released_at/note 落库。
+        snaps2 = dp.main_force_limits(self.store, now=T0)
+        self.assertEqual(snaps2[self.QMAX]['limited'], 0)
+        self.assertEqual(snaps2[self.QMAX]['release_note'], 'user confirmed credit refill')
+        self.assertIsNotNone(snaps2[self.QMAX]['released_at_utc'])
+
+    def test_record_rejects_non_limitable_pools(self):
+        """ZCode、任一 Flash、退休 DeepSeek、Luna 均不落标；limited 恒 False。"""
+        for pk in ('zcode:GLM-5.3', 'qoder:Qwen3.8-Flash',
+                   'qodercn:Qwen3.8-Flash', 'qodercn:DeepSeek-Flash',
+                   dp.LUNA_KEY):
+            with self.subTest(pk=pk):
+                r = dp.record_main_force_limit(self.store, pk, task_id='t',
+                                               attempt_token='x',
+                                               evidence_path=str(self.base),
+                                               evidence_sha256='0' * 64, now=T0)
+                self.assertFalse(r['recorded'], r)
+                self.assertFalse(r.get('drift'), r)
+                self.assertIn('not a quota-limitable', r['reasons'][0])
+                self.assertFalse(dp.main_force_limited(self.store, pk, now=T0))
+
+    def test_record_rejects_missing_attempt(self):
+        ev_path, ev_sha = self._evidence()
+        r = dp.record_main_force_limit(self.store, self.QMAX, task_id='ghost',
+                                       attempt_token='no-such-token',
+                                       evidence_path=ev_path, evidence_sha256=ev_sha,
+                                       now=T0)
+        self.assertFalse(r['recorded'], r)
+        self.assertTrue(r['drift'], r)
+        self.assertIn('no attempt found', r['reasons'][0])
+        self.assertFalse(dp.main_force_limited(self.store, self.QMAX, now=T0))
+
+    def test_record_rejects_task_and_pool_drift(self):
+        """attempt 已存在但 pool_key 或 task_id 与 marker 参数不一致 → drift 拒。"""
+        tok = self.reserve_exec('real', 'qoder', 'Qwen3.8-Max', 'qoder', pk=self.QMAX)
+        ev_path, ev_sha = self._evidence('ev1.json')
+        # task_id 漂移
+        r1 = dp.record_main_force_limit(self.store, self.QMAX, task_id='someone-else',
+                                        attempt_token=tok, evidence_path=ev_path,
+                                        evidence_sha256=ev_sha, now=T0)
+        self.assertFalse(r1['recorded'], r1)
+        self.assertTrue(r1['drift'], r1)
+        self.assertIn('task_id drift', r1['reasons'][0])
+        # pool_key 漂移（拿 QMax 的 token 想给 CNMax 落标）
+        r2 = dp.record_main_force_limit(self.store, self.CNMAX, task_id='real',
+                                        attempt_token=tok, evidence_path=ev_path,
+                                        evidence_sha256=ev_sha, now=T0)
+        self.assertFalse(r2['recorded'], r2)
+        self.assertTrue(r2['drift'], r2)
+        self.assertIn('pool_key drift', r2['reasons'][0])
+        self.assertFalse(dp.main_force_limited(self.store, self.QMAX, now=T0))
+        self.assertFalse(dp.main_force_limited(self.store, self.CNMAX, now=T0))
+
+    def test_record_rejects_evidence_sha_mismatch(self):
+        """证据文件存在但 sha256 与声明值不一致 → drift 拒。"""
+        tok = self.reserve_exec('es', 'qoder', 'Qwen3.8-Max', 'qoder', pk=self.QMAX)
+        ev_path, _ = self._evidence('ev2.json', payload='real bytes\n')
+        r = dp.record_main_force_limit(self.store, self.QMAX, task_id='es',
+                                       attempt_token=tok, evidence_path=ev_path,
+                                       evidence_sha256='f' * 64, now=T0)
+        self.assertFalse(r['recorded'], r)
+        self.assertTrue(r['drift'], r)
+        self.assertIn('evidence_sha256 does not match', r['reasons'][0])
+        self.assertFalse(dp.main_force_limited(self.store, self.QMAX, now=T0))
+
+    def test_record_rejects_missing_evidence_file(self):
+        tok = self.reserve_exec('ef', 'qoder', 'Qwen3.8-Max', 'qoder', pk=self.QMAX)
+        missing = str(self.base / 'no-such-file.json')
+        r = dp.record_main_force_limit(self.store, self.QMAX, task_id='ef',
+                                       attempt_token=tok, evidence_path=missing,
+                                       evidence_sha256='0' * 64, now=T0)
+        self.assertFalse(r['recorded'], r)
+        self.assertTrue(r['drift'], r)
+        self.assertIn('does not exist', r['reasons'][0])
+
+    def test_record_requires_binding_fields(self):
+        """缺 attempt_token/task_id 或 evidence_path/evidence_sha256 → drift 拒。"""
+        tok = self.reserve_exec('bf', 'qoder', 'Qwen3.8-Max', 'qoder', pk=self.QMAX)
+        ev_path, ev_sha = self._evidence('ev3.json')
+        for kwargs in (
+            dict(task_id='bf', attempt_token=tok),  # 缺 evidence 字段
+            dict(evidence_path=ev_path, evidence_sha256=ev_sha),  # 缺 attempt 字段
+            dict(task_id='bf', evidence_path=ev_path, evidence_sha256=ev_sha),  # 缺 token
+        ):
+            with self.subTest(kwargs=sorted(kwargs)):
+                r = dp.record_main_force_limit(self.store, self.QMAX, now=T0, **kwargs)
+                self.assertFalse(r['recorded'], r)
+                self.assertTrue(r['drift'], r)
+
+    def test_record_is_idempotent_and_clears_release_traces(self):
+        """同一 pool 重复 record 只刷新证据/时间戳，仍 limited=1，清空旧的 released_at/note。"""
+        tok = self.reserve_exec('idp', 'qoder', 'Qwen3.8-Max', 'qoder', pk=self.QMAX)
+        ev1, s1 = self._evidence('a.json', payload='first\n')
+        r1 = dp.record_main_force_limit(self.store, self.QMAX, task_id='idp',
+                                        attempt_token=tok, evidence_path=ev1,
+                                        evidence_sha256=s1, now=T0)
+        self.assertTrue(r1['recorded'])
+        dp.release_main_force_limit(self.store, self.QMAX, note='temp release',
+                                    now=T0 + timedelta(seconds=10))
+        # 再次落标：应覆盖 limited=1，清空 released_at/note，指向新证据。
+        (self.base / 'a.json').write_text('second\n', encoding='utf-8', newline='\n')
+        import hashlib as _h
+        s2 = _h.sha256((self.base / 'a.json').read_bytes()).hexdigest()
+        r2 = dp.record_main_force_limit(self.store, self.QMAX, task_id='idp',
+                                        attempt_token=tok, evidence_path=ev1,
+                                        evidence_sha256=s2,
+                                        now=T0 + timedelta(seconds=20))
+        self.assertTrue(r2['recorded'])
+        snap = dp.main_force_limits(self.store, now=T0)[self.QMAX]
+        self.assertEqual(snap['limited'], 1)
+        self.assertEqual(snap['evidence_sha256'], s2)
+        self.assertIsNone(snap['released_at_utc'])
+        self.assertIsNone(snap['release_note'])
+
+    def test_consume_for_entry_releases_reserved_on_limited(self):
+        """consume 前发现本池已 limited → 在同一事务内把本次 reserved CAS 到
+        start_failed；返回 allowed=False/sent=False/capacity_released=True；
+        另一 attempt 的 reserved 完全不受影响（不越权释放别人的占位）。"""
+        # 先用显式 executor 把 QMax 名额 reserved 出来（此时尚未落标 → claim OK）
+        tok = self.reserve_exec('c1', 'qoder', 'Qwen3.8-Max', 'qoder', pk=self.QMAX)
+        # 独立池 CN Max 的另一个 reserved：本用例结束后必须仍是 reserved（不被越权释放）。
+        tok_cn = self.reserve_exec('c2', 'qodercn', 'Qwen3.8-Max', 'qodercn',
+                                   pk=self.CNMAX)
+        # 再对该 QMax 池落标（绑定当前 attempt 与真实证据文件）
+        ev, sha = self._evidence('c1.json', payload='limited evidence\n')
+        rec = dp.record_main_force_limit(self.store, self.QMAX, task_id='c1',
+                                         attempt_token=tok, evidence_path=ev,
+                                         evidence_sha256=sha, now=T0)
+        self.assertTrue(rec['recorded'], rec)
+        self.assertTrue(dp.main_force_limited(self.store, self.QMAX, now=T0))
+        # consume 前先查限额命中 → 释放本次 reserved 到 start_failed，拒启动。
+        out = dp.consume_for_entry(self.store, task_id='c1', runtime='qoder',
+                                   model='Qwen3.8-Max',
+                                   workspace=str(self._ws_for('c1')),
+                                   prompt_sha256='p', claim_token=tok,
+                                   now=T0 + timedelta(seconds=2))
+        self.assertFalse(out['allowed'], out)
+        self.assertFalse(out['sent'], out)
+        self.assertFalse(out['claimed'], out)
+        self.assertEqual(out['reason'], 'main_force_limited', out)
+        self.assertEqual(out['pool_key'], self.QMAX, out)
+        self.assertTrue(out['capacity_released'], out)
+        # 本次 reserved 已释放到 start_failed（不泄漏）。
+        self.assertEqual(self._state(tok), 'start_failed')
+        # 别人的 CN Max reserved 完全不动。
+        self.assertEqual(self._state(tok_cn), 'reserved')
+
+    def test_consume_for_entry_running_token_not_falsely_released(self):
+        """running 旧 token 遇限额：UPDATE WHERE state=reserved 命中 0 行，绝不谎称
+        capacity_released。保留原 running 状态与在途占位，只拒绝重复启动。"""
+        tok = self.reserve_exec('rn', 'qoder', 'Qwen3.8-Max', 'qoder', pk=self.QMAX)
+        ws = str(self._ws_for('rn'))
+        first = dp.consume_for_entry(self.store, task_id='rn', runtime='qoder',
+                                     model='Qwen3.8-Max', workspace=ws,
+                                     prompt_sha256='p', claim_token=tok,
+                                     wrapper_pid=4321, wrapper_created='w1', now=T0)
+        self.assertTrue(first['allowed'], first)
+        self.assertEqual(self._state(tok), 'running')
+        ev, sha = self._evidence('rn.json', payload='limited after running\n')
+        self.assertTrue(dp.record_main_force_limit(
+            self.store, self.QMAX, task_id='rn', attempt_token=tok,
+            evidence_path=ev, evidence_sha256=sha,
+            now=T0 + timedelta(seconds=1))['recorded'])
+        out = dp.consume_for_entry(self.store, task_id='rn', runtime='qoder',
+                                   model='Qwen3.8-Max', workspace=ws,
+                                   prompt_sha256='p', claim_token=tok,
+                                   wrapper_pid=4321, wrapper_created='w1',
+                                   now=T0 + timedelta(seconds=2))
+        self.assertFalse(out['allowed'], out)
+        self.assertFalse(out['sent'], out)
+        self.assertEqual(out['reason'], 'main_force_limited', out)
+        self.assertEqual(out['pool_key'], self.QMAX, out)
+        self.assertFalse(out['capacity_released'], out)
+        self.assertEqual(self._state(tok), 'running')
+        self.assertEqual(dp.status(self.store, now=T0)['pools'][self.QMAX]['active'], 1)
+
+    def test_consume_for_entry_unknown_token_not_falsely_released(self):
+        """ACTIVE_STATES 实际含 'unknown'（非 launch_unknown）：unknown 旧 token 遇限额同样
+        不得假释放，保留原 unknown 状态与占位，拒绝重复启动。"""
+        self.assertIn('unknown', dp.ACTIVE_STATES)
+        tok = self.reserve_exec('uk', 'qoder', 'Qwen3.8-Max', 'qoder', pk=self.QMAX)
+        ws = str(self._ws_for('uk'))
+        dp.mark_running(self.store, tok, wrapper_pid=5000, wrapper_created='c5000', now=T0)
+        dp.mark_unknown(self.store, tok, now=T0)
+        self.assertEqual(self._state(tok), 'unknown')
+        ev, sha = self._evidence('uk.json', payload='limited while unknown\n')
+        self.assertTrue(dp.record_main_force_limit(
+            self.store, self.QMAX, task_id='uk', attempt_token=tok,
+            evidence_path=ev, evidence_sha256=sha,
+            now=T0 + timedelta(seconds=1))['recorded'])
+        out = dp.consume_for_entry(self.store, task_id='uk', runtime='qoder',
+                                   model='Qwen3.8-Max', workspace=ws,
+                                   prompt_sha256='p', claim_token=tok,
+                                   wrapper_pid=5000, wrapper_created='c5000',
+                                   now=T0 + timedelta(seconds=2))
+        self.assertFalse(out['allowed'], out)
+        self.assertFalse(out['sent'], out)
+        self.assertEqual(out['reason'], 'main_force_limited', out)
+        self.assertEqual(out['pool_key'], self.QMAX, out)
+        self.assertFalse(out['capacity_released'], out)
+        self.assertEqual(self._state(tok), 'unknown')
+        self.assertEqual(dp.status(self.store, now=T0)['pools'][self.QMAX]['active'], 1)
+
+    def test_consume_for_entry_allows_when_pool_released(self):
+        """release_main_force_limit 后同一 reserved 可正常 consume 到 running。"""
+        tok = self.reserve_exec('rl', 'qoder', 'Qwen3.8-Max', 'qoder', pk=self.QMAX)
+        ev, sha = self._evidence('rl.json', payload='limited once\n')
+        self.assertTrue(dp.record_main_force_limit(
+            self.store, self.QMAX, task_id='rl', attempt_token=tok,
+            evidence_path=ev, evidence_sha256=sha, now=T0)['recorded'])
+        self.assertTrue(dp.release_main_force_limit(
+            self.store, self.QMAX, note='user refill',
+            now=T0 + timedelta(seconds=5))['released'])
+        out = dp.consume_for_entry(self.store, task_id='rl', runtime='qoder',
+                                   model='Qwen3.8-Max',
+                                   workspace=str(self._ws_for('rl')),
+                                   prompt_sha256='p', claim_token=tok,
+                                   now=T0 + timedelta(seconds=6))
+        self.assertTrue(out['allowed'], out)
+        self.assertEqual(self._state(tok), 'running')
 
 
 if __name__ == '__main__':

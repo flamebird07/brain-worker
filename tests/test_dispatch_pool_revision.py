@@ -95,8 +95,11 @@ class TempStoreMixin:
                  wrapper_pid, wrapper_created))
 
     def fill_domestic(self, prefix='seed', n=8):
-        pools = ['zcode:GLM-5.3'] * 2 + ['qoder:Qwen3.8-Max'] * 2 \
-            + ['qoder:Qwen3.8-Flash'] * 2 + ['qodercn:DeepSeek-Flash'] * 2
+        # BW-POOL-SPLIT-20261010-S3 真实五池 8 槽：zcode×2 + 两地区 Max 各 1 + 两地区
+        # Flash 各 2（CN DeepSeek-Flash 已 retired，不再作为在途基线）。
+        pools = ['zcode:GLM-5.3'] * 2 + ['qoder:Qwen3.8-Max'] \
+            + ['qodercn:Qwen3.8-Max'] + ['qoder:Qwen3.8-Flash'] * 2 \
+            + ['qodercn:Qwen3.8-Flash'] * 2
         for i in range(n):
             self.seed_attempt(f'{prefix}-{i}', f'{prefix}-task-{i}', pools[i])
 
@@ -117,7 +120,10 @@ class TestUnifiedPolicy(TempStoreMixin, unittest.TestCase):
                          _preclaim=False)
         self.assertFalse(out['allowed'])
         self.assertTrue(out['routing_required'])
-        self.assertEqual(out['selected']['pool_key'], 'zcode:GLM-5.3')
+        # 空库请求 Flash → 优先主力，绝不保留 Flash；committed/active 全平票时按 pool_key
+        # stable tie 选国际 Qwen3.8-Max（真实候选集合内主力在前）。
+        self.assertIn(out['selected']['pool_key'], dp.MAIN_FORCE_KEYS)
+        self.assertEqual(out['selected']['pool_key'], 'qoder:Qwen3.8-Max')
 
     def test_reserve_luna_rejected(self):
         out = dp.reserve(self.store, task_id='t', runtime='luna', model='native',
@@ -133,42 +139,25 @@ class TestUnifiedPolicy(TempStoreMixin, unittest.TestCase):
         self.assertFalse(out['allowed'])
         self.assertEqual(out['reason'], 'luna_requires_ticket')
 
-    def test_fill_six_legit_then_seventh_rejected(self):
-        # 1:1 主力：交替请求两主力各得 2。Z4：不同 task 用独立 workspace 目录（真实
-        # 单写入守卫下不同任务共享 C:/w 会被正确拒绝，fixture 不得再虚拟同一路径）。
-        for i, (rt, md) in enumerate([('zcode', 'GLM-5.3'), ('qoder', 'Qwen3.8-Max'),
-                                      ('zcode', 'GLM-5.3'), ('qoder', 'Qwen3.8-Max')]):
-            out = dp.select_and_claim(self.store, task_id=f't{i}', runtime=rt, model=md,
-                                      workspace=f'C:/w/t{i}', prompt_sha256=f'{i}' * 64,
-                                      now=T0, _preclaim=False)
+    def test_fill_eight_legit_then_ninth_rejected(self):
+        # BW-POOL-SPLIT-20261010-S3 真实五池 8 槽：经显式 executor 逐槽确定性 claim（各池
+        # 不超自身容量），每次 assert allowed；填满 8 后任何 AUTO 国内组合才 capacity_full
+        # 且 domestic_full。Z4：不同 task 用独立 workspace 目录（真实单写入守卫）。
+        fill = [('t0', 'zcode', 'GLM-5.3', 'zcode'),
+                ('t1', 'zcode', 'GLM-5.3', 'zcode'),
+                ('t2', 'qoder', 'Qwen3.8-Max', 'qoder'),
+                ('t3', 'qodercn', 'Qwen3.8-Max', 'qodercn'),
+                ('t4', 'qoder', 'Qwen3.8-Flash', 'qoder'),
+                ('t5', 'qoder', 'Qwen3.8-Flash', 'qoder'),
+                ('t6', 'qodercn', 'Qwen3.8-Flash', 'qodercn'),
+                ('t7', 'qodercn', 'Qwen3.8-Flash', 'qodercn')]
+        for tid, rt, md, ex in fill:
+            out = dp.select_and_claim(self.store, task_id=tid, runtime=rt, model=md,
+                                      workspace=f'C:/w/{tid}', prompt_sha256='p' * 64,
+                                      executor=ex, now=T0, _preclaim=False)
             self.assertTrue(out['allowed'], out)
-        # 主力满：请求 Flash 被 select（溢出合法），再填 2 个。
-        for i in (4, 5):
-            out = dp.select_and_claim(self.store, task_id=f't{i}', runtime='qoder',
-                                      model='Qwen3.8-Flash', workspace=f'C:/w/t{i}',
-                                      prompt_sha256=f'{i}' * 64, now=T0, _preclaim=False)
-            self.assertTrue(out['allowed'], out)
-            self.assertEqual(out['pool_key'], 'qoder:Qwen3.8-Flash')
-        self.assertEqual(dp.status(self.store, now=T0)['domestic']['active'], 6)
-        # 七：AUTO 主力+溢出组合已全满 → 不再报整池 full，而是 routing 到仍有空位的 CN
-        # 补充候选（旧 6 满 + CN 空 = routing CN），且此时并未真正占槽。
-        out = dp.select_and_claim(self.store, task_id='t6', runtime='zcode',
-                                  model='GLM-5.3', workspace='C:/w/t6',
-                                  prompt_sha256='6' * 64, now=T0, _preclaim=False)
-        self.assertFalse(out['allowed'], out)
-        self.assertTrue(out['routing_required'], out)
-        self.assertEqual(out['selected']['pool_key'], 'qodercn:DeepSeek-Flash')
-        self.assertFalse(out['domestic_full'])
-        # 八/九：经公开 API 把 CN 2 槽也填满（AUTO 入口点名 CN 且有空位即 claim），每次
-        # assert allowed；不造 PID、不跳测试。
-        for i in (7, 8):
-            cn = dp.select_and_claim(self.store, task_id=f't{i}', runtime='qodercn',
-                                     model='DeepSeek-Flash', workspace=f'C:/w/t{i}',
-                                     prompt_sha256=f'{i}' * 64, now=T0, _preclaim=False)
-            self.assertTrue(cn['allowed'], cn)
-            self.assertEqual(cn['pool_key'], 'qodercn:DeepSeek-Flash')
         self.assertEqual(dp.status(self.store, now=T0)['domestic']['active'], 8)
-        # 第九次（八槽全满）：AUTO 任意国内组合才 capacity_full 且 domestic_full。
+        # 第八槽已满 → 第九次 AUTO 任意国内组合才 capacity_full 且 domestic_full。
         out = dp.select_and_claim(self.store, task_id='t9', runtime='zcode',
                                   model='GLM-5.3', workspace='C:/w/t9',
                                   prompt_sha256='9' * 64, now=T0, _preclaim=False)
@@ -600,7 +589,9 @@ class TestOverflowNotSubstitutedZ2(TempStoreMixin, unittest.TestCase):
     """Z2-2：两主力满时请求 Z/Max 必须 routing_required，绝不偷换成 Flash 落库。"""
 
     def _fill_mains(self):
-        for i, pool in enumerate(['zcode:GLM-5.3'] * 2 + ['qoder:Qwen3.8-Max'] * 2):
+        # 三主力填满：zcode×2 + 两地区 Max 各 1（BW-POOL-SPLIT-20261010-S3）。
+        for i, pool in enumerate(['zcode:GLM-5.3'] * 2 + ['qoder:Qwen3.8-Max']
+                                 + ['qodercn:Qwen3.8-Max']):
             self.seed_attempt(f'm-{i}', f'm-task-{i}', pool)
 
     def test_select_and_claim_main_full_routes_to_flash_no_substitution(self):
@@ -611,9 +602,10 @@ class TestOverflowNotSubstitutedZ2(TempStoreMixin, unittest.TestCase):
         self.assertFalse(out['allowed'])
         self.assertTrue(out['routing_required'])
         self.assertEqual(out['selected']['pool_key'], 'qoder:Qwen3.8-Flash')
-        # 原主力计数绝不 >2，且没有任何 zcode runtime 被记到 Flash 池。
+        # 原主力计数绝不超各自容量，且没有任何 zcode runtime 被记到 Flash 池。
         self.assertEqual(self.active_count('zcode:GLM-5.3'), 2)
-        self.assertEqual(self.active_count('qoder:Qwen3.8-Max'), 2)
+        self.assertEqual(self.active_count('qoder:Qwen3.8-Max'), 1)
+        self.assertEqual(self.active_count('qodercn:Qwen3.8-Max'), 1)
         with closing(dp.connect(self.store)) as conn:
             rows = conn.execute('SELECT runtime, model, pool_key FROM attempts '
                                 "WHERE pool_key='qoder:Qwen3.8-Flash'").fetchall()
@@ -627,7 +619,8 @@ class TestOverflowNotSubstitutedZ2(TempStoreMixin, unittest.TestCase):
         self.assertFalse(out['allowed'])
         self.assertTrue(out['routing_required'])
         self.assertEqual(out['selected']['pool_key'], 'qoder:Qwen3.8-Flash')
-        self.assertEqual(self.active_count('qoder:Qwen3.8-Max'), 2)
+        self.assertEqual(self.active_count('qoder:Qwen3.8-Max'), 1)
+        self.assertEqual(self.active_count('qodercn:Qwen3.8-Max'), 1)
         with closing(dp.connect(self.store)) as conn:
             rows = conn.execute('SELECT runtime, model, pool_key FROM attempts '
                                 "WHERE pool_key='qoder:Qwen3.8-Flash'").fetchall()

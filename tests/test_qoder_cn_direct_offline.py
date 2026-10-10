@@ -116,8 +116,15 @@ class ResolveModelIdTests(_NoPopen):
     def test_resolve_cn_model_id_maps_and_missing(self):
         cfg = {'cli': 'x', 'config_dir': 'y',
                'model_ids': {'DeepSeek-Flash': 'real-id-123'}}
+        # 自定义 Token Plan：必须走 model_ids 映射到真实服务端 ID（保留客户端自定义）。
         self.assertEqual(qd.resolve_cn_model_id(cfg, 'DeepSeek-Flash'), 'real-id-123')
-        self.assertIsNone(qd.resolve_cn_model_id(cfg, 'Qwen3.8-Max'))
+        # CN 内置官方 Qwen 白名单：字面串直传即合法成功路径（不查 model_ids、不猜 UUID、
+        # 不把内置名当自定义）。这是 S2/S3 的 CN 主力/兜底组合。
+        self.assertEqual(qd.resolve_cn_model_id(cfg, 'Qwen3.8-Max'), 'Qwen3.8-Max')
+        self.assertEqual(qd.resolve_cn_model_id(cfg, 'Qwen3.8-Flash'), 'Qwen3.8-Flash')
+        # 未映射的非内置名仍拒绝（None → 调用方零 Popen），绝不猜同名内建/Qwen。
+        self.assertIsNone(qd.resolve_cn_model_id(cfg, 'Bogus-Not-Mapped'))
+        self.assertIsNone(qd.resolve_cn_model_id(cfg, 'GLM-5.3'))
 
 
 class CnMainRefusalTests(_NoPopen):
@@ -142,18 +149,31 @@ class CnMainRefusalTests(_NoPopen):
         self.assertEqual(self.calls, [])  # 0 Popen
         self.assertFalse(out_dir.exists())  # 零证据目录
 
-    def test_unmapped_default_model_zero_popen(self):
-        # 忘传 --model 时缺省是国际 Qwen3.8-Max，CN 配置未映射该名 → 拒绝、0 Popen。
+    def test_builtin_default_model_not_refused_at_mapping(self):
+        # CN 内置白名单：缺省 --model 是 Qwen3.8-Max，属 CN 内置官方组合，映射门**不得**再
+        # 以“无 model_ids 映射”拒绝（旧口径已改）。用记录型假 Popen 证明它通过映射门、消费了
+        # CN claim、真正到达 Popen，且 --model 下发的是内置字面串（非友好名映射、非猜 UUID）。
+        # 绝不真跑 CLI：假 Popen 立即抛哨兵，main 捕获后安全释放本占位（start_failed）。
         cfg = self.write_cn_config({'DeepSeek-Flash': 'real-id-123'})
         ws, pf = self.make_prompt()
-        out_dir = self.tmp / 'out-default'
+        out_dir = self.tmp / 'out-builtin-default'
+        captured = {}
+
+        def recording_popen(argv, *a, **k):
+            captured['argv'] = argv
+            raise RuntimeError('sentinel: reached Popen (mapping gate passed)')
+
+        qd.subprocess.Popen = recording_popen
         rc = self._run_main([
             '--runtime', 'qodercn', '--cn-config', str(cfg),
             '--workspace', str(ws), '--prompt-file', str(pf),
             '--output-dir', str(out_dir), '--stage', 'BW-CN-TEST'])
-        self.assertEqual(rc, 2, rc)
-        self.assertEqual(self.calls, [])
-        self.assertFalse(out_dir.exists())
+        # 不是映射门拒绝（rc != 2）；确实到达 Popen；--model 为内置 Qwen3.8-Max 字面串。
+        self.assertNotEqual(rc, 2, rc)
+        self.assertIn('argv', captured)
+        argv = captured['argv']
+        self.assertEqual(qd.DEFAULT_MODEL, 'Qwen3.8-Max')
+        self.assertEqual(argv[argv.index('--model') + 1], qd.DEFAULT_MODEL)
 
     def test_cn_resume_without_verifiable_source_rejected(self):
         cfg = self.write_cn_config({'DeepSeek-Flash': 'real-id-123'})
@@ -185,6 +205,102 @@ class CnMainRefusalTests(_NoPopen):
         self.assertEqual(rc, 2, rc)
         self.assertEqual(self.calls, [])
         self.assertFalse(out_dir.exists())
+
+
+# ============================================================================
+# BW-POOL-SPLIT-20261010-S5 需求 2 回归：qoder_direct 明确限额文本识别
+# ============================================================================
+class ExplicitQuotaLimitHitTests(unittest.TestCase):
+    """_explicit_quota_limit_hit 只扫结构化错误载体（result_errors / errors_info），
+    绝不扫报告正文、绝不把 permission / 认证 / 成功 / 取消 exit / 单独 quota 误作限额。
+    覆盖真实失败文案 “You've reached your credit usage limit.”。"""
+
+    def _hit(self, errors=None, errors_info=None):
+        summary = {'result_errors': errors, 'result_errors_info': errors_info,
+                   'protocol_success': False}
+        return qd._explicit_quota_limit_hit(summary)
+
+    def test_recognizes_credit_usage_limit_real_text(self):
+        """需求 2 必识别文案：errors 列表直接含 “You've reached your credit usage limit.”。"""
+        hit, ev = self._hit(errors=["You've reached your credit usage limit."])
+        self.assertTrue(hit, (hit, ev))
+        self.assertEqual(ev, "You've reached your credit usage limit.")
+
+    def test_recognizes_credit_usage_limit_in_errors_info(self):
+        hit, ev = self._hit(errors_info=[{'status': 402, 'code': 'quota',
+                                          'details': "You've reached your credit "
+                                          'usage limit. Please upgrade.'}])
+        self.assertTrue(hit, (hit, ev))
+        self.assertIn('credit usage limit', ev.lower())
+
+    def test_recognizes_case_insensitive(self):
+        hit, _ = self._hit(errors=["YOU'VE REACHED YOUR CREDIT USAGE LIMIT."])
+        self.assertTrue(hit, hit)
+
+    def test_recognizes_credits_exhausted_variants(self):
+        for text in ('Credits exhausted for this account.',
+                     'You are out of credits.',
+                     'insufficient balance — top up required',
+                     '额度用尽，请稍后重试',
+                     '积分不足'):
+            with self.subTest(text=text):
+                hit, _ = self._hit(errors=[text])
+                self.assertTrue(hit, (text, hit))
+
+    def test_does_not_classify_bare_quota_word(self):
+        """单独 “quota” 文案不能当硬限额；无 429、无 markers → hit=False。"""
+        hit, ev = self._hit(errors=['quota status: normal'])
+        self.assertFalse(hit, (hit, ev))
+        self.assertIsNone(ev)
+
+    def test_does_not_scan_report_body(self):
+        """载体全空、正文里出现 429 或 credit usage limit → hit=False（分类器不看正文）。"""
+        summary = {'result_errors': None, 'result_errors_info': None,
+                   'response_text': "upstream said 429 and You've reached your "
+                                    'credit usage limit. (report body)',
+                   'protocol_success': False}
+        self.assertFalse(qd._explicit_quota_limit_hit(summary)[0])
+
+    def test_does_not_classify_permission_denial(self):
+        hit, ev = self._hit(errors=['No permission client configured for Bash'],
+                            errors_info=[{'category': 'permission',
+                                          'details': 'user denied tool Edit'}])
+        self.assertFalse(hit, (hit, ev))
+
+    def test_does_not_classify_auth_error(self):
+        hit, ev = self._hit(errors=['invalid api key', 'unauthorized: 401'],
+                            errors_info=[{'status': 401, 'code': 'auth',
+                                          'details': 'token expired'}])
+        self.assertFalse(hit, (hit, ev))
+
+    def test_does_not_classify_success_or_cancellation(self):
+        """成功/取消（exit 4294967295）绝不落标：载体为空则 hit=False，
+        protocol_success=True 也仍由调用方另行把关（此处只测分类器本身）。"""
+        self.assertFalse(self._hit(errors=[], errors_info=[])[0])
+        # 模拟取消：errors 里出现 exit code 文案但没有 markers
+        hit, _ = self._hit(errors=['process exited with code 4294967295 (cancelled)'])
+        self.assertFalse(hit)
+
+    def test_marker_table_excludes_ambiguous_tokens(self):
+        """硬限额 markers 只保留明确文案；不含裸 'quota' 或 '429'，避免误伤。"""
+        joined = '|'.join(qd._QUOTA_HARD_LIMIT_MARKERS)
+        self.assertNotIn('quota|', joined + '|')  # 无裸 quota 项
+        for marker in qd._QUOTA_HARD_LIMIT_MARKERS:
+            self.assertNotIn('429', marker)
+            self.assertNotEqual(marker.strip(), 'quota')
+        # 明确包含需求 2 的关键片段
+        self.assertIn('credit usage limit', qd._QUOTA_HARD_LIMIT_MARKERS)
+
+    def test_qoder_max_pool_key_only_for_two_built_in_max_pools(self):
+        """非 Max 模型 / 未知 runtime 一律 None，绝不偷偷给 Flash/ZCode/自定义落标。"""
+        self.assertEqual(qd._qoder_max_pool_key(qd.RUNTIME_INTERNATIONAL, 'Qwen3.8-Max'),
+                         'qoder:Qwen3.8-Max')
+        self.assertEqual(qd._qoder_max_pool_key(qd.RUNTIME_CN, 'Qwen3.8-Max'),
+                         'qodercn:Qwen3.8-Max')
+        for model in ('Qwen3.8-Flash', 'GLM-5.3', 'DeepSeek-Flash', 'some-custom'):
+            for rt in (qd.RUNTIME_INTERNATIONAL, qd.RUNTIME_CN, 'zcode', 'codebuddy'):
+                with self.subTest(rt=rt, model=model):
+                    self.assertIsNone(qd._qoder_max_pool_key(rt, model))
 
 
 if __name__ == '__main__':

@@ -293,13 +293,14 @@ class ParallelRehearsalTests(unittest.TestCase):
 
     def _reserve(self, task_id, runtime, model, ws, prompt_path, stage):
         # 并发演练：为确切 (runtime, model) 预留 claim，入口再用 --dispatch-claim 精确
-        # 消费。reserve 与 select-and-claim 共用统一国内 1:1 轮转策略（绝不绕过轮转），
-        # 因此需要连续占满同一主力时，测试按轮转顺序插入另一主力的合法预留来配平。
+        # 消费。BW-POOL-SPLIT-20261010-S3 真实五池（ZCode=2、两地区 Max 各 1、两地区 Flash
+        # 各 2）下国际 Max 只有 1 槽，测试按确切组合用显式 executor 逐一确定性预留，
+        # 绝不依赖 AUTO 轮转猜池（轮转可能把第二个 Max 改派到别的池，破坏同入口并行）。
         # prompt_sha256 用原始字节哈希，与入口口径一致。
         res = dp.reserve(self.dispatch_store, task_id=task_id, runtime=runtime,
                          model=model, workspace=str(ws),
                          prompt_sha256=hashlib.sha256(prompt_path.read_bytes()).hexdigest(),
-                         stage=stage)
+                         stage=stage, executor=runtime)
         self.assertTrue(res['allowed'], res)
         return res['token']
 
@@ -354,19 +355,21 @@ class ParallelRehearsalTests(unittest.TestCase):
                                                 'BW-PARR-ZCPERM', plan, 'GLM-5.3',
                                                 zc_claim),
                       self._base_env('zcperm', ws, report), ws, 'BW-PARR-ZCPERM'))
-        # 3 & 4) 两个 Qoder 成功完整绑定报告（独立 workspace，同名 output.py）
-        #    两者同为主力 Qwen3.8-Max，恰好占满该池容量 2（并发上限，不溢出）。
-        for tag, stage in (('qa', 'BW-PARR-QA'), ('qb', 'BW-PARR-QB')):
+        # 3 & 4) 两个 Qoder 成功完整绑定报告（独立 workspace，同名 output.py）。
+        #    BW-POOL-SPLIT-20261010-S3：国际 Qwen3.8-Max 只有 1 槽，第二个 qoder 并行任务
+        #    走同级国际 Qwen3.8-Flash 兜底（executor='qoder'，同区不跨执行器），二者共存。
+        for tag, stage, qmodel in (('qa', 'BW-PARR-QA', 'Qwen3.8-Max'),
+                                    ('qb', 'BW-PARR-QB', 'Qwen3.8-Flash')):
             ws = self._mk_workspace(tag)
             prompt = self._write(f'prompt-{tag}.txt', f'Qoder {tag} 并行演练任务。\n')
-            plan = self._plan('T-' + tag.upper(), stage, 'qoder', 'Qwen3.8-Max', ws,
+            plan = self._plan('T-' + tag.upper(), stage, 'qoder', qmodel, ws,
                               prompt, ['Read'])
-            claim = self._reserve('T-' + tag.upper(), 'qoder', 'Qwen3.8-Max', ws,
+            claim = self._reserve('T-' + tag.upper(), 'qoder', qmodel, ws,
                                   prompt, stage)
             report = self._write(f'report-{tag}.txt',
                                  build_bound_report(stage, str(ws)))
             specs.append((tag, self._qoder_cmd(ws, prompt, ws / 'out', stage, plan,
-                                               'Qwen3.8-Max', claim),
+                                               qmodel, claim),
                           self._base_env(tag, ws, report), ws, stage))
 
         # 并发启动四适配器子进程（真实重叠由 barrier 门控完成证明）。
@@ -498,27 +501,27 @@ class ParallelRehearsalTests(unittest.TestCase):
         self.barrier.mkdir()
 
         # 2) 起两个 Qoder 成功任务（barrier_total=3），此刻它们仍卡在 barrier 内。
-        #    两者同为主力 Qwen3.8-Max，恰好占满该池容量 2；第三个接管任务只能走溢出
-        #    Qwen3.8-Flash（主力已满，溢出合法），从而不突破任一池上限。
-        #    1:1 轮转下不能连续预留同一主力：插入两个 zcode 幻影预留把 zcode 池也填到
-        #    上限，ia/ib 两个 Max 才合法占满主力 Max 池（幻影名额只占容量、从不 launch）。
+        #    BW-POOL-SPLIT-20261010-S3：国际 Qwen3.8-Max 只有 1 槽，故 ia 占主力 Max、
+        #    ib 走同级国际 Flash；两个 zcode 幻影预留把 zcode 池也填到上限（只占容量、
+        #    从不 launch），确保接管任务的 Flash 名额不被 AUTO 改派，绝不突破任一池上限。
         self._reserve('T-PHZ0', 'zcode', 'GLM-5.3', self._mk_workspace('phz0'),
                       self._write('prompt-phz0.txt', 'phantom zcode 0\n'), 'BW-FB-PHZ0')
         inflight = {}
-        for tag, stage in (('ia', 'BW-FB-IA'), ('ib', 'BW-FB-IB')):
+        for tag, stage, qmodel in (('ia', 'BW-FB-IA', 'Qwen3.8-Max'),
+                                   ('ib', 'BW-FB-IB', 'Qwen3.8-Flash')):
             if tag == 'ib':
                 self._reserve('T-PHZ1', 'zcode', 'GLM-5.3', self._mk_workspace('phz1'),
                               self._write('prompt-phz1.txt', 'phantom zcode 1\n'),
                               'BW-FB-PHZ1')
             wsi = self._mk_workspace(tag)
             pi = self._write(f'prompt-{tag}.txt', f'Qoder {tag} 在途任务。\n')
-            pl = self._plan('T-' + tag.upper(), stage, 'qoder', 'Qwen3.8-Max', wsi,
+            pl = self._plan('T-' + tag.upper(), stage, 'qoder', qmodel, wsi,
                             pi, ['Read'])
-            claim = self._reserve('T-' + tag.upper(), 'qoder', 'Qwen3.8-Max', wsi,
+            claim = self._reserve('T-' + tag.upper(), 'qoder', qmodel, wsi,
                                   pi, stage)
             outi = wsi / 'out'
             pr = subprocess.Popen(self._qoder_cmd(wsi, pi, outi, stage, pl,
-                                                  'Qwen3.8-Max', claim),
+                                                  qmodel, claim),
                                   env=self._base_env(tag, wsi,
                                                      self._write(f'report-{tag}.txt',
                                                                  build_bound_report(

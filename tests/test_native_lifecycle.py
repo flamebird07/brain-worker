@@ -58,28 +58,28 @@ class NativeLifecycleTests(unittest.TestCase):
     # routing_required 拒绝（fixture 不能反向松生产轮转）；合法顺序 Z,Max,Z,Max,
     # Flash,Flash，每次独立 workspace 并逐一核验 allowed/token/pool_key。
     def _fill_domestic(self):
-        plan = [('zcode', 'GLM-5.3'), ('qoder', 'Qwen3.8-Max'),
-                ('zcode', 'GLM-5.3'), ('qoder', 'Qwen3.8-Max'),
-                ('qoder', 'Qwen3.8-Flash'), ('qoder', 'Qwen3.8-Flash')]
+        # BW-POOL-SPLIT-20261010-S3 五池 8 槽：zcode×2 + 两地区 Max 各 1 + 两地区 Flash 各 2。
+        # 全部经显式 executor 逐一确定性 claim（CN 内置只能 executor='qodercn'，AUTO 轮换
+        # 不保证落某特定主力），每次核验 allowed/token/pool_key。
+        plan = [('zcode', 'GLM-5.3', 'zcode'), ('zcode', 'GLM-5.3', 'zcode'),
+                ('qoder', 'Qwen3.8-Max', 'qoder'),
+                ('qodercn', 'Qwen3.8-Max', 'qodercn'),
+                ('qoder', 'Qwen3.8-Flash', 'qoder'),
+                ('qoder', 'Qwen3.8-Flash', 'qoder'),
+                ('qodercn', 'Qwen3.8-Flash', 'qodercn'),
+                ('qodercn', 'Qwen3.8-Flash', 'qodercn')]
         tokens = []
-        for i, (runtime, model) in enumerate(plan):
+        for i, (runtime, model, ex) in enumerate(plan):
             out = dp.reserve(self.store, task_id=f'dom-{i}', runtime=runtime,
                              model=model, workspace=f'ws-dom-{i}',
-                             prompt_sha256='d' * 64, now=T0)
-            self.assertTrue(out.get('allowed') and out.get('token'), out)
-            self.assertEqual(out['pool_key'], f'{runtime}:{model}', out)
-            tokens.append(out['token'])
-        # 2 个 CN 补充候选（显式 executor='qodercn'，独立 workspace，不动 1:1 轮转计数）。
-        for j, (runtime, model) in enumerate([('qodercn', 'DeepSeek-Flash')] * 2):
-            out = dp.reserve(self.store, task_id=f'dom-cn-{j}', runtime=runtime,
-                             model=model, workspace=f'ws-dom-cn-{j}',
-                             prompt_sha256='d' * 64, executor='qodercn', now=T0)
+                             prompt_sha256='d' * 64, executor=ex, now=T0)
             self.assertTrue(out.get('allowed') and out.get('token'), out)
             self.assertEqual(out['pool_key'], f'{runtime}:{model}', out)
             tokens.append(out['token'])
         st = dp.status(self.store, now=T0)
         self.assertEqual(st['domestic']['active'], dp.DOMESTIC_TOTAL_CAPACITY,
                          st['domestic'])
+        # 2 个 zcode 记 committed_zcode；两地区 Qwen3.8-Max 合计记 committed_qoder。
         self.assertEqual(st['rotation']['committed_zcode'], 2, st['rotation'])
         self.assertEqual(st['rotation']['committed_qoder'], 2, st['rotation'])
         return tokens

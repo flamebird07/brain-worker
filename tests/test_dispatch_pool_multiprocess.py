@@ -185,27 +185,23 @@ class _SpawnMixin(unittest.TestCase):
             return [dict(r) for r in conn.execute(sql, params).fetchall()]
 
     def _fill_six_via_api(self):
-        """真实 API 填满八满基线（交替主力 → 各 2，再 Flash 2，再显式 qodercn 补 2），
-        返回 token 列表。CN 只能经 executor='qodercn' 独立 claim，AUTO 永不自动选中。"""
+        """真实 API 填满八满基线（BW-POOL-SPLIT-20261010-S3 五池：zcode×2 + 两地区 Max 各
+        1 + 两地区 Flash 各 2）。全部经显式 executor 逐一 claim 保证确定性（CN 内置只能经
+        executor='qodercn'，AUTO 轮换不保证落某特定主力），返回 8 个 token。"""
         toks = []
-        plan = [('zcode', 'GLM-5.3'), ('qoder', 'Qwen3.8-Max'),
-                ('zcode', 'GLM-5.3'), ('qoder', 'Qwen3.8-Max'),
-                ('qoder', 'Qwen3.8-Flash'), ('qoder', 'Qwen3.8-Flash')]
-        for i, (rt, md) in enumerate(plan):
+        plan = [('zcode', 'GLM-5.3', 'zcode'), ('zcode', 'GLM-5.3', 'zcode'),
+                ('qoder', 'Qwen3.8-Max', 'qoder'),
+                ('qodercn', 'Qwen3.8-Max', 'qodercn'),
+                ('qoder', 'Qwen3.8-Flash', 'qoder'),
+                ('qoder', 'Qwen3.8-Flash', 'qoder'),
+                ('qodercn', 'Qwen3.8-Flash', 'qodercn'),
+                ('qodercn', 'Qwen3.8-Flash', 'qodercn')]
+        for i, (rt, md, ex) in enumerate(plan):
             out = dp.select_and_claim(self.store, task_id=f'base-{i}', runtime=rt,
                                       model=md, workspace=f'C:/mp/base-{i}',
                                       chat_id=f'bc{i}',
                                       stage=f'bs{i}', prompt_sha256=f'{i}' * 64,
-                                      now=T0, _preclaim=False)
-            self.assertTrue(out['allowed'], out)
-            toks.append(out['token'])
-        for j in range(2):
-            out = dp.select_and_claim(self.store, task_id=f'base-cn-{j}',
-                                      runtime='qodercn', model='DeepSeek-Flash',
-                                      workspace=f'C:/mp/base-cn-{j}',
-                                      chat_id=f'bcc{j}', stage=f'bsc{j}',
-                                      prompt_sha256=f'c{j}' * 64, executor='qodercn',
-                                      now=T0, _preclaim=False)
+                                      executor=ex, now=T0, _preclaim=False)
             self.assertTrue(out['allowed'], out)
             toks.append(out['token'])
         return toks

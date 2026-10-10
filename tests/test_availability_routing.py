@@ -90,17 +90,18 @@ class _TmpBase(unittest.TestCase):
         return dp.status(self.dispatch, now=T0)['pools'][pk]['active']
 
     def _fill_six(self):
+        # BW-POOL-SPLIT-20261010-S3 五池 8 槽：zcode×2 + 两地区 Max 各 1 + 两地区 Flash 各 2。
         toks = []
         combos = [('zcode', 'GLM-5.3'), ('zcode', 'GLM-5.3'),
-                  ('qoder', 'Qwen3.8-Max'), ('qoder', 'Qwen3.8-Max'),
+                  ('qoder', 'Qwen3.8-Max'), ('qodercn', 'Qwen3.8-Max'),
                   ('qoder', 'Qwen3.8-Flash'), ('qoder', 'Qwen3.8-Flash'),
-                  ('qodercn', 'DeepSeek-Flash'), ('qodercn', 'DeepSeek-Flash')]
+                  ('qodercn', 'Qwen3.8-Flash'), ('qodercn', 'Qwen3.8-Flash')]
         for i, (rt, md) in enumerate(combos):
             ex = 'zcode' if rt == 'zcode' else ('qodercn' if rt == 'qodercn' else 'qoder')
             r = dp.reserve(self.dispatch, task_id=f'f{i}', runtime=rt, model=md,
                            workspace=str(self._ws_for(f'f{i}')), prompt_sha256='p',
                            stage='s1', now=T0, executor=ex)
-            self.assertTrue(r['reserved'], r)
+            self.assertTrue(r.get('allowed') and r.get('token'), r)
             toks.append(r['token'])
         return toks
 
@@ -361,28 +362,32 @@ class DispatchRoutingTests(_TmpBase):
 
     def test_reclaim_skips_blocked_zcode(self):
         # 降级票据（capacity）只在受信任候选确实排空时记录；claim_due 原子回收只选可用主力
-        # （跳过被 blocked 的 ZCode）。B4 缺陷 7：capacity 降级必须客观核验受信任候选（含 CN
-        # 补充候选）真实排空——先把 QMax+Flash+CN 占满（ZCode 已 blocked 不在合格候选），再
-        # 释放一个 QMax 名额，回收才会原子落到 QMax，Z 始终保持 blocked（不为旧断言排除 CN）。
+        # （跳过被 blocked 的 ZCode）。BW-POOL-SPLIT-20261010-S3：ZCode blocked 后合格候选
+        # 为两地区 Qwen3.8-Max（各 1）+ 两地区 Flash（各 2）——先把它们占满，再释放一个
+        # QMax 名额，回收才会原子落到 QMax，Z 始终保持 blocked。
         self._hold_zcode()
         toks = []
-        for i in range(2):
-            r = dp.reserve(self.dispatch, task_id=f'q{i}', runtime='qoder',
-                           model='Qwen3.8-Max', workspace=str(self._ws_for(f'q{i}')),
-                           prompt_sha256='p', stage='s1', now=T0, executor='qoder')
-            self.assertTrue(r['reserved'], r)
-            toks.append(r['token'])
+        r = dp.reserve(self.dispatch, task_id='q0', runtime='qoder',
+                      model='Qwen3.8-Max', workspace=str(self._ws_for('q0')),
+                      prompt_sha256='p', stage='s1', now=T0, executor='qoder')
+        self.assertTrue(r.get('allowed') and r.get('token'), r)
+        toks.append(r['token'])
+        r = dp.reserve(self.dispatch, task_id='cq0', runtime='qodercn',
+                      model='Qwen3.8-Max', workspace=str(self._ws_for('cq0')),
+                      prompt_sha256='p', stage='s1', now=T0, executor='qodercn')
+        self.assertTrue(r.get('allowed') and r.get('token'), r)
+        toks.append(r['token'])
         for i in range(2):
             r = dp.reserve(self.dispatch, task_id=f'fl{i}', runtime='qoder',
                            model='Qwen3.8-Flash', workspace=str(self._ws_for(f'fl{i}')),
                            prompt_sha256='p', stage='s1', now=T0, executor='qoder')
-            self.assertTrue(r['reserved'], r)
+            self.assertTrue(r.get('allowed') and r.get('token'), r)
             toks.append(r['token'])
         for i in range(2):
-            r = dp.reserve(self.dispatch, task_id=f'cn{i}', runtime='qodercn',
-                           model='DeepSeek-Flash', workspace=str(self._ws_for(f'cn{i}')),
+            r = dp.reserve(self.dispatch, task_id=f'cfl{i}', runtime='qodercn',
+                           model='Qwen3.8-Flash', workspace=str(self._ws_for(f'cfl{i}')),
                            prompt_sha256='p', stage='s1', now=T0, executor='qodercn')
-            self.assertTrue(r['reserved'], r)
+            self.assertTrue(r.get('allowed') and r.get('token'), r)
             toks.append(r['token'])
         sc = self._scope('rc')
         ask = dp.ask_record(self.dispatch, task_id='rc', scope=sc, ask_message_id='m1',
@@ -1377,12 +1382,13 @@ class B5ScopeComboTests(_TmpBase):
         r = dp.reserve(self.dispatch, task_id=f'{runtime}{model}{i}', runtime=runtime,
                       model=model, workspace=str(self._ws_for(f'{runtime}{model}{i}')),
                       prompt_sha256='p', stage='s1', now=T0, executor=executor)
-        self.assertTrue(r['reserved'], r)
+        self.assertTrue(r.get('allowed') and r.get('token'), r)
         return r['token']
 
     def test_combo_without_runtime_reclaims_only_flash_never_max(self):
         sc = {**self._scope('fl'), 'executor': 'qoder', 'model': 'Qwen3.8-Flash'}
-        max_toks = [self._reserve(i, 'qoder', 'Qwen3.8-Max', 'qoder') for i in range(2)]
+        # BW-POOL-SPLIT-20261010-S3：国际 Qwen3.8-Max 只有 1 槽；填 1 Max + 2 Flash。
+        max_toks = [self._reserve(0, 'qoder', 'Qwen3.8-Max', 'qoder')]
         flash_toks = [self._reserve(i, 'qoder', 'Qwen3.8-Flash', 'qoder') for i in range(2)]
         ask = dp.ask_record(self.dispatch, task_id='fl', scope=sc, ask_message_id='m1',
                             now=T0, degradation_reason='capacity',
@@ -1392,12 +1398,12 @@ class B5ScopeComboTests(_TmpBase):
         self._free_slot(max_toks[0])  # 只腾出 Max → B4 会误抢 Max；B5 必须只等 Flash
         out = dp.claim_due(self.dispatch, task_id='fl', now=T0, quota_store=self.quota)
         self.assertFalse(out['claimed'], out)  # Flash 满 → 不回收，绝不改派 Max
-        self.assertEqual(self._active(QMAX), 1, out)  # 腾出的 Max 未被本 Flash 任务占用
+        self.assertEqual(self._active(QMAX), 0, out)  # 腾出的 Max 未被本 Flash 任务占用
         self.assertEqual(self._luna_active(), 0)      # 绝不 Luna
 
     def test_combo_without_runtime_reclaims_flash_when_flash_frees(self):
         sc = {**self._scope('fr'), 'executor': 'qoder', 'model': 'Qwen3.8-Flash'}
-        [self._reserve(i, 'qoder', 'Qwen3.8-Max', 'qoder') for i in range(2)]
+        self._reserve(0, 'qoder', 'Qwen3.8-Max', 'qoder')
         flash_toks = [self._reserve(i, 'qoder', 'Qwen3.8-Flash', 'qoder') for i in range(2)]
         ask = dp.ask_record(self.dispatch, task_id='fr', scope=sc, ask_message_id='m1',
                             now=T0, degradation_reason='capacity',
@@ -1408,7 +1414,7 @@ class B5ScopeComboTests(_TmpBase):
         out = dp.claim_due(self.dispatch, task_id='fr', now=T0, quota_store=self.quota)
         self.assertTrue(out['claimed'], out)
         self.assertEqual(out['pool_key'], QFLASH)
-        self.assertEqual(self._active(QMAX), 2)  # Max 不受触碰
+        self.assertEqual(self._active(QMAX), 1)  # Max 不受触碰
 
     def test_combo_conflict_and_unknown_model_fail_closed(self):
         conflict = {**self._scope('cx'), 'executor': 'qoder', 'runtime': 'zcode',

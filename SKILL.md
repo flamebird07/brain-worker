@@ -1,15 +1,15 @@
 ---
 name: brain-worker
-description: 按主脑与执行 Agent 分工完成大量阅读、开发、批量修改、测试、迁移或审计；支持已就绪且已授权的国际 Qoder、Qoder CN、ZCode 直连及可选 GPT-6 Luna 云端原生子 Agent，Luna 遵循当前调用审批；CodeBuddy/WorkBuddy 改为 human-relay only（只生成可复制提示词、人工交外部 Agent，不再直接派发）；本机未另行指定时按可用主力 `zcode:GLM-5.3`/`qoder:Qwen3.8-Max` 各 2 的 best-effort 1:1 轮换、明确 executor+model 授权组合优先，主力不可用时改用溢出 Flash 或已授权接续，各入口回读原始报告并独立验收；也支持 human-relay。简单规划、推理与独立验收可由 GPT 主脑直接处理；工程实施由用户事先明确同意的执行器承担。
+description: 按主脑与执行 Agent 分工完成大量阅读、开发、批量修改、测试、迁移或审计；支持已就绪且已授权的国际 Qoder、Qoder CN、ZCode 直连及可选 GPT-6 Luna 云端原生子 Agent，Luna 遵循当前调用审批；CodeBuddy/WorkBuddy 改为 human-relay only（只生成可复制提示词、人工交外部 Agent，不再直接派发）；本机未另行指定时按国内五池真实容量 `zcode:GLM-5.3`=2、国际 `qoder:Qwen3.8-Max`=1、CN `qodercn:Qwen3.8-Max`=1、两区 Flash 各 2（合计 8）做 best-effort 1:1 轮换、明确 executor+model 授权组合优先；两 Flash 同级，AUTO 在合格可用主力均不可用或已满时从两区 Flash 选，明确 executor 或 model 的约束保持；三主力明确限额自动跳过、不查询余额，用户明确指定受限单模型时如实拒绝而不偷偷换模型，各入口回读原始报告并独立验收；也支持 human-relay。简单规划、推理与独立验收可由 GPT 主脑直接处理；工程实施由用户事先明确同意的执行器承担。
 ---
 
 # 主脑与苦力 Agent
 
-执行器范围（2026-10-08 用户决定，同日最新追加）：WorkBuddy 与独立 CodeBuddy CLI 均改为 human-relay only，不再从当前 Skill/CLI/控制面提交新的直接派发调用；选择它们时只生成完整可复制提示词，由客户人工交给外部 Agent，生成提示词不记成已派发。当前直连派发保留国际 Qoder、Qoder CN 与 ZCode，默认按可用主力 `zcode:GLM-5.3`/`qoder:Qwen3.8-Max` 的 1:1 轮换、明确 executor+model 组合授权优先，主力不可用时改用溢出 Flash 或已授权接续（不再表述为“ZCode 默认优先、Qoder 唯一模型”）。不再启动 WorkBuddy 的认证或测试。历史能力、原错误与模型信息与测试证据保留，仅作离线证据回放/档案，不作为重新启用授权。
+执行器范围（2026-10-08 用户决定，同日最新追加）：WorkBuddy 与独立 CodeBuddy CLI 均改为 human-relay only，不再从当前 Skill/CLI/控制面提交新的直接派发调用；选择它们时只生成完整可复制提示词，由客户人工交给外部 Agent，生成提示词不记成已派发。当前直连派发保留国际 Qoder、Qoder CN 与 ZCode，默认按国内五池真实容量（ZCode=2、国际 Max=1、CN Max=1、两区 Flash 各 2、合计 8）做 1:1 轮换、明确 executor+model 组合授权优先；两 Flash 同级，AUTO 在合格可用主力均不可用或已满时从两区 Flash 选，明确 executor 或 model 的约束保持（不再表述为“ZCode 默认优先、Qoder 唯一模型”）。不再启动 WorkBuddy 的认证或测试。历史能力、原错误与模型信息与测试证据保留，仅作离线证据回放/档案，不作为重新启用授权。
 
 ## GPT-6 Luna 原生子 Agent（可选）
 
-GPT-6 Luna（模型标识 `gpt-6-luna`）是可选执行端，通过所在宿主实际提供的原生子 Agent 工具调用。本机未另行指定时按可用主力 `zcode:GLM-5.3`/`qoder:Qwen3.8-Max` 各 2 的 1:1 轮换、明确 executor+model 授权组合优先，主力不可用时改用溢出 Flash 或已授权接续；Qoder 沿用其既有入口配置（不再表述为“ZCode 默认优先、Qoder 唯一模型”）。Luna 不自动接替任何在途任务，也不改变适用任务/在途任务已有的执行选择；非容量类 Luna 需明确授权、绝不凭超时自动接替；GPT/Luna 的工程实施须用户事先明确同意，不自动代做。
+GPT-6 Luna（模型标识 `gpt-6-luna`）是可选执行端，通过所在宿主实际提供的原生子 Agent 工具调用。本机未另行指定时按国内五池真实容量（ZCode=2、国际 Max=1、CN Max=1、两区 Flash 各 2、合计 8）做 1:1 轮换、明确 executor+model 授权组合优先；两 Flash 同级，AUTO 在合格可用主力均不可用或已满时从两区 Flash 选，明确 executor 或 model 的约束保持；Qoder 沿用其既有入口配置（不再表述为“ZCode 默认优先、Qoder 唯一模型”）。Luna 不自动接替任何在途任务，也不改变适用任务/在途任务已有的执行选择；非容量类 Luna 需明确授权、绝不凭超时自动接替；GPT/Luna 的工程实施须用户事先明确同意，不自动代做。
 
 每次考虑调用 Luna 时，检查当前环境工具是否提供该模型、当前用户授权及审批要求，并遵循当次生效的 custom rule 与平台规则；需要审批时取得对应批准后才启动。能力登记、历史启动成功或工具存在都不是后续调用授权；不把动态规则、过去批准或某次测试参数固化为永久授权或默认参数。
 
@@ -138,7 +138,7 @@ ZCode 真实派发入口（以及已退休为人工转交、现仅由 `tests/off
 
 ### 全局并发容量池与 1:1 路由（2026-10-08，BW-GITHUB-CLOSEOUT-S4）
 
-所有会话共享同一持久**并发容量池** `scripts/dispatch_pool.py`（纯标准库 sqlite3、`BEGIN IMMEDIATE` 原子事务，默认 `~/.brain-worker/dispatch-pool.sqlite3`，`BRAIN_WORKER_DISPATCH_STORE` 覆盖；测试必须传显式临时 store）。分配口径：主力 `zcode:GLM-5.3` 与 `qoder:Qwen3.8-Max` 各最多 2 个真实在途执行器、按 committed 计数做 **best-effort 1:1** 轮换（非严格均衡，文档不宣称严格相等）；溢出 `qoder:Qwen3.8-Flash` 最多 2 个，**只有两主力池都满**才允许；**国内合计 6**（BW-QODER-CN-20261010-A2 起再叠加 Qoder CN 补充候选 `qodercn:DeepSeek-Flash` 固定 2、**总 8**，原 6 不变；BW-QODER-CN-20261010-A4 起 CN 还作为 `AUTO` 在原合格主力/国际 Flash 不可用或已满后的最后补充候选，原 6 满 + CN 空时 `AUTO` 改道 CN、只有原 8 全满才物理 full）；未授权组合容量为 0 一律拒。Luna（`luna:native`）**只做救援、无数量上限**：只有国内**总 8 名额全满（含 CN 补充候选）**、宿主**真的问过用户**（外部 agent 还是 Luna）、且 **300 秒无回复**后，经 `claim-due` 在同一事务内原子竞争裁决才可由**宿主原生调用**——Python 只落库票据、绝不谎称已问或已派生 Luna；一旦用户回复即不再自动裁决（等待超时≠默认无限授权）；等待期间任何国内名额释放**优先国内并原子取消同 task 的 pending 票据**（不双派国内+Luna）；原生工具已启动但在写出 agentID 前崩溃 → `launch_unknown` 待人工核验、**绝不自动重复启动**；Luna 沿用原任务文件/命令/副作用范围，不借救援绕过权限拒绝、额度错误或部署审批。
+所有会话共享同一持久**并发容量池** `scripts/dispatch_pool.py`（纯标准库 sqlite3、`BEGIN IMMEDIATE` 原子事务，默认 `~/.brain-worker/dispatch-pool.sqlite3`，`BRAIN_WORKER_DISPATCH_STORE` 覆盖；测试必须传显式临时 store）。分配口径（当前有效，已由 BW-POOL-SPLIT-20261010-S2/S3 定型为五池）：主力 `zcode:GLM-5.3`=2、`qoder:Qwen3.8-Max`=1、`qodercn:Qwen3.8-Max`=1，同级兜底 `qoder:Qwen3.8-Flash`=2、`qodercn:Qwen3.8-Flash`=2，**国内合计 8**（`DOMESTIC_TOTAL_CAPACITY`）；按 committed 计数做 **best-effort 1:1** 轮换（非严格均衡，文档不宣称严格相等）；两 Flash 同级，`AUTO` 在合格可用主力均不可用或已满时从两区 Flash 选，明确 executor/model 的约束保持（`AUTO` 本可跨国际/CN 选合格候选）；`qodercn:DeepSeek-Flash` 退休为 0，仅供旧在途 attempt 按真实终态自然释放；未授权组合容量为 0 一律拒。（历史：本段旧版曾记为“国际 Max 各 2 + CN DeepSeek 补充 2、合计 6→8”的演变，已由上述五池口径取代。）Luna（`luna:native`）**只做救援、无数量上限**：只有国内**总 8 名额全满（含 CN 补充候选）**、宿主**真的问过用户**（外部 agent 还是 Luna）、且 **300 秒无回复**后，经 `claim-due` 在同一事务内原子竞争裁决才可由**宿主原生调用**——Python 只落库票据、绝不谎称已问或已派生 Luna；一旦用户回复即不再自动裁决（等待超时≠默认无限授权）；等待期间任何国内名额释放**优先国内并原子取消同 task 的 pending 票据**（不双派国内+Luna）；原生工具已启动但在写出 agentID 前崩溃 → `launch_unknown` 待人工核验、**绝不自动重复启动**；Luna 沿用原任务文件/命令/副作用范围，不借救援绕过权限拒绝、额度错误或部署审批。
 
 Qoder/ZCode 入口在**建输出目录、Popen 之前**必须消费/校验一个容量 claim（`consume_for_entry`），**不能靠提示词或一个传入布尔跳过**：给了 `--dispatch-claim` 就精确校验（task/runtime/model/workspace/prompt_sha256 任一漂移即拒），没给就走 `select_and_claim` 原子路由，非被选中组合 → `routing_required`/`sent=false`/退出 2、**零证据目录、零 Popen、不计轮次**；路由选择绝不把权限拒绝/登录缺失/额度限流伪装成容量溢出。**子进程真实结束立即释放名额**（不等报告绑定/业务验收），启动失败/取消/异常结束释放本 attempt，wrapper 死但子进程仍活（或存活未知）不释放、不被抢占，PID 复用绑定创建时刻（Windows 只读 `GetProcessTimes`），Qoder 派生的工具子进程不算另一个 worker。**容量并发 ≠ 额度冷却**：额度门禁仍在 `quota_control`；两个 ZCode workspace 走同一 provider 时经**已校验的容量 claim**放行，同 workspace 单写入与 unknown/在途保护不变，不删通道行、不禁用门禁、不伪造 claim；CodeBuddy 旧限流与旧占位完全不变、不进池。详见 [references/global-dispatch.md](references/global-dispatch.md)。
 
@@ -151,6 +151,20 @@ Qoder/ZCode 入口在**建输出目录、Popen 之前**必须消费/校验一个
 - **ZCode 跳过直接复用既有 availability**：本轮**不改** `quota_control.py`/`zcode_direct.py`、不查剩余额度/账单、不新增历史导入/冷却/恢复探针/额度系统、不发任何 ZCode 请求。CN 池与主脑侧读取的正是主脑已写入并回读确认的既有 `hard_hold`（真实 429/1310）；`dispatch_pool` 经既有 `_zcode_availability_blocked` 只读回核，**Z 限额时 AUTO 自动跳过 Z**（改道可用主力/溢出，显式 `executor='zcode'` 得 `zcode_unavailable`），满足"只知是否限额、不读额度"。真实剩余额度不在本轮范围。
 
 详见 [references/qodercn-direct.md](references/qodercn-direct.md)。本节只登记已落实的最小改动；真实 CN 小读/写验收、安装版/仓库版与 GitHub/Obsidian 同步由主脑独立执行，不在本阶段。
+
+### 五池真实分配与主力明确限额落标（2026-10-10，BW-POOL-SPLIT-20261010-S2/S3/S5）
+
+S2/S3 依用户明确指令把国内池重构为**五池真实分配、总 8**：主力 `zcode:GLM-5.3=2`、`qoder:Qwen3.8-Max=1`、`qodercn:Qwen3.8-Max=1`，同级兜底 `qoder:Qwen3.8-Flash=2`、`qodercn:Qwen3.8-Flash=2`（两 Flash 同级；`AUTO` 在合格可用主力均不可用或已满时从两区 Flash 选，本可跨国际/CN 选合格候选，只有明确 `executor`/`model` 约束才锁定本地区；三主力明确限额经 `main_force_limits` 自动跳过，不查询余额、不新增额度服务或定时器）。`qodercn:DeepSeek-Flash` **新派发退休为 0**（`LEGACY_RETIRED_POOL_KEYS`，`_domestic_policy` 返 `unknown_pool`），但**已存在的在途 attempt 仍按真实 runtime/model 计入 `_domestic_active` 总数并做真实终态释放**——不杀旧 Max/DeepSeek 进程、不因新池缩表误清活锁、不越总 8。CN 内置模型真实名是 `Qwen3.8-Max`/`Qwen3.8-Flash`（**不是** `Qwen-3.8-*`），私有 `local-entry-cn.json` 与真实 model_id 映射不改写、不覆盖、不新增评分或调度器。
+
+S5 落地两个 Qoder Max 池的**明确限额**闭环（用户口径：只用结构化真实失败落标，绝不查余额、不加定时器/探针/评分/新服务、不改 `quota_control.py`/`zcode_direct.py`）：
+- **可承载标记的池仅限** `QUOTA_LIMITABLE_POOLS = (qoder:Qwen3.8-Max, qodercn:Qwen3.8-Max)`。ZCode 继续走 `quota_control` 的 availability；任一 Flash、退休 DeepSeek、Luna 永不落标（绝不误挡 Flash、绝不动 ZCode 既有 availability 口径）。
+- **`record_main_force_limit` 强绑真实 attempt + 错误证据**：必须携带 `task_id + attempt_token + evidence_path + evidence_sha256`，事务内回核 attempt 行存在、`pool_key` 与 `task_id` 与传入一致，`evidence_path` 指向真实存在文件且其 sha256 与声明一致；任一漂移（缺字段、无 attempt、pool/task 漂移、证据文件缺失或哈希漂移）一律 `recorded=False / drift=True` 拒绝写入，绝不凭一个 flag 钉死主力。同一池重复落标只刷新证据/时间戳并清空旧的 `released_at/release_note`。
+- **`consume_for_entry` 消费预留票据前先查限额**：同一 `BEGIN IMMEDIATE` 事务内若本 attempt 的 `pool_key` 命中 `main_force_limits.limited=1`，只把**本 token** CAS `reserved→start_failed`（`capacity_released=True`），返回 `sent=False / allowed=False / reason='main_force_limited'`，**绝不泄漏本次占位、绝不越权释放其他 task 的 reserved**。release 后同 reserved 可正常 consume 到 running；release 只由用户明确额度恢复/重置后经 `release_main_force_limit` 人工触发，附 `note`，绝不靠旧成功日志自动清。
+- **`qoder_direct` 真实失败文本识别**：`_QUOTA_HARD_LIMIT_MARKERS` 明确含 `"credit usage limit"`（用户真实文案 “You've reached your credit usage limit.” 必识别），与既有 `credits exhausted / out of credits / 积分用尽 / 额度不足` 同层；识别只扫 `result_errors / result_errors_info` 结构化载体，绝不扫报告正文/response.md。裸 “quota” 单词、正文里 429/文案、permission 拒绝、认证/401、成功、取消 exit code `4294967295` 都**不当限额**；`_qoder_max_pool_key` 只对 `Qwen3.8-Max` + `qoder`/`qodercn` 返回非 None，绝不误给 Flash/ZCode/自定义名落标。落标时序：**先** `record_main_force_limit`（写 `stdout.json` 原字节 sha256 为证据）→ **再** 真实终态释放（`_release_claim('finished', …)`），杜绝槽释放后另一 chat 立刻重复提交；落标异常绝不阻断真实终态释放（不泄漏锁）。
+- **AUTO/executor 路由保留**：显式 `executor='qoder'` 请求 QMax 且未落标 → 直接 claim；已落标 → 同 executor 内 Flash 兜底（`routing_required` 选 `qoder:Qwen3.8-Flash`），绝不复活限额 Max、绝不跨地区换 CN。`executor='qodercn'` 同规则镜像 CN Max→CN Flash。Luna 侧不变：domestic 任何时刻都绝不启用 Luna、unknown 保占位、明确模型不偷偷换、外派被拦不 GPT 代做。
+- **迁移债务总 8 硬守卫**：`_domestic_active >= DOMESTIC_TOTAL_CAPACITY` 时任何新国内 claim 一律 `full`，不派第 9 个；旧 Max/DeepSeek 在途自然终态后计数才下降。
+
+离线回归：`tests/test_dispatch_pool.py::MainForceLimitTests` 覆盖 record/read/release/read 完整往返 + task/pool/evidence-sha/attempt-missing/fields-missing drift 全拒 + 非限额池拒 + 幂等覆盖 + `consume_for_entry` 只释放本次 reserved；`tests/test_qoder_cn_direct_offline.py::ExplicitQuotaLimitHitTests` 覆盖真实文案 “You've reached your credit usage limit.” 命中 + case 不敏感 + errors_info 载体 + `credits exhausted / out of credits / insufficient balance / 额度用尽 / 积分不足` 变体 + 裸 “quota”/正文 429/permission/auth/success/exit-4294967295 全不误伤 + `_qoder_max_pool_key` 只两 Max 池非 None；`tests/test_dispatch_pool_qodercn.py` 覆盖 CN Max/Flash 五池容量与退休 DeepSeek 新派发 `unknown_pool`。Windows/Linux CI 矩阵都跑，不访问网络、不读凭据、不查真实额度。详见 [references/global-dispatch.md](references/global-dispatch.md)、[references/qoder-direct.md](references/qoder-direct.md)、[references/qodercn-direct.md](references/qodercn-direct.md)。
 
 ### ZCode 独立 availability 与执行器资格路由（2026-10-09，BW-AVAILABILITY-20261009-B2）
 
