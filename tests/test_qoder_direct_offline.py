@@ -48,6 +48,24 @@ def load_module(path: Path):
     return m
 
 
+def make_window_wrapper(rundir: Path, script_path: Path) -> str:
+    # BW-MAX-WINDOW-20261010-S4：内置 Max 仅在北京时间主力时段放行，真实入口子进程按墙钟判定，
+    # 白天会如实拒绝、输出目录不建、后续读取 summary/report-state/request 直接 FileNotFoundError。
+    # 此处只在测试 RUN_DIR 里生成临时 wrapper：同 scripts 路径导入 dispatch_pool、把 utcnow 固定到
+    # UTC 15:00（北京 23:00，时段内），再用 runpy 原样以 __main__ 运行 --script 指定的原脚本并完整
+    # 转交 CLI argv。时钟控制仅此离线夹具，不改生产入口/模型默认/argv/续用/权限，也不加 --now/env 开关。
+    wrapper = rundir / 'qd_in_window_wrapper.py'
+    wrapper.write_text(
+        'import sys, runpy\n'
+        f'sys.path.insert(0, {str(script_path.parent)!r})\n'
+        'from datetime import datetime, timezone\n'
+        'import dispatch_pool as dp\n'
+        'dp.utcnow = lambda: datetime(2026, 10, 8, 15, 0, 0, tzinfo=timezone.utc)\n'
+        f'runpy.run_path({str(script_path)!r}, run_name="__main__")\n',
+        encoding='utf-8')
+    return str(wrapper)
+
+
 def build_report(stage: str, project_root: str, *, drop_section=None,
                  close_line=True) -> str:
     lines = ['WORKER_REPORT_START',
@@ -70,6 +88,7 @@ def main() -> int:
     args = ap.parse_args()
     script_path = Path(args.script).resolve(strict=True)
     RUN_DIR.mkdir(parents=True, exist_ok=False)
+    wrapper = make_window_wrapper(RUN_DIR, script_path)
     print(f'== Qoder direct 候选离线测试 run {RUN_DIR.name} ==')
     print(f'under test: {script_path}')
     qd = load_module(script_path)
@@ -177,7 +196,7 @@ def main() -> int:
         # ~/.brain-worker 池；空池下主力 Qwen3.8-Max 直接放行，不受 1:1 轮换历史影响。
         env['BRAIN_WORKER_DISPATCH_STORE'] = str(
             RUN_DIR / f'dispatch-{uuid.uuid4().hex}.sqlite3')
-        cmd = [sys.executable, str(script_path),
+        cmd = [sys.executable, wrapper,
                '--workspace', str(work), '--prompt-file', str(prompt_path),
                '--output-dir', str(out_dir), '--config', str(stub_cfg_path)]
         if stage:

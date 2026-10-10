@@ -39,6 +39,24 @@ def load_module(path):
     return m
 
 
+def make_window_wrapper(rundir: Path, script_path: Path) -> str:
+    # BW-MAX-WINDOW-20261010-S4：内置 Max 仅在北京时间主力时段放行，真实入口子进程按墙钟判定，
+    # 白天会如实拒绝、输出目录不建、后续读取 report-state/summary 直接 FileNotFoundError。
+    # 仅在测试 RUN_DIR 生成临时 wrapper：同 scripts 路径导入 dispatch_pool、把 utcnow 固定到 UTC
+    # 15:00（北京 23:00，时段内），再用 runpy 以 __main__ 原样运行 --script 指定的原脚本并完整转交
+    # CLI argv。时钟控制仅此离线夹具，不改生产入口/模型默认/argv/续用/绑定规则，也不加 --now/env 开关。
+    wrapper = rundir / 'qd_in_window_wrapper.py'
+    wrapper.write_text(
+        'import sys, runpy\n'
+        f'sys.path.insert(0, {str(script_path.parent)!r})\n'
+        'from datetime import datetime, timezone\n'
+        'import dispatch_pool as dp\n'
+        'dp.utcnow = lambda: datetime(2026, 10, 8, 15, 0, 0, tzinfo=timezone.utc)\n'
+        f'runpy.run_path({str(script_path)!r}, run_name="__main__")\n',
+        encoding='utf-8')
+    return str(wrapper)
+
+
 def report(stage, root, *, stage_field=None, path_field=None, close=True):
     sf = stage_field if stage_field is not None else f'阶段编号与执行方式{FW}{stage}。执行方式：离线。'
     pf = path_field if path_field is not None else f'实际项目绝对路径{FW}{root}'
@@ -57,6 +75,7 @@ def main():
     args = ap.parse_args()
     script_path = Path(args.script).resolve(strict=True)
     RUN_DIR.mkdir(parents=True, exist_ok=False)
+    wrapper = make_window_wrapper(RUN_DIR, script_path)
     print(f'== Qoder direct binding gate tests run {RUN_DIR.name} ==')
     print(f'under test: {script_path}')
     qd = load_module(script_path)
@@ -147,7 +166,7 @@ def main():
         # 并发容量池隔离：每个 out 用各自全新的临时 store，绝不读写真实 ~/.brain-worker 池。
         env['BRAIN_WORKER_DISPATCH_STORE'] = str(
             RUN_DIR / ('dispatch-' + Path(out).name + '.sqlite3'))
-        cmd = [sys.executable, str(script_path), '--workspace', root,
+        cmd = [sys.executable, wrapper, '--workspace', root,
                '--prompt-file', str(promptp), '--output-dir', str(out),
                '--config', str(cfgp), '--stage', stage]
         if extra:
@@ -189,7 +208,7 @@ def main():
     # ---------- --stage required ----------
     o = RUN_DIR / 'e-nostage'
     env = os.environ.copy(); env['STUB_MODE'] = 'ok'; env['STUB_REPORT_FILE'] = str(repfp)
-    r = subprocess.run([sys.executable, str(script_path), '--workspace', root,
+    r = subprocess.run([sys.executable, wrapper, '--workspace', root,
                         '--prompt-file', str(promptp), '--output-dir', str(o),
                         '--config', str(cfgp)], capture_output=True, env=env, timeout=60)
     check('--stage required: refusal before invocation, no output dir created',
