@@ -41,6 +41,7 @@ FAILURE_TYPES = ('quota_429', 'permission_rule_denied', 'permission_client_missi
 # read_dirs 表示是否有外部只读目录 grant。ZCode 只有整工具开关，不能假称细粒度文件权限。
 CAPABILITY = {
     'qoder': {'fine_grained': True, 'read_dirs': True},
+    'qodercn': {'fine_grained': True, 'read_dirs': True},
     'codebuddy': {'fine_grained': True, 'read_dirs': False},
     'zcode': {'fine_grained': False, 'read_dirs': False},
 }

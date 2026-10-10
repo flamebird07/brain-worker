@@ -14,9 +14,12 @@
 | 主力 | `zcode:GLM-5.3` | 2 | 与 Qoder 主力 **1:1** 轮换 |
 | 主力 | `qoder:Qwen3.8-Max` | 2 | 与 ZCode 主力 **1:1** 轮换 |
 | 溢出 | `qoder:Qwen3.8-Flash` | 2 | 默认 AUTO：两主力池都无合格可用槽才用；用户明确指定已授权 Flash 组合时按其真实容量独立派发（不受“两主力满”限制） |
+| CN 补充 | `qodercn:DeepSeek-Flash` | 2 | Qoder CN 原生 CLI（`runtime=qodercn`）：**既可经显式 `executor='qodercn'` 独立 claim**，也作为 **`AUTO` 的最后补充候选**——只有原合格主力与国际 Flash 都不可用或已满时才把 CN 当补充（`AUTO` 返回 `routing_required` 选 CN，入口已是 CN 则允许 claim；**原 6 满 + CN 空不报整池 full，只有原 8 全满才物理 full**）；明确指定 Qoder/ZCode/CN 的约束不互换、不扩大；与国际/ZCode 可同时在不同 workspace 并行，同 workspace 仍单写入（BW-QODER-CN-20261010-A2/A4） |
 | 救援 | `luna:native` | 无上限 | 只经 `claim-due` 竞争裁决，绝不被自动选中 |
 
-- **国内合计上限 = 6**（`DOMESTIC_TOTAL_CAPACITY`）：主力 2×2 + 溢出 2。
+- **国内合计上限 = 8**（`DOMESTIC_TOTAL_CAPACITY`，BW-QODER-CN-20261010-A2 起）：主力 2×2 + 溢出 2
+  + Qoder CN 补充 2。原 Z2 / 国际 Max2 / 国际 Flash2 **仍原样不变**，Luna“全满”阈值随总 8 更新，
+  不扩 Luna 授权。
 - **Luna 无数量上限**，但它不计入国内名额，也永远不在正常路由里被派生。
 - 未列入本表的组合（例如 `qoder:GLM-5.3`、`zcode:Qwen3.8-Max`、任意未授权模型）容量为 0，
   `reserve`/`select_and_claim` 一律以 `unknown_pool` 拒绝，绝不派发未授权组合。
@@ -41,8 +44,11 @@
    - 目标就是当前入口且有容量 → claim；
    - 目标是**另一个**合格主力组合 → `routing_required`（当前入口不是被选中组合，**不先提交错
      模型、不浪费或重复占用名额**，改由被选中入口继续）；
-   - 无合格可用主力而 Flash 有合格空槽 → 回退 `routing_required` 到溢出 Flash；**所有候选均无可用槽
-     不等于物理六满**，降级原因与是否授权按 §执行器约束 及后文区分处理。
+   - 无合格可用主力而 Flash 有合格空槽 → 回退 `routing_required` 到溢出 Flash；
+   - 无合格可用主力、国际 Flash 也满，但 CN 补充候选有真实空槽 → `routing_required` 选 CN
+     （调用入口已是 CN 则直接 claim）；**原 6 满 + CN 空绝不报整池 full**；
+   - CN 也满（**原 8 全满**）才 `capacity_full`。**候选均无可用槽不等于物理满**，降级原因与是否
+     授权按 §执行器约束 及后文区分处理。
 
 轮换按**已提交计数**（`rotation.committed_zcode` / `committed_qoder`）驱动，是尽力而为的
 1:1，不保证任意时刻两池在途数严格相等：历史提交、单侧释放都会造成短暂偏差，这是设计允许的。
@@ -71,8 +77,9 @@
 - **`executor='zcode'`**：ZCode 被 availability 阻断 → `zcode_unavailable` 拒绝（**不改道到别的
   主力、不落 Flash**）；有空位则 claim，满则 `capacity_full`（无 Flash 回退）。
 - **`executor='auto'`（缺省）**：保留历史 committed 计数与 1:1 公平轮换，只在**合格**主力间轮换；
-  请求 ZCode 但其被阻断 → 改道到可用主力/溢出或 `capacity_full`，**绝不改道回不可用的 ZCode**。
-  **不清库、不重置轮换计数**。
+  请求 ZCode 但其被阻断 → 改道到可用主力/溢出；两主力与国际 Flash 都满而 CN 补充候选有空槽 →
+  改道 CN（入口已是 CN 则 claim），**CN 也满（原 8 全满）才 `capacity_full`**，**绝不改道回不可用的
+  ZCode**，也**不改道回别的池去互换明确指定的组合**。**不清库、不重置轮换计数**、不新增评分/额度逻辑。
 - **消费 token 前复检**：`consume_for_entry` 走 `--dispatch-claim` token 路径时，在同一事务里
   **重新校验 ZCode availability**；若预留后通道转为不可用，则释放**本次自己**的 reserved 占位
   （`reserved→start_failed`，`capacity_released=True`，reason `zcode_unavailable`），**不泄漏本任务
@@ -159,7 +166,8 @@
 
 Luna 是**救援**通道，无数量上限，但绝不无条件启动。流程：
 
-1. 六个国内名额全满时，**宿主先真的问用户**“外部 agent 还是 Luna”。Python 只落库票据，
+1. 国内名额全满时（BW-QODER-CN-20261010-A2 起阈值随总 8 更新，含 Qoder CN 补充 2；判定走
+   `_domestic_active ≥ DOMESTIC_TOTAL_CAPACITY`），**宿主先真的问用户**“外部 agent 还是 Luna”。Python 只落库票据，
    **绝不谎称已经问过或已经派生 Luna**——真实提问与原生工具调用由宿主负责。
 2. `dp.ask_record(task_id, ...)` 记录一次真实提问票据，开始 **300 秒**计时
    （`LUNA_ASK_TIMEOUT_SECONDS`）。同一 task 只能有一个 `pending`/`claimed` 票据；**重启不重置
@@ -167,7 +175,8 @@ Luna 是**救援**通道，无数量上限，但绝不无条件启动。流程�
 3. 用户回复 → `dp.reply(task_id, choice)`（`luna`/`external_agent`/`domestic`/`cancel`）。
    **一旦回复，`claim_due` 不再自动裁决**——等待超时不当作默认无限授权。
 4. 到期竞争裁决 `dp.claim_due(task_id, now)`：只有票据 `pending`、已过 deadline、未回复、未
-   claim，**且六个国内名额确实全满**时，才在同一 `BEGIN IMMEDIATE` 事务里创建一个 `luna:native`
+   claim，**且国内总 8 名额（含 CN 补充候选）确实全满**（`_domestic_active ≥ DOMESTIC_TOTAL_CAPACITY`）时，
+   才在同一 `BEGIN IMMEDIATE` 事务里创建一个 `luna:native`
    attempt 并把票据置 `claimed`，返回 `launch_state='host_must_call_native'`（**宿主仍须真实
    调用原生工具**，池只给竞争裁决与名额，不代跑）。
 5. **国内名额释放优先国内、原子取消同 task 的 pending 救援票据**（不双派国内 + Luna）：
@@ -187,12 +196,14 @@ Luna 是**救援**通道，无数量上限，但绝不无条件启动。流程�
   `ask_record` 对**任何已存在票据**直接拒绝并回读 `state`/`deadline_utc`/`reply_choice`（纯 INSERT，
   无 `ON CONFLICT` 重置）；`pending` 不重置计时器。
 - **票据 scope 损坏/缺失 → fail-closed**（`scope_corrupt=True`，绝不据损坏数据启动 Luna 或 reclaim）。
-- **可用性不足的降级决策**：当**国内名额未满 6** 但因 availability 不足以正常派工时，允许一次新的
+- **可用性不足的降级决策**：当**国内名额未满总 8（含 CN 补充候选）** 但因 availability 不足以正常派工时，允许一次新的
   降级 `ask_record`，须带**独立、客观的降级理由** `degradation_reason ∈ {quota, auth, capacity}` +
   `degradation_detail`；`quota` 理由必须由 §3b availability 的客观证据支撑
-  （`_zcode_availability_blocked`），无证据则拒绝。降级票据**绕过“六名额全满”前提**，但
+  （`_zcode_availability_blocked`），无证据则拒绝；`capacity` 理由必须经 `_scope_allowed_candidates`
+  客观核验受信任候选（含 CN 补充候选）确已排空——仍有空槽（例如 CN 还有位）时**拒绝降级、优先用国内候选**。
+  降级票据**绕过“总 8 全满”前提**，但
   **非 capacity 的超时绝不可替代显式授权**：只有用户显式回复 `luna` 才 claim Luna；等待超时
-  ≠ 授权（`degraded && reply != luna` → 拒绝）。**六名额全满 + 300s + 用户授权**的既有规则不变。
+  ≠ 授权（`degraded && reply != luna` → 拒绝）。**总 8 全满 + 真实提问 + 300s + 用户授权**的既有规则不变。
 
 ## 与额度门禁的边界（quota ≠ concurrency）
 

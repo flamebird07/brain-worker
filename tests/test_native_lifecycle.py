@@ -69,6 +69,14 @@ class NativeLifecycleTests(unittest.TestCase):
             self.assertTrue(out.get('allowed') and out.get('token'), out)
             self.assertEqual(out['pool_key'], f'{runtime}:{model}', out)
             tokens.append(out['token'])
+        # 2 个 CN 补充候选（显式 executor='qodercn'，独立 workspace，不动 1:1 轮转计数）。
+        for j, (runtime, model) in enumerate([('qodercn', 'DeepSeek-Flash')] * 2):
+            out = dp.reserve(self.store, task_id=f'dom-cn-{j}', runtime=runtime,
+                             model=model, workspace=f'ws-dom-cn-{j}',
+                             prompt_sha256='d' * 64, executor='qodercn', now=T0)
+            self.assertTrue(out.get('allowed') and out.get('token'), out)
+            self.assertEqual(out['pool_key'], f'{runtime}:{model}', out)
+            tokens.append(out['token'])
         st = dp.status(self.store, now=T0)
         self.assertEqual(st['domestic']['active'], dp.DOMESTIC_TOTAL_CAPACITY,
                          st['domestic'])

@@ -94,9 +94,9 @@ class TempStoreMixin:
                 (token, task_id, runtime, model, pool, state, child_pid, child_created,
                  wrapper_pid, wrapper_created))
 
-    def fill_domestic(self, prefix='seed', n=6):
+    def fill_domestic(self, prefix='seed', n=8):
         pools = ['zcode:GLM-5.3'] * 2 + ['qoder:Qwen3.8-Max'] * 2 \
-            + ['qoder:Qwen3.8-Flash'] * 2
+            + ['qoder:Qwen3.8-Flash'] * 2 + ['qodercn:DeepSeek-Flash'] * 2
         for i in range(n):
             self.seed_attempt(f'{prefix}-{i}', f'{prefix}-task-{i}', pools[i])
 
@@ -150,11 +150,29 @@ class TestUnifiedPolicy(TempStoreMixin, unittest.TestCase):
             self.assertTrue(out['allowed'], out)
             self.assertEqual(out['pool_key'], 'qoder:Qwen3.8-Flash')
         self.assertEqual(dp.status(self.store, now=T0)['domestic']['active'], 6)
-        # 第七个：任何国内组合都满。
+        # 七：AUTO 主力+溢出组合已全满 → 不再报整池 full，而是 routing 到仍有空位的 CN
+        # 补充候选（旧 6 满 + CN 空 = routing CN），且此时并未真正占槽。
         out = dp.select_and_claim(self.store, task_id='t6', runtime='zcode',
                                   model='GLM-5.3', workspace='C:/w/t6',
                                   prompt_sha256='6' * 64, now=T0, _preclaim=False)
-        self.assertFalse(out['allowed'])
+        self.assertFalse(out['allowed'], out)
+        self.assertTrue(out['routing_required'], out)
+        self.assertEqual(out['selected']['pool_key'], 'qodercn:DeepSeek-Flash')
+        self.assertFalse(out['domestic_full'])
+        # 八/九：经公开 API 把 CN 2 槽也填满（AUTO 入口点名 CN 且有空位即 claim），每次
+        # assert allowed；不造 PID、不跳测试。
+        for i in (7, 8):
+            cn = dp.select_and_claim(self.store, task_id=f't{i}', runtime='qodercn',
+                                     model='DeepSeek-Flash', workspace=f'C:/w/t{i}',
+                                     prompt_sha256=f'{i}' * 64, now=T0, _preclaim=False)
+            self.assertTrue(cn['allowed'], cn)
+            self.assertEqual(cn['pool_key'], 'qodercn:DeepSeek-Flash')
+        self.assertEqual(dp.status(self.store, now=T0)['domestic']['active'], 8)
+        # 第九次（八槽全满）：AUTO 任意国内组合才 capacity_full 且 domestic_full。
+        out = dp.select_and_claim(self.store, task_id='t9', runtime='zcode',
+                                  model='GLM-5.3', workspace='C:/w/t9',
+                                  prompt_sha256='9' * 64, now=T0, _preclaim=False)
+        self.assertFalse(out['allowed'], out)
         self.assertEqual(out['reason'], 'capacity_full')
         self.assertTrue(out['domestic_full'])
 
@@ -698,8 +716,9 @@ class TestClaimDueScopeZ2(TempStoreMixin, unittest.TestCase):
         self.assertTrue(cons['allowed'], cons)
         # 任何字段漂移（stage）必须拒绝：再造一张票走一次完整回收。
         sc2 = _scope('sc2')
-        # Z3 修复：释放 seed-1 后国内只有 5 个在途，先补一个真实在途 attempt 回到六满，
-        # sc2 的票据必须在确实六满时询问（未满询问会被正确拒绝）。
+        # Z3 修复：释放 seed-1 后再补一个真实在途 attempt，使国内回到满容量（总 8，
+        # BW-QODER-CN-20261010-A2 起含 2 个 CN 补充候选）；sc2 的票据必须在确实满容量时
+        # 询问（未满询问会被正确拒绝）。
         with closing(dp.connect(self.store)) as conn:
             conn.execute("UPDATE attempts SET state='cancelled' WHERE token='seed-1'")
         self.seed_attempt('refill-sc2', 'refill-sc2-task', 'qoder:Qwen3.8-Flash')

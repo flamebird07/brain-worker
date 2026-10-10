@@ -29,6 +29,13 @@ import prompt_contract as pc  # noqa: E402 三入口共享九节契约（标准�
 import dispatch_pool as dp  # noqa: E402 跨会话并发容量池（同目录，标准库 sqlite3）
 
 DEFAULT_CONFIG = _SCRIPTS_DIR / 'local-entry.json'
+DEFAULT_CN_CONFIG = _SCRIPTS_DIR / 'local-entry-cn.json'
+# 运行时名称（报告/池/预检共用口径）：国际 Node-bundle = 'qoder'；本机原生 CN = 'qodercn'。
+RUNTIME_INTERNATIONAL = 'qoder'
+RUNTIME_CN = 'qodercn'
+# CN 池里的**友好名**（pool 组合 qodercn:DeepSeek-Flash 用该名）；真正下发给原生 EXE 的
+# --model 是 config model_ids 映射出来的服务端模型 ID，绝不把友好名当 ID、也绝不冒充 Qwen。
+CN_MODEL = 'DeepSeek-Flash'
 # argparse 缺省模型 = 并发容量池指定的 qoder 主力组合 Qwen3.8-Max（每会话持久 1:1 两名）。
 # 不传 --model 的自主派工即请求主力 Max；Qwen3.8-Flash 在池里是溢出组合，仅当主力满员时
 # 由容量池按溢出策略改道。控制面回归 tests/test_execution_control.py 的 fixture 已同步为
@@ -61,6 +68,50 @@ def load_entry_config(path=None) -> dict:
         if not p.is_absolute() or not p.is_file():
             raise FileNotFoundError(f'entry config {key!r} must be an existing absolute file: {p}')
     return cfg
+
+
+def load_cn_config(path=None) -> dict:
+    """Qoder CN 原生 EXE 入口配置（与国际 Node-bundle 配置并存、互不覆盖）。要求：
+    - `cli`：qodercn 原生可执行文件的绝对且存在路径；
+    - `config_dir`：绝对且存在的配置目录（显式 --config-dir 可覆盖）；
+    - `model_ids`：友好名→真实模型 ID 的映射（缺映射即拒绝启动，绝不回退同名的
+      内建/Qwen 模型，也不把友好名当 ID）。
+    配置只留占位示例、绝不含真实登录态或凭据。"""
+    cfg_path = Path(path) if path else DEFAULT_CN_CONFIG
+    if not cfg_path.is_absolute():
+        raise ValueError(f'CN entry config path must be absolute: {cfg_path}')
+    if not cfg_path.is_file():
+        raise FileNotFoundError(f'CN entry config file not found: {cfg_path}')
+    cfg_path = cfg_path.resolve()
+    cfg = json.loads(cfg_path.read_text(encoding='utf-8'))
+    if not isinstance(cfg, dict):
+        raise ValueError(f'CN entry config must be a JSON object: {cfg_path}')
+    for key in ('cli', 'config_dir'):
+        if key not in cfg:
+            raise KeyError(f'CN entry config missing key {key!r}: {cfg_path}')
+        p = Path(cfg[key])
+        if not p.is_absolute():
+            raise ValueError(f'CN entry config {key!r} must be an absolute path: {p}')
+    if not Path(cfg['cli']).is_file():
+        raise FileNotFoundError(f'CN entry config cli must be an existing file: {cfg["cli"]}')
+    if not Path(cfg['config_dir']).is_dir():
+        raise FileNotFoundError(f'CN entry config config_dir must be an existing dir: '
+                                f'{cfg["config_dir"]}')
+    model_ids = cfg.get('model_ids')
+    if not isinstance(model_ids, dict) or not model_ids:
+        raise ValueError(f'CN entry config model_ids must be a non-empty object: {cfg_path}')
+    for name, mid in model_ids.items():
+        if not isinstance(name, str) or not isinstance(mid, str) or not name.strip() \
+                or not mid.strip():
+            raise ValueError(f'CN entry config model_ids entries must be non-empty '
+                             f'strings: {name!r}->{mid!r}')
+    return cfg
+
+
+def resolve_cn_model_id(cfg: dict, model: str) -> str | None:
+    """把 CN 友好模型名映射成真实模型 ID；缺映射返回 None（调用方拒绝启动、零 Popen）。
+    绝不猜同名的内建/Qwen 模型，绝不把友好名当 ID 直接下发。"""
+    return cfg['model_ids'].get(model)
 
 
 def _validate_rule_list(value, *, field: str):
@@ -138,6 +189,33 @@ def build_argv(cfg: dict, workspace: str, model: str, tools: str,
                                         disallowed_tools, add_dirs)
     argv = [cfg['node'], cfg['qodercli'],
             '--cwd', workspace, '--model', model,
+            '--tools', tools, '--permission-mode', 'dont_ask',
+            '--strict-mcp-config', '--mcp-config', '{"mcpServers":{}}',
+            '--output-format', 'json', '-p']
+    for rule in perms['allowed_tools']:
+        argv += ['--allowed-tools', rule]
+    for rule in perms['disallowed_tools']:
+        argv += ['--disallowed-tools', rule]
+    for d in perms['add_dirs']:
+        argv += ['--add-dir', d]
+    if session_id:
+        argv += ['--resume', session_id]
+    return argv
+
+
+def build_cn_argv(cfg: dict, config_dir: str, model_id: str, workspace: str, tools: str,
+                  session_id: str | None, *,
+                  allowed_tools=None, disallowed_tools=None,
+                  add_dirs=None) -> list[str]:
+    """Qoder CN 原生 EXE 调用的安全参数数组（无 shell），与国际 build_argv 严格区分：
+    - 首元素是原生 `cli`（非 node + qodercli.js）；
+    - `--config-dir` 承载本机登录态所在配置目录（显式传入、不读默认用户目录）；
+    - `--model` 下发的是 config.model_ids 映射出的**真实模型 ID**（非友好名、非 Qwen）。
+    权限/工具可见性/续接口径与国际一致，permission-mode 固定 dont_ask。"""
+    perms = effective_permission_rules(tools, allowed_tools,
+                                        disallowed_tools, add_dirs)
+    argv = [cfg['cli'], '--config-dir', config_dir,
+            '--cwd', workspace, '--model', model_id,
             '--tools', tools, '--permission-mode', 'dont_ask',
             '--strict-mcp-config', '--mcp-config', '{"mcpServers":{}}',
             '--output-format', 'json', '-p']
@@ -385,7 +463,22 @@ def main():
     ap.add_argument('--resume-session-id', '--session-id', dest='session_id', default=None,
                     help='Resume a known Qoder session using the official --resume flag.')
     ap.add_argument('--config', default=str(DEFAULT_CONFIG),
-                    help='Local entry config JSON with absolute node/qodercli paths.')
+                    help='Local entry config JSON with absolute node/qodercli paths '
+                         '(international runtime=qoder).')
+    ap.add_argument('--runtime', default=RUNTIME_INTERNATIONAL,
+                    choices=[RUNTIME_INTERNATIONAL, RUNTIME_CN],
+                    help='Executor runtime. "qoder" = existing international Node-bundle '
+                         'config (unchanged). "qodercn" = local Qoder CN native EXE via a '
+                         'separate CN config (cli/config_dir/model_ids).')
+    ap.add_argument('--cn-config', default=str(DEFAULT_CN_CONFIG),
+                    help='Qoder CN native entry config JSON (runtime=qodercn only).')
+    ap.add_argument('--config-dir', dest='config_dir', default=None,
+                    help='Explicit Qoder CN config dir override (runtime=qodercn only); '
+                         'otherwise the CN config config_dir is used.')
+    ap.add_argument('--resume-source', dest='resume_source', default=None,
+                    help='Path to a prior CN request.json that verifiably established '
+                         'the CN session (runtime=qodercn only). CN continuation is '
+                         'refused without this verifiable CN source.')
     ap.add_argument('--dispatch-plan', dest='dispatch_plan', default=None,
                     help='Optional task-level dispatch plan JSON. New parallel dispatch '
                          'must supply it; the legacy path (no plan) stays compatible. '
@@ -436,7 +529,55 @@ def main():
     args = ap.parse_args()
     if not args.stage or not args.stage.strip():
         ap.error('--stage is required and must be non-empty')
-    cfg = load_entry_config(args.config)
+    is_cn = args.runtime == RUNTIME_CN
+    cn_model_id = None
+    cn_config_dir = None
+    if is_cn:
+        # CN 原生运行时：独立配置、独立 config_dir、友好名→真实 ID 映射；任一不满足都在
+        # 读提示词、消费容量、建目录、Popen 之前拒绝（零 Popen、零证据目录）。
+        try:
+            cfg = load_cn_config(args.cn_config)
+        except (ValueError, KeyError, FileNotFoundError, OSError,
+                json.JSONDecodeError) as exc:
+            print(json.dumps({'cn_entry_rejected': True, 'sent': False, 'exit_code': 2,
+                              'runtime': RUNTIME_CN,
+                              'reasons': [f'Qoder CN config invalid: {exc!r}']},
+                             ensure_ascii=False))
+            return 2
+        cn_config_dir = args.config_dir or cfg['config_dir']
+        cn_model_id = resolve_cn_model_id(cfg, args.model)
+        if cn_model_id is None:
+            print(json.dumps({'cn_model_mapping_missing': True, 'sent': False,
+                              'exit_code': 2, 'runtime': RUNTIME_CN,
+                              'model_requested': args.model,
+                              'reasons': ['requested CN model has no real model-id '
+                                          'mapping; refusing to send the friendly name '
+                                          'as an ID or to auto-select a same-named/Qwen '
+                                          'builtin — zero Popen']}, ensure_ascii=False))
+            return 2
+        if args.session_id:
+            # CN 接续：至少拒绝把国际原件/session 当作 CN 续用；无来源可证 → 拒绝。绝不新建
+            # 会话系统——只有 --resume-source 指向一份 runtime=qodercn 的历史 request 才放行。
+            src_ok = False
+            src_reason = 'no --resume-source provided to verify a CN origin'
+            if args.resume_source:
+                try:
+                    prior = json.loads(Path(args.resume_source).read_text(encoding='utf-8'))
+                    if prior.get('runtime_name') == RUNTIME_CN and prior.get('resume_verifiable'):
+                        src_ok = True
+                    else:
+                        src_reason = (f'resume source {args.resume_source!r} is not a '
+                                      f'verifiable Qoder CN original (runtime_name='
+                                      f'{prior.get("runtime_name")!r})')
+                except (OSError, ValueError) as exc:
+                    src_reason = f'resume source unreadable: {exc!r}'
+            if not src_ok:
+                print(json.dumps({'cn_resume_rejected': True, 'sent': False,
+                                  'exit_code': 2, 'runtime': RUNTIME_CN,
+                                  'reasons': [src_reason]}, ensure_ascii=False))
+                return 2
+    else:
+        cfg = load_entry_config(args.config)
     work = Path(args.workspace).resolve(strict=True)
     prompt_path = Path(args.prompt_file).resolve(strict=True)
     prompt_bytes = prompt_path.read_bytes()
@@ -446,10 +587,16 @@ def main():
     out = Path(args.output_dir).resolve()
     perms = effective_permission_rules(args.tools, args.allowed_tools,
                                         args.disallowed_tools, args.add_dirs)
-    argv = build_argv(cfg, str(work), args.model, args.tools, args.session_id,
-                      allowed_tools=perms['allowed_tools'],
-                      disallowed_tools=perms['disallowed_tools'],
-                      add_dirs=perms['add_dirs'])
+    if is_cn:
+        argv = build_cn_argv(cfg, cn_config_dir, cn_model_id, str(work), args.tools,
+                             args.session_id, allowed_tools=perms['allowed_tools'],
+                             disallowed_tools=perms['disallowed_tools'],
+                             add_dirs=perms['add_dirs'])
+    else:
+        argv = build_argv(cfg, str(work), args.model, args.tools, args.session_id,
+                          allowed_tools=perms['allowed_tools'],
+                          disallowed_tools=perms['disallowed_tools'],
+                          add_dirs=perms['add_dirs'])
     # Put the carrier contract in the official system-prompt channel as well as
     # the full task template. Never repair or trim the returned report. The contract
     # comes from the shared prompt-contract module so all three entries emit an
@@ -474,7 +621,7 @@ def main():
                              ensure_ascii=False))
             return 2
         actual = {'task_id': plan.get('task_id'), 'stage': args.stage,
-                  'runtime': 'qoder', 'model': args.model, 'workspace': str(work),
+                  'runtime': args.runtime, 'model': args.model, 'workspace': str(work),
                   'cwd': str(work), 'prompt_sha256': prompt_sha256,
                   'argv': argv, 'shell': False,
                   'grants': ec.grants_from_rules(perms['allowed_tools'],
@@ -511,11 +658,11 @@ def main():
     # 绝不因历史 committed 计数被 1:1 改派到 ZCode；同一持久 ZCode availability 状态只用于
     # 保证不会被绕回不可用的 ZCode。
     pool_gate = dp.consume_for_entry(
-        dispatch_store, task_id=task_id, runtime='qoder', model=args.model,
+        dispatch_store, task_id=task_id, runtime=args.runtime, model=args.model,
         workspace=str(work), prompt_sha256=prompt_sha256, stage=args.stage,
         chat_id=args.chat_id, claim_token=args.dispatch_claim,
         wrapper_pid=wrapper_pid, wrapper_created=wrapper_created,
-        executor='qoder', quota_store=quota_store, quota_routes=args.quota_routes)
+        executor=args.runtime, quota_store=quota_store, quota_routes=args.quota_routes)
     if not pool_gate['allowed']:
         print(json.dumps({'capacity_gate_rejected': True, 'sent': False, 'exit_code': 2,
                           'routing_required': bool(pool_gate.get('routing_required')),
@@ -577,9 +724,16 @@ def main():
                    'add_dirs': list(perms['add_dirs']),
                    'stage': args.stage, 'chat_id': args.chat_id,
                    'resume_session_id': args.session_id,
-                   'entry_config': str(Path(args.config).resolve()),
-                   'runtime': {'node': cfg['node'], 'qodercli': cfg['qodercli']},
+                   'entry_config': str(Path(args.cn_config if is_cn else args.config).resolve()),
+                   'runtime': ({'cli': cfg['cli'], 'config_dir': cn_config_dir} if is_cn
+                               else {'node': cfg['node'], 'qodercli': cfg['qodercli']}),
                    'argv': argv}
+        if is_cn:
+            # 保留真实 runtime / model_requested(友好名) / model_id(真实 ID) 口径；旧国际
+            # 请求记录不受影响。resume_verifiable 供 CN 接续来源核验。
+            request['runtime_name'] = RUNTIME_CN
+            request['model_id'] = cn_model_id
+            request['resume_verifiable'] = True
         if plan_block is not None:
             request['dispatch_plan'] = plan_block
         (out / 'request.json').write_text(json.dumps(request, ensure_ascii=False, indent=2),

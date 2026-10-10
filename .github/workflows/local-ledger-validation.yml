@@ -129,6 +129,19 @@ jobs:
       - name: Dispatch pool multiprocess offline regression (cross-OS spawn, temp SQLite)
         run: python -m unittest discover -s tests -p "test_dispatch_pool_multiprocess.py" -v
 
+      # BW-QODER-CN-20261010-A4：Qoder CN 容量池行为回归（CN 固定 2 槽 / 国内总 8；AUTO 在
+      # 原合格主力与国际 Flash 不可用或已满后把 CN 当最后补充候选——6 满+CN 空 routing_required
+      # 选 CN、入口已是 CN 则 claim、只有原 8 全满才物理 capacity_full；明确 Qoder/ZCode/CN 约束
+      # 不互换；跨区域并行/同区单写入/跨 runtime 拒消费旧 claim/真实终态释放/Z hard_hold 跳过），
+      # 与 CN 原生直连回归（国际 argv 逐字不变、友好名→真实 ID 映射、缺映射 0 Popen、跨 runtime
+      # 接续拒绝）。每用例独立临时 SQLite + 本地假 Popen，绝不读写真实/共享池或额度库；纯标准库、
+      # 无网络、不登录、不调模型，Windows/Linux 矩阵都跑。
+      - name: Dispatch pool Qoder CN behavior offline regression (temp SQLite, no real pool)
+        run: python -m unittest discover -s tests -p "test_dispatch_pool_qodercn.py" -v
+
+      - name: Qoder CN direct offline regression (no login or network)
+        run: python tests/test_qoder_cn_direct_offline.py
+
       - name: Parallel and fallback offline regression
         run: python tests/test_parallel_execution.py
 

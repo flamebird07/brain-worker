@@ -103,21 +103,31 @@ class _PoolBase(unittest.TestCase):
                                    now=T0, _preclaim=False)
 
     def fill_domestic(self):
-        """按 1:1 轮转把六个国内名额填满：zcode、Max 交替各 2，主力满后 Flash 2。
+        """把八个国内名额填满：zcode、Max 交替各 2，主力满后 Flash 2，再由显式
+        executor='qodercn' 补 2 个 CN 补充候选（原 Z2/国际 Max2/国际 Flash2 容量不变）。
 
-        返回 token 列表，顺序为 [zcode, Max, zcode, Max, Flash, Flash]。每个 task 独立
-        workspace；请求组合严格匹配轮转选中组合，绝不放松 1:1 或共享目录。
+        返回 token 列表，顺序为 [zcode, Max, zcode, Max, Flash, Flash, CN, CN]。每个 task
+        独立 workspace；CN 只能经显式 qodercn 入口 claim，AUTO 永不自动选中 CN。
         """
         seq = [('f0', 'zcode', 'GLM-5.3'), ('f1', 'qoder', 'Qwen3.8-Max'),
                ('f2', 'zcode', 'GLM-5.3'), ('f3', 'qoder', 'Qwen3.8-Max'),
                ('f4', 'qoder', 'Qwen3.8-Flash'), ('f5', 'qoder', 'Qwen3.8-Flash')]
         toks = [self.reserve(t, rt, md) for (t, rt, md) in seq]
+        # 2 个 CN 补充候选（独立 workspace，显式 executor='qodercn'）。
+        for t in ('f6', 'f7'):
+            r = dp.reserve(self.store, task_id=t, runtime='qodercn',
+                           model='DeepSeek-Flash',
+                           workspace=str(self._ws_for(t)), prompt_sha256='p',
+                           executor='qodercn', now=T0, _preclaim=False)
+            self.assertClaimed(r, 'qodercn:DeepSeek-Flash')
+            toks.append(r['token'])
         st = dp.status(self.store, now=T0)
         self.assertEqual(st['domestic']['active'], dp.DOMESTIC_TOTAL_CAPACITY)
         self.assertTrue(st['domestic']['full'])
         self.assertEqual(st['pools']['zcode:GLM-5.3']['active'], 2)
         self.assertEqual(st['pools']['qoder:Qwen3.8-Max']['active'], 2)
         self.assertEqual(st['pools']['qoder:Qwen3.8-Flash']['active'], 2)
+        self.assertEqual(st['pools']['qodercn:DeepSeek-Flash']['active'], 2)
         return toks
 
 
@@ -126,13 +136,14 @@ class CapacityAndKnownPoolTests(_PoolBase):
         self.assertEqual(dp.capacity_for('zcode:GLM-5.3'), 2)
         self.assertEqual(dp.capacity_for('qoder:Qwen3.8-Max'), 2)
         self.assertEqual(dp.capacity_for('qoder:Qwen3.8-Flash'), 2)
+        self.assertEqual(dp.capacity_for('qodercn:DeepSeek-Flash'), 2)
         self.assertIsNone(dp.capacity_for('luna:native'))
         self.assertEqual(dp.capacity_for('qoder:Unknown-Model'), 0)
-        self.assertEqual(dp.DOMESTIC_TOTAL_CAPACITY, 6)
+        self.assertEqual(dp.DOMESTIC_TOTAL_CAPACITY, 8)
 
     def test_is_known_pool(self):
         for pk in ('zcode:GLM-5.3', 'qoder:Qwen3.8-Max',
-                   'qoder:Qwen3.8-Flash', 'luna:native'):
+                   'qoder:Qwen3.8-Flash', 'qodercn:DeepSeek-Flash', 'luna:native'):
             self.assertTrue(dp.is_known_pool(pk), pk)
         self.assertFalse(dp.is_known_pool('qoder:GLM-5.3'))
         self.assertFalse(dp.is_known_pool('zcode:Qwen3.8-Max'))
@@ -231,8 +242,19 @@ class OverflowRoutingTests(_PoolBase):
         self.reserve('m3', 'qoder', 'Qwen3.8-Max')
         self.reserve('f0', 'qoder', 'Qwen3.8-Flash')
         self.reserve('f1', 'qoder', 'Qwen3.8-Flash')
+        # AUTO 入口请求 Flash：主力与 Flash 均满，但 CN 补充候选仍有空位 → 不再报整池 full，
+        # 而是 routing_required 选 CN（旧 6 满 + CN 空语义），且未真正占槽。
         r = self.select('f2', 'qoder', 'Qwen3.8-Flash')
-        self.assertRejected(r, 'capacity_full')
+        self.assertFalse(r.get('allowed'), r)
+        self.assertTrue(r.get('routing_required'), r)
+        self.assertEqual(r['selected']['pool_key'], dp.CN_POOL_KEY)
+        self.assertFalse(r.get('domestic_full'), r)
+        # 显式 executor='qoder'：Flash 满仍按该 combo 自身容量判满，绝不扩指定执行器到 CN。
+        q = dp.reserve(self.store, task_id='fq', runtime='qoder', model='Qwen3.8-Flash',
+                       workspace=str(self._ws_for('fq')), prompt_sha256='p',
+                       executor='qoder', now=T0, _preclaim=False)
+        self.assertRejected(q, 'capacity_full')
+        self.assertFalse(q.get('domestic_full'), q)
 
 
 class SameWorkspaceGuardTests(_PoolBase):
@@ -726,9 +748,9 @@ class StatusTests(_PoolBase):
         self.reserve('q', 'qoder', 'Qwen3.8-Max')
         st = dp.status(self.store, now=T0)
         self.assertEqual(set(st['pools']), set(dp.CAPACITY))
-        self.assertEqual(st['domestic']['capacity'], 6)
+        self.assertEqual(st['domestic']['capacity'], 8)
         self.assertEqual(st['domestic']['active'], 2)
-        self.assertEqual(st['domestic']['free'], 4)
+        self.assertEqual(st['domestic']['free'], 6)
         self.assertFalse(st['domestic']['full'])
         self.assertEqual(st['rotation']['committed_zcode'], 1)
         self.assertEqual(st['rotation']['committed_qoder'], 1)
@@ -740,8 +762,8 @@ class StatusTests(_PoolBase):
         dp.claim_due(self.store, task_id='L', now=T0 + timedelta(seconds=400),
                      _preclaim=False)
         st = dp.status(self.store, now=T0)
-        # Luna 在途不占国内名额口径（国内仍为 6/6，Luna 单列且无上限）。
-        self.assertEqual(st['domestic']['active'], 6)
+        # Luna 在途不占国内名额口径（国内仍为 8/8，Luna 单列且无上限）。
+        self.assertEqual(st['domestic']['active'], 8)
         self.assertEqual(st['pools'][dp.LUNA_KEY]['active'], 1)
 
 

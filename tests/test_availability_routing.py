@@ -93,11 +93,13 @@ class _TmpBase(unittest.TestCase):
         toks = []
         combos = [('zcode', 'GLM-5.3'), ('zcode', 'GLM-5.3'),
                   ('qoder', 'Qwen3.8-Max'), ('qoder', 'Qwen3.8-Max'),
-                  ('qoder', 'Qwen3.8-Flash'), ('qoder', 'Qwen3.8-Flash')]
+                  ('qoder', 'Qwen3.8-Flash'), ('qoder', 'Qwen3.8-Flash'),
+                  ('qodercn', 'DeepSeek-Flash'), ('qodercn', 'DeepSeek-Flash')]
         for i, (rt, md) in enumerate(combos):
+            ex = 'zcode' if rt == 'zcode' else ('qodercn' if rt == 'qodercn' else 'qoder')
             r = dp.reserve(self.dispatch, task_id=f'f{i}', runtime=rt, model=md,
                            workspace=str(self._ws_for(f'f{i}')), prompt_sha256='p',
-                           stage='s1', now=T0, executor=('zcode' if rt == 'zcode' else 'qoder'))
+                           stage='s1', now=T0, executor=ex)
             self.assertTrue(r['reserved'], r)
             toks.append(r['token'])
         return toks
@@ -358,9 +360,10 @@ class DispatchRoutingTests(_TmpBase):
         self.assertEqual(self._active(ZCODE), 0)
 
     def test_reclaim_skips_blocked_zcode(self):
-        # 降级票据（capacity）在国内未满时创建；claim_due 原子回收只选可用主力（跳过 ZCode）。
-        # B4 缺陷 7：capacity 降级必须客观核验受信任候选确实排空——先把 QMax+Flash 占满
-        # （ZCode 已 blocked 不在合格候选），再释放一个 QMax 名额，回收才会原子落到 QMax。
+        # 降级票据（capacity）只在受信任候选确实排空时记录；claim_due 原子回收只选可用主力
+        # （跳过被 blocked 的 ZCode）。B4 缺陷 7：capacity 降级必须客观核验受信任候选（含 CN
+        # 补充候选）真实排空——先把 QMax+Flash+CN 占满（ZCode 已 blocked 不在合格候选），再
+        # 释放一个 QMax 名额，回收才会原子落到 QMax，Z 始终保持 blocked（不为旧断言排除 CN）。
         self._hold_zcode()
         toks = []
         for i in range(2):
@@ -375,6 +378,12 @@ class DispatchRoutingTests(_TmpBase):
                            prompt_sha256='p', stage='s1', now=T0, executor='qoder')
             self.assertTrue(r['reserved'], r)
             toks.append(r['token'])
+        for i in range(2):
+            r = dp.reserve(self.dispatch, task_id=f'cn{i}', runtime='qodercn',
+                           model='DeepSeek-Flash', workspace=str(self._ws_for(f'cn{i}')),
+                           prompt_sha256='p', stage='s1', now=T0, executor='qodercn')
+            self.assertTrue(r['reserved'], r)
+            toks.append(r['token'])
         sc = self._scope('rc')
         ask = dp.ask_record(self.dispatch, task_id='rc', scope=sc, ask_message_id='m1',
                             now=T0, degradation_reason='capacity',
@@ -387,6 +396,8 @@ class DispatchRoutingTests(_TmpBase):
         self.assertTrue(out['claimed'], out)
         self.assertEqual(out['mode'], 'domestic_reclaim')
         self.assertEqual(out['pool_key'], QMAX)
+        # ZCode 保持 blocked：回收从不因 availability hold 被绕开。
+        self.assertEqual(self._active(ZCODE), 0)
 
 
 # ============================================================ C. Luna 状态机

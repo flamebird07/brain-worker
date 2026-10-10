@@ -185,7 +185,8 @@ class _SpawnMixin(unittest.TestCase):
             return [dict(r) for r in conn.execute(sql, params).fetchall()]
 
     def _fill_six_via_api(self):
-        """真实 API 填满六满基线（交替主力 → 各 2，再 Flash 2），返回 token 列表。"""
+        """真实 API 填满八满基线（交替主力 → 各 2，再 Flash 2，再显式 qodercn 补 2），
+        返回 token 列表。CN 只能经 executor='qodercn' 独立 claim，AUTO 永不自动选中。"""
         toks = []
         plan = [('zcode', 'GLM-5.3'), ('qoder', 'Qwen3.8-Max'),
                 ('zcode', 'GLM-5.3'), ('qoder', 'Qwen3.8-Max'),
@@ -195,6 +196,15 @@ class _SpawnMixin(unittest.TestCase):
                                       model=md, workspace=f'C:/mp/base-{i}',
                                       chat_id=f'bc{i}',
                                       stage=f'bs{i}', prompt_sha256=f'{i}' * 64,
+                                      now=T0, _preclaim=False)
+            self.assertTrue(out['allowed'], out)
+            toks.append(out['token'])
+        for j in range(2):
+            out = dp.select_and_claim(self.store, task_id=f'base-cn-{j}',
+                                      runtime='qodercn', model='DeepSeek-Flash',
+                                      workspace=f'C:/mp/base-cn-{j}',
+                                      chat_id=f'bcc{j}', stage=f'bsc{j}',
+                                      prompt_sha256=f'c{j}' * 64, executor='qodercn',
                                       now=T0, _preclaim=False)
             self.assertTrue(out['allowed'], out)
             toks.append(out['token'])
@@ -308,9 +318,9 @@ class TestSixFullRace(_SpawnMixin, unittest.TestCase):
             self.assertEqual(ticket['claimed_token'], fin['token'])
         else:
             self.assertEqual(fin['mode'], 'domestic_reclaim')
-        # 国内总量不超 6。
+        # 国内总量不超总容量（BW-QODER-CN-20261010-A2 起为 8）。
         dom = dp.status(self.store, now=T0 + timedelta(seconds=301))['domestic']
-        self.assertLessEqual(dom['active'], 6)
+        self.assertLessEqual(dom['active'], dp.DOMESTIC_TOTAL_CAPACITY)
 
 
 class TestPidReuseAndLateFinish(_SpawnMixin, unittest.TestCase):

@@ -1,0 +1,7 @@
+{
+  "cli": "/absolute/path/to/qodercn-native-cli",
+  "config_dir": "/absolute/path/to/qodercn/config-dir",
+  "model_ids": {
+    "DeepSeek-Flash": "REPLACE_WITH_REAL_CN_MODEL_ID"
+  }
+}
