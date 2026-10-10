@@ -2,7 +2,7 @@
 
 > 运行时 `runtime='qodercn'`：本机已登录的 Qoder CN **原生 CLI**（EXE），与既有国际
 > `qoder`（node + `qodercli.js` bundle）**并存、互不覆盖**。本轮落实最小可验收改动：
-> 独立配置、友好名→真实模型 ID 映射、CN 六池容量（内置 Max=1 时段门同国际、自定义主力 `Qwen-3.8-Max`=2 不套时段仍复用限额、与国际 Flash 同级的 Flash=2；国内合计 10）、跨区域并行/同区互斥、跨 runtime
+> 独立配置、友好名→真实模型 ID 映射、CN 六池容量（内置 Max=1 时段门同国际、自定义主力 `Qwen-3.8-Max`=2 时段门同国际（BW-CUSTOM-MAX-NIGHT-20261010-S1 起纳入仅北京 22:00 含至 08:00 不含作主力）并复用限额、与国际 Flash 同级的 Flash=2；国内合计 10）、跨区域并行/同区互斥、跨 runtime
 > claim 隔离、真实终态释放、Z 限额自动跳过（复用既有 availability）。**真实 CN 隔离小读/写
 > 已由主脑独立验收**（见下节）；CN 后端权重/费用/真实模型 ID 身份仍未知，**本轮未做完整工程
 > 验收，也未安装/上线**。
@@ -60,7 +60,7 @@ python <技能目录>/scripts/qoder_direct.py --runtime qodercn --cn-config <绝
 
 ## 容量与并行（与 global-dispatch 一致）
 
-- CN 池当前有效容量（BW-POOL-SPLIT-20261010-S2/S3 + BW-MAX-WINDOW-20261010-S2 六池定型）：主力 **`qodercn:Qwen3.8-Max=1`**（CN 内置 Max，独立池、时段门同国际 Max）、CN 自定义主力 **`qodercn:Qwen-3.8-Max=2`**（友好名带连字符 `Qwen-3.8-Max`，与内置 `Qwen3.8-Max` 不同；属 Qoder 主力组、复用既有 committed 1:1 轮换、**不套时段门、但复用 `main_force_limits` 限额判定、各自 pool_key 独立落标**），同级兜底 **`qodercn:Qwen3.8-Flash=2`**（与 `qoder:Qwen3.8-Flash` 同级）。`qodercn:DeepSeek-Flash` 新派发退休为 0（`LEGACY_RETIRED_POOL_KEYS`，`_domestic_policy` 返 `unknown_pool`），仅供已存在旧在途 attempt 真实终态释放。（历史：BW-QODER-CN-20261010-A2/A4 阶段曾把 `qodercn:DeepSeek-Flash` 当固定 2 槽的独立/AUTO 最后补充候选、国际 Max 仍 2、合计 6→8，已由 S2/S3 五池口径取代，BW-MAX-WINDOW-20261010-S2 再并入 CN 自定义主力升为六池总 10。）
+- CN 池当前有效容量（BW-POOL-SPLIT-20261010-S2/S3 + BW-MAX-WINDOW-20261010-S2 六池定型）：主力 **`qodercn:Qwen3.8-Max=1`**（CN 内置 Max，独立池、时段门同国际 Max）、CN 自定义主力 **`qodercn:Qwen-3.8-Max=2`**（友好名带连字符 `Qwen-3.8-Max`，与内置 `Qwen3.8-Max` 不同；属 Qoder 主力组、复用既有 committed 1:1 轮换、**与两内置 Max 同套时段门（BW-CUSTOM-MAX-NIGHT-20261010-S1 起仅北京时间 22:00 含至次日 08:00 不含作为主力参与新派工）、并复用 `main_force_limits` 限额判定、各自 pool_key 独立落标**），同级兜底 **`qodercn:Qwen3.8-Flash=2`**（与 `qoder:Qwen3.8-Flash` 同级）。`qodercn:DeepSeek-Flash` 新派发退休为 0（`LEGACY_RETIRED_POOL_KEYS`，`_domestic_policy` 返 `unknown_pool`），仅供已存在旧在途 attempt 真实终态释放。（历史：BW-QODER-CN-20261010-A2/A4 阶段曾把 `qodercn:DeepSeek-Flash` 当固定 2 槽的独立/AUTO 最后补充候选、国际 Max 仍 2、合计 6→8，已由 S2/S3 五池口径取代，BW-MAX-WINDOW-20261010-S2 再并入 CN 自定义主力升为六池总 10。）
 - `AUTO` 在合格可用主力均不可用或已满时从两区 Flash **同级**选、可跨国际/CN 选合格候选；只有明确指定 `Qoder`/`ZCode`/`CN` 的 `executor`/`model` 约束才保持本地区、不互换、不扩大。默认入口仍通过准确
   runtime/model 选中的真正执行器提交，绝不伪装 Qwen 或改未授权模型。
 - **国内合计 10**：`zcode:GLM-5.3=2` + 国际内置 Max=1 + CN 内置 Max=1 + CN 自定义主力=2 + 国际 Flash=2 + CN Flash=2。Luna 阈值随总 10 更新，
@@ -104,7 +104,7 @@ CN 接续**至少拒绝把国际原件/session 当作 CN 续用**：无 `--resum
 
 ```text
 python tests/test_qoder_cn_direct_offline.py    # 国际 argv 不变 / CN 映射 / 缺映射 0 Popen / CN 接续拒绝
-python tests/test_dispatch_pool_qodercn.py      # CN 池/总 10、自定义主力不套时段、跨区域并行、同区互斥、跨 runtime 拒、终态释放、Z hold 跳过
+python tests/test_dispatch_pool_qodercn.py      # CN 池/总 10、自定义主力时段门同内置（用例经夜间 T0 claim）、跨区域并行、同区互斥、跨 runtime 拒、终态释放、Z hold 跳过
 ```
 
 两者用本地假 Popen、临时 SQLite，绝不读写真实/共享池或额度库，不证明真实后端能力。CN 隔离小
@@ -114,7 +114,7 @@ python tests/test_dispatch_pool_qodercn.py      # CN 池/总 10、自定义主�
 ## 六池真实分配与 CN 内置/自定义 Max 明确限额（2026-10-10，BW-POOL-SPLIT-20261010-S2/S3/S5 + BW-MAX-WINDOW-20261010-S2）
 
 S2/S3 依用户明确指令重构国内池，BW-MAX-WINDOW-20261010-S2 加 CN 自定义主力后定型为**六池真实分配、总 10**：
-- 主力：`zcode:GLM-5.3=2`、国际内置 `qoder:Qwen3.8-Max=1`、**CN 内置 `qodercn:Qwen3.8-Max=1`**、**CN 自定义 `qodercn:Qwen-3.8-Max=2`**（各池独立、可跨区域并行、跨 runtime 绝不互抢；自定义主力属 Qoder 主力组、复用既有 1:1 轮换、不套时段门）。
+- 主力：`zcode:GLM-5.3=2`、国际内置 `qoder:Qwen3.8-Max=1`、**CN 内置 `qodercn:Qwen3.8-Max=1`**、**CN 自定义 `qodercn:Qwen-3.8-Max=2`**（各池独立、可跨区域并行、跨 runtime 绝不互抢；自定义主力属 Qoder 主力组、复用既有 1:1 轮换、与两内置 Max 同套主力时段门（BW-CUSTOM-MAX-NIGHT-20261010-S1：仅北京 22:00 含至 08:00 不含作主力）。
 - 同级兜底 Flash：`qoder:Qwen3.8-Flash=2`、**`qodercn:Qwen3.8-Flash=2`**。两 Flash **同级**：`AUTO` 在合格可用主力均不可用或已满时从两区 Flash 选、可跨国际/CN 选合格候选；只有明确指定 `executor`/`model` 时才锁定本地区兜底（国际 Max→国际 Flash、CN Max→CN Flash），不跨区互换明确组合。
 - **CN 内置模型真实名**：`Qwen3.8-Max` / `Qwen3.8-Flash`（内置池口径，**不是** `Qwen-3.8-*`）；CN 自定义主力用带连字符的友好名 `Qwen-3.8-Max` 以示与内置区分，仍经私有 `model_ids` 映射到真实模型 ID。私有 `local-entry-cn.json` 的 `cli / config_dir / model_ids` 映射不改写、不覆盖、不新增评分或调度器；示例仅占位、绝不写死本机 UUID/真实 ID 到公共源码。
 - **DeepSeek-Flash 新派发退休为 0**：`LEGACY_RETIRED_POOL_KEYS = ('qodercn:DeepSeek-Flash',)`、`_domestic_policy` 返 `unknown_pool`；但既有在途 attempt 仍按真实 runtime/model 计入 `_domestic_active` 总数并做真实终态释放——不杀旧 Max/DeepSeek 进程、不因新池缩表误清活锁、不越总 10。
@@ -127,6 +127,6 @@ S5 给 **CN 内置 Qwen3.8-Max** 加上与国际 QMax 同规格的**明确限额
 - **落标 → 释放时序**：`main()` 先 `record_main_force_limit`、后 `_release_claim('finished', …)`；落标异常被 `except Exception` 兜住不阻断真实终态释放（不泄漏锁）。
 - **恢复只人工**：`release_main_force_limit(store, pk, note=…)` 只在用户明确额度恢复/重置后调用；不查余额、不加定时器/探针/评分/新服务/外部 API、不改 `quota_control.py`/`zcode_direct.py`、绝不靠成功旧日志自动清。
 - **AUTO/executor 路由保留**：`executor='qodercn'` 请求 CN Max 且未落标 → 直接 claim；已落标或已满 → 同 executor 内 CN Flash 兜底（`routing_required` 选 `qodercn:Qwen3.8-Flash`），绝不复活限额 Max、绝不跨地区换国际池。ZCode availability 跳过路径不变。Luna 侧不变：domestic 任何时刻都不启用 Luna、unknown 保占位、明确模型不偷偷换。
-- **牛马主力时段门（2026-10-10 BW-MAX-WINDOW-20261010-S1）**：用户锁定——Qoder CN 内置 `Qwen3.8-Max` **只在北京时间 22:00（含）至次日 08:00（不含）作为主力**，与国际 Max 同门。这段时间以外：`AUTO` 新派工自动跳过 CN Max（走 ZCode 主力或同级 CN Flash）；主脑显式把新任务 `reserve` 到 CN Max → `dispatch_pool` 如实拒绝 `main_force_window_closed`，绝不偷偷换成 CN Flash。若 CN Max 曾在时段内预留、启动时已跨过 08:00，`consume_for_entry` 把该 reserved 真实释放为 `start_failed`（只释放本任务占位、不泄漏不抢占），已 `running`/`unknown` 旧在途绝不误释放。北京时间固定按 UTC+8 折算、与本地时区无关；时段门只套两内置 `Qwen3.8-Max`，国内合计已由 BW-MAX-WINDOW-20261010-S2 升为 10，CN 自定义主力 `qodercn:Qwen-3.8-Max`（2 槽、不套时段、复用限额判定）与 CN Flash/ZCode/自定义模型一样不受该时段门影响。详见 [global-dispatch](global-dispatch.md) §“牛马主力时段门”。
+- **牛马主力时段门（2026-10-10 BW-MAX-WINDOW-20261010-S1）**：用户锁定——Qoder CN 内置 `Qwen3.8-Max` **只在北京时间 22:00（含）至次日 08:00（不含）作为主力**，与国际 Max 同门。这段时间以外：`AUTO` 新派工自动跳过 CN Max（走 ZCode 主力或同级 CN Flash）；主脑显式把新任务 `reserve` 到 CN Max → `dispatch_pool` 如实拒绝 `main_force_window_closed`，绝不偷偷换成 CN Flash。若 CN Max 曾在时段内预留、启动时已跨过 08:00，`consume_for_entry` 把该 reserved 真实释放为 `start_failed`（只释放本任务占位、不泄漏不抢占），已 `running`/`unknown` 旧在途绝不误释放。北京时间固定按 UTC+8 折算、与本地时区无关；**BW-CUSTOM-MAX-NIGHT-20261010-S1 起时段门扩为三个 Qoder Max**（`WINDOW_GATED_MAIN_FORCES = (qoder:Qwen3.8-Max, qodercn:Qwen3.8-Max, qodercn:Qwen-3.8-Max)`），CN 自定义主力 `qodercn:Qwen-3.8-Max`（2 槽）与两内置走同一 `_max_window_blocks` 门、同享夜间窗口，白天显式 `reserve`/`consume`/原生入口 `select_and_claim` 同样 `main_force_window_closed`，跨 08:00 的 `reserved` 真实释放而 `running`/`unknown` 不被抢占；国内合计仍由 BW-MAX-WINDOW-20261010-S2 升为 10（容量口径不变）；CN Flash、ZCode、退休 DeepSeek 与其他自定义模型不受该时段门影响。详见 [global-dispatch](global-dispatch.md) §“牛马主力时段门”。
 
-**离线回归**（每用例独立临时 SQLite，零网络）：`tests/test_dispatch_pool_qodercn.py`（六池容量含 CN 自定义主力不套时段/退休 DeepSeek `unknown_pool`/跨区域并行/跨 runtime 拒/终态释放/Z hold 跳过）、`tests/test_dispatch_pool.py::MainForceLimitTests`（record/read/release/read 往返 + drift 全拒 + `consume_for_entry` 只释放本次 reserved + 自定义 CN 主力限额无连带）、`tests/test_qoder_cn_direct_offline.py::ExplicitQuotaLimitHitTests`（真实文案命中 + 不误伤 + `_qoder_max_pool_key` 只对两内置 Max 与 CN 自定义主力返回非 None、其他一律 None）。Windows/Linux CI 矩阵都跑。
+**离线回归**（每用例独立临时 SQLite，零网络）：`tests/test_dispatch_pool_qodercn.py`（六池容量含 CN 自定义主力时段门同内置、用例经夜间 T0 claim/退休 DeepSeek `unknown_pool`/跨区域并行/跨 runtime 拒/终态释放/Z hold 跳过）、`tests/test_dispatch_pool.py::BeijingMainForceWindowTests`（三 Qoder Max 时段门：自定义 22:00 含/08:00 不含边界、白天显式与 AUTO 零启动、夜间两槽、跨 08 点本 reserved 真实释放、running 活任务不假释放）、`tests/test_dispatch_pool.py::MainForceLimitTests`（record/read/release/read 往返 + drift 全拒 + `consume_for_entry` 只释放本次 reserved + 自定义 CN 主力限额无连带）、`tests/test_qoder_cn_direct_offline.py::ExplicitQuotaLimitHitTests`（真实文案命中 + 不误伤 + `_qoder_max_pool_key` 只对两内置 Max 与 CN 自定义主力返回非 None、其他一律 None）。Windows/Linux CI 矩阵都跑。

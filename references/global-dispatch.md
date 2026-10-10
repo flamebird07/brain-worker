@@ -14,7 +14,7 @@
 | 主力 | `zcode:GLM-5.3` | 2 | 与其他主力按 committed 做 best-effort 1:1 轮换 |
 | 主力 | `qoder:Qwen3.8-Max` | 1 | 国际 Max 主力；明确限额命中时经 `main_force_limits` 自动跳过，不查余额；**BW-MAX-WINDOW-20261010-S1：作为主力仅北京时间 22:00（含）至次日 08:00（不含）参与新派工，其余时段 AUTO 自动跳过、主脑显式 `reserve` 如实拒绝** |
 | 主力 | `qodercn:Qwen3.8-Max` | 1 | CN 内置 Max 主力；独立池，不受国际 Max 标记影响，限额规则同国际 Max；**BW-MAX-WINDOW-20261010-S1：主力时段门同国际 Max（北京时间 22:00 含至 08:00 不含）** |
-| 主力 | `qodercn:Qwen-3.8-Max` | 2 | CN 自定义主力（友好名带连字符 `Qwen-3.8-Max`，与内置 `Qwen3.8-Max` 不同）；属 Qoder 主力组、复用既有 committed 1:1 轮换；**BW-MAX-WINDOW-20261010-S2：不套时段门（全天可新派），但复用 `main_force_limits` 限额判定，各自 pool_key 独立落标、对两内置 Max 无连带** |
+| 主力 | `qodercn:Qwen-3.8-Max` | 2 | CN 自定义主力（友好名带连字符 `Qwen-3.8-Max`，与内置 `Qwen3.8-Max` 不同）；属 Qoder 主力组、复用既有 committed 1:1 轮换；**BW-CUSTOM-MAX-NIGHT-20261010-S1：纳入主力时段门（作为主力仅北京时间 22:00 含至次日 08:00 不含参与新派工，其余时段 AUTO 自动跳过、主脑显式 `reserve`/`consume` 如实拒绝），并复用 `main_force_limits` 限额判定，各自 pool_key 独立落标、对两内置 Max 无连带** |
 | 兜底 | `qoder:Qwen3.8-Flash` | 2 | 与 CN Flash **同级**；`AUTO` 在合格可用主力均不可用或已满时从两区 Flash 选（可跨国际/CN），明确 `executor='qoder'` 时按本地区约束 |
 | 兜底 | `qodercn:Qwen3.8-Flash` | 2 | 与 `qoder:Qwen3.8-Flash` 同级；`AUTO` 可跨区选，明确 `executor='qodercn'` 时按本地区约束 |
 | 退休 | `qodercn:DeepSeek-Flash` | 0 | 新派发退休（`LEGACY_RETIRED_POOL_KEYS`，`_domestic_policy` 返 `unknown_pool`），仅供已存在旧在途 attempt 按真实 runtime/model 计入总数并真实终态释放 |
@@ -25,33 +25,37 @@
 - 未列入本表的组合（例如 `qoder:GLM-5.3`、`zcode:Qwen3.8-Max`、任意未授权模型）容量为 0，
   `reserve`/`select_and_claim` 一律以 `unknown_pool` 拒绝，绝不派发未授权组合。
 
-## 牛马主力时段门（BW-MAX-WINDOW-20261010-S1）
+## 牛马主力时段门（BW-MAX-WINDOW-20261010-S1 + BW-CUSTOM-MAX-NIGHT-20261010-S1）
 
-用户 2026-10-10 锁定：Qoder 国际内置 `Qwen3.8-Max` 与 Qoder CN 内置 `Qwen3.8-Max` **只在
-北京时间 22:00（含）至次日 08:00（不含）作为主力**参与新派工；其余时间新派工自动跳过。
+用户 2026-10-10 锁定：Qoder 国际内置 `Qwen3.8-Max`、Qoder CN 内置 `Qwen3.8-Max` 与 CN
+自定义 `Qwen-3.8-Max` 三个 Qoder Max **只在北京时间 22:00（含）至次日 08:00（不含）作为主力**
+参与新派工；其余时间新派工自动跳过（BW-CUSTOM-MAX-NIGHT-20261010-S1 把自定义纳入相同时段门）。
 实现口径（全部在 `dispatch_pool.py`，复用既有注入的 `now`/UTC，绝不依赖宿主系统时区）：
 
 - **北京时间固定按 UTC+8 折算**：`_beijing_hour(now)` 先把 `now` 归一到 UTC 再加 8 小时取
   小时；`_main_force_window_open` 判 `h≥22 或 h<8`——22:00 可选、08:00 不可选（左闭右开）。
-- **只门控这两个 Qoder 内置 Max**（`WINDOW_GATED_MAIN_FORCES = (qoder:Qwen3.8-Max, qodercn:Qwen3.8-Max)`）；`zcode:GLM-5.3` 主力、CN 自定义主力 `qodercn:Qwen-3.8-Max`、两地区
+- **门控这三个 Qoder Max**（`WINDOW_GATED_MAIN_FORCES = (qoder:Qwen3.8-Max,
+  qodercn:Qwen3.8-Max, qodercn:Qwen-3.8-Max)`）；`zcode:GLM-5.3` 主力、两地区
   `Qwen3.8-Flash` 兜底、`luna:native` 救援、已退休 `qodercn:DeepSeek-Flash` 一律不受时段约束。
-- **AUTO 白天自动跳过**：`_eligible_main_forces(conn, zcode_blocked, now)` 在非时段把两个 Max
-  从合格主力里剔除，`_select_main_force` 只在剩余主力（ZCode）里 best-effort 轮换，ZCode 也不可用
-  /已满时才落到同级 Flash；两 Max 被跳过后绝不新落。
+- **AUTO 白天自动跳过**：`_eligible_main_forces(conn, zcode_blocked, now)` 在非时段把三个 Qoder
+  Max 从合格主力里剔除，`_select_main_force` 只在剩余主力（ZCode）里 best-effort 轮换，ZCode 也不
+  可用/已满时才落到同级 Flash；三 Max 被跳过后绝不新落。
 - **主脑显式预留如实拒绝、绝不静默换模型**：`reserve(..., executor='qoder'/'qodercn',
-  model='Qwen3.8-Max', now=白天)` → `main_force_window_closed`（`sent=false`、非
-  `routing_required`），绝不偷偷换成同区 Flash。原生入口自身的 select/consume（同一 owner lane）
-  不因该时段门被硬拒，保持既有行为不依赖墙钟；真正的时段约束落在“候选过滤 + 主脑预留 + 启动前再检查”。
+  model='Qwen3.8-Max'/'Qwen-3.8-Max', now=白天)` → `main_force_window_closed`（`sent=false`、非
+  `routing_required`），绝不偷偷换成同区 Flash。自定义分支走同一 `_max_window_blocks` 门。原生入口
+  自身的 select/consume（同一 owner lane）**没有墙钟豁免**：`select_and_claim` 在时段外同样返回
+  `main_force_window_closed`（回滚、零提交），约束落在“候选过滤 + 主脑预留 + 原生入口 + 启动前再检查”
+  所有新派工入口。
 - **预留启动前再检查（跨 08:00 真实释放）**：`consume_for_entry` 消费已预留 token 前，若本 attempt
-  落在受门控 Max 而当前已离开时段：`reserved` 在同事务内真实释放为 `start_failed`（只释放本任务
-  自己的占位、绝不泄漏、绝不抢占别人名额）；`running`/`unknown` 旧在途绝不假释放，只拒绝重复启动。
-- **降级 `claim_due` 使用同一候选过滤**：国内回收经同一 `_eligible_main_forces` 过滤，钉住 Max 的原
-  scope 在非时段保持 pending（如实 `main_force_window_closed`/`model_unavailable`），绝不回收 Max、
-  绝不改派别的模型、绝不当作 Luna。
-- 活任务不追杀：本门只影响**新** `reserve`/`consume`/`claim_due`，已 running/unknown 占位与真实终态
-  释放逻辑完全不变。时段门只套两内置 `Qwen3.8-Max`；BW-MAX-WINDOW-20261010-S2 后续新增的 CN 自定义主力
-  `qodercn:Qwen-3.8-Max`（国内合计由 8 升为 10）不套时段门、但复用限额判定，与自定义模型/Flash/ZCode 一样不受时段约束；
-  不加定时器/余额查询/数据库表/后台任务。
+  落在受门控的任一 Qoder Max（含自定义）而当前已离开时段：`reserved` 在同事务内真实释放为
+  `start_failed`（只释放本任务自己的占位、绝不泄漏、绝不抢占别人名额）；`running`/`unknown` 旧在途
+  绝不假释放，只拒绝重复启动。
+- **降级 `claim_due` 使用同一候选过滤**：国内回收经同一 `_eligible_main_forces` 过滤，钉住任一
+  Qoder Max 的原 scope 在非时段保持 pending（如实 `main_force_window_closed`/`model_unavailable`），
+  绝不回收 Max、绝不改派别的模型、绝不当作 Luna。
+- 活任务不追杀：本门只影响**新** `reserve`/`consume`/`claim_due`，不改静态总容量 10、不弱化
+  capacity/锁/限额，已 running/unknown 占位与真实终态释放逻辑完全不变。不加定时器/余额查询/
+  数据库表/后台任务。
 
 ## 1:1 主力轮换是 best-effort，不是严格均衡
 

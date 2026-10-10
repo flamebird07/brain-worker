@@ -263,7 +263,7 @@ class TerminalReleaseTests(_Store):
         st = dp.status(self.store, now=T0)['domestic']
         self.assertEqual(st['active'], 6)
         self.assertFalse(st['full'])  # 6/10 不算满
-        # 补齐 CN 自定义 Max 2（不受时段约束，正常 executor='qodercn' claim）。
+        # 补齐 CN 自定义 Max 2（now=T0 为北京 23:00、在主力时段内，正常 executor='qodercn' claim）。
         for tid in ('cu0', 'cu1'):
             r = dp.select_and_claim(self.store, task_id=tid, runtime='qodercn',
                                     model='Qwen-3.8-Max', workspace=self.ws(tid),

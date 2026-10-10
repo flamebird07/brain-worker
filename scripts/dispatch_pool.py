@@ -205,7 +205,8 @@ CN_MODEL = 'Qwen3.8-Max'
 CN_POOL_KEY = f'{CN_RUNTIME}:{CN_MODEL}'  # 现指向 CN 主力 Qwen3.8-Max（正常池新组合）
 CN_MAX_POOL_KEY = f'{CN_RUNTIME}:Qwen3.8-Max'
 # BW-MAX-WINDOW-20261010-S2：CN 自定义 Qoder 主力友好名（短横线 Qwen-3.8-Max），真实 --model
-# 经既有私有 model_ids 映射下发，池名以友好名为准，属 Qoder 主力组、不受内置 Max 时段门约束。
+# 经既有私有 model_ids 映射下发，池名以友好名为准，属 Qoder 主力组；BW-CUSTOM-MAX-NIGHT-
+# 20261010-S1：与两内置 Max 同受北京时间主力时段门约束（仅 22:00 含至 08:00 不含新派工）。
 CN_CUSTOM_MAX_POOL_KEY = f'{CN_RUNTIME}:Qwen-3.8-Max'
 CN_CUSTOM_MAX_MODEL = 'Qwen-3.8-Max'
 CN_FLASH_POOL_KEY = f'{CN_RUNTIME}:Qwen3.8-Flash'
@@ -307,17 +308,18 @@ def _parse(ts):
 
 
 # ------------------------------------------------------------------ 主力时段（北京时间）
-# BW-MAX-WINDOW-20261010-S1：两个 Qoder 内置 Max（国际 qoder:Qwen3.8-Max 与 CN 内置
-# qodercn:Qwen3.8-Max）只在北京时间 22:00（含）至次日 08:00（不含）作为主力新派工；其它
-# 时间新 reserve/consume 自动跳过该两池。北京时间固定按 UTC+8 计算，绝不依赖宿主系统时区：
-# 把注入的 now（缺省 utcnow）折算到 +08:00 再取小时，与本地钟点无关。22:00 可选、08:00 不
-# 可选（左闭右开跨午夜窗口）。ZCode 主力、两地区 Flash 兜底、Luna、已 retired DeepSeek 的
-# 时段一律不受本窗口限制。
+# BW-CUSTOM-MAX-NIGHT-20261010-S1：三个 Qoder Max 主力（国际内置 qoder:Qwen3.8-Max、CN
+# 内置 qodercn:Qwen3.8-Max、CN 自定义 qodercn:Qwen-3.8-Max）只在北京时间 22:00（含）至
+# 次日 08:00（不含）作为主力新派工；其它时间新 reserve/consume 自动跳过该三池。北京时间固
+# 定按 UTC+8 计算，绝不依赖宿主系统时区：把注入的 now（缺省 utcnow）折算到 +08:00 再取小
+# 时，与本地钟点无关。22:00 可选、08:00 不可选（左闭右开跨午夜窗口）。ZCode 主力、两地区
+# Flash 兜底、Luna、已 retired DeepSeek 的时段一律不受本窗口限制。
 BEIJING_UTC_OFFSET = timedelta(hours=8)
 MAIN_FORCE_WINDOW_START_HOUR = 22  # 北京时间 22:00 含
 MAIN_FORCE_WINDOW_END_HOUR = 8      # 北京时间 08:00 不含
-# 仅这两个 Qoder 内置 Max 主力受时段门约束。
-WINDOW_GATED_MAIN_FORCES = (QMAX_POOL_KEY, CN_MAX_POOL_KEY)
+# 这三个 Qoder Max 主力受同一时段门约束（BW-CUSTOM-MAX-NIGHT-20261010-S1：把 CN 自定义
+# Qwen-3.8-Max 纳入相同时段门，AUTO/reserve/select/consume/claim_due 口径一致）。
+WINDOW_GATED_MAIN_FORCES = (QMAX_POOL_KEY, CN_MAX_POOL_KEY, CN_CUSTOM_MAX_POOL_KEY)
 
 
 def _beijing_hour(now) -> int:
@@ -339,7 +341,8 @@ def _main_force_window_open(now) -> bool:
 
 
 def _max_window_blocks(pk, now) -> bool:
-    """该池是否被主力时段门挡下：仅两个 Qoder 内置 Max 在非窗口时间被挡；其它池永不挡。"""
+    """该池是否被主力时段门挡下：仅三个 Qoder Max 主力（两内置 + CN 自定义）在非窗口时间被
+    挡；其它池永不挡。"""
     return pk in WINDOW_GATED_MAIN_FORCES and not _main_force_window_open(now)
 
 
@@ -913,11 +916,12 @@ def _eligible_main_forces(conn, zcode_blocked, now=None):
     限额都自动跳过、不查询余额；两个 Qoder 内置 Max 还受北京时间主力时段门约束。
     - ZCode:GLM-5.3 被持久 availability 阻断（hard_hold / bounded backoff /
       recovery_unverified）时剔除——保持既有 quota_control 口径不变；
-    - 两个 Qoder Max（国际 qoder:Qwen3.8-Max 与 CN 内置 qodercn:Qwen3.8-Max）被
-      `_main_force_limit_active` 明确限额标记命中时剔除（同一事务内只读回核）；
-    - BW-MAX-WINDOW-20261010-S1：同一两 Qoder Max 在北京时间非 22:00（含）至 08:00
-      （不含）时段的**新派工候选**里剔除（`_max_window_blocks`）；ZCode 主力不受时段约束，
-      两地区 Flash 兜底永不被时段/限额误挡。
+    - 三个 Qoder Max（国际 qoder:Qwen3.8-Max、CN 内置 qodercn:Qwen3.8-Max 与 CN 自定义
+      qodercn:Qwen-3.8-Max）被 `_main_force_limit_active` 明确限额标记命中时剔除（同一事务
+      内只读回核）；
+    - BW-MAX-WINDOW-20261010-S1 + BW-CUSTOM-MAX-NIGHT-20261010-S1：这三 Qoder Max 在北京
+      时间非 22:00（含）至 08:00（不含）时段的**新派工候选**里剔除（`_max_window_blocks`）；
+      ZCode 主力不受时段约束，两地区 Flash 兜底永不被时段/限额误挡。
     先过滤合格候选，再在可用主力间做 best-effort 平衡（绝不把名额分给不可用/已限额/
     非时段的主力）。"""
     eligible = set()
@@ -1073,12 +1077,13 @@ def _domestic_policy(conn, requested_pk, now, executor='auto', eligible=None,
       绝不跨执行器；提交非 qoder 组合 → executor_conflict；
     - executor='qodercn'（受信任主脑显式指定 CN 原生入口）：有空位且未被明确限额的
       qodercn:Qwen3.8-Max 直接 claim，同样**仅主力时段**、时段外 `main_force_window_closed`
-      拒绝；自定义 qodercn:Qwen-3.8-Max（不套时段、仍复用限额判定）有空且未限额 → 直接
+      拒绝；自定义 qodercn:Qwen-3.8-Max（BW-CUSTOM-MAX-NIGHT-20261010-S1：与两内置 Max 同
+      套主力时段门、时段外如实拒绝；时段内仍复用限额判定）有空且未限额 → 直接
       claim；Max 满或被明确限额 → routing 到 qodercn:Qwen3.8-Flash；Flash 也满 → full；
       绝不跨执行器；提交非 CN 组合 → executor_conflict；
     - executor='zcode'（ZCode 入口，最后的权威原子门）：ZCode 不可用 → zcode_unavailable；
       有空位 → claim；满 → full（绝不回落 Flash/其它池）；提交非 ZCode 组合 → executor_conflict；
-    - executor='auto'：先过滤合格候选（ZCode 不可用、时段外的两内置 Max、被明确限额的主力剔除），
+    - executor='auto'：先过滤合格候选（ZCode 不可用、时段外的三 Qoder Max（两内置 + 自定义）、被明确限额的主力剔除），
       再在可用主力之间按现有 rotation committed + 真实在途数做 best-effort 平衡；本池有空也不
       绕过轮转；选中≠请求 → routing；主力都不可用/已满/已限额 → 两地区 Flash 同级兜底；
       两 Flash 也满才 full。
@@ -1133,9 +1138,13 @@ def _domestic_policy(conn, requested_pk, now, executor='auto', eligible=None,
                 return 'routing', CN_FLASH_POOL_KEY
             return 'full', None
         if requested_pk == CN_CUSTOM_MAX_POOL_KEY:
-            # BW-POOL-SPLIT-20261010-S2：自定义 CN Max（Qwen-3.8-Max）不套内置时段，
-            # 但复用既有明确限额判定；有空位且未限额 → 直接 claim；已限额或已满 → CN Flash
-            # 兜底，绝不误挡 Flash、绝不跨执行器。
+            # BW-CUSTOM-MAX-NIGHT-20261010-S1：自定义 CN Max（Qwen-3.8-Max）纳入与两内置 Max
+            # 相同的北京时间主力时段门（仅 22:00 含至 08:00 不含做主力）；时段外无论
+            # reserve/select_and_claim/consume 一律如实拒绝新启动，绝不静默换成同区 CN Flash。
+            # 时段内复用既有明确限额判定；有空位且未限额 → 直接 claim；已限额或已满 → CN
+            # Flash 兜底，绝不误挡 Flash、绝不跨执行器。
+            if _max_window_blocks(CN_CUSTOM_MAX_POOL_KEY, now):
+                return 'main_force_window_closed', None
             if not _main_force_limit_active(conn, CN_CUSTOM_MAX_POOL_KEY):
                 cap = capacity_for(requested_pk)
                 if cap is not None and _count_active(conn, requested_pk) < cap:
@@ -1355,7 +1364,7 @@ def select_and_claim(store_path=None, *, task_id, runtime, model, workspace,
             if verdict == 'main_force_window_closed':
                 conn.execute('ROLLBACK')
                 return _reject('main_force_window_closed', task_id, pk,
-                               ['the explicitly requested Qoder built-in Qwen3.8-Max is '
+                               [f'the explicitly requested Qoder Max pool {pk!r} is '
                                 'only a main force during the Beijing-time window '
                                 '22:00 (inclusive) to 08:00 (exclusive); it is now '
                                 'outside that window, so a new dispatch is honestly '
@@ -1473,7 +1482,7 @@ def reserve(store_path=None, *, task_id, runtime, model, workspace, prompt_sha25
             if verdict == 'main_force_window_closed':
                 conn.execute('ROLLBACK')
                 return _reject('main_force_window_closed', task_id, pk,
-                               ['the explicitly reserved Qoder built-in Qwen3.8-Max is '
+                               [f'the explicitly reserved Qoder Max pool {pk!r} is '
                                 'only a main force during the Beijing-time window '
                                 '22:00 (inclusive) to 08:00 (exclusive); it is now '
                                 'outside that window, so the reserve is honestly refused '
@@ -1693,8 +1702,9 @@ def consume_for_entry(store_path=None, *, task_id, runtime, model, workspace,
                                 'reason': 'main_force_window_closed',
                                 'pool_key': row['pool_key'], 'task_id': task_id,
                                 'capacity_released': False,
-                                'reasons': ['this attempt reserved into a Qoder built-in '
-                                            'Qwen3.8-Max during the main-force window, but '
+                                'reasons': ['this attempt reserved into a gated Qoder Max '
+                                            f'pool {row["pool_key"]!r} during the main-force '
+                                            'window, but '
                                             'the Beijing-time window (22:00 inclusive to '
                                             '08:00 exclusive) has closed before the start '
                                             'and this attempt is no longer reserved (state='
@@ -2439,7 +2449,7 @@ def claim_due(store_path=None, *, task_id, now=None, scope=None,
                                            'so it is never silently swapped to another '
                                            'model (model_unavailable)'
                                            if scope_combo_limited else '')
-                                        + ('; the pinned Qoder built-in Qwen3.8-Max is only '
+                                        + ('; the pinned Qoder Max pool is only '
                                            'a main force during Beijing time 22:00 '
                                            '(inclusive) to 08:00 (exclusive) and is outside '
                                            'that window now, so it is never silently '

@@ -18,7 +18,7 @@ BW-MAX-WINDOW-20261010-S1（用户可理解的分配规则）：Qoder 国际内�
 到国际 Max → `dispatch_pool` 如实拒绝 `main_force_window_closed`，**绝不偷偷换成别的模型**。
 若 Max 曾在时段内预留、到启动时已跨过 08:00，`consume_for_entry` 会把该 reserved 占位真实释放为
 `start_failed`（只释放本任务自己那份，不泄漏、不抢别人），已 `running`/`unknown` 的旧在途绝不误
-释放。北京时间按固定 UTC+8 折算、与运行机器本地时区无关；时段门只套两内置 `Qwen3.8-Max`，国内合计已由 BW-MAX-WINDOW-20261010-S2 升为 10，CN 自定义主力 `qodercn:Qwen-3.8-Max`（2 槽、不套时段、复用限额判定）与 Flash/ZCode/自定义模型一样不受该时段门影响。详见 [global-dispatch](global-dispatch.md) §“牛马主力时段门”。
+释放。北京时间按固定 UTC+8 折算、与运行机器本地时区无关；时段门套三个 Qoder Max——两内置 `Qwen3.8-Max` 与 CN 自定义主力 `qodercn:Qwen-3.8-Max`（BW-CUSTOM-MAX-NIGHT-20261010-S1 起纳入同一 22:00 含至 08:00 不含时段门，白天 AUTO 跳过、显式 `reserve`/`consume` 如实拒绝、跨点真实释放本 reserved）；国内合计已由 BW-MAX-WINDOW-20261010-S2 升为 10；Flash/ZCode/其它自定义模型不受该时段门影响。详见 [global-dispatch](global-dispatch.md) §“牛马主力时段门”。
 
 BW-AVAILABILITY-20261009-B4：受信任主脑明确授权的 **`executor='qoder'` + `--model` 组合硬约束**贯穿
 `consume_for_entry`——含本阶段真实执行的 `Qwen3.8-Flash`——有空位即直接 claim 该精确组合，
