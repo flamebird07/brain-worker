@@ -5,7 +5,7 @@
 > `quota_control` 的**额度冷却门禁**是两回事：容量并发 ≠ 额度。落地口径以本文件为准，实现以
 > `scripts/dispatch_pool.py` 为准，二者不一致时以代码为准并回修文档。
 
-## 分配决策（当前有效，BW-POOL-SPLIT-20261010-S2/S3 + BW-MAX-WINDOW-20261010-S2 六池定型）
+## 分配决策（当前有效，BW-POOL-SPLIT-20261010-S2/S3 + BW-MAX-WINDOW-20261010-S2 六池定型 + BW-CLAUDE-DEEPSEEK-S3/S4 第 11 主力槽）
 
 所有会话共享同一个持久池，绝不各自为政：
 
@@ -18,9 +18,17 @@
 | 兜底 | `qoder:Qwen3.8-Flash` | 2 | 与 CN Flash **同级**；`AUTO` 在合格可用主力均不可用或已满时从两区 Flash 选（可跨国际/CN），明确 `executor='qoder'` 时按本地区约束 |
 | 兜底 | `qodercn:Qwen3.8-Flash` | 2 | 与 `qoder:Qwen3.8-Flash` 同级；`AUTO` 可跨区选，明确 `executor='qodercn'` 时按本地区约束 |
 | 退休 | `qodercn:DeepSeek-Flash` | 0 | 新派发退休（`LEGACY_RETIRED_POOL_KEYS`，`_domestic_policy` 返 `unknown_pool`），仅供已存在旧在途 attempt 按真实 runtime/model 计入总数并真实终态释放 |
+| 主力（第 11 槽，BW-CLAUDE-DEEPSEEK-S2/S3/S4） | `claude:deepseek-flash` | 1 | Claude Code CLI / deepseek-flash：容量 1，**已登记入 `MAIN_FORCE_POOLS`/`MAIN_FORCE_KEYS`/`MAIN_FORCE_CAPACITY`**，`DOMESTIC_TOTAL_CAPACITY = 6+4+1 = 11`（**原 10 槽一项未减**），claude 在途**计入** `_domestic_active`；属**独立第三公平组 claude**（committed 由 `_count_committed_claude` 从真实 attempts 统计，绝不污染 committed_zcode/committed_qoder），**AUTO 可选**但平票排 Z2/Qoder 之后、绝不抢原路由；显式 `executor='claude'`/点名该 combo 保持精确组合、无跨模型回退；受 `deepseek_offpeak` 时段门约束（工作日 09:00–12:00、14:00–18:00 高峰不得新派；其余/周末/2026 假日全天可派）；可承载 `main_force_limits` 明确限额标记 |
 | 救援 | `luna:native` | 无上限 | 只经 `claim-due` 竞争裁决，绝不被自动选中 |
 
-- **国内合计上限 = 10**（`DOMESTIC_TOTAL_CAPACITY=10`，`_domestic_active ≥ 10` 时任何新国内 claim 一律 `full`、不派第 11 个）：`zcode:GLM-5.3`=2 + 国际内置 Max=1 + CN 内置 Max=1 + CN 自定义主力=2 + 国际 Flash=2 + CN Flash=2。退休 DeepSeek 新派发不占额度但既有在途仍计入总数。（历史：本表旧版曾记为“国际 Max 各 2 + CN DeepSeek 补充 2、合计 6→8”，S2/S3 收为五池总 8，BW-MAX-WINDOW-20261010-S2 加入 CN 自定义主力升为六池总 10，详见 §11。）
+- **国内合计上限 = 11**（`DOMESTIC_TOTAL_CAPACITY = 主力 7（zcode 2 + 两内置 Max 各 1 + CN 自定义 2 +
+  claude 1）+ 两地区 Flash 各 2（4）= 11`，`_domestic_active ≥ 11` 时任何新国内 claim 一律 `full`、
+  **绝不派第 12 个**，仍在途的退休 DeepSeek 与超额旧 Max 等迁移债务同样计入总数）：
+  `zcode:GLM-5.3`=2 + 国际内置 Max=1 + CN 内置 Max=1 + CN 自定义主力=2 + `claude:deepseek-flash`=1
+  + 国际 Flash=2 + CN Flash=2。退休 DeepSeek 新派发不占额度但既有在途仍计入总数。
+  **原 10 槽一项未减**。（历史：本表旧版曾记为“国际 Max 各 2 + CN DeepSeek 补充 2、合计 6→8”，
+  S2/S3 收为五池总 8，BW-MAX-WINDOW-20261010-S2 加入 CN 自定义主力升为六池总 10，
+  BW-CLAUDE-DEEPSEEK-S3/S4 再加 claude 第 11 主力槽升为总 11，详见 §11。）
 - **Luna 无数量上限**，但它不计入国内名额，也永远不在正常路由里被派生。
 - 未列入本表的组合（例如 `qoder:GLM-5.3`、`zcode:Qwen3.8-Max`、任意未授权模型）容量为 0，
   `reserve`/`select_and_claim` 一律以 `unknown_pool` 拒绝，绝不派发未授权组合。
@@ -53,9 +61,69 @@
 - **降级 `claim_due` 使用同一候选过滤**：国内回收经同一 `_eligible_main_forces` 过滤，钉住任一
   Qoder Max 的原 scope 在非时段保持 pending（如实 `main_force_window_closed`/`model_unavailable`），
   绝不回收 Max、绝不改派别的模型、绝不当作 Luna。
-- 活任务不追杀：本门只影响**新** `reserve`/`consume`/`claim_due`，不改静态总容量 10、不弱化
+- 活任务不追杀：本门只影响**新** `reserve`/`consume`/`claim_due`，不改静态总容量 11、不弱化
   capacity/锁/限额，已 running/unknown 占位与真实终态释放逻辑完全不变。不加定时器/余额查询/
   数据库表/后台任务。
+
+## Claude Code / deepseek-flash 第 11 主力槽（BW-CLAUDE-DEEPSEEK-S2/S3/S4，现行口径）
+
+客户 2026-10-11 追加：新增 1 个主力槽 `claude:deepseek-flash`（Claude Code CLI，经 DeepSeek
+Anthropic 兼容入口 `https://api.deepseek.com/anthropic`，精确模型 `deepseek-flash`）。可派工
+槽位由 10 增至 **11**，**原 10 槽一项未减**；S3/S4 现行口径是 claude **登记入主力体系**、
+作为**独立第三公平组**参与 AUTO，而不是把旧池缩小：
+
+- **容量与公平组**：`CAPACITY['claude:deepseek-flash']=1`，且进入 `MAIN_FORCE_POOLS`/
+  `MAIN_FORCE_KEYS`/`MAIN_FORCE_CAPACITY`，故 `DOMESTIC_TOTAL_CAPACITY=11`；`_domestic_active`
+  统计**所有非 Luna 在途 attempt**（含 claude 与仍在途的退休 DeepSeek/超额旧 Max 迁移债务），
+  达 11 时任何新国内 claim 一律 `full`、**绝不派第 12 个**。committed 轮转用**独立第三组**
+  计数 `_count_committed_claude`（真实 attempts，`child_pid NOT NULL`），**绝不污染**
+  `committed_zcode`/`committed_qoder`；`_grp_rank` 令 claude 平票时排 Z2/Qoder 之后，
+  **原 10 槽路由/1:1/Luna 阈值语义完全不变**。
+- **AUTO 可选但不绕公平**：AUTO 的 claude 入口请求**经 `_select_main_force` 轮转**
+  （`_eligible_main_forces` 先按真实空位 + 时段门 + 限额过滤），**不绕过公平选择**；
+  显式 `executor='claude'` 或点名 `claude:deepseek-flash` 组合走**精确组合**硬约束，
+  绝不跨到其它池、**无跨模型回退**；`executor` 与请求组合冲突 → `executor_conflict`。
+- **`_domestic_policy` claude 分支顺序（S4 收口）**：`executor_conflict` →
+  **总 11 守卫先判**（`_domestic_active ≥ 11` → `full`，迁移债务满 11 时即便 claude 自身有空位
+  也绝不派第 12）→ 时段门（`main_force_window_closed`）→ 限额（`full`）→ 本池空位 `claim` →
+  本池满 `full`。
+- **时段门（`deepseek_offpeak.py`，北京时间固定 UTC+8）**：周一至周五除去中国法定节假日，
+  09:00（含）–12:00（不含）、14:00（含）–18:00（不含）为**高峰，不得新派**；其余时段、周末、
+  2026 已核对假日全天可派。周末只看星期几（调休周六仍属空闲、绝不当高峰）。**12:00 是上午峰的
+  右开边界**，12:00–14:00 午休与 18:00 后属可派时段——测试与验收不得把 12:00 当峰值。
+  **未知年度**无法确认工作日高峰是否为假日 → 高峰保守关闭，offhours/weekend 仍放行。门由
+  `_max_window_blocks` 统一实现（`offpeak` 缺失时 fail-closed），AUTO/reserve/consume/claim_due
+  口径一致。
+- **跨高峰真实释放**：`consume_for_entry` 消费已预留 token 前若已进入高峰，只把**本任务自己的**
+  `reserved` 在同一事务内真实释放为 `start_failed`，绝不启动、绝不抢占别人名额，
+  `running`/`unknown` 绝不假释放——与三 Qoder Max 夜间门同一机制、同一段拒绝/释放代码路径。
+- **限额标记复用**：claude 纳入 `QUOTA_LIMITABLE_POOLS`，仅在**同一条真实错误条目内绑定的**
+  结构化 429/硬限额证据下 `record_main_force_limit` 落标，`main_force_limits` 自动跳过新派、
+  绝不查余额；无证据不自动清标，恢复只由人工 `release_main_force_limit`。取消退出码
+  （`4294967295`/`-1`）与 SIG **绝不判为 429**。
+- **入口与生命周期**：`scripts/claude_direct.py` 运行时 `claude`，`-p --output-format stream-json
+  --verbose`、`--permission-mode dontAsk`（任何其它权限模式被 `build_argv` 直接拒绝，
+  **绝不 bypass/yolo**）、逐项 `--tools`/`--allowedTools`（**默认不开 Bash**——未通过精确只读
+  自动批准验收故默认不开放）、stdin 传任务、`--append-system-prompt` 附完整九节契约、
+  `--max-turns`；**`--bare` 被拒**（官方 Node CLI 2.1.76 不支持）；模型/权限模式/base_url
+  与钉死值不同一律 `ValueError`。子进程 env 把 `ANTHROPIC_MODEL` 与 default
+  opus/sonnet/haiku/subagent 全部钉死 `deepseek-flash`（禁止回退 Claude/pro），
+  `CLAUDE_CODE_SIMPLE` **绝不设置**。真实错误提取：`is_error=true` 时即使 `subtype=success`
+  也从 result 字符串取真实 API 错误；`errors` 非空或 `parse_error` ⇒ 绝不
+  `protocol_success`；`tool_use.id`↔`tool_result` 真实配对，**成功回执 ≥1** 才算工程成功。
+  生命周期：预检失败 ⇒ **零 Popen**；`consume_for_entry`→`mark_running`（真实 PID）→
+  `bind_child`（**`bound` 必须显式 `true`**）→**无条件**真实终态释放并保留真实释放结果，
+  已启动但退出未知保留 `launch_unknown`。凭据只进子进程 env（token 环境变量或 Windows DPAPI
+  密文经官方宿主 `powershell`/`pwsh` 解密），绝不进 argv/request/异常/证据；私有配置
+  `claude-entry.local.json` 由 root 本机持有，worker 工具拒绝读取。
+- **真实世界事实（与离线证明分开）**：**官方 Node CLI 2.1.76 真实 Read/Write 已成功**
+  （前轮 `error_max_turns`、原件保留无报告，独立记录、不等同验收通过）；
+  **native 2.1.220/296 连接失败单列**，不与 Node 事实混写；**费用未知**——CLI 估算 ≠ 账单。
+  **真实一次新入口 Read/Write 验收由主脑（root）执行，worker 不调 API。**
+
+> 状态：本槽与入口已纳入 `python -m unittest discover -s tests -p "test_*.py"` 离线回归
+> （全套通过、含 1 项平台跳过；确切用例数以最近一次原样运行与 SKILL.md 为准），
+> 零网络、零凭据、零真实额度查询、零真实模型启动。
 
 ## 1:1 主力轮换是 best-effort，不是严格均衡
 
@@ -81,20 +149,23 @@
    - 无合格可用主力时按两区 Flash **同级**选（`AUTO` 可跨国际/CN 选合格候选），任一区 Flash 仍有
      空槽即 `routing_required` 指向该区（调用入口已是该区 Flash 则直接 claim），**不因其中一区
      Flash 满就报整池 full**；
-   - 各主力（`zcode` + 两内置 Max + CN 自定义 Max）与两区 Flash 均满（**总 10 全满**）才 `capacity_full`。**候选均无可用槽不等于物理满**，
+   - 各主力（`zcode` + 两内置 Max + CN 自定义 Max + claude 第 11 槽）与两区 Flash 均满（**总 11 全满**）才 `capacity_full`。**候选均无可用槽不等于物理满**，
      降级原因与是否授权按 §执行器约束 及后文区分处理。
 
-轮换按**已提交计数**（`rotation.committed_zcode` / `committed_qoder`）驱动，是尽力而为的
-1:1，不保证任意时刻两池在途数严格相等：历史提交、单侧释放都会造成短暂偏差，这是设计允许的。
+轮换按**已提交计数**（`rotation.committed_zcode` / `committed_qoder` / `committed_claude`）驱动，是尽力而为的
+1:1，不保证任意时刻各池在途数严格相等：历史提交、单侧释放都会造成短暂偏差，这是设计允许的。
+**claude 是独立第三公平组**（`_count_committed_claude` 只从真实 attempts 提交历史统计，
+绝不污染 committed_zcode/committed_qoder；`_grp_rank` 令 claude 平票时排 Z2/Qoder 之后）。
 文档不宣称严格均衡。`reserve` 与 `select_and_claim` 共用同一套统一国内策略（`_domestic_policy`）：
-**默认 AUTO 不绕过 1:1 轮换**；但**受信任主脑明确给出的 executor/已授权 executor+model 组合是硬
-约束**，优先于历史 committed 比例（见 §执行器约束 与 §B4 加固）——有空位的指定 Qoder/Flash 绝不因
+**默认 AUTO 不绕过 1:1 轮换**（AUTO 的 claude 入口请求同样经 `_select_main_force` 公平轮转，
+不绕过选择）；但**受信任主脑明确给出的 executor/已授权 executor+model 组合是硬
+约束**，优先于历史 committed 比例（见 §执行器约束 与 §B4 加固）——有空位的指定 Qoder/Flash/Claude 绝不因
 比例被改道。
 
 ## 执行器约束与 availability 资格过滤（BW-AVAILABILITY-20261009-B2）
 
 `select_and_claim`/`reserve`/`consume_for_entry`/`claim_due` 新增可选 `executor`
-（`auto`|`qoder`|`zcode`，缺省 `auto`）与 `quota_store`/`quota_routes` 透传。**先过滤合格候选，
+（`auto`|`qoder`|`zcode`|`claude`，缺省 `auto`）与 `quota_store`/`quota_routes` 透传。**先过滤合格候选，
 再在可用主力之间做 1:1**：
 
 - **availability 资格过滤走 param-or-env 的正式默认持久源**：解析顺序为显式 `quota_store` →
@@ -112,7 +183,7 @@
   主力、不落 Flash**）；有空位则 claim，满则 `capacity_full`（无 Flash 回退）。
 - **`executor='auto'`（缺省）**：保留历史 committed 计数与 1:1 公平轮换，只在**合格**主力间轮换；
   请求 ZCode 但其被阻断 → 改道到可用主力/同级 Flash；各主力与国际 Flash 都满而 CN Flash 有空槽 →
-  改道 CN Flash（入口已是 CN Flash 则 claim），**两区 Flash 也满（总 10 全满）才 `capacity_full`**，**绝不改道回不可用的
+  改道 CN Flash（入口已是 CN Flash 则 claim），**主力（含 claude 第 11 槽）与两区 Flash 也满（总 11 全满）才 `capacity_full`**，**绝不改道回不可用的
   ZCode**，也**不改道回别的池去互换明确指定的组合**。**不清库、不重置轮换计数**、不新增评分/额度逻辑。
 - **消费 token 前复检**：`consume_for_entry` 走 `--dispatch-claim` token 路径时，在同一事务里
   **重新校验 ZCode availability**；若预留后通道转为不可用，则释放**本次自己**的 reserved 占位
@@ -127,7 +198,8 @@
 - **combo 硬约束**：`executor`+`runtime`+`model` 明确组合（含 `qoder:Qwen3.8-Flash`）贯穿
   `reserve/select_and_claim/consume_for_entry/claim_due`，作为候选集合硬边界——受信任主脑明确
   已授权的组合**不因别的候选有空位而被拒绝**；默认 AUTO 主力优先/容量/1:1 与各池真实容量
-  （BW-MAX-WINDOW-20261010-S2 后为六池总 10：`zcode`=2、两内置 Max 各 1、CN 自定义 Max=2、两区 Flash 各 2）
+  （BW-MAX-WINDOW-20261010-S2 后为六池总 10：`zcode`=2、两内置 Max 各 1、CN 自定义 Max=2、两区 Flash 各 2；
+  BW-CLAUDE-DEEPSEEK-S3/S4 起把 claude 登记为第 11 主力槽 → **总 11**，原 10 槽一项未减）
   为既定政策不变（并发 2/4 为 Skill 政策、非已核实 Qoder 进程上限）。
 - **国内回收尊重原 scope**：`claim_due` 用 `_scope_allowed_candidates` 依原 scope 组合/executor
   收窄候选（绑 Qoder 只回收 QMax/Flash，绝不因 ZCode 有空位改派 ZCode）；绑 ZCode 且被阻断 →
@@ -141,7 +213,7 @@
   即过滤不可用 ZCode；派工写事务内不调用写额度 helper。
 - **竞态与 Luna 保护**：429 事实**先于**可再派空槽发布（`_preclaim_reconcile` 要求 child+wrapper
   双死且创建身份匹配，auto 回收只放执行容量不清 availability）；`reply`/`claim_due` 保护
-  claimed/settled/cancelled/launch_unknown，settled 票据不被迟到/重复回复重开；物理满（总 10）与
+  claimed/settled/cancelled/launch_unknown，settled 票据不被迟到/重复回复重开；物理满（总 11，含 claude 第 11 槽）与
   “合格候选耗尽”分列报告，误报不自动 Luna。
 
 ## 入口在 Popen 前的唯一容量门
@@ -201,7 +273,7 @@
 
 Luna 是**救援**通道，无数量上限，但绝不无条件启动。流程：
 
-1. 国内名额全满时（BW-QODER-CN-20261010-A2 起阈值随总 8 更新，BW-MAX-WINDOW-20261010-S2 加入 CN 自定义主力后再升为总 10，含两内置 Max/自定义 Max/CN 补充；判定走
+1. 国内名额全满时（BW-QODER-CN-20261010-A2 起阈值随总 8 更新，BW-MAX-WINDOW-20261010-S2 加入 CN 自定义主力后再升为总 10，BW-CLAUDE-DEEPSEEK-S3/S4 加入 claude 第 11 主力槽后升为**总 11（原 10 槽一项未减）**，含两内置 Max/自定义 Max/CN 补充/claude；判定走
    `_domestic_active ≥ DOMESTIC_TOTAL_CAPACITY`），**宿主先真的问用户**“外部 agent 还是 Luna”。Python 只落库票据，
    **绝不谎称已经问过或已经派生 Luna**——真实提问与原生工具调用由宿主负责。
 2. `dp.ask_record(task_id, ...)` 记录一次真实提问票据，开始 **300 秒**计时
@@ -210,7 +282,7 @@ Luna 是**救援**通道，无数量上限，但绝不无条件启动。流程�
 3. 用户回复 → `dp.reply(task_id, choice)`（`luna`/`external_agent`/`domestic`/`cancel`）。
    **一旦回复，`claim_due` 不再自动裁决**——等待超时不当作默认无限授权。
 4. 到期竞争裁决 `dp.claim_due(task_id, now)`：只有票据 `pending`、已过 deadline、未回复、未
-   claim，**且国内总 10 名额（含自定义主力与 CN 补充候选）确实全满**（`_domestic_active ≥ DOMESTIC_TOTAL_CAPACITY`）时，
+   claim，**且国内总 11 名额（含自定义主力、CN 补充候选与 claude 第 11 槽）确实全满**（`_domestic_active ≥ DOMESTIC_TOTAL_CAPACITY`）时，
    才在同一 `BEGIN IMMEDIATE` 事务里创建一个 `luna:native`
    attempt 并把票据置 `claimed`，返回 `launch_state='host_must_call_native'`（**宿主仍须真实
    调用原生工具**，池只给竞争裁决与名额，不代跑）。
@@ -231,14 +303,14 @@ Luna 是**救援**通道，无数量上限，但绝不无条件启动。流程�
   `ask_record` 对**任何已存在票据**直接拒绝并回读 `state`/`deadline_utc`/`reply_choice`（纯 INSERT，
   无 `ON CONFLICT` 重置）；`pending` 不重置计时器。
 - **票据 scope 损坏/缺失 → fail-closed**（`scope_corrupt=True`，绝不据损坏数据启动 Luna 或 reclaim）。
-- **可用性不足的降级决策**：当**国内名额未满总 10（含自定义主力与 CN 补充候选）** 但因 availability 不足以正常派工时，允许一次新的
+- **可用性不足的降级决策**：当**国内名额未满总 11（含自定义主力、CN 补充候选与 claude 第 11 槽）** 但因 availability 不足以正常派工时，允许一次新的
   降级 `ask_record`，须带**独立、客观的降级理由** `degradation_reason ∈ {quota, auth, capacity}` +
   `degradation_detail`；`quota` 理由必须由 §3b availability 的客观证据支撑
   （`_zcode_availability_blocked`），无证据则拒绝；`capacity` 理由必须经 `_scope_allowed_candidates`
   客观核验受信任候选（含 CN 补充候选）确已排空——仍有空槽（例如 CN 还有位）时**拒绝降级、优先用国内候选**。
-  降级票据**绕过“总 10 全满”前提**，但
+  降级票据**绕过“总 11 全满”前提**，但
   **非 capacity 的超时绝不可替代显式授权**：只有用户显式回复 `luna` 才 claim Luna；等待超时
-  ≠ 授权（`degraded && reply != luna` → 拒绝）。**总 10 全满 + 真实提问 + 300s + 用户授权**的既有规则不变。
+  ≠ 授权（`degraded && reply != luna` → 拒绝）。**总 11 全满 + 真实提问 + 300s + 用户授权**的既有规则不变。
 
 ## 与额度门禁的边界（quota ≠ concurrency）
 
@@ -328,9 +400,9 @@ python scripts/dispatch_pool.py --store <abs> cancel-pending --task-id T [--reas
 > 绝不自动重派；worker 说"我结束了"不算终态，必须宿主回读原生回执；国内 attempt
 > 永不经过 settle-native 退出。
 
-## 11. 六池真实分配与主力明确限额（2026-10-10，BW-POOL-SPLIT-20261010-S2/S3/S5 + BW-MAX-WINDOW-20261010-S2）
+## 11. 六池 + claude 第 11 槽真实分配与主力明确限额（2026-10-10/11，BW-POOL-SPLIT-20261010-S2/S3/S5 + BW-MAX-WINDOW-20261010-S2 + BW-CLAUDE-DEEPSEEK-S3/S4）
 
-S2/S3 定型的国内真实容量经 BW-MAX-WINDOW-20261010-S2 加入 CN 自定义主力后为六池：`zcode:GLM-5.3=2`、国际内置 `qoder:Qwen3.8-Max=1`、CN 内置 `qodercn:Qwen3.8-Max=1`、CN 自定义 `qodercn:Qwen-3.8-Max=2`、`qoder:Qwen3.8-Flash=2`、`qodercn:Qwen3.8-Flash=2`；`qodercn:DeepSeek-Flash` 退休为 0（`LEGACY_RETIRED_POOL_KEYS`）但既有在途 attempt 仍计入 `_domestic_active` 总数、真实终态自然释放；`luna:native` 无上限、仅救援。`DOMESTIC_TOTAL_CAPACITY=10` 硬守卫不派第 11 个。CN 内置模型真实名 `Qwen3.8-Max`/`Qwen3.8-Flash`（**不是** `Qwen-3.8-*`）；自定义主力用带连字符的友好名 `Qwen-3.8-Max` 与内置区分。
+S2/S3 定型的国内真实容量经 BW-MAX-WINDOW-20261010-S2 加入 CN 自定义主力后为六池：`zcode:GLM-5.3=2`、国际内置 `qoder:Qwen3.8-Max=1`、CN 内置 `qodercn:Qwen3.8-Max=1`、CN 自定义 `qodercn:Qwen-3.8-Max=2`、`qoder:Qwen3.8-Flash=2`、`qodercn:Qwen3.8-Flash=2`；**BW-CLAUDE-DEEPSEEK-S3/S4 追加主力 `claude:deepseek-flash=1`（独立第三公平组，见上文 Claude 章节）→ 物理总容量 11**；`qodercn:DeepSeek-Flash` 退休为 0（`LEGACY_RETIRED_POOL_KEYS`）但既有在途 attempt 仍计入 `_domestic_active` 总数、真实终态自然释放；`luna:native` 无上限、仅救援。`DOMESTIC_TOTAL_CAPACITY=10` 硬守卫不派第 11 个（**BW-CLAUDE-DEEPSEEK-S3/S4 现行口径：claude 登记为第 11 个主力池 `claude:deepseek-flash`=1 后，`DOMESTIC_TOTAL_CAPACITY=11`、绝不派第 12 个；原 10 槽一项未减**）。CN 内置模型真实名 `Qwen3.8-Max`/`Qwen3.8-Flash`（**不是** `Qwen-3.8-*`）；自定义主力用带连字符的友好名 `Qwen-3.8-Max` 与内置区分。
 
 S5 增加 Qoder Max 池的**明确限额**闭环（BW-MAX-WINDOW-20261010-S2 把自定义 CN 主力并入承载范围）：
 - **限额承载范围**：`QUOTA_LIMITABLE_POOLS = (qoder:Qwen3.8-Max, qodercn:Qwen3.8-Max, qodercn:Qwen-3.8-Max)`。自定义 CN 主力复用同一标记机制，各自 pool_key 独立落标、对两内置 Max 无连带。ZCode 仍走 `quota_control` availability；任一 Flash、退休 DeepSeek、Luna 永不落标；绝不误挡 Flash、绝不动 ZCode 既有 availability 口径。

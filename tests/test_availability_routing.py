@@ -90,16 +90,20 @@ class _TmpBase(unittest.TestCase):
         return dp.status(self.dispatch, now=T0)['pools'][pk]['active']
 
     def _fill_six(self):
-        # BW-MAX-WINDOW-20261010-S2 六池 10 槽：zcode×2 + 两内置 Max 各 1 + CN 自定义 Max×2
-        # + 两地区 Flash 各 2。全部经显式 executor 逐一确定性 claim。
+        # BW-CLAUDE-DEEPSEEK-S4 十一满基线：zcode×2 + 两内置 Max 各 1 + CN 自定义 Max×2
+        # + 两地区 Flash 各 2 + claude:deepseek-flash×1（第 11 主力槽；T0=北京周四 23:00
+        # offhours，时段门放行）。全部经显式 executor 逐一确定性 claim。
         toks = []
         combos = [('zcode', 'GLM-5.3'), ('zcode', 'GLM-5.3'),
                   ('qoder', 'Qwen3.8-Max'), ('qodercn', 'Qwen3.8-Max'),
                   ('qodercn', 'Qwen-3.8-Max'), ('qodercn', 'Qwen-3.8-Max'),
                   ('qoder', 'Qwen3.8-Flash'), ('qoder', 'Qwen3.8-Flash'),
-                  ('qodercn', 'Qwen3.8-Flash'), ('qodercn', 'Qwen3.8-Flash')]
+                  ('qodercn', 'Qwen3.8-Flash'), ('qodercn', 'Qwen3.8-Flash'),
+                  ('claude', 'deepseek-flash')]
         for i, (rt, md) in enumerate(combos):
-            ex = 'zcode' if rt == 'zcode' else ('qodercn' if rt == 'qodercn' else 'qoder')
+            ex = ('zcode' if rt == 'zcode' else
+                  'claude' if rt == 'claude' else
+                  'qodercn' if rt == 'qodercn' else 'qoder')
             r = dp.reserve(self.dispatch, task_id=f'f{i}', runtime=rt, model=md,
                            workspace=str(self._ws_for(f'f{i}')), prompt_sha256='p',
                            stage='s1', now=T0, executor=ex)
@@ -364,9 +368,10 @@ class DispatchRoutingTests(_TmpBase):
 
     def test_reclaim_skips_blocked_zcode(self):
         # 降级票据（capacity）只在受信任候选确实排空时记录；claim_due 原子回收只选可用主力
-        # （跳过被 blocked 的 ZCode）。BW-MAX-WINDOW-20261010-S2：ZCode blocked 后合格候选
-        # 为两内置 Max（各 1）+ CN 自定义 Max（2）+ 两地区 Flash（各 2）——先把它们占满，再
-        # 释放一个 QMax 名额，回收才会原子落到 QMax，Z 始终保持 blocked。
+        # （跳过被 blocked 的 ZCode）。BW-CLAUDE-DEEPSEEK-S4：ZCode blocked 后合格候选
+        # 为两内置 Max（各 1）+ CN 自定义 Max（2）+ 两地区 Flash（各 2）+ claude 第 11 槽
+        # （1）——先把它们全部占满，再释放一个 QMax 名额，回收才会原子落到 QMax，
+        # Z 始终保持 blocked（claude 空槽时降级/回收都必须先如实优先 claude）。
         self._hold_zcode()
         toks = []
         r = dp.reserve(self.dispatch, task_id='q0', runtime='qoder',
@@ -397,6 +402,12 @@ class DispatchRoutingTests(_TmpBase):
                            prompt_sha256='p', stage='s1', now=T0, executor='qodercn')
             self.assertTrue(r.get('allowed') and r.get('token'), r)
             toks.append(r['token'])
+        # claude 第 11 槽也必须真实占住：只要它还空着，capacity 降级就是伪造耗尽。
+        r = dp.reserve(self.dispatch, task_id='cl0', runtime='claude',
+                       model='deepseek-flash', workspace=str(self._ws_for('cl0')),
+                       prompt_sha256='p', stage='s1', now=T0, executor='claude')
+        self.assertTrue(r.get('allowed') and r.get('token'), r)
+        toks.append(r['token'])
         sc = self._scope('rc')
         ask = dp.ask_record(self.dispatch, task_id='rc', scope=sc, ask_message_id='m1',
                             now=T0, degradation_reason='capacity',

@@ -185,9 +185,10 @@ class _SpawnMixin(unittest.TestCase):
             return [dict(r) for r in conn.execute(sql, params).fetchall()]
 
     def _fill_six_via_api(self):
-        """真实 API 填满十满基线（BW-MAX-WINDOW-20261010-S2 六池：zcode×2 + 两内置 Max 各
-        1 + CN 自定义 Max×2 + 两地区 Flash 各 2）。全部经显式 executor 逐一 claim 保证确定性
-        （CN 池只能经 executor='qodercn'，AUTO 轮换不保证落某特定主力），返回 10 个 token。"""
+        """真实 API 填满十一满基线（BW-CLAUDE-DEEPSEEK-S4：zcode×2 + 两内置 Max 各
+        1 + CN 自定义 Max×2 + 两地区 Flash 各 2 + claude 第 11 槽×1；T0=北京周四 23:00
+        claude offhours）。全部经显式 executor 逐一 claim 保证确定性
+        （CN 池只能经 executor='qodercn'，claude 经 executor='claude'，AUTO 轮换不保证落某特定主力），返回 11 个 token。"""
         toks = []
         plan = [('zcode', 'GLM-5.3', 'zcode'), ('zcode', 'GLM-5.3', 'zcode'),
                 ('qoder', 'Qwen3.8-Max', 'qoder'),
@@ -197,12 +198,13 @@ class _SpawnMixin(unittest.TestCase):
                 ('qoder', 'Qwen3.8-Flash', 'qoder'),
                 ('qoder', 'Qwen3.8-Flash', 'qoder'),
                 ('qodercn', 'Qwen3.8-Flash', 'qodercn'),
-                ('qodercn', 'Qwen3.8-Flash', 'qodercn')]
+                ('qodercn', 'Qwen3.8-Flash', 'qodercn'),
+                ('claude', 'deepseek-flash', 'claude')]
         for i, (rt, md, ex) in enumerate(plan):
             out = dp.select_and_claim(self.store, task_id=f'base-{i}', runtime=rt,
                                       model=md, workspace=f'C:/mp/base-{i}',
                                       chat_id=f'bc{i}',
-                                      stage=f'bs{i}', prompt_sha256=f'{i}' * 64,
+                                      stage=f'bs{i}', prompt_sha256=f'{i:x}' * 64,
                                       executor=ex, now=T0, _preclaim=False)
             self.assertTrue(out['allowed'], out)
             toks.append(out['token'])

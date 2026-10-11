@@ -142,6 +142,19 @@ jobs:
       - name: Qoder CN direct offline regression (no login or network)
         run: python tests/test_qoder_cn_direct_offline.py
 
+      # BW-CLAUDE-DEEPSEEK-S2/S3/S4：Claude Code CLI / deepseek-flash 第 11 主力槽（AUTO 可选、
+      # 独立第三公平组、总 11 硬守卫含 claude）的离线回归，Windows/Linux 矩阵都跑。全部纯标准库、
+      # 每用例独立临时 SQLite、FakePopen/可注入探针：绝不访问网络、不读凭据、不查真实额度、
+      # 不启动真实模型；真实一次新入口 Read/Write 验收由主脑本机执行，不在 CI 里预写成功。
+      - name: DeepSeek offpeak window gate offline regression (stdlib only, no network)
+        run: python -m unittest discover -s tests -p "test_deepseek_offpeak.py" -v
+
+      - name: Claude pool capacity, window gate and limit marker offline regression (temp SQLite, no real pool)
+        run: python -m unittest discover -s tests -p "test_dispatch_pool_claude.py" -v
+
+      - name: Claude direct entry argv, lifecycle and binding offline regression (FakePopen, no network or credentials)
+        run: python -m unittest discover -s tests -p "test_claude_direct.py" -v
+
       - name: Parallel and fallback offline regression
         run: python tests/test_parallel_execution.py
 

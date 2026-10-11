@@ -154,6 +154,13 @@ try:
 except ImportError:  # isolated revision tree / standalone tests
     qc = None
 
+# claude:deepseek-flash 时段门复用同仓 deepseek_offpeak（北京时间固定 UTC+8 + 轻量假日表）。
+# 缺失时保守拒绝 claude 高峰新派（fail-closed），不影响其它池。
+try:
+    import deepseek_offpeak as offpeak  # noqa: E402
+except ImportError:  # isolated revision tree / standalone tests
+    offpeak = None
+
 # ------------------------------------------------------------------ 池定义
 # BW-POOL-SPLIT-20261010-S2 + BW-MAX-WINDOW-20261010-S2 用户 2026-10-10 最新分配：
 #   六池布局、调度总数 10：
@@ -168,14 +175,19 @@ except ImportError:  # isolated revision tree / standalone tests
 # committed 计数平衡，组内以当前真实在途数决定优先；仅对合格可用候选平衡，绝不因历史轮换
 # 拦有空位的候选（`_select_main_force` 先按 capacity/active 过滤再排序）。不新增记分系统，
 # 复用 rotation 两列 committed_zcode / committed_qoder 与 `_count_active` 即足够。
+# BW-CLAUDE-DEEPSEEK-S3：Claude Code / deepseek-flash（claude:deepseek-flash，容量 1）纳入
+# 主力候选与 AUTO 可派集合，成为**独立第三公平组 claude**（与 Z2 组、Qoder 组并列），
+# 物理调度总数 DOMESTIC_TOTAL_CAPACITY = 6 + 4 + 1 = 11。
 MAIN_FORCE_POOLS = (('zcode', 'GLM-5.3'),
                     ('qoder', 'Qwen3.8-Max'),
                     ('qodercn', 'Qwen3.8-Max'),
-                    ('qodercn', 'Qwen-3.8-Max'))
+                    ('qodercn', 'Qwen-3.8-Max'),
+                    ('claude', 'deepseek-flash'))
 MAIN_FORCE_CAPACITY = {'zcode:GLM-5.3': 2,
                        'qoder:Qwen3.8-Max': 1,
                        'qodercn:Qwen3.8-Max': 1,
-                       'qodercn:Qwen-3.8-Max': 2}
+                       'qodercn:Qwen-3.8-Max': 2,
+                       'claude:deepseek-flash': 1}
 OVERFLOW_POOLS = (('qoder', 'Qwen3.8-Flash'), ('qodercn', 'Qwen3.8-Flash'))
 OVERFLOW_CAPACITY = {'qoder:Qwen3.8-Flash': 2, 'qodercn:Qwen3.8-Flash': 2}
 # BW-POOL-SPLIT-20261010-S2：CN DeepSeek-Flash 从正常池退出，但保留池名与 0 容量条目，
@@ -186,7 +198,7 @@ LUNA_RUNTIME = 'luna'
 LUNA_MODEL = 'native'
 LUNA_ASK_TIMEOUT_SECONDS = 300
 DOMESTIC_TOTAL_CAPACITY = (sum(MAIN_FORCE_CAPACITY.values())
-                           + sum(OVERFLOW_CAPACITY.values()))  # 6 + 4 = 10
+                           + sum(OVERFLOW_CAPACITY.values()))  # 7 + 4 = 11
 
 # pool_key -> capacity（None 表示无上限，仅 Luna；0 表示已退出正常池但保留历史真实在途）。
 CAPACITY = {}
@@ -195,6 +207,18 @@ CAPACITY.update(OVERFLOW_CAPACITY)
 for _rk in LEGACY_RETIRED_POOL_KEYS:
     CAPACITY[_rk] = 0
 CAPACITY['luna:native'] = None
+# BW-CLAUDE-DEEPSEEK-S3：claude:deepseek-flash 已并入 MAIN_FORCE_POOLS/CAPACITY 成为第 11 个
+# 可派工槽（独立第三公平组 claude，容量 1），故其容量已在上面 CAPACITY.update 中登记，无需重复。
+# 关键口径：
+#  - DOMESTIC_TOTAL_CAPACITY = 11，claude 在途计入国内总在途（_domestic_active 只排除 Luna）；
+#  - _select_main_force 的 Z2/Qoder best-effort 1:1 轮转不受影响：claude 的 committed 由
+#    attempts 中 child_pid 非空的真实提交历史计算，且平票时排在 Z2/Qoder 之后（绝不抢原路由）；
+#  - claude 受 deepseek_offpeak 的北京时间工作日高峰门约束（高峰不得新派，offhours/周末/假日
+#    全天可派），且仅经 claude 自身 capacity=1 约束，无任何跨模型回退。
+CLAUDE_RUNTIME = 'claude'
+CLAUDE_MODEL = 'deepseek-flash'
+CLAUDE_POOL_KEY = f'{CLAUDE_RUNTIME}:{CLAUDE_MODEL}'
+CLAUDE_CAPACITY = 1
 MAIN_FORCE_KEYS = tuple(f'{r}:{m}' for r, m in MAIN_FORCE_POOLS)
 OVERFLOW_KEYS = tuple(f'{r}:{m}' for r, m in OVERFLOW_POOLS)
 # 兼容既有引用名（CN_KEYS/CN_POOL_KEY 保留为空元组/空串，代码不再据此派工）；
@@ -220,7 +244,8 @@ LUNA_KEY = f'{LUNA_RUNTIME}:{LUNA_MODEL}'
 # 两地区 Flash 兜底永不被限额标记误挡；自定义 Max 与内置 Max 各自独立落标、互不连坐。标记只是
 # 布尔不可用 + pool_key + 真实 attempt + 错误证据路径/哈希，绝不查余额、不带定时器/期限/
 # 自动恢复探针/评分/新服务/外部 API；恢复只由用户明确额度恢复/重置后人工解除。
-QUOTA_LIMITABLE_POOLS = (QMAX_POOL_KEY, CN_MAX_POOL_KEY, CN_CUSTOM_MAX_POOL_KEY)
+QUOTA_LIMITABLE_POOLS = (QMAX_POOL_KEY, CN_MAX_POOL_KEY, CN_CUSTOM_MAX_POOL_KEY,
+                         CLAUDE_POOL_KEY)
 
 # attempt 状态机：在途（占容量）与已释放（不占容量）。
 ACTIVE_STATES = ('reserved', 'running', 'unknown')
@@ -341,9 +366,32 @@ def _main_force_window_open(now) -> bool:
 
 
 def _max_window_blocks(pk, now) -> bool:
-    """该池是否被主力时段门挡下：仅三个 Qoder Max 主力（两内置 + CN 自定义）在非窗口时间被
-    挡；其它池永不挡。"""
+    """该池是否被时段门挡下（高峰不得新派、已预留跨到高峰时 consume 释放本 token）：
+    - claude:deepseek-flash：由 deepseek_offpeak 判定（北京时间工作日 09:00–12:00、
+      14:00–18:00 关闭；其余/周末/2026 假日放行；未知年度工作日高峰保守关闭）。offpeak
+      不可用时 fail-closed（视为挡下，绝不在不确定时误派）。
+    - 三个 Qoder Max（两内置 + CN 自定义）：非北京 22:00–08:00 窗口挡下。
+    - 其它池永不挡。"""
+    if pk == CLAUDE_POOL_KEY:
+        if offpeak is None:
+            return True
+        return not offpeak.can_dispatch(now)
     return pk in WINDOW_GATED_MAIN_FORCES and not _main_force_window_open(now)
+
+
+def _window_closed_reason(pk) -> str:
+    """时段门拒绝的人类可读原因（按池区分 claude 高峰门 vs 三 Qoder Max 夜间门）。"""
+    if pk == CLAUDE_POOL_KEY:
+        return (f'the requested pool {pk!r} (Claude Code / deepseek-flash) may not start a '
+                'new dispatch during Beijing-time weekday peak windows 09:00(inclusive)-'
+                '12:00(exclusive) or 14:00(inclusive)-18:00(exclusive) (nor in an unknown '
+                'year during a weekday peak, conservatively closed); off-hours, weekends and '
+                'listed 2026 statutory holidays remain open, and it is never swapped to '
+                'another model')
+    return (f'the explicitly requested Qoder Max pool {pk!r} is only a main force during '
+            'the Beijing-time window 22:00 (inclusive) to 08:00 (exclusive); it is now '
+            'outside that window, so a new dispatch is honestly refused and never silently '
+            'swapped to another model')
 
 
 def default_store_path() -> Path:
@@ -577,6 +625,17 @@ def _count_active(conn, pk) -> int:
     return int(row['n']) if row else 0
 
 
+def _count_committed_claude(conn) -> int:
+    """claude 独立第三组的 committed 计数（BW-CLAUDE-DEEPSEEK-S3）：从**已有 attempts 表**的真实
+    提交历史计算（`pool_key=claude:deepseek-flash` 且 `child_pid IS NOT NULL`，即真实启动过子进程
+    的 attempt），绝不新增 rotation 列/表/框架。仅用于 `_select_main_force` 的组间 best-effort
+    公平；claude 不计入 committed_zcode/committed_qoder。"""
+    row = conn.execute(
+        'SELECT COUNT(*) AS n FROM attempts WHERE pool_key=? AND child_pid IS NOT NULL',
+        (CLAUDE_POOL_KEY,)).fetchone()
+    return int(row['n']) if row else 0
+
+
 def _active_task(conn, task_id):
     return conn.execute(
         'SELECT * FROM attempts WHERE task_id=? AND state IN (%s) LIMIT 1'
@@ -619,10 +678,11 @@ def _workspace_busy_reject(task_id, pk, row):
 
 
 def _domestic_active(conn) -> int:
-    """国内总在途保护计数（BW-POOL-SPLIT-20261010-S3）：统计**所有非 Luna 的在途
-    attempt**，含仍在途的 retired DeepSeek 与超额旧 Max（迁移债务）。这样即便某个新池
-    按各自容量看似有空位，只要真实总在途已达 8，就不会派出第 9 个；减少容量不杀老任务，
-    老任务依真实终态自然释放后计数才下降。Luna（救援池、无上限）不计入国内总额。"""
+    """国内总在途保护计数（BW-POOL-SPLIT-20261010-S3 + BW-CLAUDE-DEEPSEEK-S3）：统计**所有
+    非 Luna 的在途 attempt**，含 claude:deepseek-flash 以及仍在途的 retired DeepSeek 与超额
+    旧 Max（迁移债务）。这样即便某个新池按各自容量看似有空位，只要真实总在途已达物理总容量
+    （现为 11：六池主力含 claude + 两地区 Flash 各 2），就不会派出超额的国内槽；减少容量不杀
+    老任务，老任务依真实终态自然释放后计数才下降。Luna（救援池、无上限）不计入国内总额。"""
     row = conn.execute(
         'SELECT COUNT(*) AS n FROM attempts WHERE pool_key != ? AND state IN (%s)'
         % ','.join('?' * len(ACTIVE_STATES)), (LUNA_KEY, *ACTIVE_STATES)).fetchone()
@@ -951,7 +1011,7 @@ def _scope_combo_from_scope(scope):
     runtime = (scope or {}).get('runtime')
     model = (scope or {}).get('model')
     exec_runtime = {'qoder': 'qoder', 'zcode': 'zcode',
-                    CN_RUNTIME: CN_RUNTIME}.get(executor)
+                    CN_RUNTIME: CN_RUNTIME, 'claude': 'claude'}.get(executor)
     if runtime and exec_runtime and str(runtime) != exec_runtime:
         return None, True
     combo_runtime = exec_runtime or (str(runtime) if runtime else None)
@@ -986,6 +1046,9 @@ def _scope_allowed_candidates(scope, zcode_blocked):
         return [QMAX_POOL_KEY, QFLASH_POOL_KEY]
     if executor == CN_RUNTIME:
         return [CN_MAX_POOL_KEY, CN_CUSTOM_MAX_POOL_KEY, CN_FLASH_POOL_KEY]
+    if executor == 'claude':
+        # 显式指定 claude 入口：只有独立第 11 槽自身，绝不跨到国内 10 槽或 Flash/回退模型。
+        return [CLAUDE_POOL_KEY]
     mains = [k for k in MAIN_FORCE_KEYS
              if not (k == ZCODE_POOL_KEY and zcode_blocked)]
     # 默认/auto 受信任候选：三主力在前、两地区 Flash 同级兜底在后；已 retired 的 CN
@@ -1022,14 +1085,24 @@ def _select_main_force(conn, requested_pk, now, eligible=None):
         return None, 'main_force_full'
     rot = _rotation_row(conn)
     group_committed = {'zcode': rot['committed_zcode'],
-                       'qoder': rot['committed_qoder']}
+                       'qoder': rot['committed_qoder'],
+                       'claude': _count_committed_claude(conn)}
 
     def _grp(pk):
-        return 'zcode' if pk == ZCODE_POOL_KEY else 'qoder'
+        if pk == ZCODE_POOL_KEY:
+            return 'zcode'
+        if pk == CLAUDE_POOL_KEY:
+            return 'claude'
+        return 'qoder'
+
+    # claude 是独立第三公平组；平票（committed+active 都相同）时排在 Z2/Qoder 之后，
+    # 保证原 10 槽的 zcode/qoder 路由与 1:1 断言绝不因新增 claude 而改变。
+    _grp_rank = {'zcode': 0, 'qoder': 0, 'claude': 1}
 
     def _key(item):
         pk, active = item
-        return (group_committed[_grp(pk)], active,
+        g = _grp(pk)
+        return (group_committed[g], active, _grp_rank[g],
                 0 if pk == requested_pk else 1, pk)
 
     avail.sort(key=_key)
@@ -1087,12 +1160,36 @@ def _domestic_policy(conn, requested_pk, now, executor='auto', eligible=None,
       再在可用主力之间按现有 rotation committed + 真实在途数做 best-effort 平衡；本池有空也不
       绕过轮转；选中≠请求 → routing；主力都不可用/已满/已限额 → 两地区 Flash 同级兜底；
       两 Flash 也满才 full。
-    - 迁移债务总额守卫：真实国内在途（含在途 retired DeepSeek 与超额旧 Max）已达总 10 时，
-      即便某新池按各自容量看似有空也一律 full，绝不派第 11 个。"""
+    - 迁移债务总额守卫（BW-CLAUDE-DEEPSEEK-S4 起对全部国内池生效，含 claude）：真实国内在途
+      （含在途 retired DeepSeek 与超额旧 Max）已达总 11 时，即便某池按各自容量看似有空也
+      一律 full，绝不派第 12 个。"""
     if requested_pk == LUNA_KEY:
         return 'reject_luna', None
     if requested_pk in LEGACY_RETIRED_POOL_KEYS:
         return 'unknown_pool', None
+    # BW-CLAUDE-DEEPSEEK-S4：claude 已计入 DOMESTIC_TOTAL_CAPACITY=11（第 11 槽），总守卫
+    # 必须同样约束 claude：真实国内在途（含迁移债务/旧超额在途）已满 11 时，即便 claude
+    # 按自身容量看似有空也绝不派第 12 个。显式点名 claude（executor='claude' 或 None）保持
+    # 精确组合：时段/限额/总守卫都过且有空位才 claim，否则如实拒绝，绝不回退国内模型；
+    # AUTO 请求 claude（executor='auto'）绝不绕过三组公平选择——落入下方 auto 分支，与
+    # 其它主力一样经 `_eligible_main_forces`（高峰/限额剔除）+ `_select_main_force` 轮转。
+    if requested_pk == CLAUDE_POOL_KEY:
+        if executor not in ('auto', 'claude', None):
+            return 'executor_conflict', None
+        if executor == 'auto':
+            if _max_window_blocks(CLAUDE_POOL_KEY, now):
+                # AUTO 的 claude 入口高峰请求：如实拒绝新派，绝不绕过公平选择偷认领自己。
+                return 'main_force_window_closed', None
+        else:
+            if _domestic_active(conn) >= DOMESTIC_TOTAL_CAPACITY:
+                return 'full', None
+            if _max_window_blocks(CLAUDE_POOL_KEY, now):
+                return 'main_force_window_closed', None
+            if _main_force_limit_active(conn, CLAUDE_POOL_KEY):
+                return 'full', None
+            if _count_active(conn, CLAUDE_POOL_KEY) < capacity_for(CLAUDE_POOL_KEY):
+                return 'claim', CLAUDE_POOL_KEY
+            return 'full', None
     # 迁移债务总额守卫（BW-POOL-SPLIT-20261010-S3）：总在途已满 10 → 任何新国内 claim 都
     # 不得放行（减少容量不杀老任务，老任务真实终态自然释放后计数才下降）。
     if _domestic_active(conn) >= DOMESTIC_TOTAL_CAPACITY:
@@ -1364,11 +1461,7 @@ def select_and_claim(store_path=None, *, task_id, runtime, model, workspace,
             if verdict == 'main_force_window_closed':
                 conn.execute('ROLLBACK')
                 return _reject('main_force_window_closed', task_id, pk,
-                               [f'the explicitly requested Qoder Max pool {pk!r} is '
-                                'only a main force during the Beijing-time window '
-                                '22:00 (inclusive) to 08:00 (exclusive); it is now '
-                                'outside that window, so a new dispatch is honestly '
-                                'refused and never silently swapped to another model'])
+                               [_window_closed_reason(pk)])
             if verdict == 'reject_luna':
                 conn.execute('ROLLBACK')
                 return _reject('luna_requires_ticket', task_id, pk,
@@ -1392,10 +1485,17 @@ def select_and_claim(store_path=None, *, task_id, runtime, model, workspace,
                 return _routing(task_id, pk, target, [why], domestic_full=domestic_full)
             if verdict == 'full':
                 conn.execute('ROLLBACK')
+                if pk == CLAUDE_POOL_KEY:
+                    full_reasons = [f'{pk} (Claude Code / deepseek-flash) is at its capacity '
+                                    'of 1 — a second concurrent dispatch to this single '
+                                    'independent slot is refused and never falls back to '
+                                    'another model; wait for the real terminal release']
+                else:
+                    full_reasons = ['the sanctioned domestic candidate set for this combo is '
+                                    'fully occupied; ask the user (external agent or Luna) and '
+                                    'record an ask ticket']
                 return _reject('capacity_full', task_id, pk,
-                               ['the sanctioned domestic candidate set for this combo is '
-                                'fully occupied; ask the user (external agent or Luna) and '
-                                'record an ask ticket'],
+                               full_reasons,
                                domestic_full=(_domestic_active(conn) >=
                                               DOMESTIC_TOTAL_CAPACITY))
             claim_pk = target
@@ -1482,11 +1582,7 @@ def reserve(store_path=None, *, task_id, runtime, model, workspace, prompt_sha25
             if verdict == 'main_force_window_closed':
                 conn.execute('ROLLBACK')
                 return _reject('main_force_window_closed', task_id, pk,
-                               [f'the explicitly reserved Qoder Max pool {pk!r} is '
-                                'only a main force during the Beijing-time window '
-                                '22:00 (inclusive) to 08:00 (exclusive); it is now '
-                                'outside that window, so the reserve is honestly refused '
-                                'and never silently swapped to another model'])
+                               [_window_closed_reason(pk)])
             if verdict == 'reject_luna':
                 conn.execute('ROLLBACK')
                 return _reject('luna_requires_ticket', task_id, pk,
@@ -1502,8 +1598,15 @@ def reserve(store_path=None, *, task_id, runtime, model, workspace, prompt_sha25
                                 domestic_full=_domestic_active(conn) >= DOMESTIC_TOTAL_CAPACITY)
             if verdict == 'full':
                 conn.execute('ROLLBACK')
+                if pk == CLAUDE_POOL_KEY:
+                    full_reason = (f'{pk} (Claude Code / deepseek-flash) is at its capacity '
+                                   'of 1 — the second concurrent dispatch to this single '
+                                   'independent slot is refused and never falls back to any '
+                                   'other model or the domestic pools')
+                else:
+                    full_reason = f'{pk} and every other domestic pool is at capacity'
                 return _reject('capacity_full', task_id, pk,
-                               [f'{pk} and every other domestic pool is at capacity'],
+                               [full_reason],
                                domestic_full=(_domestic_active(conn) >=
                                               DOMESTIC_TOTAL_CAPACITY))
             tok = _insert_claim(conn, task_id=task_id, stage=stage, chat_id=chat_id,
@@ -1717,12 +1820,11 @@ def consume_for_entry(store_path=None, *, task_id, runtime, model, workspace,
                             'reason': 'main_force_window_closed',
                             'pool_key': row['pool_key'], 'task_id': task_id,
                             'capacity_released': True,
-                            'reasons': ['this reserved attempt could not start before the '
-                                        'Beijing-time main-force window (22:00 inclusive to '
-                                        '08:00 exclusive) for Qwen3.8-Max closed; released '
-                                        'this attempt\'s own reserved placeholder to '
-                                        'start_failed (real release, never leaked, never '
-                                        'preempting another task) and refused the start']}
+                            'reasons': [_window_closed_reason(row['pool_key']) +
+                                        '; released this attempt\'s own reserved '
+                                        'placeholder to start_failed (real release, never '
+                                        'leaked, never preempting another task) and refused '
+                                        'the start before Popen']}
                 # Z4：同 task 原消费除外；别的 task 已在同真实 workspace 在途写入则拒。
                 busy = _workspace_conflict(conn, workspace, own_token=claim_token)
                 if busy is not None:
@@ -2406,6 +2508,8 @@ def claim_due(store_path=None, *, task_id, now=None, scope=None,
                 if target is None and allowed is not None:
                     for k in allowed:
                         if k not in MAIN_FORCE_KEYS and capacity_for(k) is not None \
+                                and not _main_force_limit_active(conn, k) \
+                                and not _max_window_blocks(k, now) \
                                 and _count_active(conn, k) < capacity_for(k):
                             target = k
                             break

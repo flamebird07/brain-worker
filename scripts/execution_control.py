@@ -44,6 +44,10 @@ CAPABILITY = {
     'qodercn': {'fine_grained': True, 'read_dirs': True},
     'codebuddy': {'fine_grained': True, 'read_dirs': False},
     'zcode': {'fine_grained': False, 'read_dirs': False},
+    # BW-CLAUDE-DEEPSEEK-S2：Claude Code CLI 支持逐文件 Edit(...)/原样 Bash(...) 细粒度授权
+    # 与 --add-dir 外部只读目录，故 fine_grained/read_dirs 均为 True。这只是让控制面接受
+    # claude 计划/精确工具授权；退休入口（codebuddy/workbuddy）的拒绝逻辑完全不受影响。
+    'claude': {'fine_grained': True, 'read_dirs': True},
 }
 
 # CodeBuddy/WorkBuddy 直连已退休为 human-relay only：控制面对**新**的直接派发计划
@@ -190,12 +194,14 @@ def _counts_domestic_concurrency(task) -> bool:
     国内六名额，已退休的 CodeBuddy/WorkBuddy 直连与其它非国内池 likewise 排除——否则
     旧的全局快照 max 会把 Luna/旧 CB/其它池当成统一容量闸，误拒本可进入真实国内闸的新
     qoder/zcode 派工（S5 复现：domestic=0、6 个 Luna executing 却报 concurrency 6
-    exceeded）。runtime 缺失/未知保守计入：真实国内容量上限由 dispatch_pool 原子池权威
+    exceeded）。BW-CLAUDE-DEEPSEEK-S2：claude:deepseek-flash 是独立第 11 槽，其容量由
+    dispatch_pool 的 claude 原子池强制（容量 1），不并入本国内 qoder/zcode 快照并发闸。
+    runtime 缺失/未知保守计入：真实国内容量上限由 dispatch_pool 原子池权威
     强制，本闸只是业务快照二级保护，保守计入不会放松原子池。"""
     rt = task.get('runtime')
     if isinstance(rt, str):
         low = rt.strip().lower()
-        if low == 'luna' or low in RETIRED_DIRECT_RUNTIMES:
+        if low == 'luna' or low == 'claude' or low in RETIRED_DIRECT_RUNTIMES:
             return False
     return True
 

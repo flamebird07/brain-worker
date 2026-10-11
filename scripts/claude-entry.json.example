@@ -1,0 +1,37 @@
+{
+  "_comment": "Claude Code CLI / deepseek-flash 入口配置示例。真实私有配置写在同目录 claude-entry.local.json（已被 .gitignore 忽略），受信任宿主默认加载它；worker 工具不得读取该 local 文件（工具作用域约束，非加载器禁令）。本 example 只放占位与指针，绝不包含真实 token/密钥。路径由 root 本机填写。",
+  "_executable_note": "官方 Node CLI 2.1.76 不支持 --bare：可执行 claude 启动器，或用 node.exe + launcher_args 指向绝对 cli.js。",
+  "executable": "C:/Program Files/nodejs/node.exe",
+  "launcher_args": [
+    "C:/Users/Administrator/AppData/Roaming/npm/node_modules/@anthropic-ai/claude-code/cli.js"
+  ],
+  "base_url": "https://api.deepseek.com/anthropic",
+  "model": "deepseek-flash",
+  "permission_mode": "dontAsk",
+  "_permission_note": "固定 dontAsk：permission_mode 为其它任何值（含 bypassPermissions）都会被 build_argv 直接拒绝；model/base_url 同样钉死 deepseek-flash 与本入口。",
+  "setting_sources": [],
+  "tools": ["Read", "Grep", "Glob", "Edit", "Write"],
+  "_tools_note": "默认**不开 Bash**（无已验证的精确只读自动批准门）；工程测试交授权 Qoder 登记条目或主脑独立验收。",
+  "allowed_tools": [
+    "Read",
+    "Grep",
+    "Glob",
+    "Edit(/absolute/path/to/file.py)"
+  ],
+  "_allowed_note": "写授权使用 Edit(<具体文件>) 逐文件形式，而非宽泛 glob；allowedTools/disallowedTools 各只在 argv 出现一次，后跟全部规则。",
+  "disallowed_tools": [],
+  "add_dirs": [],
+  "max_turns": 40,
+  "append_system_prompt": true,
+  "_no_fallback_note": "子进程 env 里 ANTHROPIC_MODEL 与 default opus/sonnet/haiku/small-fast/subagent(CLAUDE_CODE_SUBAGENT_MODEL) 全部钉死 deepseek-flash，禁止回退 Claude 或 pro。",
+  "env": {},
+  "_env_note": "子进程 env 会清除继承的 ANTHROPIC_AUTH_TOKEN/ANTHROPIC_API_KEY/CLAUDE_CODE_OAUTH_TOKEN/CLAUDE_CODE_SIMPLE 与 HTTP(S)_PROXY；凭据只以 ANTHROPIC_API_KEY 注入子进程 env，绝不进 argv/证据。",
+  "credential_source": {
+    "mode": "credential_file",
+    "path": "REPLACE_WITH_ABSOLUTE_DPAPI_SECURESTRING_FILE",
+    "_path_note": "真实 DPAPI 密文文件路径由 root 在 claude-entry.local.json 填写，本 example 不落任何密文。",
+    "pwsh_path": "powershell",
+    "_pwsh_note": "本机 Windows powershell.exe 因模块加载冲突不可用时，改指官方宿主 pwsh.exe（默认 powershell）。"
+  },
+  "_offline_note": "离线/CI 无真实凭据时可把 credential_source.mode 设为 token_env 并只从环境变量读取（见 env 名 ANTHROPIC_API_KEY）；token 只进子进程 env，绝不进 argv/request/异常/证据。"
+}

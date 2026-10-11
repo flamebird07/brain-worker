@@ -58,9 +58,11 @@ class NativeLifecycleTests(unittest.TestCase):
     # routing_required 拒绝（fixture 不能反向松生产轮转）；合法顺序 Z,Max,Z,Max,
     # Flash,Flash，每次独立 workspace 并逐一核验 allowed/token/pool_key。
     def _fill_domestic(self):
-        # BW-MAX-WINDOW-20261010-S2 六池 10 槽：zcode×2 + 两内置 Max 各 1 + CN 自定义 Max×2
-        # + 两地区 Flash 各 2。全部经显式 executor 逐一确定性 claim（CN 池只能
-        # executor='qodercn'，AUTO 轮换不保证落某特定主力），每次核验 allowed/token/pool_key。
+        # BW-CLAUDE-DEEPSEEK-S4 十一满：zcode×2 + 两内置 Max 各 1 + CN 自定义 Max×2
+        # + 两地区 Flash 各 2 + claude:deepseek-flash×1（第 11 主力槽；T0=北京周四 23:00，
+        # 主力时段内且 claude offhours，真实 API 直接 claim）。全部经显式 executor 逐一
+        # 确定性 claim（CN 池只能 executor='qodercn'，claude 只能 executor='claude'，
+        # AUTO 轮换不保证落某特定主力），每次核验 allowed/token/pool_key。
         plan = [('zcode', 'GLM-5.3', 'zcode'), ('zcode', 'GLM-5.3', 'zcode'),
                 ('qoder', 'Qwen3.8-Max', 'qoder'),
                 ('qodercn', 'Qwen3.8-Max', 'qodercn'),
@@ -69,7 +71,8 @@ class NativeLifecycleTests(unittest.TestCase):
                 ('qoder', 'Qwen3.8-Flash', 'qoder'),
                 ('qoder', 'Qwen3.8-Flash', 'qoder'),
                 ('qodercn', 'Qwen3.8-Flash', 'qodercn'),
-                ('qodercn', 'Qwen3.8-Flash', 'qodercn')]
+                ('qodercn', 'Qwen3.8-Flash', 'qodercn'),
+                ('claude', 'deepseek-flash', 'claude')]
         tokens = []
         for i, (runtime, model, ex) in enumerate(plan):
             out = dp.reserve(self.store, task_id=f'dom-{i}', runtime=runtime,
