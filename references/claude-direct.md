@@ -14,11 +14,14 @@
 - **已登记入主力体系**：`claude:deepseek-flash` 在 `MAIN_FORCE_POOLS`/`MAIN_FORCE_KEYS`/
   `MAIN_FORCE_CAPACITY` 内，`DOMESTIC_TOTAL_CAPACITY = 6 + 4 + 1 = 11`（**原 10 槽一项未减**）；
   `_domestic_active` 统计所有非 Luna 在途 attempt，**claude 在途计入国内总额**。
-- **独立第三公平组 claude**（与 Z2 组、Qoder 组并列）：committed 由 attempts 真实提交历史
-  `_count_committed_claude` 统计，**绝不污染** committed_zcode/committed_qoder；平票时排
-  Z2/Qoder 之后（`_grp_rank` claude 最后），绝不抢原路由。
-- `AUTO` **可选** claude：AUTO 的 claude 入口请求**不绕过公平选择**，经 `_select_main_force`
-  轮转（先过滤真实空位与时段门/限额，再在合格主力间平衡）；显式 `executor='claude'` 保持
+- **独立组 claude**：committed 由 attempts 真实提交历史
+  `_count_committed_claude` 统计，**绝不污染** committed_zcode/committed_qoder；
+  BW-MAIN-PRIORITY-20261011-S1 当前口径：claude 优先级层=1——排三 Qoder Max（层=0）之后、
+  `zcode:GLM-5.3`（层=2）之前，Max 全不可用时 claude 允许窗且有空位即优先于 Z；旧
+  “平票排 Z2/Qoder 之后（`_grp_rank`）”的跨层 1:1 属历史、已被覆盖，历史 committed
+  计数照旧保留记账但不再参与跨层竞争。
+- `AUTO` **可选** claude：AUTO 的 claude 入口请求**不绕过统一选择**，经同一权威 `_select_main_force`
+  优先级排序（先过滤真实空位与时段门/限额，再按优先级层选择、同层内在途平衡）；显式 `executor='claude'` 保持
   精确组合、绝不跨到其它池或回退模型。
 - `_domestic_policy` claude 分支（S4 收口）：`executor_conflict` → **总 11 守卫先于一切**
   （迁移债务满 11 时 `full`，**绝不派第 12 个**）→ 时段门 `main_force_window_closed` →

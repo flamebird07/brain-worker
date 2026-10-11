@@ -389,9 +389,11 @@ class NativeLifecycleTests(unittest.TestCase):
 
     # ---------- 5. 国内旧 finish 边界不变；Luna 不能走国内 finish ----------
     def test_domestic_finish_boundary_unchanged(self):
+        # 准备用显式 executor='zcode' 固定组合，绕过 AUTO 跨层改派（BW-MAIN-PRIORITY-S1）；
+        # 国内旧 finish 边界断言原样保留。
         out = dp.reserve(self.store, task_id='dom-x', runtime='zcode',
                          model='GLM-5.3', workspace='ws-x', prompt_sha256='a' * 64,
-                         now=T0)
+                         executor='zcode', now=T0)
         tok = out['token']
         fin = dp.finish(self.store, tok, terminal='finished', now=T0)
         self.assertFalse(fin['released'], fin)  # 无 child 证据仍拒绝

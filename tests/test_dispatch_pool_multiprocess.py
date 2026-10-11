@@ -124,12 +124,14 @@ def _sleep_worker(alive_event):
 
 
 def _ws_claim_worker(store, barrier, q, worker_id, workspace):
-    """Z4：同真实 workspace 不同 task 的并发 claim 竞争（跨 OS spawn）。"""
+    """Z4：同真实 workspace 不同 task 的并发 claim 竞争（跨 OS spawn）。
+    显式 executor='zcode' 固定组合，绕过 AUTO 跨层改派（BW-MAIN-PRIORITY-S1），让并发只
+    考验单写入守卫本身；父用例与此 worker 保持一致。"""
     try:
         barrier.wait(timeout=BARRIER_TIMEOUT)
         out = dp.select_and_claim(store, task_id=f'ws-{worker_id}', runtime='zcode',
                                   model='GLM-5.3', workspace=workspace,
-                                  stage=f'w{worker_id}',
+                                  stage=f'w{worker_id}', executor='zcode',
                                   prompt_sha256=f'{worker_id:x}' * 64, now=T0,
                                   _preclaim=False)
         q.put({'kind': 'claim', 'worker': worker_id, 'allowed': out['allowed'],
@@ -263,7 +265,7 @@ class TestConcurrentConsume(_SpawnMixin, unittest.TestCase):
     def test_same_reserved_token_single_winner(self):
         res = dp.reserve(self.store, task_id='mpk', runtime='zcode', model='GLM-5.3',
                          workspace='C:/mp', prompt_sha256='k' * 64, stage='sk',
-                         chat_id='ck', now=T0, _preclaim=False)
+                         chat_id='ck', executor='zcode', now=T0, _preclaim=False)
         self.assertTrue(res['allowed'], res)
         n = 4
         barrier = _CTX.Barrier(n)
@@ -364,16 +366,16 @@ class TestPidReuseAndLateFinish(_SpawnMixin, unittest.TestCase):
         old = dp.select_and_claim(self.store, task_id='lat', runtime='zcode',
                                   model='GLM-5.3', workspace='C:/mp',
                                   prompt_sha256='o' * 64, stage='ls', chat_id='lc',
-                                  now=T0, _preclaim=False)
+                                  executor='zcode', now=T0, _preclaim=False)
         self.assertTrue(old['allowed'], old)
         self.assertTrue(dp.finish(self.store, old['token'], terminal='cancelled',
                                   now=T0)['released'])
-        # 同 task 新 attempt（跨 1:1 轮转请求 Max），旧 token 晚到的重复 finish
-        # 只能幂等，绝不影响/释放新在途行。
+        # 同 task 新 attempt（显式 executor='qoder' 固定 Qoder Max 组合），旧 token 晚到的
+        # 重复 finish 只能幂等，绝不影响/释放新在途行。
         new = dp.select_and_claim(self.store, task_id='lat', runtime='qoder',
                                   model='Qwen3.8-Max', workspace='C:/mp',
                                   prompt_sha256='n' * 64, stage='ls', chat_id='lc',
-                                  now=T0, _preclaim=False)
+                                  executor='qoder', now=T0, _preclaim=False)
         self.assertTrue(new['allowed'], new)
         again = dp.finish(self.store, old['token'], terminal='finished', now=T0)
         self.assertFalse(again['released'])
@@ -564,20 +566,20 @@ class TestWorkspaceSingleWriterZ4(_SpawnMixin, unittest.TestCase):
             aliases.append(base.replace('\\', '/'))  # Windows 正斜杠表示
             aliases.append(base.replace('/', '\\'))  # Windows 反斜杠表示
         a = dp.select_and_claim(self.store, task_id='wa', runtime='zcode',
-                                model='GLM-5.3', workspace=base,
+                                model='GLM-5.3', workspace=base, executor='zcode',
                                 prompt_sha256='a' * 64, now=T0, _preclaim=False)
         self.assertTrue(a['allowed'], a)
         for alias in aliases:
             b = dp.select_and_claim(self.store, task_id='wb', runtime='zcode',
-                                    model='GLM-5.3', workspace=alias,
+                                    model='GLM-5.3', workspace=alias, executor='zcode',
                                     prompt_sha256='b' * 64, now=T0, _preclaim=False)
             self.assertFalse(b['allowed'], alias)
             self.assertEqual(b['reason'], 'workspace_in_flight', alias)
             self.assertFalse(b['sent'])
         # reserve / claim_due 国内回收与 Luna 分支同样不绕过（Luna 票据 scope 同目录）。
         r = dp.reserve(self.store, task_id='wc', runtime='zcode', model='GLM-5.3',
-                       workspace=base, prompt_sha256='c' * 64, now=T0,
-                       _preclaim=False)
+                       workspace=base, prompt_sha256='c' * 64, executor='zcode',
+                       now=T0, _preclaim=False)
         self.assertFalse(r['allowed'])
         self.assertEqual(r['reason'], 'workspace_in_flight')
 

@@ -89,10 +89,15 @@ class _PoolBase(unittest.TestCase):
 
     # ---- 便捷动作 ----
     def reserve(self, task, runtime, model, pk=None, ws=None, prompt='p',
-                stage=None, chat_id=None):
+                stage=None, chat_id=None, executor=None):
+        """确定性占位准备：默认把 executor 固定为所请求的 runtime，绕过 AUTO 跨层优先级
+        改派（BW-MAIN-PRIORITY-S1：夜间 AUTO 会把 zcode 请求改派到 Qoder Max）。本 helper
+        只服务于生命周期/容量/工作区/owner 等非 AUTO 排序用例的准备，绝不改生产算法；真正
+        验证 AUTO 排序的用例走 self.select（保留 AUTO 路径）。"""
         r = dp.reserve(self.store, task_id=task, runtime=runtime, model=model,
                        workspace=str(ws if ws is not None else self._ws_for(task)),
                        prompt_sha256=prompt, stage=stage, chat_id=chat_id,
+                       executor=executor if executor is not None else runtime,
                        now=T0, _preclaim=False)
         self.assertClaimed(r, pk or dp.pool_key(runtime, model))
         return r['token']
@@ -211,14 +216,25 @@ class CapacityAndKnownPoolTests(_PoolBase):
 
 
 class MainForceRotationTests(_PoolBase):
-    def test_select_balances_1_1_by_committed_count(self):
-        # 请求 zcode，但 committed 平票且 zcode 排在前（MAIN_FORCE_KEYS 顺序）→ 选中 zcode。
+    def test_select_prefers_max_tier_then_claude_then_zcode(self):
+        # BW-MAIN-PRIORITY-S1 新主力优先级：三 Qoder Max > claude:deepseek-flash > zcode。
+        # 空池请求 zcode → AUTO 改派到最高层且有位的 qoder:Qwen3.8-Max（历史 committed 计数
+        # 仍照旧记账，但绝不再参与跨层排序，低层不能抢高层名额）。
         r1 = self.select('t1', 'zcode', 'GLM-5.3')
-        self.assertClaimed(r1, 'zcode:GLM-5.3')
-        # 现在 committed_zcode=1 > committed_qoder=0：请求 zcode 会被轮换到 qoder。
+        self.assertRouting(r1, 'qoder:Qwen3.8-Max')
+        self.assertFalse(r1.get('sent', True))
+        # 占满三 Qoder Max 层（4 槽）后，请求 zcode → 落到下一层 claude:deepseek-flash。
+        self.reserve_exec('m0', 'qoder', 'Qwen3.8-Max', 'qoder')
+        self.reserve_exec('m1', 'qodercn', 'Qwen3.8-Max', 'qodercn')
+        self.reserve_exec('m2', 'qodercn', 'Qwen-3.8-Max', 'qodercn')
+        self.reserve_exec('m3', 'qodercn', 'Qwen-3.8-Max', 'qodercn')
         r2 = self.select('t2', 'zcode', 'GLM-5.3')
-        self.assertRouting(r2, 'qoder:Qwen3.8-Max')
+        self.assertRouting(r2, 'claude:deepseek-flash')
         self.assertFalse(r2.get('sent', True))
+        # claude 层也满后，请求 zcode → 命中 zcode 自身层，直接 claim（高层全满才落最低层）。
+        self.reserve_exec('c0', 'claude', 'deepseek-flash', 'claude')
+        r3 = self.select('t3', 'zcode', 'GLM-5.3')
+        self.assertClaimed(r3, 'zcode:GLM-5.3')
 
     def test_select_prefers_requested_combo_on_tie(self):
         r = self.select('tie', 'qoder', 'Qwen3.8-Max')
@@ -294,18 +310,23 @@ class OverflowRoutingTests(_PoolBase):
 class SameWorkspaceGuardTests(_PoolBase):
     def test_same_real_workspace_two_writers_only_one_claims(self):
         # 真正同一真实目录：不同 task 竞争同一 workspace，只有一个能 claim（守卫不放松）。
+        # 准备用显式 executor 固定组合，绕过 AUTO 跨层改派（BW-MAIN-PRIORITY-S1），单写入
+        # 守卫断言原样保留。
         shared = self._ws_for('shared')
         r1 = dp.reserve(self.store, task_id='w1', runtime='zcode', model='GLM-5.3',
-                        workspace=str(shared), prompt_sha256='p', now=T0, _preclaim=False)
+                        workspace=str(shared), prompt_sha256='p', executor='zcode',
+                        now=T0, _preclaim=False)
         self.assertClaimed(r1, 'zcode:GLM-5.3')
         r2 = dp.reserve(self.store, task_id='w2', runtime='qoder', model='Qwen3.8-Max',
-                        workspace=str(shared), prompt_sha256='p', now=T0, _preclaim=False)
+                        workspace=str(shared), prompt_sha256='p', executor='qoder',
+                        now=T0, _preclaim=False)
         self.assertFalse(r2.get('allowed'), r2)
         self.assertEqual(r2.get('reason'), 'workspace_in_flight')
         # 释放 w1 后，同一真实目录恢复可写。
         dp.finish(self.store, r1['token'], terminal='cancelled', now=T0)
         r3 = dp.reserve(self.store, task_id='w2', runtime='qoder', model='Qwen3.8-Max',
-                        workspace=str(shared), prompt_sha256='p', now=T0, _preclaim=False)
+                        workspace=str(shared), prompt_sha256='p', executor='qoder',
+                        now=T0, _preclaim=False)
         self.assertTrue(r3.get('allowed'), r3)
 
 
@@ -370,14 +391,15 @@ class ConsumeForEntryTests(_PoolBase):
         self.assertEqual(self._state(tok), 'reserved')
 
     def test_consume_without_token_routes(self):
-        # 无 token → 走 select_and_claim；请求主力在空池 → claim 成功。
-        r = dp.consume_for_entry(self.store, task_id='n', runtime='zcode',
-                                 model='GLM-5.3', workspace=str(self._ws_for('n')),
+        # 无 token → 走 select_and_claim；BW-MAIN-PRIORITY-S1 新优先级下三 Qoder Max 为最高
+        # 层，空池请求 qoder:Qwen3.8-Max 即被 AUTO 选中并直接 claim（无需改派）。
+        r = dp.consume_for_entry(self.store, task_id='n', runtime='qoder',
+                                 model='Qwen3.8-Max', workspace=str(self._ws_for('n')),
                                  prompt_sha256='p', wrapper_pid=4321, wrapper_created='w1',
                                  now=T0)
         self.assertTrue(r['allowed'], r)
         self.assertTrue(r['claimed'])
-        self.assertEqual(r['pool_key'], 'zcode:GLM-5.3')
+        self.assertEqual(r['pool_key'], 'qoder:Qwen3.8-Max')
 
     def test_consume_without_token_can_route_wrong_combo(self):
         self.reserve('z0', 'zcode', 'GLM-5.3')
@@ -810,10 +832,12 @@ class CliSmokeTests(_PoolBase):
         self.assertEqual(args.command, 'status')
 
     def test_cli_reserve_then_status(self):
+        # CLI 冒烟：显式 --executor zcode 固定组合，绕过 AUTO 跨层改派（BW-MAIN-PRIORITY-S1），
+        # 仍真实跑 parser+main+reserve+status 全链路。
         self.assertEqual(dp.main(['--store', self.store, 'reserve', '--task-id', 'cli',
                                   '--runtime', 'zcode', '--model', 'GLM-5.3',
                                   '--workspace', str(self._ws_for('cli')),
-                                  '--prompt-sha256', 'deadbeef']), 0)
+                                  '--prompt-sha256', 'deadbeef', '--executor', 'zcode']), 0)
         st = dp.status(self.store)
         self.assertEqual(st['pools']['zcode:GLM-5.3']['active'], 1)
 

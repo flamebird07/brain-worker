@@ -5,20 +5,20 @@
 > `quota_control` 的**额度冷却门禁**是两回事：容量并发 ≠ 额度。落地口径以本文件为准，实现以
 > `scripts/dispatch_pool.py` 为准，二者不一致时以代码为准并回修文档。
 
-## 分配决策（当前有效，BW-POOL-SPLIT-20261010-S2/S3 + BW-MAX-WINDOW-20261010-S2 六池定型 + BW-CLAUDE-DEEPSEEK-S3/S4 第 11 主力槽）
+## 分配决策（当前有效，BW-POOL-SPLIT-20261010-S2/S3 + BW-MAX-WINDOW-20261010-S2 六池定型 + BW-CLAUDE-DEEPSEEK-S3/S4 第 11 主力槽 + BW-MAIN-PRIORITY-20261011-S1 主力优先级）
 
 所有会话共享同一个持久池，绝不各自为政：
 
 | 角色 | 组合（`runtime:model`） | 每组合真实在途上限 | 说明 |
 | --- | --- | --- | --- |
-| 主力 | `zcode:GLM-5.3` | 2 | 与其他主力按 committed 做 best-effort 1:1 轮换 |
+| 主力 | `zcode:GLM-5.3` | 2 | 优先级层=2（最后，BW-MAIN-PRIORITY-20261011-S1）：三 Qoder Max（层=0）与 `claude:deepseek-flash`（层=1）全部不合格或无空位才轮到；旧跨层 committed 1:1 属历史、已被覆盖 |
 | 主力 | `qoder:Qwen3.8-Max` | 1 | 国际 Max 主力；明确限额命中时经 `main_force_limits` 自动跳过，不查余额；**BW-MAX-WINDOW-20261010-S1：作为主力仅北京时间 22:00（含）至次日 08:00（不含）参与新派工，其余时段 AUTO 自动跳过、主脑显式 `reserve` 如实拒绝** |
 | 主力 | `qodercn:Qwen3.8-Max` | 1 | CN 内置 Max 主力；独立池，不受国际 Max 标记影响，限额规则同国际 Max；**BW-MAX-WINDOW-20261010-S1：主力时段门同国际 Max（北京时间 22:00 含至 08:00 不含）** |
-| 主力 | `qodercn:Qwen-3.8-Max` | 2 | CN 自定义主力（友好名带连字符 `Qwen-3.8-Max`，与内置 `Qwen3.8-Max` 不同）；属 Qoder 主力组、复用既有 committed 1:1 轮换；**BW-CUSTOM-MAX-NIGHT-20261010-S1：纳入主力时段门（作为主力仅北京时间 22:00 含至次日 08:00 不含参与新派工，其余时段 AUTO 自动跳过、主脑显式 `reserve`/`consume` 如实拒绝），并复用 `main_force_limits` 限额判定，各自 pool_key 独立落标、对两内置 Max 无连带** |
+| 主力 | `qodercn:Qwen-3.8-Max` | 2 | CN 自定义主力（友好名带连字符 `Qwen-3.8-Max`，与内置 `Qwen3.8-Max` 不同）；属 Qoder 主力组，优先级层=0（与两内置 Max 同层，BW-MAIN-PRIORITY-20261011-S1；同层内按真实在途数平衡）；**BW-CUSTOM-MAX-NIGHT-20261010-S1：纳入主力时段门（作为主力仅北京时间 22:00 含至次日 08:00 不含参与新派工，其余时段 AUTO 自动跳过、主脑显式 `reserve`/`consume` 如实拒绝），并复用 `main_force_limits` 限额判定，各自 pool_key 独立落标、对两内置 Max 无连带** |
 | 兜底 | `qoder:Qwen3.8-Flash` | 2 | 与 CN Flash **同级**；`AUTO` 在合格可用主力均不可用或已满时从两区 Flash 选（可跨国际/CN），明确 `executor='qoder'` 时按本地区约束 |
 | 兜底 | `qodercn:Qwen3.8-Flash` | 2 | 与 `qoder:Qwen3.8-Flash` 同级；`AUTO` 可跨区选，明确 `executor='qodercn'` 时按本地区约束 |
 | 退休 | `qodercn:DeepSeek-Flash` | 0 | 新派发退休（`LEGACY_RETIRED_POOL_KEYS`，`_domestic_policy` 返 `unknown_pool`），仅供已存在旧在途 attempt 按真实 runtime/model 计入总数并真实终态释放 |
-| 主力（第 11 槽，BW-CLAUDE-DEEPSEEK-S2/S3/S4） | `claude:deepseek-flash` | 1 | Claude Code CLI / deepseek-flash：容量 1，**已登记入 `MAIN_FORCE_POOLS`/`MAIN_FORCE_KEYS`/`MAIN_FORCE_CAPACITY`**，`DOMESTIC_TOTAL_CAPACITY = 6+4+1 = 11`（**原 10 槽一项未减**），claude 在途**计入** `_domestic_active`；属**独立第三公平组 claude**（committed 由 `_count_committed_claude` 从真实 attempts 统计，绝不污染 committed_zcode/committed_qoder），**AUTO 可选**但平票排 Z2/Qoder 之后、绝不抢原路由；显式 `executor='claude'`/点名该 combo 保持精确组合、无跨模型回退；受 `deepseek_offpeak` 时段门约束（工作日 09:00–12:00、14:00–18:00 高峰不得新派；其余/周末/2026 假日全天可派）；可承载 `main_force_limits` 明确限额标记 |
+| 主力（第 11 槽，BW-CLAUDE-DEEPSEEK-S2/S3/S4） | `claude:deepseek-flash` | 1 | Claude Code CLI / deepseek-flash：容量 1，**已登记入 `MAIN_FORCE_POOLS`/`MAIN_FORCE_KEYS`/`MAIN_FORCE_CAPACITY`**，`DOMESTIC_TOTAL_CAPACITY = 6+4+1 = 11`（**原 10 槽一项未减**），claude 在途**计入** `_domestic_active`；属**独立组 claude**（committed 由 `_count_committed_claude` 从真实 attempts 统计，绝不污染 committed_zcode/committed_qoder），**AUTO 可选**；BW-MAIN-PRIORITY-20261011-S1 当前口径：优先级层=1，排三 Qoder Max（层=0）之后、`zcode:GLM-5.3`（层=2）之前——Max 全不可用时 claude 允许窗且有空位即优先于 Z（旧“平票排 Z2/Qoder 之后”属历史口径、已被覆盖）；显式 `executor='claude'`/点名该 combo 保持精确组合、无跨模型回退；受 `deepseek_offpeak` 时段门约束（工作日 09:00–12:00、14:00–18:00 高峰不得新派；其余/周末/2026 假日全天可派）；可承载 `main_force_limits` 明确限额标记 |
 | 救援 | `luna:native` | 无上限 | 只经 `claim-due` 竞争裁决，绝不被自动选中 |
 
 - **国内合计上限 = 11**（`DOMESTIC_TOTAL_CAPACITY = 主力 7（zcode 2 + 两内置 Max 各 1 + CN 自定义 2 +
@@ -46,7 +46,9 @@
   qodercn:Qwen3.8-Max, qodercn:Qwen-3.8-Max)`）；`zcode:GLM-5.3` 主力、两地区
   `Qwen3.8-Flash` 兜底、`luna:native` 救援、已退休 `qodercn:DeepSeek-Flash` 一律不受时段约束。
 - **AUTO 白天自动跳过**：`_eligible_main_forces(conn, zcode_blocked, now)` 在非时段把三个 Qoder
-  Max 从合格主力里剔除，`_select_main_force` 只在剩余主力（ZCode）里 best-effort 轮换，ZCode 也不
+  Max 从合格主力里剔除，`_select_main_force` 只在剩余合格主力里按优先级层排序（BW-MAIN-PRIORITY-
+  20261011-S1：`claude:deepseek-flash`（层=1，offpeak 允许窗且有空位时）先于 `zcode:GLM-5.3`
+  （层=2）），claude 与 ZCode 也都不
   可用/已满时才落到同级 Flash；三 Max 被跳过后绝不新落。
 - **主脑显式预留如实拒绝、绝不静默换模型**：`reserve(..., executor='qoder'/'qodercn',
   model='Qwen3.8-Max'/'Qwen-3.8-Max', now=白天)` → `main_force_window_closed`（`sent=false`、非
@@ -70,17 +72,18 @@
 客户 2026-10-11 追加：新增 1 个主力槽 `claude:deepseek-flash`（Claude Code CLI，经 DeepSeek
 Anthropic 兼容入口 `https://api.deepseek.com/anthropic`，精确模型 `deepseek-flash`）。可派工
 槽位由 10 增至 **11**，**原 10 槽一项未减**；S3/S4 现行口径是 claude **登记入主力体系**、
-作为**独立第三公平组**参与 AUTO，而不是把旧池缩小：
+作为**独立组**参与 AUTO（BW-MAIN-PRIORITY-20261011-S1 起优先级层=1），而不是把旧池缩小：
 
 - **容量与公平组**：`CAPACITY['claude:deepseek-flash']=1`，且进入 `MAIN_FORCE_POOLS`/
   `MAIN_FORCE_KEYS`/`MAIN_FORCE_CAPACITY`，故 `DOMESTIC_TOTAL_CAPACITY=11`；`_domestic_active`
   统计**所有非 Luna 在途 attempt**（含 claude 与仍在途的退休 DeepSeek/超额旧 Max 迁移债务），
-  达 11 时任何新国内 claim 一律 `full`、**绝不派第 12 个**。committed 轮转用**独立第三组**
-  计数 `_count_committed_claude`（真实 attempts，`child_pid NOT NULL`），**绝不污染**
-  `committed_zcode`/`committed_qoder`；`_grp_rank` 令 claude 平票时排 Z2/Qoder 之后，
-  **原 10 槽路由/1:1/Luna 阈值语义完全不变**。
-- **AUTO 可选但不绕公平**：AUTO 的 claude 入口请求**经 `_select_main_force` 轮转**
-  （`_eligible_main_forces` 先按真实空位 + 时段门 + 限额过滤），**不绕过公平选择**；
+  达 11 时任何新国内 claim 一律 `full`、**绝不派第 12 个**。committed 计数用**独立**统计
+  `_count_committed_claude`（真实 attempts，`child_pid NOT NULL`），**绝不污染**
+  `committed_zcode`/`committed_qoder`；BW-MAIN-PRIORITY-20261011-S1 当前口径：claude 优先级层=1
+  （三 Qoder Max=0 之后、ZCode=2 之前），旧 `_grp_rank` 平票排 Z2/Qoder 之后的跨层 1:1 属历史、
+  已被覆盖；历史 committed 计数照旧保留记账，**原 10 槽的容量/时段/限额/Luna 阈值语义不变**。
+- **AUTO 可选但不绕统一选择**：AUTO 的 claude 入口请求**经同一权威 `_select_main_force` 优先级排序**
+  （`_eligible_main_forces` 先按真实空位 + 时段门 + 限额过滤），**不绕过统一选择**；
   显式 `executor='claude'` 或点名 `claude:deepseek-flash` 组合走**精确组合**硬约束，
   绝不跨到其它池、**无跨模型回退**；`executor` 与请求组合冲突 → `executor_conflict`。
 - **`_domestic_policy` claude 分支顺序（S4 收口）**：`executor_conflict` →
@@ -125,7 +128,7 @@ Anthropic 兼容入口 `https://api.deepseek.com/anthropic`，精确模型 `deep
 > （全套通过、含 1 项平台跳过；确切用例数以最近一次原样运行与 SKILL.md 为准），
 > 零网络、零凭据、零真实额度查询、零真实模型启动。
 
-## 1:1 主力轮换是 best-effort，不是严格均衡
+## 主力优先级排序 Max > Claude > GLM（BW-MAIN-PRIORITY-20261011-S1，覆盖旧跨层 1:1）
 
 `select_and_claim` 在无显式 claim 时做**原子路由选择**，顺序如下：
 
@@ -140,8 +143,11 @@ Anthropic 兼容入口 `https://api.deepseek.com/anthropic`，精确模型 `deep
    - 合格可用主力仍有空位 → `routing_required` 到某主力组合（默认 AUTO 主力优先，不无故用 Flash）；
    - 无合格可用主力且 Flash 有合格空槽 → 允许 claim Flash；
    - Flash 也满 → `capacity_full`。
-4. **（仅默认 AUTO 且未明确绑定组合时）** 请求主力：在**合格可用**主力之间按 `committed` 计数轮换选
-   目标——**committed 少者优先；平票时优先请求的组合**。
+4. **（仅默认 AUTO 且未明确绑定组合时）** 请求主力：在**合格可用**主力之间按**优先级层**排序选
+   目标（BW-MAIN-PRIORITY-20261011-S1）——**三 Qwen-3.8-Max（国际内置/CN 内置/CN 自定义，层=0）
+   最高，`claude:deepseek-flash`（层=1）次之，`zcode:GLM-5.3`（层=2）最后**；历史 committed 计数、
+   请求池偏好与在途数**绝不能**让低层抢高层，最高层全部不合格或无空位才落下一层；**同层内真实
+   在途数少者优先，平票才优先请求的组合，再按 pool_key stable tie**。
    - 目标就是当前入口且有容量 → claim；
    - 目标是**另一个**合格主力组合 → `routing_required`（当前入口不是被选中组合，**不先提交错
      模型、不浪费或重复占用名额**，改由被选中入口继续）；
@@ -152,21 +158,22 @@ Anthropic 兼容入口 `https://api.deepseek.com/anthropic`，精确模型 `deep
    - 各主力（`zcode` + 两内置 Max + CN 自定义 Max + claude 第 11 槽）与两区 Flash 均满（**总 11 全满**）才 `capacity_full`。**候选均无可用槽不等于物理满**，
      降级原因与是否授权按 §执行器约束 及后文区分处理。
 
-轮换按**已提交计数**（`rotation.committed_zcode` / `committed_qoder` / `committed_claude`）驱动，是尽力而为的
-1:1，不保证任意时刻各池在途数严格相等：历史提交、单侧释放都会造成短暂偏差，这是设计允许的。
-**claude 是独立第三公平组**（`_count_committed_claude` 只从真实 attempts 提交历史统计，
-绝不污染 committed_zcode/committed_qoder；`_grp_rank` 令 claude 平票时排 Z2/Qoder 之后）。
+排序第一键是**优先级层**（时段受限的三 Qoder Max 在允许时段优先排活），同层内按真实在途数
+best-effort 平衡，不保证任意时刻同层各池在途数严格相等：单侧释放会造成短暂偏差，这是设计允许的。
+历史 committed 计数（`rotation.committed_zcode` / `committed_qoder` 与 `_count_committed_claude`）
+**照旧保留记账，但不再驱动跨层轮换**——旧跨层 best-effort 1:1（committed 少者组优先、claude 平票排
+Z2/Qoder 之后）属历史行为，已由 BW-MAIN-PRIORITY-20261011-S1 明确覆盖。
 文档不宣称严格均衡。`reserve` 与 `select_and_claim` 共用同一套统一国内策略（`_domestic_policy`）：
-**默认 AUTO 不绕过 1:1 轮换**（AUTO 的 claude 入口请求同样经 `_select_main_force` 公平轮转，
+**默认 AUTO 不绕过优先级排序**（AUTO 的 claude 入口请求同样经 `_select_main_force` 统一排序，
 不绕过选择）；但**受信任主脑明确给出的 executor/已授权 executor+model 组合是硬
-约束**，优先于历史 committed 比例（见 §执行器约束 与 §B4 加固）——有空位的指定 Qoder/Flash/Claude 绝不因
-比例被改道。
+约束**，优先于优先级层（见 §执行器约束 与 §B4 加固）——有空位的指定 Qoder/Flash/Claude/ZCode 绝不因
+排序被改道，也不擅自跨区。
 
 ## 执行器约束与 availability 资格过滤（BW-AVAILABILITY-20261009-B2）
 
 `select_and_claim`/`reserve`/`consume_for_entry`/`claim_due` 新增可选 `executor`
 （`auto`|`qoder`|`zcode`|`claude`，缺省 `auto`）与 `quota_store`/`quota_routes` 透传。**先过滤合格候选，
-再在可用主力之间做 1:1**：
+再在可用主力之间按优先级层排序（Max > Claude > GLM，同层在途平衡）**：
 
 - **availability 资格过滤走 param-or-env 的正式默认持久源**：解析顺序为显式 `quota_store` →
   环境变量 `BRAIN_WORKER_QUOTA_STORE` → 受信任默认持久文件 `qc.default_store_path()`（即
@@ -177,11 +184,12 @@ Anthropic 兼容入口 `https://api.deepseek.com/anthropic`，精确模型 `deep
   传入时读 §3b 的 `zcode_availability`（[quota-routing](quota-routing.md)）：被阻断的 ZCode 通道
   从可用主力集合里剔除。
 - **`executor='qoder'`（受信任主脑显式选择）**：有空位直接 claim `qoder:Qwen3.8-Max`，Max 满则按
-  溢出策略改道 Flash；**绝不因历史 committed 计数被 1:1 改道到 ZCode**。请求组合与 executor 冲突
+  溢出策略改道 Flash；**绝不因历史 committed 计数或主力排序被改道到 ZCode**。请求组合与 executor 冲突
   （如 executor=qoder 却请求 zcode 组合）→ `executor_conflict` 拒绝。
 - **`executor='zcode'`**：ZCode 被 availability 阻断 → `zcode_unavailable` 拒绝（**不改道到别的
   主力、不落 Flash**）；有空位则 claim，满则 `capacity_full`（无 Flash 回退）。
-- **`executor='auto'`（缺省）**：保留历史 committed 计数与 1:1 公平轮换，只在**合格**主力间轮换；
+- **`executor='auto'`（缺省）**：保留历史 committed 计数记账，只在**合格**主力间按优先级层排序
+  （Max > Claude > GLM，同层在途平衡，BW-MAIN-PRIORITY-20261011-S1）；
   请求 ZCode 但其被阻断 → 改道到可用主力/同级 Flash；各主力与国际 Flash 都满而 CN Flash 有空槽 →
   改道 CN Flash（入口已是 CN Flash 则 claim），**主力（含 claude 第 11 槽）与两区 Flash 也满（总 11 全满）才 `capacity_full`**，**绝不改道回不可用的
   ZCode**，也**不改道回别的池去互换明确指定的组合**。**不清库、不重置轮换计数**、不新增评分/额度逻辑。
@@ -197,7 +205,8 @@ Anthropic 兼容入口 `https://api.deepseek.com/anthropic`，精确模型 `deep
 
 - **combo 硬约束**：`executor`+`runtime`+`model` 明确组合（含 `qoder:Qwen3.8-Flash`）贯穿
   `reserve/select_and_claim/consume_for_entry/claim_due`，作为候选集合硬边界——受信任主脑明确
-  已授权的组合**不因别的候选有空位而被拒绝**；默认 AUTO 主力优先/容量/1:1 与各池真实容量
+  已授权的组合**不因别的候选有空位而被拒绝**；默认 AUTO 主力优先/容量/主力排序（现为优先级层
+  Max > Claude > GLM，见上文）与各池真实容量
   （BW-MAX-WINDOW-20261010-S2 后为六池总 10：`zcode`=2、两内置 Max 各 1、CN 自定义 Max=2、两区 Flash 各 2；
   BW-CLAUDE-DEEPSEEK-S3/S4 起把 claude 登记为第 11 主力槽 → **总 11**，原 10 槽一项未减）
   为既定政策不变（并发 2/4 为 Skill 政策、非已核实 Qoder 进程上限）。
@@ -226,10 +235,10 @@ Anthropic 兼容入口 `https://api.deepseek.com/anthropic`，精确模型 `deep
   - 给了 `--dispatch-claim <token>` → 同一 `BEGIN IMMEDIATE` 事务内先精确校验（task/runtime/
     model/workspace/prompt_sha256/stage/chat_id 任一漂移即拒），通过则 CAS `reserved→running`
     并持有名额；重复/并发消费同一 token 只有一个 `allowed`（一槽绝不双 Popen）；
-  - 没给 claim → `select_and_claim` 原子**自动**路由（统一国内策略：1:1 轮换 + 溢出 + 容量 +
+  - 没给 claim → `select_and_claim` 原子**自动**路由（统一国内策略：主力优先级排序 + 溢出 + 容量 +
     任务防重）；非被选中组合 → `routing_required`。
 - `--dispatch-plan` 只用于 `execution_control.preflight` 的权限/工作区/依赖快照核验，**绝不**
-  作为绕过 1:1 轮换或溢出改道的“确切组合”后门；携带计划者仍走同一条 `select_and_claim` 原子
+  作为绕过主力优先级排序或溢出改道的“确切组合”后门；携带计划者仍走同一条 `select_and_claim` 原子
   路由（旧的 `exact_combo` 旁路已废弃移除）。
 - 任何非放行结果（`allowed=false`）→ 入口打印 `capacity_gate_rejected`/`sent:false`/
   `exit_code:2`（含 `routing_required` 与被选中组合），**零证据目录创建、零 Popen、不计轮次**。
@@ -239,8 +248,8 @@ Anthropic 兼容入口 `https://api.deepseek.com/anthropic`，精确模型 `deep
   池里落一条在途 attempt），绝不靠提示词或一个传入布尔跳过；容量上限与任务防重在每条路径都强制。
 
 `reserve` 供主脑/测试为**确切** `(runtime, model)` 预留一个确定 token，再交给对应入口用
-`--dispatch-claim` 精确消费。`reserve` 与 `select_and_claim` 共用统一国内策略（1:1 轮换、溢出
-改道、容量上限、任务防重、真实 workspace 单写入守卫），**不绕过轮换**：请求组合非轮转选中组合
+`--dispatch-claim` 精确消费。`reserve` 与 `select_and_claim` 共用统一国内策略（主力优先级排序、溢出
+改道、容量上限、任务防重、真实 workspace 单写入守卫），**不绕过统一排序**：请求组合非选中组合
 时同样 `routing_required`。生产入口正常路径不带 `reserve` 语义——它只消费/校验或走
 `select_and_claim`。
 
@@ -367,7 +376,9 @@ store，复用既有 `dispatch_pool` 权威方法
 （`CAPACITY`/`MAIN_FORCE_KEYS`/`OVERFLOW_KEYS`/`capacity_for`/`_count_active`/
 `_active_task`/`_workspace_conflict`/`_domestic_active`/`_zcode_availability_blocked`/
 `_main_force_limit_active`/`_max_window_blocks`/`_select_main_force`/`_scope_allowed_candidates`），
-**不复制**公平轮换/日历/额度算法。用途是：主脑**先规划、再生成精确入口参数**，最终正式
+**不复制**主力排序/日历/额度算法（主力选择始终复用单一权威 `_select_main_force`，
+BW-MAIN-PRIORITY-20261011-S1 的 Max > Claude > GLM 优先级对本入口同样生效，绝不另造排序）。
+用途是：主脑**先规划、再生成精确入口参数**，最终正式
 入口仍原子复核——规划快照**绝不是**占位、派发或实时成功证明。
 
 ### 真实 `fixed` 与临时 `temporary_fallback` 的区别
@@ -524,7 +535,8 @@ executing/awaiting_acceptance` 或**未独立验收**时拒绝新选择（不抢
 
 - 容量池是 `sqlite3` 单文件持久锁，不是分布式协调服务；跨机器不共享（同一用户同一机器跨
   cwd/版本共享即达标）。
-- 1:1 轮换是 best-effort，短暂偏差不自动纠正（见上）。
+- 同层在途平衡是 best-effort，短暂偏差不自动纠正；跨层是硬性优先级层（Max > Claude > GLM，
+  见上）。旧跨层 committed 1:1 属历史口径、已被 BW-MAIN-PRIORITY-20261011-S1 覆盖。
 - Luna 的真实提问、原生工具调用、agentID 写回全部依赖宿主；池只持久化票据与竞争裁决，
   无法证明宿主真的问了或真的启动了——`launch_unknown` 就是对这一非幂等窗口的保守兜底。
 - Windows 之外平台拿不到进程创建时刻（`process_identity.created` 为 `None`），`reconcile`

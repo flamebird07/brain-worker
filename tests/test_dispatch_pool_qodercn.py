@@ -121,15 +121,20 @@ class CapacityAndRotationTests(_Store):
 
     def test_auto_prefers_main_then_flash_then_full_at_eleven(self):
         # 真实目标：主力优先 → 同级 Flash 兜底 → 11 满才物理满。
+        # BW-MAIN-PRIORITY-S1 新优先级：三 Qoder Max > claude > zcode。空池 AUTO 请求 zcode
+        # 会被改派到最高层 qoder:Qwen3.8-Max（routing_required，绝不误落 Z）。
         first = dp.select_and_claim(self.store, task_id='p0', runtime='zcode',
                                     model='GLM-5.3', workspace=self.ws('p0'),
                                     prompt_sha256='p', executor='auto', now=T0,
                                     _preclaim=False)
-        self.assertTrue(first['allowed'], first)
-        self.assertEqual(first['pool_key'], ZCODE)
-        # 用明确 executor 约束填满其余十槽（Z 第 2 + 两区内置 Max 各 1 + CN 自定义 Max 2
+        self.assertFalse(first['allowed'], first)
+        self.assertTrue(first['routing_required'], first)
+        self.assertEqual(first['selected']['pool_key'], QMAX)
+        self.assertEqual(self.active(ZCODE), 0)
+        # 用明确 executor 约束填满全部十一槽（Z 2 + 两区内置 Max 各 1 + CN 自定义 Max 2
         # + claude 1 + 两区 Flash 各 2）→ 总 11。
-        fill = [('z1', 'zcode', 'GLM-5.3', 'zcode'),
+        fill = [('z0', 'zcode', 'GLM-5.3', 'zcode'),
+                ('z1', 'zcode', 'GLM-5.3', 'zcode'),
                 ('q0', 'qoder', 'Qwen3.8-Max', 'qoder'),
                 ('c0', 'qodercn', 'Qwen3.8-Max', 'qodercn'),
                 ('cu0', 'qodercn', 'Qwen-3.8-Max', 'qodercn'),

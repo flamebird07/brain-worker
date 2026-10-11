@@ -348,10 +348,12 @@ class DispatchRoutingTests(_TmpBase):
         self.assertEqual(out['reason'], 'executor_conflict')
 
     def test_consume_token_recheck_releases_placeholder_no_leak(self):
-        # 先在没有 hold 时预留一个 ZCode token，再落 hold，消费时必须再核验并释放本占位。
+        # 先用可验证的固定 Z 预留（显式 executor='zcode'，绕过 AUTO 跨层改派
+        # BW-MAIN-PRIORITY-S1），再落 hold 让 availability 发生新阻断，消费时必须再核验并
+        # 释放本占位。
         r = dp.reserve(self.dispatch, task_id='tk', runtime='zcode', model='GLM-5.3',
                        workspace=str(self._ws_for('tk')), prompt_sha256='p', stage='s1',
-                       chat_id='c1', now=T0)
+                       chat_id='c1', executor='zcode', now=T0)
         self.assertTrue(r['reserved'], r)
         self.assertEqual(self._active(ZCODE), 1)
         self._hold_zcode()
@@ -1400,13 +1402,17 @@ class B5DefaultAvailabilityTests(_TmpBase):
 
     def test_default_missing_db_zero_writes_keeps_zcode_eligible(self):
         missing = self.tmp / 'no-quota.sqlite3'
+        # 缺库 = 无阻断 → ZCode 仍合格。BW-MAIN-PRIORITY-S1 下 AUTO 会优先 Qoder Max，故
+        # 此处用明确 executor='zcode' 约束验证 Z 仍 eligible（而非断言 AUTO 选 Z），并保留
+        # 缺库零写入断言。
         with mock.patch.dict(os.environ, {'BRAIN_WORKER_QUOTA_STORE': str(missing)}):
             out = dp.select_and_claim(self.dispatch, task_id='mz', runtime='zcode',
                                       model='GLM-5.3', workspace=str(self._ws_for('mz')),
-                                      prompt_sha256='p', stage='s1', executor='auto',
+                                      prompt_sha256='p', stage='s1', executor='zcode',
                                       now=T0)
         self.assertFalse(missing.exists())  # 缺库绝不建库/建表（零写）
-        self.assertTrue(out['allowed'], out)  # 缺库 = 无阻断 → ZCode 合格
+        self.assertTrue(out['allowed'], out)  # 缺库 = 无阻断 → ZCode 合格可 claim
+        self.assertEqual(out['pool_key'], ZCODE)
         self.assertEqual(self._active(ZCODE), 1)
 
 

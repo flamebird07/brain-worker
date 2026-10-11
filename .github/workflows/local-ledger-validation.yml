@@ -206,6 +206,15 @@ jobs:
       - name: Stage selection read-only planner offline regression (temp SQLite, no real pool)
         run: python -m unittest discover -s tests -p "test_stage_selection.py" -v
 
+      # BW-MAIN-PRIORITY-20261011-S1：主力优先级（三 Qoder Max > claude:deepseek-flash >
+      # zcode:GLM-5.3，同层在途平衡）专项离线回归。临时 SQLite + mock Z 可用函数，零真实
+      # 模型/凭据/池；覆盖夜间 Max 优先压过更高 committed 历史、Max 满/限额换另一 Max、
+      # Max 全不可用 Claude 允许窗优先 Z、Claude 满/限额/峰值才 Z、主力全满才 Flash、
+      # 显式 Z/固定 Flash 不强制 Max、CN 不跨区、22/08 边界与 DeepSeek 独立时间门不变、
+      # stage_selection 复用同一权威排序。Windows/Linux 矩阵都跑。
+      - name: Main force priority offline regression (temp SQLite, no real pool)
+        run: python -m unittest discover -s tests -p "test_main_force_priority.py" -v
+
       - name: Upload test outputs
         if: always()
         uses: actions/upload-artifact@v4

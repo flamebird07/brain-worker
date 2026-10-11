@@ -171,10 +171,13 @@ except ImportError:  # isolated revision tree / standalone tests
 #     **不受内置 Max 时段门约束**，复用既有私有 model_ids 映射下发真实 ID）；
 #   兜底（同级两池共 4 槽）：qoder:Qwen3.8-Flash=2、qodercn:Qwen3.8-Flash=2；
 #   CN 独立补充池（qodercn:DeepSeek-Flash）仍在正常候选池移除（capacity=0，仅旧在途释放）。
-# 主力之间 best-effort 1:1：Z2 与 Qoder 主力组（两内置 Max + 自定义 Max 合计 4 槽）之间按
-# committed 计数平衡，组内以当前真实在途数决定优先；仅对合格可用候选平衡，绝不因历史轮换
-# 拦有空位的候选（`_select_main_force` 先按 capacity/active 过滤再排序）。不新增记分系统，
-# 复用 rotation 两列 committed_zcode / committed_qoder 与 `_count_active` 即足够。
+# 主力优先级（BW-MAIN-PRIORITY-20261011-S1，覆盖旧跨层 best-effort 1:1）：AUTO 只在**当前
+# 真实有空位**且合格的候选里，按主力优先级层排序——三 Qoder Max（两内置 Max + 自定义 Max）
+# 最高，其次 claude:deepseek-flash，最后 zcode:GLM-5.3；同层内以当前真实在途数少者优先，
+# 平票才优先请求组合，再按 pool_key stable tie（`_select_main_force` 先按 capacity/active
+# 过滤再排序）。历史 committed 计数（rotation 两列 committed_zcode / committed_qoder 与
+# claude 提交历史）仍照旧记账并保留，但**不再参与跨层排序**，低层绝不能凭历史计数抢高层名额。
+# 不新增记分系统，复用既有 rotation 列与 `_count_active` 即足够。
 # BW-CLAUDE-DEEPSEEK-S3：Claude Code / deepseek-flash（claude:deepseek-flash，容量 1）纳入
 # 主力候选与 AUTO 可派集合，成为**独立第三公平组 claude**（与 Z2 组、Qoder 组并列），
 # 物理调度总数 DOMESTIC_TOTAL_CAPACITY = 6 + 4 + 1 = 11。
@@ -211,8 +214,10 @@ CAPACITY['luna:native'] = None
 # 可派工槽（独立第三公平组 claude，容量 1），故其容量已在上面 CAPACITY.update 中登记，无需重复。
 # 关键口径：
 #  - DOMESTIC_TOTAL_CAPACITY = 11，claude 在途计入国内总在途（_domestic_active 只排除 Luna）；
-#  - _select_main_force 的 Z2/Qoder best-effort 1:1 轮转不受影响：claude 的 committed 由
-#    attempts 中 child_pid 非空的真实提交历史计算，且平票时排在 Z2/Qoder 之后（绝不抢原路由）；
+#  - _select_main_force 现按主力优先级层排序（BW-MAIN-PRIORITY-20261011-S1：三 Qoder Max >
+#    claude:deepseek-flash > zcode:GLM-5.3）：claude 的 committed 仍由 attempts 中 child_pid
+#    非空的真实提交历史计算并保留记账，但只作历史计数、不再参与跨层排序（claude 处于中间层，
+#    仅当最高层三 Qoder Max 全部不合格或无空位时才轮到它，绝不凭历史计数抢更高层名额）；
 #  - claude 受 deepseek_offpeak 的北京时间工作日高峰门约束（高峰不得新派，offhours/周末/假日
 #    全天可派），且仅经 claude 自身 capacity=1 约束，无任何跨模型回退。
 CLAUDE_RUNTIME = 'claude'
@@ -628,8 +633,10 @@ def _count_active(conn, pk) -> int:
 def _count_committed_claude(conn) -> int:
     """claude 独立第三组的 committed 计数（BW-CLAUDE-DEEPSEEK-S3）：从**已有 attempts 表**的真实
     提交历史计算（`pool_key=claude:deepseek-flash` 且 `child_pid IS NOT NULL`，即真实启动过子进程
-    的 attempt），绝不新增 rotation 列/表/框架。仅用于 `_select_main_force` 的组间 best-effort
-    公平；claude 不计入 committed_zcode/committed_qoder。"""
+    的 attempt），绝不新增 rotation 列/表/框架。BW-MAIN-PRIORITY-20261011-S1 起 `_select_main_force`
+    改按主力优先级层排序（三 Qoder Max > claude > zcode），本计数**仅保留作历史记账**（供
+    status/rotation 观测），不再参与跨层排序或组间 best-effort 公平；claude 不计入
+    committed_zcode/committed_qoder。"""
     row = conn.execute(
         'SELECT COUNT(*) AS n FROM attempts WHERE pool_key=? AND child_pid IS NOT NULL',
         (CLAUDE_POOL_KEY,)).fetchone()
@@ -1057,18 +1064,20 @@ def _scope_allowed_candidates(scope, zcode_blocked):
 
 
 def _select_main_force(conn, requested_pk, now, eligible=None):
-    """主力选择（BW-POOL-SPLIT-20261010-S2）：
-    1. 候选 = `MAIN_FORCE_KEYS` 经 `eligible` 过滤（ZCode availability 阻断时先剔除，
-       绝不把名额分给不可用的 ZCode）；
+    """主力选择（BW-MAIN-PRIORITY-20261011-S1，覆盖旧跨层 best-effort 1:1）：
+    1. 候选 = `MAIN_FORCE_KEYS` 经 `eligible` 过滤（ZCode availability 阻断、三 Qoder Max
+       明确限额/北京时段门外都先剔除，绝不把名额分给不合格主力）；
     2. 只保留**当前真实有空位**的池（capacity_for > `_count_active`）——绝不因历史
-       committed 计数拦有空位的候选（"任何历史 1:1 计数不阻塞合格有空位的 Qoder"）；
-    3. 组间 best-effort 1:1 用现有 rotation 两列：committed_zcode（Z2 组）与
-       committed_qoder（Qoder Max 组：qoder:Qwen3.8-Max + qodercn:Qwen3.8-Max 合计），
-       committed 少的组优先；
-    4. 组内平衡：Qoder Max 组两地区之间用**当前真实在途数**（`_count_active`）少者优先，
-       Z2 组只有一个池，直接命中；
-    5. 平票才优先请求的组合（best-effort，非严格均衡，见 references/global-dispatch.md）；
-    6. 不新增记分/服务/额度，只用已有的 rotation 两列与 attempts 表真实计数。
+       committed 计数拦有空位的候选；
+    3. 排序第一键 = 主力优先级层：三 Qoder Max（qoder:Qwen3.8-Max /
+       qodercn:Qwen3.8-Max / qodercn:Qwen-3.8-Max）=0，claude:deepseek-flash=1，
+       zcode:GLM-5.3=2。历史 committed、请求池偏好与在途数**绝不能**让低层抢高层名额；
+       最高层全部不合格或无空位才落到下一层；
+    4. 同层内保持现有在途平衡：当前真实在途数（`_count_active`）少者优先，平票才优先
+       请求的组合，再按 pool_key stable tie；rotation 历史 committed 计数照旧保留记账，
+       但不再参与跨层竞争；
+    5. 全部主力都无可用槽才返回 main_force_full（由调用方走两地区 Flash 兜底）；
+    6. 不新增记分/服务/额度，只用已有 attempts 表真实计数。
     返回 (target_pk, reason)。"""
     order = list(MAIN_FORCE_KEYS)
     if eligible is not None:
@@ -1083,26 +1092,14 @@ def _select_main_force(conn, requested_pk, now, eligible=None):
             avail.append((pk, active))
     if not avail:
         return None, 'main_force_full'
-    rot = _rotation_row(conn)
-    group_committed = {'zcode': rot['committed_zcode'],
-                       'qoder': rot['committed_qoder'],
-                       'claude': _count_committed_claude(conn)}
-
-    def _grp(pk):
-        if pk == ZCODE_POOL_KEY:
-            return 'zcode'
-        if pk == CLAUDE_POOL_KEY:
-            return 'claude'
-        return 'qoder'
-
-    # claude 是独立第三公平组；平票（committed+active 都相同）时排在 Z2/Qoder 之后，
-    # 保证原 10 槽的 zcode/qoder 路由与 1:1 断言绝不因新增 claude 而改变。
-    _grp_rank = {'zcode': 0, 'qoder': 0, 'claude': 1}
+    # BW-MAIN-PRIORITY-20261011-S1：时段受限主力在允许时段优先排活——三 Qoder Max 最高，
+    # 其次 claude:deepseek-flash，最后 zcode:GLM-5.3（全天可用者垫底）。
+    tier = {QMAX_POOL_KEY: 0, CN_MAX_POOL_KEY: 0, CN_CUSTOM_MAX_POOL_KEY: 0,
+            CLAUDE_POOL_KEY: 1, ZCODE_POOL_KEY: 2}
 
     def _key(item):
         pk, active = item
-        g = _grp(pk)
-        return (group_committed[g], active, _grp_rank[g],
+        return (tier.get(pk, len(tier)), active,
                 0 if pk == requested_pk else 1, pk)
 
     avail.sort(key=_key)
