@@ -357,6 +357,150 @@ python scripts/dispatch_pool.py --store <abs> cancel-pending --task-id T [--reas
 **测试必须传显式临时 store**，绝不写真实池。所有裁决在 `BEGIN IMMEDIATE` 事务内原子完成，
 跨进程/跨会话/跨 cwd 一致。
 
+## 阶段重裁决只读规划入口（`scripts/stage_selection.py`，BW-STAGE-SELECTION-S1/S2）
+
+`stage_selection` 是**只读规划入口**：它**不是**新调度器/常驻服务/数据库表，也**绝不**
+`connect`/`reserve`/`select_and_claim`/`reconcile`/`mark`/`finish`。它只以 sqlite
+`mode=ro`（`PRAGMA query_only=ON` + `BEGIN` 只读事务，**绝不用 `immutable=1`**；缺库/缺
+schema/不可读快照一律如实拒绝且**绝不**创建/迁移/写 WAL/sidecar）打开**已有** dispatch
+store，复用既有 `dispatch_pool` 权威方法
+（`CAPACITY`/`MAIN_FORCE_KEYS`/`OVERFLOW_KEYS`/`capacity_for`/`_count_active`/
+`_active_task`/`_workspace_conflict`/`_domestic_active`/`_zcode_availability_blocked`/
+`_main_force_limit_active`/`_max_window_blocks`/`_select_main_force`/`_scope_allowed_candidates`），
+**不复制**公平轮换/日历/额度算法。用途是：主脑**先规划、再生成精确入口参数**，最终正式
+入口仍原子复核——规划快照**绝不是**占位、派发或实时成功证明。
+
+### 真实 `fixed` 与临时 `temporary_fallback` 的区别
+
+- **`fixed`**：授权明确要求某个 `runtime+model` 组合时，**即使是 Flash 也按原组合**，
+  绝不因为是 Flash 就被主力替换；该组合被时段门/明确限额/容量挡下时**如实拒绝**
+  （`fixed_candidate_unavailable`），绝不静默改道。
+- **`temporary_fallback`**：授权携带明确的 `fallback_scope`（**必须显式含 `task_id` 与
+  `stage`**）与当阶段指定的 `runtime+model`（**必须是两区 Flash 之一**，否则
+  `temporary_not_flash`）。`fallback_scope.task_id` **缺失或 != 本 `task_id` 一律
+  `fallback_scope_mismatch` 拒绝**——缺字段不得猜授权、不凭 previous 或候选集合蒙混。
+  **同阶段**（`fallback_scope.stage == 本轮 stage`）时**只按该指定 Flash**临时降级
+  （`temporary_fallback_selected`，仍须在授权集合内并通过时段/限额/容量门，否则
+  `temporary_candidate_unavailable`）——**不是 AUTO 关系选择，也不是永久 `fixed`**；
+  `allowed_candidates` 保留**基础授权候选集合**（不是只放选中 Flash）。
+  **旧 `fallback_scope` 的原值不改写**：先按 `fallback_scope.stage` 识别到期，而非先用
+  本轮 stage 去校验旧 scope；旧 temp 的 `authorization_scope` 只对**其原 scope** 核验，
+  **不跨 task**、**不凭随意 previous 误授权**。到期（`fallback_scope.stage != 本轮 stage`）
+  时，**只有** `previous.task_id == task_id`、`previous.stage == fallback_scope.stage`、
+  且 previous 为真实终态 + 已独立验收，才允许切换**显式 `parent_authorization`**
+  （parent 当前 task/stage 必须合法、`quote` 真实、类型限 `auto`/`fixed`/`executor`）重新
+  裁决，receipt 记 `reselection_due=true`；无 previous 或 previous 不匹配一律
+  `fallback_scope_mismatch` 拒绝。**到期可用集合取 `parent.allowed_candidates` 与本轮原
+  base `allowed_candidates` 的交集（不扩权），空交集拒绝**，禁止 unknown/retired/Luna/非
+  列表注入；**绝不把 `previous selected` 变成约束、绝不猜测扩大授权**。
+
+  短例（旧临时 s1 → 显式父授权、本 task 范围 AUTO → 当前 s2 重新裁决；**不改写成新 scope**）：
+
+  ```json
+  {"selection_mode": "temporary_fallback",
+   "fallback_scope": {"task_id": "T", "stage": "s1"},
+   "runtime": "qodercn", "model": "Qwen3.8-Flash",
+   "parent_authorization": {"selection_mode": "auto",
+     "quote": "本轮真实原话", "authorization_scope": {"task_id": "T", "stage": "s2"}}}
+  ```
+  ```json
+  {"previous": {"task_id": "T", "stage": "s1", "state": "finished",
+                "acceptance_reviewed": true}}
+  ```
+  此时 receipt 的 `selection_mode`/`authorization_quote`/`authorization_scope`/
+  `allowed_candidates` 体现**本轮有效父授权**，旧值仅在 `source_*` 与 `fallback_scope` 追溯。
+
+### 会话复用规则
+
+`session_reuse_allowed` **仅当** `previous.task_id` **显式等于**本 `task_id`、本次
+`selected(runtime/model)` 与 `previous` 上轮组合**相同**、`previous` 为真实终态且
+`previous.acceptance_reviewed` 为真（已独立验收）时才记；**缺 `task_id` 或来自 OTHER 任务
+一律不复用**，**绝不跨 task 继承**旧 CLI session / session ID。普通 AUTO/fixed 合法新选择
+照常返回（`selected` 非空），但 `session_reuse_allowed=false`，也不把 CLI session 延续当作
+授权或本轮选择。
+
+### 上下文、执行器与只读快照
+
+- **必需上下文**：`task_id`/`stage`/`workspace` 缺一即 `missing_context` 拒绝（无法核对防重与
+  工作区）；CLI 对应参数 **required**。
+- **有限字段直查**：`executor` 模式缺 `executor` 字段或非法类型/未知值 → `invalid_executor`
+  直接 JSON 拒绝（不做通用 schema 框架）。
+- **executor 本地区约束**：`executor` 模式的授权候选与本轮 `dp._scope_allowed_candidates`
+  给出的本地区集合取交集，**绝不跨区**；地区外候选在 `candidate_filters` 如实显示
+  `not_authorized`，**绝不把未选范围显示成 `eligible`**。
+- **只读快照**：只以 `mode=ro`（`PRAGMA query_only=ON` + `BEGIN` 只读事务）打开**既有**库，
+  **绝不用 `immutable=1`**（会忽略 WAL 中最新在途记录，不是安全快照）。WAL 存在但 `-shm`
+  缺失、模式/库不可读 → 如实 `store_snapshot_unavailable`，**绝不创建 sidecar/建库/建表/
+  迁移**；缺 `attempts`/`rotation` schema → `store_refused`。connect 成功但
+  `PRAGMA`/`BEGIN` 失败时**先 close 已建连接再抛 `Refused`**，不留连接泄漏、不改库。回归用
+  临时 WAL 库 + 打开的 writer 保留最新 active，规划必须真实读到它；不可读/缺 schema 时字节
+  与文件集不得改变，**绝不把过期基页当作成功**。逐候选过滤按**时段 → 明确限额 → 容量**
+  顺序只读求值；入口后续仍由正式入口**原子加锁**复核，规划快照永不代替锁。
+
+### 最小 receipt schema（输出 JSON，无占位）
+
+```json
+{
+  "preview_only": true, "sent": false, "placeholder": false,
+  "task_id": "T", "stage": "s2", "workspace": "…abs ws…",
+  "observed_at_utc": "2026-10-11T00:00:00+00:00",
+  "selection_mode": "auto|fixed|executor|temporary_fallback",
+  "selected_reason": "main_force_selected|executor_region_main|flash_fallback_selected|fixed_authorized|temporary_fallback_selected|null",
+  "authorization_quote": "…本轮有效授权原话（到期重选时为父授权原话）…",
+  "authorization_scope": {"task_id": "T", "stage": "s2"},
+  "allowed_candidates": ["zcode:GLM-5.3", "…"],
+  "fallback_scope": {"task_id": "T", "stage": "s1"}, "reselection_due": false,
+  "source_selection_mode": "temporary_fallback（仅到期重选时出现，追溯用）",
+  "source_authorization_quote": "…旧 temp 原话…",
+  "source_authorization_scope": {"task_id": "T", "stage": "s1"},
+  "session_reuse_allowed": false,
+  "selected": {"runtime": "zcode", "model": "GLM-5.3", "pool_key": "zcode:GLM-5.3"},
+  "candidate_filters": {"qoder:Qwen3.8-Max": "window_closed|explicitly_limited|capacity_full|zcode_unavailable|not_authorized|eligible"},
+  "zcode_blocked": false, "refused": null,
+  "snapshot_note": "snapshot time is not live capacity; the authoritative entry re-checks atomically"
+}
+```
+
+到期重选时 `selection_mode`/`authorization_quote`/`authorization_scope`/`allowed_candidates`
+体现**本轮有效父授权**，旧 temp 的 `source_selection_mode`/`source_authorization_quote`/
+`source_authorization_scope` 仅作追溯；`fallback_scope` 保留旧值、`reselection_due=true`。
+`refused` 非空时 `selected=null` 且整项拒绝（不换模型/不落 Luna）；拒绝原因含
+`missing_authorization`/`missing_context`/`no_source_quote`/`missing_authorization_scope`/
+`scope_conflict`/`unknown_selection_mode`/`invalid_executor`/`missing_fixed_combo`/
+`empty_allowed_candidates`/`unauthorized_candidate`/`previous_in_flight`/
+`previous_awaiting_acceptance`/`previous_not_terminal`/`task_in_flight`/`workspace_conflict`/
+`domestic_total_full`/`fallback_scope_mismatch`/`parent_authorization_required`/
+`candidate_not_authorized`/`fixed_candidate_unavailable`/`temporary_not_flash`/
+`temporary_candidate_unavailable`/`rotation_state_unavailable`/`no_eligible_candidate`/
+`store_refused`/`store_snapshot_unavailable`。
+
+### CLI 与示例调用（先规划，再精确参数）
+
+```text
+python scripts/stage_selection.py --store <abs.sqlite3> --task-id T --stage s2 \
+  --workspace <abs ws> --authorization-json '<authorization object>' \
+  [--previous-json '<previous record>'] [--quota-store <db>]
+```
+
+`--task-id`/`--stage`/`--workspace` 均为 **required**（缺一即 `missing_context` 拒绝）。
+
+退出码 **0 = 选择成功 / 2 = 拒绝**（输出 JSON）。拿到 `selected.pool_key` 后，主脑再用
+精确 `runtime/model`（`reserve`/`select_and_claim` 的 `--dispatch-claim` 路径）交正式入口
+原子复核——规划入口本身**不占名额、不派工**。`previous` 记录前阶段
+`task/stage/runtime/model/state` 及 `acceptance_reviewed`：前轮 `reserved/running/unknown/
+executing/awaiting_acceptance` 或**未独立验收**时拒绝新选择（不抢占、不停进程、不重复
+派工），只有真实终态 + 已独立验收（含明确失败验收后的补修）才可新裁决。
+
+> 离线回归 `tests/test_stage_selection.py`：临时 SQLite + mock Z 可用函数，零真实模型/
+> 共享库/凭据/余额；覆盖临时 CN Flash 终态后新阶段重选主力、fixed 长期不变、executor
+> 不跨区、**白天三 Max 剔除、其它主力各自判窗与可用**、夜晚进入并
+> 保公平、明确限额跳过、容量过滤、在途/未验收/同 workspace 冲突/父授权缺失/scope 漂移
+> 整项拒绝、旧 scope 到期重选、父授权交集不扩权、`fallback_scope` 缺 `task_id` 拒绝、
+> 会话复用仅限同 task 组合（OTHER/missing 一律 false）、只读打开失败先 close 不泄漏、
+> 上下文缺项、WAL 活 writer 可见与不可读
+> 快照拒绝、读写前后哈希不变、缺库不创建、退休/Luna 不授权、CLI 退出码。Windows/Linux
+> CI 矩阵都跑。
+
 ## 迁移边界
 
 - 生产 `scripts/codebuddy_direct.py` **已删除可执行传输路径**（不再 `import subprocess`，

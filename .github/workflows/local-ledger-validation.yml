@@ -198,6 +198,14 @@ jobs:
       - name: ZCode permission broker offline regression
         run: python tests/test_zcode_permission_broker.py
 
+      # BW-STAGE-SELECTION-S1：阶段重裁决只读规划入口（scripts/stage_selection.py）的
+      # 专项离线回归。只读 mode=ro 打开临时 SQLite、mock Z 可用函数，绝不真实模型/共享库/
+      # 凭据/余额；覆盖临时 Flash 终态后新阶段重选主力、fixed 不变、executor 不跨区、时段门、
+      # 明确限额、容量、在途/未验收/workspace 冲突/父授权缺失/scope 漂移、只读不写库、
+      # 缺库不创建与 CLI 退出码。Windows/Linux 矩阵都跑。
+      - name: Stage selection read-only planner offline regression (temp SQLite, no real pool)
+        run: python -m unittest discover -s tests -p "test_stage_selection.py" -v
+
       - name: Upload test outputs
         if: always()
         uses: actions/upload-artifact@v4
