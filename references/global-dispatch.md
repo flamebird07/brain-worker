@@ -439,6 +439,16 @@ BW-MAIN-PRIORITY-20261011-S1 的 Max > Claude > GLM 优先级对本入口同样�
 - **executor 本地区约束**：`executor` 模式的授权候选与本轮 `dp._scope_allowed_candidates`
   给出的本地区集合取交集，**绝不跨区**；地区外候选在 `candidate_filters` 如实显示
   `not_authorized`，**绝不把未选范围显示成 `eligible`**。
+- **AUTO 候选全集与 `not_authorized` 语义（BW-CANDIDATE-SCOPE-S1）**：AUTO 的
+  `allowed_candidates` 从真实用户原话/原 scope **保留完整已授权候选**（当前 7 候选＝三 Qoder
+  Max + claude + zcode + 两区 Flash）；时段/明确限额/容量/ZCode availability 等**动态不可用只写
+  `candidate_filters`**（`window_closed`/`explicitly_limited`/`capacity_full`/`zcode_unavailable`），
+  **绝不改写 `allowed_candidates` 去绕过**。某 `runtime:model` 失败（含内置两 Max 落 `explicitly_limited`）
+  **不泛化成整个 executor**，CN 自定义 `qodercn:Qwen-3.8-Max` 仍**独立评估**、优先级仍最高。`not_authorized`
+  **只表示该池不在本轮输入里**，未核对真人原话**不得**说成“用户未授权/撤权”；运行错误不算撤权，授权缩窄
+  必须有真实用户新指令或 executor 约束。诚实边界：入口**不能**凭主脑自写 `quote` 自动验证真人授权，也**不**
+  新增机器级防伪门、`not_authorized` 字段改动或强制 AUTO 全集代码门（合法用户范围可更窄），靠 7 候选规范 +
+  独立回读审查把关。默认 Flash 临时选择只对本阶段生效、下一轮按优先级重选；既有明确 `fixed` Flash 保持。
 - **只读快照**：只以 `mode=ro`（`PRAGMA query_only=ON` + `BEGIN` 只读事务）打开**既有**库，
   **绝不用 `immutable=1`**（会忽略 WAL 中最新在途记录，不是安全快照）。WAL 存在但 `-shm`
   缺失、模式/库不可读 → 如实 `store_snapshot_unavailable`，**绝不创建 sidecar/建库/建表/

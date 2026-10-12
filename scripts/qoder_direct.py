@@ -449,13 +449,15 @@ def _qoder_failure_facts(summary: dict) -> dict:
                          'model_requested': summary.get('model_requested')}}
 
 
-# BW-POOL-SPLIT-20261010-S3：两个 Qoder Max 主力“明确限额”最小标记的判定与落标。
+# BW-POOL-SPLIT-20261010-S3：三个 Qoder Max 主力“明确限额”最小标记的判定与落标。
 # 只有真实终态的**结构化失败载体**（result_errors / errors_info）明确命中硬限额才落标；
 # 绝不扫描报告正文，绝不把 permission 拒绝 / 解析失败 / 取消退出码(4294967295) / 普通报告
-# 正文里的 429 / 单独 quota 标签误作限额。Flash、ZCode、自定义名永不落标（不误挡 Flash、
-# 不动 ZCode 既有 availability 口径）。
+# 正文里的 429 / 单独 quota 标签误作限额。两个内置 Max（qoder/qodercn:Qwen3.8-Max）与 CN
+# 自定义 Max（qodercn:Qwen-3.8-Max）各自独立落标、互不连坐；Flash、ZCode、国际自定义名
+# 永不落标（不误挡 Flash、不动 ZCode 既有 availability 口径、不把自定义映射到内置池）。
 _QUOTA_HARD_LIMIT_MARKERS = (
-    'credits exhausted', 'out of credits', 'credit exhausted', 'credits depleted',
+    'credits exhausted', 'credits have been exhausted', 'out of credits',
+    'credit exhausted', 'credits depleted',
     'insufficient credits', 'insufficient balance', 'no credits left',
     'quota exhausted', 'credit usage limit',
     '积分用尽', '积分不足', '余额不足', '额度用尽', '额度不足',
@@ -871,7 +873,7 @@ def main():
                          ensure_ascii=False))
         return 3
     # 子进程真实结束 → 先解析真实终态（原始错误/输出完整保留），判定是否明确限额；若明确
-    # 限额且真实为两个 Qoder Max 主力之一，则**先落限额标记，再释放本占位**。顺序保证：占位
+    # 限额且真实为三个 Qoder Max 主力之一，则**先落限额标记，再释放本占位**。顺序保证：占位
     # 未释放（槽仍占用）时先写标记，避免槽一释放另一个 chat 立刻向已知限额池重复提交；落标记
     # 或任何后续保存失败也必须做真实终态释放（带 owner 身份、不泄漏锁、不谎称已释放）。
     summary = {'exit_code': child.returncode, 'finished_at': datetime.now(timezone.utc).isoformat(),
@@ -931,8 +933,9 @@ def main():
             summary['report_state_file'] = str(out / 'report-state.json')
         summary['diagnostics'] = ec.diagnose(_qoder_failure_facts(summary))
         # 明确限额落标：只在**真实失败终态**（非协议成功）且结构化失败载体明确命中硬限额、
-        # 且 runtime/model 真实为两个 Qoder Max 主力之一时落标。先落标再释放占位，杜绝另一
-        # chat 在槽释放后立刻重复提交；落标异常绝不阻断真实终态释放（不泄漏锁）。
+        # 且 runtime/model 真实为三个 Qoder Max 主力之一时落标。先落标再释放占位，杜绝另一
+        # chat 在槽释放后立刻重复提交；落标异常绝不阻断真实终态释放（不泄漏锁）。原始错误与
+        # 同时发生的 permission_denials 一并保留，落标不消去任何审批拒绝。
         if not summary.get('protocol_success'):
             hit, evidence = _explicit_quota_limit_hit(summary)
             limited_pk = _qoder_max_pool_key(args.runtime, args.model) if hit else None

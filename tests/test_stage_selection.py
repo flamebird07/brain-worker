@@ -192,6 +192,52 @@ class WindowAndLimitTests(_Base):
         self.assertEqual(r['selected']['pool_key'], 'qoder:Qwen3.8-Max', r)
 
 
+class NightAutoCustomMaxRegression(_Base):
+    """BW-CANDIDATE-SCOPE-S1 需求 3：独立夜间 AUTO 候选回归。绝不查询额度、不扩权、
+    不把某 runtime:model 失败泛化成整个 executor，也不把 not_authorized 说成用户撤权。"""
+
+    def test_night_auto_selects_cn_custom_max_when_builtins_limited(self):
+        """7 候选全授权、内置 CN 与国际 Max 已明确限额、Claude 合格时，按既有
+        Max>Claude>Z 优先级选择 CN 自定义 Max，绝不落到 Claude 或 Flash，也不因内置
+        失败泛化到自定义（自定义独立评估）。allowed 全集与逐候选原因如实保留。"""
+        self.build_store()
+        self.set_limit('qoder:Qwen3.8-Max')
+        self.set_limit('qodercn:Qwen3.8-Max')
+        allowed = ALL_MAINS + ALL_FLASH
+        r = self.plan(self.auth('auto', 'T', 's2', allowed), now=T_NIGHT)
+        self.assertEqual(r['refused'], None, r)
+        self.assertEqual(sorted(r['allowed_candidates']), sorted(allowed))  # 不缩权
+        self.assertEqual(r['selected']['pool_key'], dp.CN_CUSTOM_MAX_POOL_KEY, r)
+        self.assertNotEqual(r['selected']['pool_key'], dp.CLAUDE_POOL_KEY)
+        self.assertNotIn(r['selected']['pool_key'], ALL_FLASH)
+        self.assertEqual(r['candidate_filters']['qoder:Qwen3.8-Max'], 'explicitly_limited')
+        self.assertEqual(r['candidate_filters']['qodercn:Qwen3.8-Max'], 'explicitly_limited')
+        self.assertEqual(r['candidate_filters'][dp.CN_CUSTOM_MAX_POOL_KEY], 'eligible')
+
+    def test_auto_narrow_cn_scope_stays_cn_others_not_authorized(self):
+        """合法用户把 AUTO 范围收窄到只 CN：选择仍在 CN 内，其余区/池如实 not_authorized
+        ——这只表示不在本轮输入里，绝不伪造“用户撤权”，也绝不偷偷扩权到 qoder/claude/zcode。"""
+        self.build_store()
+        cn_scope = CN_MAINS + [CN_FLASH]
+        r = self.plan(self.auth('auto', 'T', 's2', cn_scope), now=T_NIGHT)
+        self.assertEqual(r['refused'], None, r)
+        self.assertEqual(sorted(r['allowed_candidates']), sorted(cn_scope))
+        self.assertTrue(r['selected']['pool_key'].startswith('qodercn:'), r)
+        self.assertEqual(r['candidate_filters']['qoder:Qwen3.8-Max'], 'not_authorized')
+        self.assertEqual(r['candidate_filters'][dp.CLAUDE_POOL_KEY], 'not_authorized')
+        self.assertEqual(r['candidate_filters'][dp.ZCODE_POOL_KEY], 'not_authorized')
+
+    def test_only_flash_input_marks_mains_not_authorized_without_fake_revocation(self):
+        """错误输入只给 Flash 时，主力的 not_authorized 只反映未列入输入（不是撤权）；
+        选择仍是该 Flash，合法窄范围不被偷偷扩到主力。"""
+        self.build_store()
+        r = self.plan(self.auth('auto', 'T', 's2', [CN_FLASH]), now=T_NIGHT)
+        self.assertEqual(r['refused'], None, r)
+        self.assertEqual(r['selected']['pool_key'], CN_FLASH, r)
+        self.assertEqual(r['candidate_filters']['qoder:Qwen3.8-Max'], 'not_authorized')
+        self.assertEqual(r['candidate_filters'][dp.CN_CUSTOM_MAX_POOL_KEY], 'not_authorized')
+
+
 class PreviousAndConflictTests(_Base):
     def test_previous_in_flight_and_not_reviewed_block(self):
         self.build_store()

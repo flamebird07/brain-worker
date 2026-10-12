@@ -9,18 +9,24 @@
 3. 缺映射 → 0 Popen：CN 请求的友好名没有真实 ID 映射时 main() 早退（返回码 2、
    subprocess.Popen 从未被调用、输出目录从未创建）。
 4. CN 接续无来源可证 → 拒绝：无 --resume-source 或非 qodercn 原件时拒绝续用（0 Popen）。
+5. BW-CANDIDATE-SCOPE-S2 主力明确限额落标：由正式 qd.main() 走真实容量入口→失败终态→
+   落标→终态释放的整条链验收（详见下方 S2 用例段落说明；不复刻生产分支、不 mock 被测件）。
 
 绝不读写真实/共享池；全程临时目录 + 假 Popen。真实 CN 任务未实际运行，成本/后端
 身份未知（见报告）。
 """
 from __future__ import annotations
 
+import hashlib
 import importlib.util
+import io
 import json
 import os
 import sys
 import tempfile
 import unittest
+from contextlib import closing, redirect_stdout
+from datetime import datetime, timezone
 from pathlib import Path
 
 HERE = Path(__file__).resolve().parent
@@ -284,6 +290,31 @@ class ExplicitQuotaLimitHitTests(unittest.TestCase):
                 hit, _ = self._hit(errors=[text])
                 self.assertTrue(hit, (text, hit))
 
+    def test_recognizes_personal_credits_have_been_exhausted_real_terminal(self):
+        """实证缺口：真实 CN 内置 Max 终态文案 “Your personal Credits have been
+        exhausted. Please check your plan.”（“have been” 插在中间，不与旧的连续
+        'credits exhausted' marker 匹配）。必须准确识别为硬限额。"""
+        msg = ('Your personal Credits have been exhausted. Please check your plan.')
+        hit, ev = self._hit(errors=[msg])
+        self.assertTrue(hit, (hit, ev))
+        self.assertEqual(ev, msg)
+
+    def test_personal_credits_have_been_exhausted_case_insensitive(self):
+        for msg in ('your personal credits have been exhausted. please check your plan.',
+                    'YOUR PERSONAL CREDITS HAVE BEEN EXHAUSTED.',
+                    'Your Personal Credits Have Been Exhausted'):
+            with self.subTest(msg=msg):
+                hit, _ = self._hit(errors=[msg])
+                self.assertTrue(hit, (msg, hit))
+
+    def test_personal_credits_have_been_exhausted_in_errors_info(self):
+        """同一文案落在 errors_info 结构化载体（details/message）也须识别；这仍只来自
+        失败终态错误载体，绝不扫报告正文。"""
+        hit, ev = self._hit(errors_info=[{
+            'details': 'Your personal Credits have been exhausted. Please check your plan.'}])
+        self.assertTrue(hit, (hit, ev))
+        self.assertIn('credits have been exhausted', str(ev).lower())
+
     def test_does_not_classify_bare_quota_word(self):
         """单独 “quota” 文案不能当硬限额；无 429、无 markers → hit=False。"""
         hit, ev = self._hit(errors=['quota status: normal'])
@@ -345,6 +376,352 @@ class ExplicitQuotaLimitHitTests(unittest.TestCase):
             for rt in (qd.RUNTIME_INTERNATIONAL, qd.RUNTIME_CN, 'zcode', 'codebuddy'):
                 with self.subTest(rt=rt, model=model):
                     self.assertIsNone(qd._qoder_max_pool_key(rt, model))
+
+
+# ============================================================================
+# BW-CANDIDATE-SCOPE-S2 需求 2 正式入口离线验收：本组用例**逐例调用正式 qd.main()**，
+# 让它真实走完 解析 argv → 容量入口 claim → Popen 子进程 → 失败终态解析 →
+# _explicit_quota_limit_hit → _qoder_max_pool_key → dp.record_main_force_limit →
+# summary.main_force_limit → 终态释放（dp.finish）的整条生产链。测试端绝不复刻
+# "命中→池 key→落标"的判断分支，也不 mock 被测识别器 / record_main_force_limit /
+# 容量守卫；只 mock 外部 Popen（合成子进程）与可注入的 PID/时钟：
+# - Popen：合成 child 真实把终态 envelope 写进 main 打开的 stdout 文件句柄，并回报
+#   预设退出码；容量入口真实 bind_child 绑到这个合成 PID，communicate 结束即
+#   模拟真实进程死亡，使真实终态探针能够放行释放；
+# - PID：仅合成 child 的存活身份是注入的，wrapper 身份仍取本进程真实 PID/创建时刻；
+# - 时钟：dp.utcnow 固定到 UTC 15:00（北京 23:00，主力时段内），避免主力时段门影响
+#   落标用例；生产入口不新增 --now 开关。
+# 全程临时 SQLite、临时合成 CN/国际配置与 CLI 存在性占位，绝无真实 CLI / 网络 /
+# 凭据 / 模型调用 / 共享池读写。断言一律回读临时库与证据目录里的真实产物。
+# ============================================================================
+_CN_LIMIT_TEXT = 'Your personal Credits have been exhausted. Please check your plan.'
+
+
+class _SyntheticChild:
+    """合成子进程：只承担"外部进程"这一件事——把终态 envelope 原样写进 stdout 句柄，
+    再按预设退出码退出。绝不参与限额判定、落标或释放逻辑。"""
+
+    def __init__(self, pid, stdout_handle, payload, returncode, on_exit):
+        self.pid = pid
+        self.returncode = None
+        self._stdout = stdout_handle
+        self._payload = payload
+        self._exit_code = returncode
+        self._on_exit = on_exit
+        self.terminated = False
+
+    def communicate(self, input=None):
+        if self._stdout is not None:
+            self._stdout.write(self._payload)
+            self._stdout.flush()
+        self.returncode = self._exit_code
+        self.terminated = True
+        self._on_exit()  # 真实进程结束：让终态探针如实回报 dead
+        return (None, None)
+
+
+class MainForceLimitRealEntryTests(_NoPopen):
+    CHILD_PID = 424242  # 仅代表"本入口启动过一个子进程"的可注入 PID，绝不存在于本机
+
+    def setUp(self):
+        super().setUp()
+        self.store = str(self.tmp / 'pool.sqlite3')
+        self.quota_store = str(self.tmp / 'quota-isolated-absent.sqlite3')
+        self.night = datetime(2026, 10, 8, 15, 0, 0, tzinfo=timezone.utc)  # 北京 23:00
+        self._real_utcnow = qd.dp.utcnow
+        qd.dp.utcnow = lambda: self.night
+        self.addCleanup(setattr, qd.dp, 'utcnow', self._real_utcnow)
+        self._real_identity = qd.dp.process_identity
+        qd.dp.process_identity = self._identity
+        self.addCleanup(setattr, qd.dp, 'process_identity', self._real_identity)
+        self._child_alive = False
+        self._pending = (b'', 0)
+        self.children = []
+
+    def _identity(self, pid, platform=None):
+        """只有合成 child 的存活身份是注入的；wrapper 身份仍走本进程真实查询。"""
+        try:
+            if int(pid) == self.CHILD_PID:
+                return {'pid': pid,
+                        'state': 'alive' if self._child_alive else 'dead',
+                        'created': 'synthetic-child-created' if self._child_alive else None}
+        except (TypeError, ValueError):
+            pass
+        return self._real_identity(pid, platform)
+
+    def _fake_popen(self, argv, *args, **kwargs):
+        self.calls.append(argv)
+        payload, exit_code = self._pending
+        child = _SyntheticChild(self.CHILD_PID, kwargs.get('stdout'), payload,
+                                exit_code, self._child_died)
+        self.children.append(child)
+        self._child_alive = True  # 子进程已诞生：真实 bind_child 会绑到这个 PID
+        return child
+
+    def _child_died(self):
+        self._child_alive = False
+
+    # ---------- 各例隔离的运行夹具：独立 tag → 独立 workspace/配置/证据目录 ----------
+    def _cn_case(self, tag, model, model_ids):
+        cli = self.tmp / ('cn-cli-' + tag + '.exe')
+        cli.write_text('placeholder-stub')  # 只要求存在，绝不代表真跑
+        cfg_dir = self.tmp / ('cfg-' + tag)
+        cfg_dir.mkdir(exist_ok=True)
+        cfg = self.tmp / ('local-entry-cn-' + tag + '.json')
+        cfg.write_text(json.dumps({'cli': str(cli), 'config_dir': str(cfg_dir),
+                                   'model_ids': model_ids}), encoding='utf-8')
+        argv, out = self._common_case(tag, ['--runtime', qd.RUNTIME_CN,
+                                           '--cn-config', str(cfg)])
+        argv += ['--model', model]
+        return argv, out
+
+    def _intl_case(self, tag, model):
+        node = self.tmp / ('intl-node-' + tag)
+        node.write_text('placeholder-stub')
+        cli = self.tmp / ('intl-qodercli-' + tag + '.js')
+        cli.write_text('placeholder-stub')
+        cfg = self.tmp / ('local-entry-' + tag + '.json')
+        cfg.write_text(json.dumps({'node': str(node), 'qodercli': str(cli)}),
+                       encoding='utf-8')
+        argv, out = self._common_case(tag, ['--runtime', qd.RUNTIME_INTERNATIONAL,
+                                            '--config', str(cfg)])
+        argv += ['--model', model]
+        return argv, out
+
+    def _common_case(self, tag, head):
+        ws = self.tmp / ('ws-' + tag)
+        ws.mkdir(exist_ok=True)
+        pf = self.tmp / ('prompt-' + tag + '.txt')
+        pf.write_text('CN 主力限额真实入口离线用例。任务ID：' + tag, encoding='utf-8')
+        out = self.tmp / ('out-' + tag)
+        argv = [head[0], head[1], head[2], head[3],
+                 '--workspace', str(ws), '--prompt-file', str(pf),
+                 '--output-dir', str(out), '--stage', 'BW-CN-LIMIT-' + tag,
+                 '--task-id', 'T-' + tag, '--dispatch-store', self.store,
+                 '--quota-store', self.quota_store]
+        return argv, out
+
+    def _run_main(self, argv, envelope, exit_code):
+        """唯一入口：正式 qd.main()。测试只提供外部事实（argv + 子进程终态字节）。"""
+        self._pending = (json.dumps(envelope, ensure_ascii=False).encode('utf-8'),
+                         exit_code)
+        before = len(self.calls)
+        old = sys.argv
+        sys.argv = ['qoder_direct.py', *argv]
+        printed = io.StringIO()
+        try:
+            with redirect_stdout(printed):
+                rc = qd.main()
+        finally:
+            sys.argv = old
+        # 真实到达过一次外部子进程入口——不是复刻分支，也不是 0 Popen 的早退路径。
+        self.assertEqual(len(self.calls) - before, 1,
+                         f'main must reach Popen exactly once; calls={self.calls}')
+        self.assertEqual(len(self.children), len(self.calls))
+        self.assertTrue(self.children[-1].terminated, 'synthetic child must truly exit')
+        return rc, json.loads(printed.getvalue())
+
+    @staticmethod
+    def _failure_envelope(errors, *, errors_info=None, permission_denials=None):
+        env = {'type': 'result', 'subtype': 'error_during_execution', 'is_error': True,
+               'stop_reason': 'end_turn', 'session_id': 'sess-cn-limit-case',
+               'total_credits': 0, 'modelUsage': {}, 'errors': errors}
+        if errors_info is not None:
+            env['errors_info'] = errors_info
+        if permission_denials is not None:
+            env['permission_denials'] = permission_denials
+        return env
+
+    @staticmethod
+    def _success_envelope(result_text):
+        return {'type': 'result', 'subtype': 'success', 'is_error': False,
+                'stop_reason': 'end_turn', 'session_id': 'sess-cn-limit-ok',
+                'total_credits': 0, 'modelUsage': {}, 'errors': [],
+                'errors_info': [], 'permission_denials': [], 'result': result_text}
+
+    def _summary(self, out):
+        return json.loads((out / 'summary.json').read_text(encoding='utf-8'))
+
+    def _attempt_by_task(self, task_id):
+        with closing(qd.dp.connect(self.store)) as conn:
+            row = conn.execute('SELECT * FROM attempts WHERE task_id=?',
+                               (task_id,)).fetchone()
+            return dict(row) if row is not None else None
+
+    def _limited_pools(self):
+        return sorted(pk for pk, row in qd.dp.main_force_limits(self.store).items()
+                      if int(row['limited']) == 1)
+
+    # ---------- 1. CN 内置 Max 失败终态：只落它自己，且经真实 claim/bind/record/release ----------
+    def test_main_records_builtin_cn_max_only_through_real_chain(self):
+        argv, out = self._cn_case('builtin-max', 'Qwen3.8-Max',
+                                  {'DeepSeek-Flash': 'real-id-123'})
+        rc, printed = self._run_main(
+            argv, self._failure_envelope([_CN_LIMIT_TEXT],
+                                         permission_denials=[{'tool': 'Edit',
+                                                              'reason': 'user denied tool Edit'}]),
+            exit_code=1)
+        self.assertEqual(rc, 3, rc)
+        summary = self._summary(out)
+        self.assertEqual(summary, printed)
+        self.assertFalse(summary['protocol_success'])
+        # 原错误必须原样保留，落标不得消去任何审批拒绝。
+        self.assertEqual(summary['result_errors'], [_CN_LIMIT_TEXT])
+        self.assertEqual(summary['permission_denials'],
+                         [{'tool': 'Edit', 'reason': 'user denied tool Edit'}])
+        stdout_bytes = (out / 'stdout.json').read_bytes()
+        self.assertIn(_CN_LIMIT_TEXT.encode('utf-8'), stdout_bytes)
+        self.assertIn(_CN_LIMIT_TEXT.encode('utf-8'),
+                      (out / 'summary.json').read_bytes())
+
+        rec = summary['main_force_limit']
+        self.assertTrue(rec['recorded'], rec)
+        self.assertEqual(rec['pool_key'], 'qodercn:Qwen3.8-Max')
+        self.assertEqual(rec['evidence'], _CN_LIMIT_TEXT)
+
+        limits = qd.dp.main_force_limits(self.store)
+        self.assertEqual(self._limited_pools(), ['qodercn:Qwen3.8-Max'])
+        row = limits['qodercn:Qwen3.8-Max']
+        # 绑定必须指向真实存在的 attempt / task / 证据文件与哈希，绝不凭空造标记。
+        self.assertEqual(row['task_id'], 'T-builtin-max')
+        attempt = self._attempt_by_task('T-builtin-max')
+        self.assertIsNotNone(attempt)
+        self.assertEqual(row['attempt_token'], attempt['token'])
+        self.assertEqual(attempt['pool_key'], 'qodercn:Qwen3.8-Max')
+        self.assertEqual(attempt['runtime'], qd.RUNTIME_CN)
+        self.assertEqual(attempt['model'], 'Qwen3.8-Max')
+        # 生产侧保存的是 .resolve() 后的长路径，而 tempfile 在 Windows 上可能给出
+        # 8.3 短名别名（ADMINI~1），二者是同一真实文件；故两边同 resolve 后仍严格相等，
+        # 并用 samefile 复核同一 inode/句柄，不放宽为结尾匹配。
+        evidence_path = Path(row['evidence_path'])
+        real_path = out / 'stdout.json'
+        self.assertEqual(evidence_path.resolve(), real_path.resolve())
+        self.assertTrue(os.path.samefile(str(evidence_path), str(real_path)))
+        self.assertEqual(row['evidence_sha256'],
+                         hashlib.sha256(stdout_bytes).hexdigest())
+        self.assertEqual(rec['evidence_sha256'], row['evidence_sha256'])
+
+        # 真实终态释放：入口自己结算自己那份占位，绝不泄漏、绝不误抢别人。
+        self.assertEqual(attempt['state'], 'finished')
+        self.assertEqual(attempt['terminal'], 'finished')
+        self.assertEqual(attempt['child_pid'], self.CHILD_PID)
+        self.assertEqual(attempt['wrapper_pid'], os.getpid())
+        self.assertTrue(summary['capacity_released'], summary)
+        self.assertEqual(summary['capacity_terminal'], 'finished')
+        self.assertEqual(
+            qd.dp.status(self.store, now=self.night)['pools']['qodercn:Qwen3.8-Max']
+            ['active'], 0)
+
+        # 不连坐：CN 自定义 Max / 国际内置 Max 一律未被波及。
+        self.assertFalse(qd.dp.main_force_limited(self.store, 'qodercn:Qwen-3.8-Max'))
+        self.assertFalse(qd.dp.main_force_limited(self.store, 'qoder:Qwen3.8-Max'))
+        self.assertNotIn('qodercn:Qwen3.8-Flash', self._limited_pools())
+        self.assertNotIn('qoder:Qwen3.8-Flash', self._limited_pools())
+
+    # ---------- 2. CN 自定义 Max 失败：只落自己；内置 Max 随后仍能真实 claim 到 Popen ----------
+    def test_main_records_custom_cn_max_without_touching_builtin(self):
+        # 自定义友好名 Qwen-3.8-Max 与内置 Qwen3.8-Max 的真实 config 映射口径不同：
+        # 前者必须经 model_ids 映射成服务端 ID 才能下发，本例据此走独立池落标。
+        argv, out = self._cn_case('custom-max', 'Qwen-3.8-Max',
+                                  {'Qwen-3.8-Max': 'synthetic-cn-custom-max-real-id'})
+        rc, printed = self._run_main(
+            argv, self._failure_envelope([_CN_LIMIT_TEXT]), exit_code=1)
+        self.assertEqual(rc, 3, rc)
+        self.assertEqual(self._limited_pools(), ['qodercn:Qwen-3.8-Max'])
+        summary = self._summary(out)
+        self.assertEqual(summary['main_force_limit']['pool_key'], 'qodercn:Qwen-3.8-Max')
+        attempt = self._attempt_by_task('T-custom-max')
+        self.assertEqual(attempt['pool_key'], 'qodercn:Qwen-3.8-Max')
+        self.assertEqual(attempt['state'], 'finished')
+        self.assertFalse(qd.dp.main_force_limited(self.store, 'qodercn:Qwen3.8-Max'))
+
+        # 反证"不波及内置"：同一库、同一时段下，内置 Max 随后仍被真实容量门放行到 Popen，
+        # 且它这次的非限额终态绝不新增任何标记（自定义标记也不得扩大到内置）。
+        before_limited = list(self._limited_pools())
+        argv2, out2 = self._cn_case('builtin-after-custom', 'Qwen3.8-Max',
+                                    {'DeepSeek-Flash': 'real-id-123'})
+        rc2, _printed2 = self._run_main(
+            argv2, self._failure_envelope(['No permission client configured for Bash'],
+                                          permission_denials=[{'tool': 'Bash',
+                                                                'reason': 'denied'}]),
+            exit_code=1)
+        self.assertEqual(rc2, 3, rc2)
+        self.assertTrue((out2 / 'stdout.json').exists(),
+                        '内置 Max 必须真的跑到子进程并留下终态证据')
+        self.assertEqual(len(self.calls), 2, self.calls)
+        self.assertEqual(self._limited_pools(), before_limited)
+        self.assertNotIn('main_force_limit', self._summary(out2))
+
+    # ---------- 3. 国际内置 Max 失败：只落国际自己那一个池 ----------
+    def test_main_records_international_max_only(self):
+        argv, out = self._intl_case('intl-max', 'Qwen3.8-Max')
+        rc, _printed = self._run_main(argv, self._failure_envelope([_CN_LIMIT_TEXT]),
+                                      exit_code=1)
+        self.assertEqual(rc, 3, rc)
+        self.assertEqual(self._limited_pools(), ['qoder:Qwen3.8-Max'])
+        self.assertFalse(qd.dp.main_force_limited(self.store, 'qodercn:Qwen3.8-Max'))
+        self.assertFalse(qd.dp.main_force_limited(self.store, 'qodercn:Qwen-3.8-Max'))
+        attempt = self._attempt_by_task('T-intl-max')
+        self.assertEqual(attempt['pool_key'], 'qoder:Qwen3.8-Max')
+        self.assertEqual(attempt['runtime'], qd.RUNTIME_INTERNATIONAL)
+        self.assertEqual(attempt['state'], 'finished')
+        self.assertTrue(self._summary(out)['capacity_released'])
+
+    # ---------- 4. 成功正文含该句但 errors=[]：绝不因正文/未绑定改成硬限额 ----------
+    def test_main_success_body_mentioning_limit_text_is_never_recorded(self):
+        body = ('9. 建议下一步：继续。\n\n' + _CN_LIMIT_TEXT +
+                '\n（以上为正文里出现的一句话，不是错误载体）')
+        argv, out = self._cn_case('success-text', 'Qwen3.8-Max',
+                                  {'DeepSeek-Flash': 'real-id-123'})
+        rc, summary = self._run_main(argv, self._success_envelope(body), exit_code=0)
+        self.assertEqual(rc, 0, rc)
+        self.assertTrue(summary['protocol_success'])
+        self.assertEqual(summary['result_errors'], [])
+        # 报告未绑定也绝不能被升级成硬限额。
+        self.assertFalse(summary['report_bound'], summary)
+        self.assertNotIn('main_force_limit', summary)
+        self.assertEqual(self._limited_pools(), [])
+        self.assertIn(_CN_LIMIT_TEXT.encode('utf-8'), (out / 'response.md').read_bytes())
+        self.assertEqual(self._attempt_by_task('T-success-text')['state'], 'finished')
+
+    # ---------- 5. permission / auth / 取消终态（无限额文本）一律不落标 ----------
+    def test_main_non_quota_terminals_never_record(self):
+        cases = (
+            ('permission', ['No permission client configured for Bash'],
+             [{'tool': 'Edit', 'reason': 'user denied tool Edit'}], None, 1),
+            ('auth', ['invalid api key', 'unauthorized: 401'], None,
+             [{'status': 401, 'code': 'auth', 'details': 'token expired'}], 1),
+            ('cancelled', ['process exited with code 4294967295 (cancelled)'], None,
+             None, 4294967295))
+        for tag, errors, denials, errors_info, exit_code in cases:
+            with self.subTest(tag=tag):
+                argv, out = self._cn_case('terminal-' + tag, 'Qwen3.8-Max',
+                                          {'DeepSeek-Flash': 'real-id-123'})
+                rc, _printed = self._run_main(
+                    argv, self._failure_envelope(errors, permission_denials=denials,
+                                                 errors_info=errors_info),
+                    exit_code=exit_code)
+                self.assertEqual(rc, 3, rc)
+                summary = self._summary(out)
+                self.assertNotIn('main_force_limit', summary)
+                self.assertEqual(summary['result_errors'], errors)  # 原错误仍保存
+                self.assertEqual(self._limited_pools(), [])
+                self.assertTrue(summary['capacity_released'], summary)
+
+    # ---------- 6. Flash 终态即使带真实限额文本也永不落标（池 key 恒 None） ----------
+    def test_main_flash_quota_text_is_never_recorded(self):
+        argv, out = self._cn_case('flash', 'Qwen3.8-Flash',
+                                  {'DeepSeek-Flash': 'real-id-123'})
+        rc, summary = self._run_main(argv, self._failure_envelope([_CN_LIMIT_TEXT]),
+                                     exit_code=1)
+        self.assertEqual(rc, 3, rc)
+        self.assertNotIn('main_force_limit', summary)
+        self.assertEqual(self._limited_pools(), [])
+        self.assertEqual(summary['result_errors'], [_CN_LIMIT_TEXT])
+        self.assertTrue(qd.dp.main_force_limited(self.store, 'qodercn:Qwen3.8-Max')
+                        is False)
+        self.assertEqual(self._attempt_by_task('T-flash')['pool_key'],
+                         'qodercn:Qwen3.8-Flash')
 
 
 if __name__ == '__main__':
