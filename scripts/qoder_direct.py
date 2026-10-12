@@ -218,6 +218,43 @@ def build_argv(cfg: dict, workspace: str, model: str, tools: str,
     return argv
 
 
+# 官方 Qoder CN 权限口径（https://docs.qoder.cn/cli/permissions）：path-scoped 写入规则只有
+# Edit(...)（它同时覆盖 Edit/Write/NotebookEdit 三个工具）；`--tools` 里的 Write 是**工具可见性**，
+# 与权限规则不是同一层。真实失败证据：CN 入口曾把 `Write(/references/project-closeout.md)` 当
+# allow 规则下发，dont_ask 下被 CLI 拒绝，而同一文件范围的 `Edit(/SKILL.md)` 成功。
+_PATH_SCOPED_WRITE = re.compile(r'^Write\((.*)\)$', re.DOTALL)
+
+
+def path_scoped_write_rules(rules) -> list[str]:
+    """挑出 CN 无法识别的**路径限定** Write 规则：`Write(<范围>)`，其中范围不是 `*`。
+    裸 `Write` 与 `Write(*)` 是工具级规则，按官方语义原样保留，不在此拒绝。"""
+    hits = []
+    for rule in rules or ():
+        if not isinstance(rule, str):
+            continue
+        m = _PATH_SCOPED_WRITE.match(rule.strip())
+        if m and m.group(1) != '*':
+            hits.append(rule)
+    return hits
+
+
+def validate_cn_permission_rules(allowed_tools, disallowed_tools) -> None:
+    """CN 构造 argv 前的权限规则门：allow 与 deny **同样**检查（路径限定的 deny 若被静默接受，
+    调用方会误以为已经禁写）。只拒绝、不翻译——绝不把 `Write(<范围>)` 自动改成 `Edit(<范围>)`
+    或任何更宽的全工具授权，改动范围必须由调用方显式重新点单。"""
+    bad = (path_scoped_write_rules(allowed_tools)
+           + path_scoped_write_rules(disallowed_tools))
+    if not bad:
+        return
+    raise ValueError(
+        'Qoder CN does not accept path-scoped Write(...) permission rules: '
+        + ', '.join(repr(r) for r in bad)
+        + '. For the same file scope use Edit(...) — per the Qoder CN permissions doc the '
+        'path-scoped write rule is Edit(...), which already covers Edit/Write/NotebookEdit; '
+        'keep tool-level bare Write or Write(*) as-is, and keep Write in --tools for tool '
+        'visibility. Refusing to auto-widen or auto-translate this rule.')
+
+
 def build_cn_argv(cfg: dict, config_dir: str, model_id: str, workspace: str, tools: str,
                   session_id: str | None, *,
                   allowed_tools=None, disallowed_tools=None,
@@ -226,9 +263,11 @@ def build_cn_argv(cfg: dict, config_dir: str, model_id: str, workspace: str, too
     - 首元素是原生 `cli`（非 node + qodercli.js）；
     - `--config-dir` 承载本机登录态所在配置目录（显式传入、不读默认用户目录）；
     - `--model` 下发的是 config.model_ids 映射出的**真实模型 ID**（非友好名、非 Qwen）。
-    权限/工具可见性/续接口径与国际一致，permission-mode 固定 dont_ask。"""
+    权限/工具可见性/续接口径与国际一致，permission-mode 固定 dont_ask；唯一差异是 CN 在构造
+    argv **之前**拒绝路径限定 Write(...) allow/deny 规则（见 validate_cn_permission_rules）。"""
     perms = effective_permission_rules(tools, allowed_tools,
                                         disallowed_tools, add_dirs)
+    validate_cn_permission_rules(perms['allowed_tools'], perms['disallowed_tools'])
     argv = [cfg['cli'], '--config-dir', config_dir,
             '--cwd', workspace, '--model', model_id,
             '--tools', tools, '--permission-mode', 'dont_ask',
@@ -674,10 +713,20 @@ def main():
     perms = effective_permission_rules(args.tools, args.allowed_tools,
                                         args.disallowed_tools, args.add_dirs)
     if is_cn:
-        argv = build_cn_argv(cfg, cn_config_dir, cn_model_id, str(work), args.tools,
-                             args.session_id, allowed_tools=perms['allowed_tools'],
-                             disallowed_tools=perms['disallowed_tools'],
-                             add_dirs=perms['add_dirs'])
+        # 规则门在容量 claim、建证据目录、Popen 之前：不兼容即受控未派发（sent=false、rc=2、
+        # 零 Popen、零输出目录），绝不把崩溃 traceback 留给调用方，也不放宽权限重试。
+        try:
+            argv = build_cn_argv(cfg, cn_config_dir, cn_model_id, str(work), args.tools,
+                                 args.session_id, allowed_tools=perms['allowed_tools'],
+                                 disallowed_tools=perms['disallowed_tools'],
+                                 add_dirs=perms['add_dirs'])
+        except ValueError as exc:
+            print(json.dumps({'cn_permission_rule_rejected': True, 'sent': False,
+                              'exit_code': 2, 'runtime': RUNTIME_CN,
+                              'allowed_tools': list(perms['allowed_tools']),
+                              'disallowed_tools': list(perms['disallowed_tools']),
+                              'reasons': [str(exc)]}, ensure_ascii=False))
+            return 2
     else:
         argv = build_argv(cfg, str(work), args.model, args.tools, args.session_id,
                           allowed_tools=perms['allowed_tools'],

@@ -251,6 +251,188 @@ class CnMainRefusalTests(_NoPopen):
 
 
 # ============================================================================
+# BW-CN-WRITE-20261012T135751Z：CN 逐文件新建权限规则不兼容的离线反例
+# ----------------------------------------------------------------------------
+# 原始失败（真实，保留不改写）：CN 入口把 allow 规则 `Write(/references/project-closeout.md)`
+# 原样下发，permission-mode=dont_ask 下被 CLI 拒绝；同一轮里 `Edit(/SKILL.md)` 成功。
+# 官方口径（docs.qoder.cn/cli/permissions）：path-scoped 写入规则是 Edit(...)，覆盖
+# Edit/Write/NotebookEdit；`--tools` 里的 Write 只是工具可见性，与权限规则不同层。
+# 本组用例只验证最小修复：CN 在构造 argv 前拒绝路径限定 Write(...) 的 allow **和** deny，
+# 工具级裸 Write / Write(*) 与 Edit(...) 逐文件规则、Write 可见性一律原样到达 argv，
+# 国际 build_argv 一字不变；拒绝必须发生在容量 claim 与 Popen 之前（0 Popen、零证据目录）。
+# ============================================================================
+_CN_BAD_WRITE_RULES = ('Write(/references/project-closeout.md)', 'Write(/probe-created.txt)',
+                       'Write(C:/work/new.md)', 'Write(**)', 'Write()')
+
+
+class CnPathScopedWriteRuleTests(unittest.TestCase):
+    def test_detector_flags_only_path_scoped_write(self):
+        """只标记路径限定 Write(...)；裸 Write、Write(*) 与 Edit(...)/Bash(...)/Read 不动。"""
+        self.assertEqual(qd.path_scoped_write_rules(_CN_BAD_WRITE_RULES),
+                         list(_CN_BAD_WRITE_RULES))
+        for rule in ('Write', 'Write(*)', 'Edit(/SKILL.md)', 'Edit(**)', 'Bash(pytest x)',
+                     'Read', 'NotebookEdit(/a.ipynb)', 'WriteX(/a.md)', 'write(/a.md)'):
+            with self.subTest(rule=rule):
+                self.assertEqual(qd.path_scoped_write_rules([rule]), [])
+        self.assertEqual(qd.path_scoped_write_rules(None), [])
+
+    def test_validate_rejects_allow_and_deny_symmetrically(self):
+        """allow 与 deny 同检：路径限定 deny 被静默接受会让调用方误以为已禁写。"""
+        for rule in _CN_BAD_WRITE_RULES:
+            for side in ('allowed_tools', 'disallowed_tools'):
+                with self.subTest(rule=rule, side=side):
+                    kwargs = {side: [rule]}
+                    with self.assertRaises(ValueError) as ctx:
+                        qd.validate_cn_permission_rules(kwargs.get('allowed_tools'),
+                                                        kwargs.get('disallowed_tools'))
+                    msg = str(ctx.exception)
+                    self.assertIn(rule, msg)
+                    self.assertIn('Edit(...)', msg)
+        # 工具级与逐文件 Edit 一律放行，且不改写调用方给的规则内容。
+        qd.validate_cn_permission_rules(['Write', 'Write(*)', 'Edit(/SKILL.md)'],
+                                         ['Write', 'Bash(npm test)'])
+
+    def test_message_never_widens_or_translates_authorization(self):
+        """拒绝文案不得出现"已自动改成 Edit"之类的隐式提权；只要求调用方自己改用同范围 Edit。"""
+        with self.assertRaises(ValueError) as ctx:
+            qd.validate_cn_permission_rules(['Write(/references/project-closeout.md)'], None)
+        msg = str(ctx.exception)
+        self.assertIn('does not accept path-scoped Write(...)', msg)
+        self.assertIn('Refusing to auto-widen or auto-translate', msg)
+        self.assertNotIn('Edit(/references/project-closeout.md)', msg)  # 绝不代填替换规则
+
+
+class CnArgvRuleGateTests(unittest.TestCase):
+    CFG = {'cli': '/abs/qodercn.exe', 'config_dir': '/abs/cfg',
+           'model_ids': {'DeepSeek-Flash': 'real-id-123'}}
+
+    def _build(self, **kw):
+        return qd.build_cn_argv(self.CFG, '/abs/cfg', 'real-id-123', '/abs/ws',
+                               kw.pop('tools', 'Read,Write'), None, **kw)
+
+    @staticmethod
+    def _rules(argv):
+        return [argv[i + 1] for i, a in enumerate(argv) if a == '--allowed-tools']
+
+    def _denies(self, argv):
+        return [argv[i + 1] for i, a in enumerate(argv) if a == '--disallowed-tools']
+
+    def test_cn_argv_refused_before_any_argv_is_built(self):
+        for rule in _CN_BAD_WRITE_RULES:
+            with self.subTest(rule=rule):
+                self.assertRaises(ValueError, self._build, allowed_tools=[rule])
+                self.assertRaises(ValueError, self._build, disallowed_tools=[rule])
+
+    def test_tool_level_write_and_edit_rules_pass_through_verbatim(self):
+        """有效 Edit 逐文件规则 + Write 可见性必须原样到达 argv：不拆逗号、不改前缀、不追加默认。"""
+        argv = self._build(tools='Read,Write',
+                           allowed_tools=['Edit(/scripts/qoder_direct.py)', 'Write',
+                                          'Write(*)'],
+                           disallowed_tools=['Write'])
+        self.assertEqual(argv[:1], ['/abs/qodercn.exe'])
+        self.assertEqual(self._rules(argv), ['Edit(/scripts/qoder_direct.py)', 'Write',
+                                             'Write(*)'])
+        self.assertEqual(self._denies(argv), ['Write'])
+        self.assertEqual(argv[argv.index('--tools') + 1], 'Read,Write')
+        self.assertEqual(argv[argv.index('--permission-mode') + 1], 'dont_ask')
+
+    def test_legacy_tools_fallback_bare_write_is_not_a_path_rule(self):
+        """未显式给 allowed_tools 时按 --tools 逗号回退成裸工具名：裸 Write 合法、不拒绝。"""
+        argv = self._build(tools='Read,Write')
+        self.assertEqual(self._rules(argv), ['Read', 'Write'])
+
+    def test_international_build_argv_unchanged_for_path_scoped_write(self):
+        """国际路径不受本门影响（本轮明确禁止改国际行为）。"""
+        built = qd.build_argv({'node': _INTL_NODE, 'qodercli': _INTL_CLI},
+                              '/abs/ws', 'Qwen3.8-Flash', 'Read,Write', None,
+                              allowed_tools=['Write(/references/project-closeout.md)'],
+                              disallowed_tools=['Write(/x.md)'])
+        self.assertEqual([built[i + 1] for i, a in enumerate(built)
+                          if a == '--allowed-tools'],
+                         ['Write(/references/project-closeout.md)'])
+        self.assertEqual([built[i + 1] for i, a in enumerate(built) if a == '--disallowed-tools'],
+                         ['Write(/x.md)'])
+
+
+class CnMainWriteRuleRefusalTests(_NoPopen):
+    def _run_main(self, argv):
+        old = sys.argv
+        sys.argv = ['qoder_direct.py', *argv]
+        printed = io.StringIO()
+        try:
+            with redirect_stdout(printed):
+                rc = qd.main()
+        finally:
+            sys.argv = old
+        return rc, json.loads(printed.getvalue())
+
+    def _case(self, tag, extra):
+        cfg = self.write_cn_config({'DeepSeek-Flash': 'real-id-123'})
+        ws, pf = self.make_prompt()
+        out_dir = self.tmp / ('out-' + tag)
+        argv = ['--runtime', 'qodercn', '--cn-config', str(cfg),
+                '--workspace', str(ws), '--prompt-file', str(pf),
+                '--output-dir', str(out_dir), '--stage', 'BW-CN-WRITE-RULE-' + tag,
+                '--model', 'Qwen3.8-Flash', '--dispatch-store',
+                str(self.tmp / 'pool.sqlite3'), '--tools', 'Read,Write', *extra]
+        return argv, out_dir
+
+    def test_main_refuses_path_scoped_write_rule_zero_popen(self):
+        """正式 main 受控未派发：rc=2、sent=false、0 Popen、零证据目录、不消费容量。"""
+        for label, extra in (('allow', ['--allowed-tools',
+                                         'Write(/references/project-closeout.md)']),
+                             ('deny', ['--disallowed-tools',
+                                       'Write(/references/project-closeout.md)'])):
+            with self.subTest(label=label):
+                argv, out_dir = self._case('main-' + label, extra)
+                rc, printed = self._run_main(argv)
+                self.assertEqual(rc, 2, printed)
+                self.assertTrue(printed['cn_permission_rule_rejected'], printed)
+                self.assertFalse(printed['sent'], printed)
+                self.assertEqual(printed['runtime'], qd.RUNTIME_CN)
+                self.assertIn('Write(/references/project-closeout.md)',
+                              ' '.join(printed['reasons']))
+                self.assertEqual(self.calls, [], 'refusal must happen before Popen')
+                self.assertFalse(out_dir.exists())
+                with closing(qd.dp.connect(str(self.tmp / 'pool.sqlite3'))) as conn:
+                    self.assertEqual(conn.execute('SELECT COUNT(*) c FROM attempts'
+                                                  ).fetchone()['c'], 0,
+                                     'refusal must not consume a capacity claim')
+
+    def test_main_accepts_edit_rule_with_write_visibility(self):
+        """正向对照：同一 CN 入口在 Edit(...) 逐文件规则 + Write 可见性下照常走到 Popen 前逻辑，
+        绝不被新门误伤（假 Popen 抛哨兵，证明 argv 已带该规则原样到达外部进程入口）。"""
+        cfg = self.write_cn_config({'DeepSeek-Flash': 'real-id-123'})
+        ws, pf = self.make_prompt()
+        out_dir = self.tmp / 'out-edit-rule'
+        captured = {}
+
+        def recording_popen(argv, *a, **k):
+            captured['argv'] = argv
+            raise RuntimeError('sentinel: reached Popen (rule gate passed)')
+
+        qd.subprocess.Popen = recording_popen
+        old = sys.argv
+        sys.argv = ['qoder_direct.py', '--runtime', 'qodercn', '--cn-config', str(cfg),
+                    '--workspace', str(ws), '--prompt-file', str(pf),
+                    '--output-dir', str(out_dir), '--stage', 'BW-CN-WRITE-RULE-OK',
+                    '--model', 'Qwen3.8-Flash', '--tools', 'Read,Write',
+                    '--allowed-tools', 'Edit(/scripts/qoder_direct.py)',
+                    '--allowed-tools', 'Write', '--dispatch-store',
+                    str(self.tmp / 'pool.sqlite3')]
+        try:
+            with redirect_stdout(io.StringIO()):
+                rc = qd.main()
+        finally:
+            sys.argv = old
+        self.assertIn('argv', captured, f'rule gate must not block valid Edit rules (rc={rc})')
+        argv = captured['argv']
+        rules = [argv[i + 1] for i, a in enumerate(argv) if a == '--allowed-tools']
+        self.assertEqual(rules, ['Edit(/scripts/qoder_direct.py)', 'Write'])
+        self.assertEqual(argv[argv.index('--tools') + 1], 'Read,Write')
+
+
+# ============================================================================
 # BW-POOL-SPLIT-20261010-S5 需求 2 回归：qoder_direct 明确限额文本识别
 # ============================================================================
 class ExplicitQuotaLimitHitTests(unittest.TestCase):

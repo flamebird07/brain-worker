@@ -91,6 +91,50 @@ CN 接续**至少拒绝把国际原件/session 当作 CN 续用**：无 `--resum
   本次已修 CLI 或已验证 CN 编辑能力；无需复制私人会话正文。本节为文档口径补充，不改代码/测试/池
   分配，也不改变上文的离线验收结论。
 
+## CN 逐文件新建/写入：路径限定规则必须用 `Edit(...)`（2026-10-12，BW-CN-WRITE-20261012T135751Z）
+
+- **原始失败证据（保留、不改写）**：上一轮 CN 派工把 `--allowed-tools Write(/references/project-closeout.md)`
+  原样下发给原生 CLI，`--permission-mode dont_ask` 下该新建动作被拒绝；**同一轮里指向另一个文件的
+  `Edit(/SKILL.md)` 成功**。两条规则范围不同（Write 规则针对 `references/project-closeout.md`、Edit 规则
+  针对 `SKILL.md`），**不是"同一文件范围"的对照**。当时 `build_cn_argv` 不做任何规则形状检查，规则一路
+  原样到达 argv，拒绝发生在 CLI 侧，因此**入口未提前指出规则形状不兼容，CLI 原始拒绝已保留**在
+  `summary` 的 `permission_denials` 与错误输出中。
+- **官方口径**（https://docs.qoder.cn/cli/permissions ，由主脑核对，本阶段不联网）：path-scoped 的
+  写入规则**只有** `Edit(...)` 这一种写法，它同时覆盖 `Edit`/`Write`/`NotebookEdit` 三个工具；不存在
+  `Write(<路径>)` 形式的逐文件写入规则。**工具可见性与权限规则是两层**：`--tools` 里出现 `Write`
+  只表示把 Write 工具暴露给模型，不代表任何授权范围；授权范围写在 `--allowed-tools`/`--disallowed-tools`。
+- **本阶段最小修复（只动 CN 分支）**：`build_cn_argv` 在**构造 argv 之前**调用
+  `validate_cn_permission_rules(perms['allowed_tools'], perms['disallowed_tools'])`，拒绝任何
+  `Write(<范围>)` 形状（范围不是 `*`）的规则，**allow 与 deny 同检**——路径限定 deny 若被静默接受，
+  调用方会误以为已经禁写。`main()` 只把这段 CN argv 构造包在 `except ValueError` 里，如实输出
+  `cn_permission_rule_rejected=true / sent=false / exit_code=2 / runtime=qodercn` 并带上原规则数组，
+  位置在**容量 claim、建证据目录、Popen 之前**：受控未派发、零 Popen、零证据目录、不消费任何 claim，
+  也不再抛 traceback。国际 `build_argv` 一字未改。
+- **原样保留、绝不动的部分**：工具级裸 `Write` 与 `Write(*)`（官方语义即工具级规则）、逐文件
+  `Edit(...)`、`Read`、`Bash(<原样命令>)`、显式空 `--allowed-tools` 列表、`--tools` 可见性里的
+  `Write`、`--add-dir`、`dont_ask` 权限模式、模型/配额/并发/认证与其它 runtime 入口。
+- **绝不自动翻译或扩权**：入口只拒绝并提示"同一文件范围请改用 `Edit(...)`"，**不会**替调用方把
+  `Write(/a/b.md)` 改写成 `Edit(/a/b.md)`，也不会降级成裸 `Write`/`Write(*)` 这类更宽的授权——范围
+  变化必须由主脑重新显式点单。不新增通用规则框架、不做隐式字符串映射、不改 `dont_ask`。
+- **逐文件新建的正确写法**：新建某一份已登记文件（含"文件当前不存在"的新建动作）在 CN 侧也传
+  `Edit(<该文件路径>)`，需要模型真的用 Write 工具时再把 `Write` 放进 `--tools` 可见性；一份文件一条
+  可重复规则、原样单值、不按逗号拆分。
+- **离线反例（本地假 Popen、临时 SQLite，零网络）**：`tests/test_qoder_cn_direct_offline.py` 的
+  `CnPathScopedWriteRuleTests` / `CnArgvRuleGateTests` / `CnMainWriteRuleRefusalTests` 证明：CN 非法
+  `Write(...)` 规则 0 Popen、零证据目录、0 attempt；有效 `Edit(...)` + `Write` 可见性原样到达 argv；
+  裸 `Write`/`Write(*)` 与国际 argv 不变。**这些只证明入口形状，不证明真实 CN CLI 已放行**；真实逐文件
+  新建能力由主脑独立核验（回执/字节/目录哈希），离线桩不得当成真实权限成功。
+- **本次独立验收事实（主脑已回读；本阶段不重跑 CN）**：全量回归 **859 项、0 失败、0 错误、1 项既有跳过**。
+  本次**国际 Qoder**（请求 `Qwen3.8-Flash`）实际开发回执已返回、`report_bound=true`。主脑另行用候选仓库正式
+  `scripts/qoder_direct.py --runtime qodercn` 做最小现场验收，请求 `Qwen3.8-Flash`：argv 只有 `Read` 与
+  `Edit(/cn-created.txt)` 两条 allow 规则，`Write` 仅作为 `--tools` 工具可见性，`dont_ask` 权限模式未改；
+  CN 侧真实 Write 一次、Read 一次、`permission_denials` 为零；产出文件 25 字节、内容精确为
+  `BW_CN_WRITE_EXACT_FILE_OK`，SHA256 `a810c96edb2dc6b0ac9fccbced0c2ba63b75f9ab9d83e7f067ae01afc6aa9a92`；
+  session `d0ef9006-805a-4fe1-957a-337d246db4d2`，正式入口退出码 0、`protocol_success=true`、
+  `capacity_released=true`、`report_bound=false`（报告格式问题的原件保留，不为格式重跑）。CN 后端只回复
+  `qfmodel` 身份、未独立确认，费用未知。**本条只证明这一次这一组逐文件 `Edit(...)` + `Write` 可见性的现场
+  组合被放行，不断言所有官方版本的内部匹配器都存在同一故障或都会同样放行。**
+
 ## ZCode 限额自动跳过（复用，不改额度系统）
 
 本轮**禁止修改** `quota_control.py`/`zcode_direct.py`、查剩余额度/账单、加历史导入/冷却/恢复探针/
@@ -103,7 +147,7 @@ CN 接续**至少拒绝把国际原件/session 当作 CN 续用**：无 `--resum
 ## 离线验证
 
 ```text
-python tests/test_qoder_cn_direct_offline.py    # 国际 argv 不变 / CN 映射 / 缺映射 0 Popen / CN 接续拒绝
+python tests/test_qoder_cn_direct_offline.py    # 国际 argv 不变 / CN 映射 / 缺映射 0 Popen / CN 接续拒绝 / CN 路径限定 Write(...) 规则拒绝与 Edit(...) 原样放行
 python tests/test_dispatch_pool_qodercn.py      # CN 池/总 10、自定义主力时段门同内置（用例经夜间 T0 claim）、跨区域并行、同区互斥、跨 runtime 拒、终态释放、Z hold 跳过
 ```
 
