@@ -159,7 +159,7 @@ export class FileSystemPortError extends Error {
 class FileScopeRunnerTests(unittest.TestCase):
     def setUp(self):
         # 受控端口走 node realpath：放在无 8.3 短名的 Public 目录下，令 Python 冻结路径与 node 一致。
-        base = os.environ.get('PUBLIC') or 'C:\\Users\\Public'
+        base = (os.environ.get('PUBLIC') or 'C:\\Users\\Public') if sys.platform == 'win32' else None
         self.root = Path(tempfile.mkdtemp(prefix='bw_fs_runner_', dir=base))
         self.addCleanup(shutil.rmtree, self.root, True)
         self.ws = self.root / 'ws'
