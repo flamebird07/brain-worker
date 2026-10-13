@@ -490,6 +490,17 @@ BW-MAIN-PRIORITY-20261011-S1 的 Max > Claude > GLM 优先级对本入口同样�
   保留、一项不弱化。
 - **最小需求回执**：receipt 增加 `permission_requirements`
   （`{"fine_grained": bool, "read_dirs": bool}`，未传为全 false），其余不变。
+- **受控文件 profile 例外（BW-ZCODE-FILES-S1，现场已核验）**：`CAPABILITY['zcode'].fine_grained` 仍为
+  `False`、绝不改写。仅当本轮需求**只需精确文件 Edit**（`edits` 非空、`bash` 与 `read_dirs` 皆空）时，
+  `stage_selection` 才把 ZCode 判为 `eligible`，并在 receipt 增加独立布尔 `controlled_file_profile_required`
+  标明该路径依赖已验证绑定的 file_scope 契约；混合 Edit+Bash 仍 `permission_incompatible`。正式 preflight
+  （`execution_control`）据 `--file-scope-contract` 冻结的 profile 复核契约精确覆盖 `edits`+workspace+实际工具，
+  才接受 ZCode 精确 Edit。**主脑据此把文件工作串行化为「ZCode 改文件 → 真实终态/磁盘回读 → Qoder 跑登记
+  测试」，绝不把整段混合授权交给 ZCode**。2026-10-13 4 个隔离 GLM-5.3 真 Agent 用例已在 FileSystemPort 层现场核验
+  （登记 Read/Edit/Write 成功、只读参考 Edit 拒、未登记 Write 拒、未登记 junction 拒，均 exit0+capacity_released；
+  正向 `report_bound=false` 仅因路径末尾多句号、余三例 true、原件保留不为格式重跑）；TraceContext 不给 toolCallId 故不伪造、
+  以 session/turn/原始工具事件关联。范围仅限登记/未登记路径与只读参考、未登记 junction，**不宣称全部重解析竞态/外部进程
+  TOCTOU 已防护、不升级 Bash、非 OS 进程沙箱**。
 - **规划顺序与边界**：**每次先明确当前权限需求 → 再规划 → 再按选中的 runtime 生成同
   权限的 plan/actual 并过正式 preflight**；不可只把旧 Qoder 计划的 runtime 换成 ZCode
   ——正式 preflight 会按 `CAPABILITY` 拒绝（`sent=false`、exit 2），该拒绝**不是模型

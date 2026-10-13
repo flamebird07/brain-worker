@@ -15,6 +15,7 @@ from pathlib import Path
 REPO = Path(__file__).resolve().parent.parent
 sys.path.insert(0, str(REPO / 'scripts'))
 import execution_control as ec  # noqa: E402
+import zcode_file_scope as zfs  # noqa: E402
 
 STUB_QODER = REPO / 'tests' / 'stub_qodercli.py'
 
@@ -160,6 +161,81 @@ class PreflightTests(unittest.TestCase):
         plan.pop('active_tasks')
         with self.assertRaises(ValueError):
             ec.validate_plan(plan)
+
+
+class ControlledFileProfileTests(unittest.TestCase):
+    """execution_control 对 ZCode 精确 Edit 的受控文件 profile 独立复核：只有本次可信入口
+    冻结并绑定、且经 SHA/覆盖/工具校验的 file_scope 才放行；宽契约、通配符、混合 Bash、
+    缺绑定一律拒绝；CAPABILITY['zcode'].fine_grained 恒为 False，不因受控文件模式被翻真。"""
+
+    def setUp(self):
+        self._tmp = tempfile.TemporaryDirectory()
+        self.addCleanup(self._tmp.cleanup)
+        self.ws = Path(self._tmp.name)
+        (self.ws / 'a.txt').write_text('A\n', encoding='utf-8')
+        contract = {'workspace': str(self.ws), 'readable_files': [], 'writable_files': ['a.txt']}
+        self.norm, reasons = zfs.normalize_file_scope(contract, self.ws)
+        self.assertEqual(reasons, [])
+        self.sha = zfs.canonical_sha(self.norm)
+
+    def _bundle(self, edit_rules=('Edit(a.txt)',)):
+        g = _grants(rules=('Read', 'Write', *edit_rules), tools=('Read', 'Write', 'Edit'))
+        plan = _plan(runtime='zcode', model='GLM-5.3', workspace=str(self.ws), cwd=str(self.ws),
+                     grants={'edits': g['edits'], 'bash': g['bash'], 'read_dirs': g['read_dirs']},
+                     tool_visibility=g['tool_visibility'], visible_tools=g['visible_tools'],
+                     allowed_tools=g['allowed_tools'], disallowed_tools=g['disallowed_tools'])
+        actual = _actual(runtime='zcode', model='GLM-5.3', workspace=str(self.ws),
+                         cwd=str(self.ws), grants=g,
+                         file_scope=self.norm, file_scope_sha256=self.sha)
+        return plan, actual
+
+    def test_precise_edit_with_bound_profile_dispatches(self):
+        plan, actual = self._bundle()
+        r = ec.preflight(plan, actual)
+        self.assertTrue(r['ok'], r['reasons'])
+
+    def test_capability_fine_grained_never_flipped(self):
+        self.assertFalse(ec.CAPABILITY['zcode']['fine_grained'])
+
+    def test_missing_binding_refused(self):
+        plan, actual = self._bundle()
+        actual.pop('file_scope')
+        actual.pop('file_scope_sha256')
+        r = ec.preflight(plan, actual)
+        self.assertFalse(r['ok'])
+        self.assertTrue(any('verified and bound file_scope profile' in x for x in r['reasons']),
+                        r['reasons'])
+
+    def test_widened_contract_sha_mismatch_refused(self):
+        plan, actual = self._bundle()
+        wider = {'workspace': self.norm['workspace'],
+                 'readable_files': self.norm['readable_files'],
+                 'writable_files': list(self.norm['writable_files']) +
+                 [{'real': zfs._normcase(os.path.realpath(self.ws / 'b.txt')), 'sha256': None}]}
+        actual['file_scope'] = wider  # 调用方擅自加宽，但 SHA 仍绑旧冻结值
+        r = ec.preflight(plan, actual)
+        self.assertFalse(r['ok'])
+        self.assertTrue(any('canonical SHA does not match' in x for x in r['reasons']), r['reasons'])
+
+    def test_wildcard_edit_refused(self):
+        plan, actual = self._bundle(edit_rules=('Edit(*.txt)',))
+        r = ec.preflight(plan, actual)
+        self.assertFalse(r['ok'])
+        self.assertTrue(any('wildcard' in x for x in r['reasons']), r['reasons'])
+
+    def test_mixed_edit_bash_still_capability_refused(self):
+        g = _grants(rules=('Read', 'Edit(a.txt)', 'Bash(python -V)'),
+                    tools=('Read', 'Write', 'Edit', 'Bash'))
+        plan = _plan(runtime='zcode', model='GLM-5.3', workspace=str(self.ws), cwd=str(self.ws),
+                     grants={'edits': g['edits'], 'bash': g['bash'], 'read_dirs': g['read_dirs']},
+                     tool_visibility=g['tool_visibility'], visible_tools=g['visible_tools'],
+                     allowed_tools=g['allowed_tools'], disallowed_tools=g['disallowed_tools'])
+        actual = _actual(runtime='zcode', model='GLM-5.3', workspace=str(self.ws),
+                         cwd=str(self.ws), grants=g,
+                         file_scope=self.norm, file_scope_sha256=self.sha)
+        r = ec.preflight(plan, actual)
+        self.assertFalse(r['ok'])
+        self.assertTrue(any('cannot express per-file' in x for x in r['reasons']), r['reasons'])
 
 
 class ParallelConflictTests(unittest.TestCase):

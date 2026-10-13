@@ -34,6 +34,7 @@ import zcode_execution_evidence as zee  # noqa: E402 执行证据门禁（契约
 import quota_control as qc  # noqa: E402 持久额度冷却与路由门禁（sqlite3，默认共享 store）
 import continuation_contract as cc  # noqa: E402 中断接续：baseline 冻结/终态交接（同目录）
 import dispatch_pool as dp  # noqa: E402 跨会话并发容量池（同目录，标准库 sqlite3）
+import zcode_file_scope as zfs  # noqa: E402 受控逐文件读写边界契约（同目录，标准库）
 DEFAULT_PROVIDER = 'account:bigmodel-individual-coding-plan'
 DEFAULT_MODEL = 'GLM-5.3'
 REASONING_LEVELS = ('low', 'high', 'max')
@@ -71,6 +72,23 @@ def _derive_adapters_entry(bootstrap_path):
     for i in range(len(parts) - 1, -1, -1):
         if parts[i].lower() == 'bootstrap':
             candidate = Path(*parts[:i]) / 'adapters' / 'src' / 'index.ts'
+            if candidate.is_file():
+                return str(candidate)
+            return None
+    return None
+
+
+def _derive_contracts_entry(bootstrap_path):
+    """从已核验的 bootstrap 绝对路径定位同一公开 SDK 树的 contracts/src/index.ts。
+
+    典型：.../packages/bootstrap/dist/index.js → .../packages/contracts/src/index.ts。
+    runner 需要它取得公开导出的 FileSystemPortError（与官方 tool handler 同一个类身份），
+    避免不同 FileSystemPortError 类导致 instanceof 判定失败。只认这一确定布局；找不到即 None
+    （runner fail-closed），绝不修改/编译官方 SDK。"""
+    parts = Path(bootstrap_path).parts
+    for i in range(len(parts) - 1, -1, -1):
+        if parts[i].lower() == 'bootstrap':
+            candidate = Path(*parts[:i]) / 'contracts' / 'src' / 'index.ts'
             if candidate.is_file():
                 return str(candidate)
             return None
@@ -607,6 +625,21 @@ def main():
                          'full-allow/yolo/bypass/auto-login. Unknown/missing fields, out-of-bound '
                          'cwd, composite/variant commands (;/&&/||/|/newline/redirect/cd) and '
                          'input SHA mismatch are refused before dispatch.')
+    ap.add_argument('--file-scope-contract', dest='file_scope_contract', default=None,
+                    help='Optional controlled per-file read/write boundary JSON '
+                         '{workspace, readable_files:[...], writable_files:[...]} enabling the '
+                         'FileSystemPort execution guard for ZCode precise Edit. Before dispatch '
+                         'the paths are normalized to canonical real paths and frozen with a '
+                         'canonical SHA; the runner recomputes the same SHA, re-verifies '
+                         'workspace/aliases/drift, decorates the official createNodeFileSystemAdapter '
+                         'and injects the guarded fileSystemPort. Reads are limited to declared '
+                         'files (external read-only references allowed); writes are limited to '
+                         'exact writable_files inside the real workspace. Symlink/junction/reparse, '
+                         'hardlink multi-link, directory/new-file parent drift, removeFile, '
+                         'listDirectory/searchFiles/searchText are refused before any side effect. '
+                         'This mode forbids Bash, command_contract, resume and any tool outside '
+                         'Read/Edit/Write; missing public factory/contract/SHA mismatch is refused '
+                         'with zero model submission and never falls back to a broad file port.')
     ap.add_argument('--dispatch-plan', dest='dispatch_plan', default=None,
                     help='Optional task-level dispatch plan JSON. ZCode exposes only '
                          'whole-tool toggles, so a plan that needs per-file Edit or '
@@ -782,6 +815,43 @@ def main():
                          ensure_ascii=False))
         return 2
 
+    # ---- 受控逐文件读写边界契约：派工前规范化真实路径并冻结 canonical SHA ----
+    file_scope = None
+    file_scope_sha256 = None
+    if args.file_scope_contract:
+        fs_problems = []
+        if args.preflight_only:
+            fs_problems.append('--file-scope-contract is not applicable to --preflight-only '
+                               '(no prompt is submitted, so no guarded file I/O occurs)')
+        if 'Bash' in tools:
+            fs_problems.append('controlled file-scope mode forbids Bash (Read/Edit/Write only)')
+        for t in ('Glob', 'Grep'):
+            if t in tools:
+                fs_problems.append(f'controlled file-scope mode forbids {t} (Read/Edit/Write only)')
+        if command_contract is not None:
+            fs_problems.append('controlled file-scope mode forbids --command-contract')
+        if args.session_id:
+            fs_problems.append('controlled file-scope mode forbids --session-id resume '
+                               '(session continuity is not an authorization)')
+        if args.mode != 'edit':
+            fs_problems.append(f'controlled file-scope mode requires --mode edit, got {args.mode!r}')
+        try:
+            raw_scope = json.loads(Path(args.file_scope_contract).read_text(encoding='utf-8'))
+        except (OSError, ValueError) as exc:
+            fs_problems.append(f'file scope contract unreadable: {exc}')
+            raw_scope = None
+        if raw_scope is not None:
+            normalized, fs_reasons = zfs.normalize_file_scope(raw_scope, work)
+            if fs_reasons:
+                fs_problems.extend(fs_reasons)
+            else:
+                file_scope = normalized
+                file_scope_sha256 = zfs.canonical_sha(normalized)
+        if fs_problems:
+            print(json.dumps({'refused_before_dispatch': True, 'sent': False,
+                              'exit_code': 2, 'reasons': fs_problems}, ensure_ascii=False))
+            return 2
+
     runner = Path(cfg['runner']) if cfg.get('runner') else DEFAULT_RUNNER
     if not runner.is_file():
         print(json.dumps({'refused_before_dispatch': True,
@@ -814,6 +884,16 @@ def main():
                   # Record the actual whole-tool allow/deny sets; no fine-grained grants.
                   'grants': ec.grants_from_rules(list(tools), [],
                                                 build_tool_disallowlist(tools), list(tools))}
+        # 受控逐文件读写边界：把已冻结并绑定 canonical SHA 的 file_scope profile 交给正式入口，
+        # 让 execution_control 独立复核“契约精确覆盖 plan.grants.edits + workspace + 实际允许
+        # 工具”后才接受 ZCode 精确 Edit；无 file_scope 时 actual 不带该 profile，fine_grained=False
+        # 仍按通用能力拒绝。command_contract / resume 在受控文件模式已被禁用，保持缺省。
+        if file_scope is not None:
+            actual['file_scope'] = file_scope
+            actual['file_scope_sha256'] = file_scope_sha256
+            # 精确 Edit(/单文件) grants 用契约真实文件路径回填，供覆盖校验逐条比对。
+            actual['grants']['edits'] = ['Edit(%s)' % e['real']
+                                         for e in file_scope['writable_files']]
         result = ec.preflight(plan, actual, active_tasks=active_tasks)
         plan_block = {'plan_path': str(Path(args.dispatch_plan).resolve()),
                       'plan_hash': result['plan_hash'], 'ok': result['ok'],
@@ -1155,6 +1235,40 @@ def main():
             derived = _derive_embedded_search_backend_entry(cfg['bootstrap'])
             if derived is not None:
                 request['embedded_search_backend_entry'] = derived
+    if file_scope is not None:
+        # 冻结的规范化契约 + canonical SHA 一起入 request；runner 独立重算 SHA、复检 workspace/
+        # 别名/漂移后装饰公开 createNodeFileSystemAdapter 并注入公开 fileSystemPort。缺公开
+        # factory/契约/绑定不一致一律 fail-closed、零提交，绝不回退默认宽文件端口。
+        request['file_scope_contract'] = file_scope
+        request['file_scope_contract_sha256'] = file_scope_sha256
+        adapters_entry = cfg.get('adapters_entry')
+        if adapters_entry is not None:
+            adapters_path = Path(adapters_entry)
+            if not adapters_path.is_absolute() or not adapters_path.is_file():
+                return _abort_before_start(
+                    {'refused_before_dispatch': True, 'exit_code': 2,
+                     'reasons': [f'entry config adapters_entry must be an existing '
+                                 f'absolute file: {adapters_entry}']}, 2)
+            request['adapters_entry'] = str(adapters_path)
+        else:
+            request['adapters_entry'] = _derive_adapters_entry(cfg['bootstrap'])
+        contracts_entry = cfg.get('contracts_entry')
+        if contracts_entry is not None:
+            contracts_path = Path(contracts_entry)
+            if not contracts_path.is_absolute() or not contracts_path.is_file():
+                return _abort_before_start(
+                    {'refused_before_dispatch': True, 'exit_code': 2,
+                     'reasons': [f'entry config contracts_entry must be an existing '
+                                 f'absolute file: {contracts_entry}']}, 2)
+            request['contracts_entry'] = str(contracts_path)
+        else:
+            request['contracts_entry'] = _derive_contracts_entry(cfg['bootstrap'])
+        # 受控文件模式的 plan/actual 绑定：execution_control 据此核对 file_scope 精确覆盖
+        # plan.grants.edits 且工具/工作区/无 Bash；缺绑定则维持通用 fine_grained=False 拒绝。
+        request['file_scope_plan_binding'] = {
+            'workspace': str(work),
+            'profile': 'zcode-controlled-file',
+            'file_scope_sha256': file_scope_sha256}
     try:
         (out / 'request.json').write_text(json.dumps(request, ensure_ascii=False, indent=2),
                                           encoding='utf-8')
@@ -1313,6 +1427,17 @@ def main():
             'embedded_search_prelude_sha256': envelope.get('embedded_search_prelude_sha256'),
             'permission_audit_events': envelope.get('permission_audit_events'),
             'permission_states': envelope.get('permission_states') or {},
+            # BW-ZCODE-FILES-S1 受控逐文件读写边界独立事实：present 是派工前 Python 侧事实，
+            # ready/audit/denied/ops 来自 runner 装饰端口真实计数；无契约时 present=false，
+            # 绝不冒称已启用文件保护（离线桩不算现场能力，未现场验证不宣称上线）。
+            'file_scope_present': file_scope is not None,
+            'file_scope_sha256': file_scope_sha256,
+            'file_scope_sha256_match': bool(envelope.get('file_scope_sha256_match')),
+            'file_scope_ready': bool(envelope.get('file_scope_ready')),
+            'file_scope_denied': envelope.get('file_scope_denied'),
+            'file_scope_ops': envelope.get('file_scope_ops'),
+            'file_scope_audit_events': envelope.get('file_scope_audit_events'),
+            'file_scope_methods': envelope.get('file_scope_methods'),
         })
         summary['protocol_success'] = (child.returncode == 0
                                        and envelope.get('ok') is True

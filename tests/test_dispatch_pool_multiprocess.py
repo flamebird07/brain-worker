@@ -332,35 +332,53 @@ class TestSixFullRace(_SpawnMixin, unittest.TestCase):
 class TestPidReuseAndLateFinish(_SpawnMixin, unittest.TestCase):
     def test_live_pid_wrong_birth_held_unknown_then_dead_released(self):
         # 真实存活子进程，但记录一个错误的出生身份 → reconcile 必须 unknown 不回收
-        # （PID 复用/身份漂移不得当作原 child 已死而抢占）。
-        alive = _CTX.Event()
-        child = _CTX.Process(target=_sleep_worker, args=(alive,))
+        # （PID 复用/身份漂移不得当作原 child 已死而抢占）。owner wrapper 用另一真实
+        # 独立子进程（同一 _sleep_worker）承载并登记其真实创建身份：child 死但原调用
+        # 未确认终态一律保守保留，只有 child+owner wrapper 都确实 dead 才自动释放。
+        child_alive = _CTX.Event()
+        child = _CTX.Process(target=_sleep_worker, args=(child_alive,))
         child.start()
         self._procs.append(child)
+        wrapper_alive = _CTX.Event()
+        wrapper = _CTX.Process(target=_sleep_worker, args=(wrapper_alive,))
+        wrapper.start()
+        self._procs.append(wrapper)
+        # 亲生独立 wrapper 进程必须拿到真实非空出生身份，据此登记可被对账核验。
+        wrapper_created = dp.process_identity(wrapper.pid).get('created')
+        self.assertIsNotNone(wrapper_created)
         try:
             with closing(dp.connect(self.store)) as conn:
                 conn.execute(
                     "INSERT INTO attempts(token, task_id, runtime, model, pool_key, "
                     "state, child_pid, child_created, wrapper_pid, wrapper_created) "
                     "VALUES('pu','pu-task','zcode','GLM-5.3','zcode:GLM-5.3',"
-                    "'running', ?, 'WRONG-BIRTH', 4242, 'w')", (child.pid,))
+                    "'running', ?, 'WRONG-BIRTH', ?, ?)",
+                    (child.pid, wrapper.pid, str(wrapper_created)))
             out = dp.reconcile(self.store, now=T0)
             self.assertNotIn('pu', out['released'])
             self.assertEqual(
                 self._rows("SELECT state FROM attempts WHERE token='pu'")[0]['state'],
                 'unknown')
-            # 确认明确 dead（真实退出）后才可释放。
-            alive.set()
+            # 确认 child 与 owner wrapper 都明确 dead（真实退出并 join）后才可释放。
+            child_alive.set()
             child.join(timeout=JOIN_TIMEOUT)
             self.assertFalse(child.is_alive())
+            wrapper_alive.set()
+            wrapper.join(timeout=JOIN_TIMEOUT)
+            self.assertFalse(wrapper.is_alive())
             out2 = dp.reconcile(self.store, now=T0)
             self.assertIn('pu', out2['released'])
         finally:
-            alive.set()
+            child_alive.set()
             child.join(timeout=JOIN_TIMEOUT)
             if child.is_alive():
                 child.terminate()
                 child.join(timeout=JOIN_TIMEOUT)
+            wrapper_alive.set()
+            wrapper.join(timeout=JOIN_TIMEOUT)
+            if wrapper.is_alive():
+                wrapper.terminate()
+                wrapper.join(timeout=JOIN_TIMEOUT)
 
     def test_old_attempt_late_finish_never_releases_new_attempt(self):
         old = dp.select_and_claim(self.store, task_id='lat', runtime='zcode',

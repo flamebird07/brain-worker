@@ -617,9 +617,10 @@ class PermissionGrantsTests(_Base):
         之外的 grants 变化时 zcode_unavailable 单独出现——两原因各归各，绝不混写。"""
         self.build_store()
         with _patch_zcode(False):
+            # 混合 Edit+Bash：无法进受控文件 profile（bash 必须为空），能力门前置，
+            # 即便 Z 被阻断仍记 permission_incompatible；与下面纯 availability 阻断相区分。
             r = self.plan(self.auth('auto', 'T', 's2', ALL_MAINS + ALL_FLASH),
-                          permission_grants={'edits': ['Edit(C:/a.py)'],
-                                             'bash': [], 'read_dirs': []})
+                          permission_grants=self.FINE)
             self.assertEqual(r['zcode_blocked'], True)
             self.assertEqual(r['candidate_filters'][dp.ZCODE_POOL_KEY],
                              'permission_incompatible', r)
@@ -704,8 +705,7 @@ class PermissionGrantsTests(_Base):
         prev = {'task_id': 'T', 'state': 'finished', 'acceptance_reviewed': True,
                 'stage': 's1', 'runtime': 'qodercn', 'model': 'Qwen3.8-Flash'}
         r = self.plan(auth, previous=prev, stage='s1',
-                      permission_grants={'edits': ['Edit(C:/a.py)'], 'bash': [],
-                                         'read_dirs': []})
+                      permission_grants=self.FINE)
         self.assertEqual(r['refused'], None, r)
         self.assertEqual(r['selected_reason'], 'temporary_fallback_selected', r)
         self.assertEqual(r['selected']['pool_key'], CN_FLASH, r)
@@ -730,6 +730,43 @@ class PermissionGrantsTests(_Base):
         self.assertEqual(r['candidate_filters'][dp.ZCODE_POOL_KEY],
                          'permission_incompatible')
         self.assertEqual(r['selected']['pool_key'], 'qoder:Qwen3.8-Flash', r)
+
+    def test_edits_only_grants_make_zcode_eligible_via_controlled_file_profile(self):
+        """仅需精确文件 Edit（无 Bash、无 read_dirs）时，ZCode 经**受控文件 profile** 变为可选，
+        回执标明 controlled_file_profile_required=True；绝不修改 CAPABILITY 的 fine_grained=False，
+        也绝不因此把混合 Bash 任务放行。"""
+        self.build_store()
+        r = self.plan(self.auth('auto', 'T', 's2', ALL_MAINS + ALL_FLASH), now=T_DAY,
+                      permission_grants={'edits': ['Edit(C:/a.py)'], 'bash': [],
+                                         'read_dirs': []})
+        self.assertEqual(r['refused'], None, r)
+        self.assertEqual(r['candidate_filters'][dp.ZCODE_POOL_KEY], 'eligible', r)
+        self.assertEqual(r['permission_requirements'],
+                         {'fine_grained': True, 'read_dirs': False})
+        self.assertTrue(r['controlled_file_profile_required'], r)
+        self._assert_capability_table_untouched()
+
+    def test_fixed_z_edits_only_selects_zcode_not_swapped(self):
+        """fixed 明确 ZCode 且本轮仅需精确 Edit：受控文件 profile 使其可选，正常选中 ZCode，
+        绝不因能力表 fine_grained=False 而偷偷换执行器。"""
+        self.build_store()
+        auth = self.auth('fixed', 'T', 's2', [dp.ZCODE_POOL_KEY],
+                         runtime='zcode', model='GLM-5.3')
+        r = self.plan(auth, permission_grants={'edits': ['Edit(C:/a.py)'], 'bash': [],
+                                               'read_dirs': []})
+        self.assertEqual(r['refused'], None, r)
+        self.assertEqual(r['selected']['pool_key'], dp.ZCODE_POOL_KEY, r)
+        self.assertTrue(r['controlled_file_profile_required'], r)
+
+    def test_mixed_edit_bash_task_remains_permission_incompatible(self):
+        """混合 Edit+Bash 整段任务继续 permission_incompatible：受控文件 profile 只覆盖纯精确
+        Edit，Bash 需求一律不成立，回执不标 controlled_file_profile_required，主脑须串行拆分。"""
+        self.build_store()
+        r = self.plan(self.auth('auto', 'T', 's2', ALL_MAINS + ALL_FLASH), now=T_DAY,
+                      permission_grants=self.FINE)
+        self.assertEqual(r['candidate_filters'][dp.ZCODE_POOL_KEY],
+                         'permission_incompatible', r)
+        self.assertFalse(r['controlled_file_profile_required'], r)
 
 
 if __name__ == '__main__':

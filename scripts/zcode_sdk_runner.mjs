@@ -15,6 +15,10 @@ import { appendFileSync, realpathSync } from 'node:fs';
 import { readFile, writeFile } from 'node:fs/promises';
 import { join } from 'node:path';
 import { pathToFileURL } from 'node:url';
+import {
+  buildFileScopeGuard, canonicalSha as fileScopeCanonicalSha,
+  createGuardedFileSystemPort,
+} from './zcode_file_scope.mjs';
 
 const argv = process.argv.slice(2);
 const requestFlag = argv.indexOf('--request');
@@ -28,6 +32,15 @@ const allowed = new Set(request.allowed_tools || []);
 // 受控命令审批注入（可选）：inner 执行端口与清理句柄，finally 里统一关闭。
 let gatedExecutionPort;
 let closeInnerPort = null;
+// BW-ZCODE-FILES-S1 受控逐文件端口（可选）：装饰后的 FileSystemPort，finally 里连带关闭 inner。
+let guardedFileScopePort;
+let fileScopeDeniedSnapshot = 0;
+let fileScopeOpsSnapshot = 0;
+let fileScopeAuditSnapshot = 0;
+// 官方 FileSystemPort 恰有这 10 个方法；装饰端口对外面必须完全一致，多/少即 fail-closed。
+// 提前到 main() 之前声明，避免 setupFileScope 引用 const 触发 TDZ。
+const FILE_SCOPE_PORT_METHODS = ['createDirectory', 'stat', 'readTextFile', 'readBinaryFile',
+  'readTextFileRange', 'writeTextFile', 'removeFile', 'listDirectory', 'searchFiles', 'searchText'];
 // 审计行计数与状态分布（供 envelope 的独立状态使用）。
 let auditLineCount = 0;
 let auditStateCounts = {};
@@ -95,6 +108,16 @@ const envelope = {
   embedded_search_prelude_sha256: null,
   permission_audit_events: 0,
   permission_states: {},
+  // BW-ZCODE-FILES-S1 受控逐文件读写边界的独立状态（互不等价，任一不能由其它推断为真）：
+  // present=本次带 file_scope 契约；ready=公开 factory/port/SHA/绑定全部核验通过并已注入；
+  // audit/denied/ops 来自装饰端口真实计数；methods=对外端口方法面。
+  file_scope_present: Boolean(request.file_scope_contract),
+  file_scope_sha256_match: false,
+  file_scope_ready: false,
+  file_scope_denied: 0,
+  file_scope_ops: 0,
+  file_scope_audit_events: 0,
+  file_scope_methods: null,
   errors: [],
   limitations: [],
 };
@@ -149,6 +172,14 @@ async function main() {
       approvalRuntimeConfig = approval.runtimeConfig || {};
     }
 
+    // ---- BW-ZCODE-FILES-S1：受控逐文件 FileSystemPort 注入（装饰公开 createNodeFileSystemAdapter）----
+    // 只在带 file_scope_contract 时启用；缺公开 factory/契约/绑定不一致立即 fail-closed，零提交，
+    // 绝不回退默认宽文件端口。
+    let injectFileSystemPort;
+    if (request.file_scope_contract) {
+      injectFileSystemPort = await setupFileScope(request);
+    }
+
     app = await bootstrap.createZCodeApp({
       env,
       ...(request.resume_session_id ? { sessionId: request.resume_session_id, resume: true } : {}),
@@ -158,6 +189,7 @@ async function main() {
       providerRuntimeHeadersPort: registry.providerRuntimeHeadersPort,
       ...(injectExecutionPort ? { executionPort: injectExecutionPort } : {}),
       ...(injectPermissionBroker ? { permissionBroker: injectPermissionBroker } : {}),
+      ...(injectFileSystemPort ? { fileSystemPort: injectFileSystemPort } : {}),
       runtimeConfig: {
         workingDirectory: request.workspace,
         mode: request.mode,
@@ -281,6 +313,7 @@ async function main() {
     envelope.event_count = events.length;
     // 命令实际执行/尝试/started 只来自闸门真实计数；绝不凭协议成功推断（见 finally 里同步）。
     syncApprovalStates();
+    syncFileScopeStates();
     await writeJson('preflight.json', preflight);
     return envelope.ok ? 0 : 3;
   } catch (error) {
@@ -310,6 +343,7 @@ async function main() {
     }
     // F：无论成功/异常/审计写失败，都按闸门真实计数同步独立状态；不把已执行谎报为零动作。
     syncApprovalStates();
+    syncFileScopeStates();
   }
 }
 
@@ -400,6 +434,123 @@ async function resolveInnerExecutionPort() {
     failClosedApproval('created inner execution port lacks run()');
   }
   return inner;
+}
+
+// BW-ZCODE-FILES-S1 受控逐文件读写边界：独立绑定与 fail-closed。
+function failClosedFileScope(message) {
+  envelope.file_scope_ready = false;
+  envelope.file_scope_denied = fileScopeDeniedSnapshot;
+  refuse(`controlled file-scope port unavailable; refusing to submit: ${message}`);
+}
+
+function makeFileScopeAuditSink() {
+  const path = join(outDir, 'file-scope-events.jsonl');
+  return {
+    record(payload) {
+      const line = safeStringify(payload);
+      try {
+        appendFileSync(path, line + '\n');
+      } catch (error) {
+        // 审计写失败冒泡：装饰端口据此拒绝下一动作（放行前失败=零副作用；执行后失败=如实保留已发生的副作用）。
+        throw new Error(`file-scope audit write failed: ${error?.message || error}`);
+      }
+    },
+  };
+}
+
+async function setupFileScope(req) {
+  // 1. 独立重算并精确比对 canonical SHA（与派工前冻结值同源），不符即零提交。
+  const recomputed = fileScopeCanonicalSha(req.file_scope_contract);
+  if (recomputed !== req.file_scope_contract_sha256) {
+    failClosedFileScope(`file scope contract sha mismatch: bound ${req.file_scope_contract_sha256} `
+      + `vs recomputed ${recomputed}`);
+  }
+  envelope.file_scope_sha256_match = true;
+  // 2. 受控文件模式硬边界（纵深防御，独立于 Python 派工前校验）：禁 Bash/command_contract/resume，
+  //    只允许 mode=edit 且工具 ⊆ {Read,Edit,Write}。任一违反即 fail-closed，绝不把会话连续当授权。
+  if (req.command_contract) failClosedFileScope('command_contract must be absent in file-scope mode');
+  if (req.resume_session_id) failClosedFileScope('resume must be absent in file-scope mode');
+  if (req.mode !== 'edit') failClosedFileScope(`file-scope mode requires mode=edit, got ${req.mode}`);
+  const scopeTools = new Set(req.allowed_tools || []);
+  if (scopeTools.has('Bash') || scopeTools.has('Glob') || scopeTools.has('Grep')) {
+    failClosedFileScope('Bash/Glob/Grep tools are forbidden in controlled file-scope mode');
+  }
+  for (const t of scopeTools) {
+    if (!['Read', 'Edit', 'Write'].includes(t)) failClosedFileScope(`unexpected tool in scope: ${t}`);
+  }
+  // 3. 解析同一棵公开 SDK 树：adapters 入口取 createNodeFileSystemAdapter，contracts 入口取
+  //    FileSystemPortError（与官方 tool handler 同一个类身份）。缺任一/未导出/不可导入即 fail-closed。
+  if (!req.adapters_entry || !req.contracts_entry) {
+    failClosedFileScope('adapters_entry and contracts_entry are both required to build the port');
+  }
+  let adapterModule;
+  try {
+    adapterModule = await import(pathToFileURL(req.adapters_entry).href);
+  } catch (error) {
+    failClosedFileScope(`adapters entry import failed: ${error?.message || error}`);
+  }
+  if (typeof adapterModule?.createNodeFileSystemAdapter !== 'function') {
+    failClosedFileScope('adapters entry does not export createNodeFileSystemAdapter');
+  }
+  let contractModule;
+  try {
+    contractModule = await import(pathToFileURL(req.contracts_entry).href);
+  } catch (error) {
+    failClosedFileScope(`contracts entry import failed: ${error?.message || error}`);
+  }
+  if (typeof contractModule?.FileSystemPortError !== 'function') {
+    failClosedFileScope('contracts entry does not export FileSystemPortError');
+  }
+  const FileSystemPortError = contractModule.FileSystemPortError;
+  let workspaceReal;
+  try {
+    workspaceReal = realpathSync(req.workspace);
+  } catch (error) {
+    failClosedFileScope(`workspace realpath unavailable: ${error?.message || error}`);
+  }
+  const inner = adapterModule.createNodeFileSystemAdapter({});
+  if (!inner || typeof inner.writeTextFile !== 'function' || typeof inner.stat !== 'function') {
+    failClosedFileScope('created inner file port lacks the expected FileSystemPort surface');
+  }
+  // 4. 冻结守卫（复检 workspace + 每项目标真实路径/别名/漂移/新文件父目录）；任一不符抛 → fail-closed。
+  let guard;
+  try {
+    guard = buildFileScopeGuard(req.file_scope_contract, { workspaceRealPath: workspaceReal,
+      FileSystemPortError });
+  } catch (error) {
+    failClosedFileScope(`file scope guard build failed: ${error?.message || error}`);
+  }
+  const sink = makeFileScopeAuditSink();
+  const port = createGuardedFileSystemPort({ innerPort: inner, guard, sink });
+  // 5. 对外方法面必须恰为官方 10 个，无额外/后台面。
+  const methods = port._fsMethods().slice().sort();
+  const expected = FILE_SCOPE_PORT_METHODS.slice().sort();
+  if (methods.length !== expected.length || methods.some((m, i) => m !== expected[i])) {
+    failClosedFileScope(`guarded port method surface is not exactly the FileSystemPort methods: `
+      + `${JSON.stringify(methods)}`);
+  }
+  guardedFileScopePort = port;
+  envelope.file_scope_ready = true;
+  envelope.file_scope_methods = methods;
+  preflight.file_scope = {
+    contract_sha256: req.file_scope_contract_sha256,
+    workspace: workspaceReal,
+    writable: (req.file_scope_contract.writable_files || []).map(e => e.real),
+    readable: (req.file_scope_contract.readable_files || []).map(e => e.real),
+    port_methods: methods,
+  };
+  return port;
+}
+
+// 同步文件守卫真实计数到独立状态（成功/异常/finally 都调用；审计写失败也不谎报为零动作）。
+function syncFileScopeStates() {
+  if (!request.file_scope_contract || !guardedFileScopePort) return;
+  fileScopeDeniedSnapshot = guardedFileScopePort._fsDenied();
+  fileScopeOpsSnapshot = guardedFileScopePort._fsOps();
+  fileScopeAuditSnapshot = guardedFileScopePort._fsAuditEvents();
+  envelope.file_scope_denied = fileScopeDeniedSnapshot;
+  envelope.file_scope_ops = fileScopeOpsSnapshot;
+  envelope.file_scope_audit_events = fileScopeAuditSnapshot;
 }
 
 async function setupCommandApproval(req) {

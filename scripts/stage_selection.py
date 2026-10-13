@@ -148,20 +148,40 @@ def _permission_requirements(grants):
             'read_dirs': bool(grants['read_dirs'])}
 
 
-def _permission_incompatible(pk, requirements):
+def _controlled_file_profile_applicable(grants):
+    """本轮是否“仅需精确文件 Edit、无 Bash、无 read_dirs”，可走 ZCode 受控文件 profile。
+    与 execution_control._zcode_controlled_file_reasons 同一判定口径，避免规划与正式入口分歧：
+    只有纯 Edit（含 Edit(/工作区相对单文件)）且无整目录/Bash 时才成立；混合 Edit+Bash 整段任务
+    不适用，ZCode 继续 permission_incompatible，由主脑按用户选择串行拆分。"""
+    if not grants:
+        return False
+    if grants['bash'] or grants['read_dirs']:
+        return False
+    return bool(grants['edits'])
+
+
+def _permission_incompatible(pk, requirements, controlled_file_ok=False):
     """复用 execution_control.CAPABILITY（按 pool_key 的 runtime 前缀查表）判能力匹配；
     绝不修改 CAPABILITY 把 ZCode 伪装成 fine_grained=True。无需求时任何候选都兼容
-    （维持旧行为：ZCode 正常 eligible）。"""
+    （维持旧行为：ZCode 正常 eligible）。当且仅当本轮仅需精确 Edit、无 Bash/read_dirs，且
+    候选是 ZCode 时，标记可选受控文件 profile（回执 profile 由正式入口独立复核后放行）。"""
     if not (requirements['fine_grained'] or requirements['read_dirs']):
         return False
     cap = ec.CAPABILITY.get(pk.split(':', 1)[0])
     if cap is None:
         return True
-    return ((requirements['fine_grained'] and not cap['fine_grained'])
-            or (requirements['read_dirs'] and not cap['read_dirs']))
+    if requirements['read_dirs'] and not cap['read_dirs']:
+        return True
+    if requirements['fine_grained'] and not cap['fine_grained']:
+        runtime = pk.split(':', 1)[0]
+        if runtime == 'zcode' and controlled_file_ok:
+            return False
+        return True
+    return False
 
 
-def _filter_candidates(conn, allowed, zcode_blocked, now, requirements=None):
+def _filter_candidates(conn, allowed, zcode_blocked, now, requirements=None,
+                       controlled_file_ok=False):
     """逐候选只读过滤，返回 (通过集合, {pk: 拒绝原因})。
     未授权/权限能力/时段/明确限额/容量 分开记录；ZCode 复用既有 availability 口径。
     `permission_incompatible` 与 `zcode_unavailable`（额度/availability）、
@@ -172,7 +192,7 @@ def _filter_candidates(conn, allowed, zcode_blocked, now, requirements=None):
         if not _allowed_candidate(pk):
             filters[pk] = 'unauthorized'
             continue
-        if _permission_incompatible(pk, requirements):
+        if _permission_incompatible(pk, requirements, controlled_file_ok):
             filters[pk] = 'permission_incompatible'
             continue
         if pk == dp.ZCODE_POOL_KEY and zcode_blocked:
@@ -281,6 +301,11 @@ def plan_stage_selection(authorization, *, previous=None, store_path=None, quota
         return _refuse('invalid_permission_grants', str(exc))
     requirements = _permission_requirements(req_grants)
     receipt['permission_requirements'] = requirements
+    # 当轮仅需精确文件 Edit、无 Bash/read_dirs 时，ZCode 可选受控文件 profile；混合 Edit+Bash
+    # 整段任务不适用，ZCode 继续 permission_incompatible（由主脑串行拆分）。与正式入口同一口径。
+    controlled_file_ok = _controlled_file_profile_applicable(req_grants)
+    receipt['controlled_file_profile_required'] = bool(
+        requirements['fine_grained'] and controlled_file_ok)
     # 上下文必须齐备，否则无法核对防重/工作区
     if not task_id or not stage or not workspace:
         return _refuse('missing_context', 'task_id/stage/workspace are required')
@@ -405,7 +430,7 @@ def plan_stage_selection(authorization, *, previous=None, store_path=None, quota
                 return _refuse('no_eligible_candidate')
 
         passed, filters = _filter_candidates(conn, eff_allowed, zcode_blocked, now,
-                                             requirements)
+                                             requirements, controlled_file_ok)
         receipt['candidate_filters'] = _per_candidate_view(eff_allowed, filters)
 
         if eff_mode == 'fixed':

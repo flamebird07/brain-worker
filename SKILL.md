@@ -350,7 +350,25 @@ spawn_error 不计已执行、`command_started` 在 started 审计写失败时�
 当次 Bash 现场能力未验或组件未 ready 时的路由，见下方「ZCode 能力验收与现场放行（决策规则）」默认路由
 一条（计划阶段限定 ZCode 只做读写 → 既有 Qoder 串行登记测试；实际授权/环境/自动审批拒绝不能换执行器
 绕过）；ZCode 的 CAPABILITY `fine_grained` 维持 `false`（无法表达 `grants.edits` 与 `grants.bash` 两种
-细粒度规则，`command_contract` 是另一套本地逐字命令闸门、不授文件沙箱）。执行证据与报告绑定分离：`protocol_success`/`report_bound` 原含义不变，`business_verified` 始终由主脑独立验收；可选 `--execution-contract` 按“最小任务执行契约 × 同 session/turn 工具事件 × 磁盘回读”产出 `execution_evidence_ok` 与具体状态（无契约时显式 null，不默认 true），规则见 [ZCode 操作参考](references/zcode-direct.md) 的执行证据门禁一节。工程任务派工应声明并使用执行契约，业务完成仍由主脑独立验收；CLI 缺省无契约仅是为兼容旧调用的显式未验状态，不能当作工程完成的证据。
+细粒度规则，`command_contract` 是另一套本地逐字命令闸门、不授文件沙箱）。**BW-ZCODE-FILES-S1** 新增
+`--file-scope-contract` 受控逐文件读写边界（`scripts/zcode_file_scope.py`/.mjs）：Python 派工前规范化冻结
+canonical SHA，runner 在同一棵公开 SDK 树装饰 `createNodeFileSystemAdapter` 出只放行登记文件的
+`FileSystemPort` 经公开 `createZCodeApp({fileSystemPort})` 注入，读=登记∪可写（允许外部只读参考）、
+写=精确 writable 且在工作区内，`removeFile`/list/search 恒拒，缺 factory/契约/绑定不一致 fail-closed
+零提交、绝不回退宽端口；`execution_control` 仍不翻 `fine_grained`，只有已验证绑定的受控文件 profile 精确
+覆盖 `plan.grants.edits`+workspace+实际工具时才接受 ZCode 精确 Edit（Bash/read_dirs/通配符/无契约继续拒、
+不可用布尔 flag 绕过），`stage_selection` 仅在纯精确 Edit 时把 ZCode 判可选并回执标 `controlled_file_profile_required`，
+混合 Edit+Bash 仍 `permission_incompatible` 由主脑串行拆分为「ZCode 改文件→真实终态/回读→Qoder 跑登记测试」。
+**现场短摘要（4 例隔离 GLM-5.3，均 FileSystemPort 层工具 I/O 边界、非 OS 进程沙箱）**：登记路径 Read/Edit/Write 成功；
+工作区内只读参考文件（`readonly.txt` 实测在工作区，非外部）下 Edit 被拒；未登记 Write、指向外部 victim 的 junction Write
+被拒且 `ops=0`。**外部只读参考目前仅离线验证，不能据此宣称现场外部参考 Edit 已拒绝**；S4 新修的父目录别名漂移也已补
+离线真实 junction/symlink 回归（`tests/test_zcode_file_scope.py::ParentAliasDriftTests`），**但尚未在隔离现场 SDK 重跑，
+不宣称主脑已拿到修复后现场回执**。通用 `fine_grained=false` 保留：纯精确 Edit 可经已验证绑定的 controlled 文件 profile，
+混合 Edit+Bash 仍拒绝并串行拆分为「ZCode 改文件→真实终态/回读→Qoder 跑登记测试」。上一轮现场四例未改业务源码/真实池，
+但本轮 S4 修复改动了 `scripts/zcode_file_scope.mjs` 并新增离线测试，不笼统写成“技能升级未改源码/测试”。四例细节、计数、
+`report_bound` 与 TOCTOU 范围等完整事实见 [ZCode 操作参考](references/zcode-direct.md) 受控逐文件读写边界一节；执行证据与
+报告绑定分离：`protocol_success`/`report_bound` 原义不变，`business_verified` 恒由主脑独立验收，无执行契约时
+`execution_evidence_ok` 显式 null（不默认 true）。
 
 ## ZCode 能力验收与现场放行（决策规则）
 

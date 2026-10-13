@@ -248,6 +248,73 @@ app/adapter/dispose 关闭无泄漏——**双身不调用真实模型、
 ZCode 的 CAPABILITY `fine_grained` 维持 `false`（dispatch-plan 无法表达 `grants.edits` 与 `grants.bash`
 两种细粒度规则；`command_contract` 是另一套本地逐字命令闸门、不授文件沙箱）。
 
+## 受控逐文件读写边界（--file-scope-contract，BW-ZCODE-FILES-S1）
+
+面向“计划阶段只让 ZCode 做精确文件 Edit”的场景，新增一条与 `command_contract` 独立的**逐文件读写
+边界**：派工前用 Python（`scripts/zcode_file_scope.py`）把契约规范化并冻结成 canonical SHA，交给
+正式入口 `zcode_direct.py`；runner（`scripts/zcode_sdk_runner.mjs`）在**同一棵已核验的公开 SDK 树**
+里取 `adapters_entry` 的 `createNodeFileSystemAdapter`、`contracts_entry` 的 `FileSystemPortError`
+（避免类身份不一致），用 `scripts/zcode_file_scope.mjs` 装饰出一个受控 `FileSystemPort`，经公开
+`createZCodeApp({ fileSystemPort })` 注入。缺公开 factory/契约/绑定不一致一律 fail-closed、零模型提交，
+**绝不回退默认宽文件端口**；不改写、不编译、不 monkey-patch 官方 SDK。
+
+契约输入（最小字段，不多余状态/开关）：
+
+```json
+{"workspace": "<绝对工作区路径>",
+ "readable_files": ["<工作区相对或外部绝对路径>", "..."],
+ "writable_files":  ["<工作区相对路径>", "..."]}
+```
+
+- **读**只放行 `readable ∪ writable` 的精确文件（允许明确的外部只读参考）；**写**只放行 `writable_files`
+  且必须落在真实工作区内；writable 默认可读。`removeFile` 恒拒；`listDirectory`/`searchFiles`/`searchText`
+  在本模式 fail-closed（Glob/Grep/Bash 关闭，仅 Read/Edit/Write 可接受）。`createDirectory` 只放行已登记
+  写文件“已存在的必要父目录”，拒绝隐式建目录。
+- 副作用前复检 `realpath`/别名/junction/reparse/硬链接(nlink>1)/目录/类型/漂移；**登记新文件（目标尚不存在）的
+  父目录在 build 期与运行期都必须逐字解析回登记父目录的真实规范键**（不是仅“在工作区内”），拒绝 build 之后
+  把父目录替换为同工作区/外部别名导致的漂移写；`createDirectory` 亦要求 realpath 逐字回到登记键。连续合法 Edit/Write
+  同一文件不被误判越界（原子替换沿用登记 real）。Windows 折叠大小写与分隔符、POSIX 保留大小写。
+- 审计（`file-scope-events.jsonl`）在放行前记 `fs_gate`、结果后记 `fs_result`，含 op/登记目标/
+  trace/session/turn/status；**未登记路径只记其 SHA，绝不记原始路径/内容/凭据**。审计写失败拒下一动作。
+- `zcode_direct.py` 记录绑定与 summary 独立字段：`file_scope_present/ready/audit/denied/ops/methods`；
+  受控模式禁止 Bash/`command_contract`/resume/其它工具，CLI 输入错误退出 2、`sent=false`，启动失败不
+  消耗额度，真实终态不变。
+- `execution_control` 的通用能力表仍保持 `fine_grained=false`；只有本次可信入口已验证并绑定的受控
+  文件 profile，经独立复核证明 file_scope 契约**精确覆盖** `plan.grants.edits` + workspace + 实际允许
+  工具时，才接受 ZCode 精确 Edit；Bash/`read_dirs`/通配符/无匹配契约一律继续拒绝，调用方不能用布尔
+  flag、删改精确 grants 或填任意宽契约绕过。`stage_selection` 仅在本轮只需精确 Edit（无 Bash/全目录
+  授权）时把 ZCode 判为可选，并在回执标 `controlled_file_profile_required`；混合 Edit+Bash 继续
+  `permission_incompatible`，由主脑串行拆分为「ZCode 改文件 → 真实终态/回读 → Qoder 跑登记测试」。
+- **现场事实（2026-10-13，4 个隔离 GLM-5.3 真 Agent 用例）**：以上此前仅离线回归（真实 guard/port 面 +
+  真实 runner 注入路径 + Python 规范化 + 跨语言 SHA 同源）；现已在真实 GLM-5.3 Agent 现场核验登记/未登记
+  路径与只读参考、未登记 junction：登记路径 Read/Edit/Write 成功（positive 有 `writeTextFile` `allowed=true`
+  的 `fs_gate`）；对已登记的**工作区内只读参考文件**（`readonly.txt` 实测位于工作区，非外部路径）下 Edit 被拒
+  （readonly `allowed=false` gate，因它不在 writable 集合）；未登记路径 Write 被拒
+  （unregistered `workspace/unregistered.txt` 未落盘、`file_scope_ops=0`）；指向 owned 外部 victim 的 junction
+  Write 被拒（alias `outside/victim.txt` 保持 OUTSIDE_SENTINEL、`ops=0`）。后两例在 Write handler 的前置 Read
+  即被端口拒绝，**不伪称有 writeTextFile 执行回执**。**外部只读参考（readable 越过工作区）目前仅离线验证，
+  上述现场用例的只读参考其实在工作区内，故不能据此宣称现场外部参考 Edit 已拒绝。** 四轮均 `exit0`、
+  `capacity_released=true`、`protocol_success=true`、`file_scope_ready`+`file_scope_sha256_match=true`；正向
+  `report_bound=false` 仅因实际路径末尾多一个句号，其余三例 `report_bound=true`，原件保留、不为格式重跑。
+  原 SDK TraceContext 不给 toolCallId，**不伪造**，须以 session/turn/原始工具事件关联；端口初始化自身另有未登记
+  辅助读取被拒，不把该拒绝计入模型工具数。范围仅限明确登记/未登记路径与只读参考、未登记 junction，
+  **不宣称所有重解析点竞态或外部进程 TOCTOU 已完全防护，不升级 Bash**。这是 FileSystemPort 层的工具 I/O 约束，
+  **不是操作系统进程沙箱**，不宣称文件级进程隔离。
+- **S4 修复：登记新文件的父目录别名漂移（独立只读复核发现的真实漏口）**：旧 `reverifyEntry`/`decide`
+  对 `sha=null`/目标不存在分支只判父目录 realpath 是否落在工作区内，未比较其真实规范键与登记父目录是否
+  逐字相等；于是登记 `A/new.txt`、build 成功后，把父目录 `A` 换成指向同工作区 `B` 的 junction/symlink（`new.txt`
+  仍不存在）时，`A` 的 realpath 解析到 `B` 仍在“工作区内”，会把未登记的 `B/new.txt` 写出去——这是两次操作之间
+  即可稳定出现的静态父目录别名漂移，不是泛化的外部进程 TOCTOU。修复令 **build 期与运行期都必须把登记新文件的
+  父目录真实规范 key 与登记父目录逐字相等**（不相等即 `parent-alias-or-drift`/`invalid_path` 拒绝），并让
+  `createDirectory` 对同一替换后的别名父目录按 realpath 逐字回到登记键才放行；保留既有旧文件别名/硬链接/类型
+  检查、`expectedRevision`/`encoding`/`signal` 透传与连续合法写入，writable 精确边界不扩大，通用 `fine_grained`
+  仍 `false`，不改 SDK/命令端口/池。**离线证据**：`tests/test_zcode_file_scope.py` 的 `ParentAliasDriftTests`
+  用真实临时目录与真实 junction/symlink（Windows `mklink /J`、POSIX `symlinkSync`，不 mock 被测守卫）证明
+  build 期拒绝已漂移父目录、运行期 write 拒绝且 inner 零调用、createDirectory 拒绝同一替换，并允许真实普通
+  父目录里的新文件正常写入；本机无能力建链接时该用例如实 skip 报告，不用假 alias 替代真实行为。**此修复尚未
+  在隔离真实现场 SDK 重跑，不宣称主脑已拿到修复后现场回执**。上一轮现场四例未改业务源码/真实池，但本轮 S4
+  修复本身改动了 `scripts/zcode_file_scope.mjs` 并新增离线测试，不能笼统写成“本技能升级未改源码/测试”。
+
 ## 报告与验收
 
 runner 只做机械校验：`response.md` 是模型**原样文本**（不修剪、不改写、不补换行），首尾标记

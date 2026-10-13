@@ -272,6 +272,59 @@ def check_parallel(plan, active_tasks, max_concurrency, actual_prompt_sha=None) 
     return reasons
 
 
+def _zcode_controlled_file_reasons(plan, actual) -> list:
+    """ZCode 精确 Edit 的受控文件 profile 独立复核（CAPABILITY 仍保持 fine_grained=False）。
+
+    仅接受本次可信入口已冻结并绑定的 file_scope profile，且必须经独立复核：契约 canonical SHA
+    与内容一致（未篡改/未加宽）、workspace 与计划一致、契约 writable 精确覆盖 plan.grants.edits
+    （双向相等、仅 Edit(<单文件>) 形式、无通配符）、实际工具面严格 ⊆ {Read,Edit,Write}、无
+    Bash/read_dirs/command_contract/resume。绝不因 caller 传入某个布尔就跳过校验。"""
+    import zcode_file_scope as zfs  # 同目录，仅标准库；懒导入避免无关入口承担加载成本
+    reasons = []
+    scope = actual.get('file_scope')
+    sha = actual.get('file_scope_sha256')
+    if not isinstance(scope, dict) or not isinstance(sha, str) or len(sha) != 64:
+        return ['ZCode precise Edit requires a verified and bound file_scope profile '
+                '(actual.file_scope + actual.file_scope_sha256); none present or malformed']
+    if set(scope) != {'workspace', 'readable_files', 'writable_files'}:
+        return ['actual.file_scope is not a canonical file_scope profile '
+                '(must carry exactly workspace/readable_files/writable_files)']
+    if zfs.canonical_sha(scope) != sha:
+        reasons.append('file_scope profile canonical SHA does not match its frozen content '
+                       '(grants altered or contract widened by the caller)')
+    if not scope.get('writable_files'):
+        reasons.append('file_scope profile grants no writable_files; precise Edit cannot be covered')
+    try:
+        scope_ws = zfs._normcase(os.path.realpath(scope['workspace']))
+        plan_ws = zfs._normcase(os.path.realpath(plan['workspace']))
+    except (TypeError, ValueError):
+        scope_ws = plan_ws = None
+    if scope_ws != plan_ws:
+        reasons.append('file_scope workspace does not resolve to the plan workspace')
+    # 精确覆盖：只 Edit(<单文件>) 形式、无通配符、writable 与 edits 双向相等（复用同源口径）。
+    reasons.extend(zfs.plan_edit_coverage_reasons(plan['grants']['edits'], scope,
+                                                  plan['workspace']))
+    a_grants = actual.get('grants') or {}
+    if a_grants.get('bash') or plan['grants']['bash']:
+        reasons.append('controlled file-scope mode forbids Bash grants')
+    if a_grants.get('read_dirs') or plan['grants']['read_dirs']:
+        reasons.append('controlled file-scope mode forbids external read_dirs grants')
+    rule_tokens = set()
+    for key in ('allowed_tools', 'tool_visibility', 'visible_tools'):
+        rule_tokens.update(plan.get(key) or [])
+        rule_tokens.update(a_grants.get(key) or [])
+    for token in rule_tokens:
+        if token in ('Read', 'Edit', 'Write') or token.startswith('Edit('):
+            continue
+        reasons.append(f'controlled file-scope mode allows only Read/Edit/Write, saw: {token!r}')
+    if actual.get('command_contract') is not None:
+        reasons.append('controlled file-scope mode forbids a command_contract')
+    if actual.get('resume_session_id'):
+        reasons.append('controlled file-scope mode forbids session resume (continuity is not '
+                       'an authorization)')
+    return reasons
+
+
 def preflight(plan, actual, *, active_tasks=None, max_concurrency=None) -> dict:
     """精确集合比对 + 并发/冲突检查。返回 dict，含 ok/reasons/plan_hash/sent。
     这是主脑快照预检，不是原子跨进程锁：调用方在返回 not ok 时必须退出 2、零 Popen。
@@ -320,16 +373,32 @@ def preflight(plan, actual, *, active_tasks=None, max_concurrency=None) -> dict:
     cap = CAPABILITY[plan['runtime']]
     a_grants = actual.get('grants') or {}
     fine_needed = bool(plan['grants']['edits'] or plan['grants']['bash'])
+    controlled_file_profile = False
     if fine_needed and not cap['fine_grained']:
-        reasons.append(f"runtime {plan['runtime']} cannot express per-file Edit or "
-                       f"verbatim Bash grants; adopt an isolated workspace with "
-                       f"tool-visibility only, or refuse")
+        # 通用能力表保持 ZCode fine_grained=False。只有本次可信入口已验证并绑定、且经独立
+        # 复核“file_scope 契约精确覆盖 plan.grants.edits + workspace + 实际允许工具”的受控文件
+        # profile 才接受 ZCode 精确 Edit；Bash/read_dirs/通配符/无匹配契约一律继续拒绝，绝不因
+        # 调用方给一个布尔 flag 就关闭校验，也不允许删改精确 grants 或填任意宽契约绕过。
+        if (plan['runtime'] == 'zcode' and not plan['grants']['bash']
+                and not plan['grants']['read_dirs']):
+            controlled_reasons = _zcode_controlled_file_reasons(plan, actual)
+            reasons.extend(controlled_reasons)
+            # 受控文件 profile 用“契约↔edits 精确覆盖 + canonical SHA + 工作区/工具”做权威校验，
+            # 它比通用 grants.edits 字面集合相等更强（相对/绝对形式一致化后比对），故此处对
+            # edits 走覆盖校验而非字面集合相等；bash/read_dirs 仍按通用双向相等兜底。
+            controlled_file_profile = not controlled_reasons
+        else:
+            reasons.append(f"runtime {plan['runtime']} cannot express per-file Edit or "
+                           f"verbatim Bash grants; adopt an isolated workspace with "
+                           f"tool-visibility only, or refuse")
     if plan['grants']['read_dirs'] and not cap['read_dirs']:
         reasons.append(f"runtime {plan['runtime']} has no external read-only directory "
                        f"grant; refuse")
 
     # grant 三类双向精确集合相等（缺计划/未计划新增都拒）。
     for key in GRANT_KEYS:
+        if controlled_file_profile and key == 'edits':
+            continue
         reasons.extend(_set_diff_reasons(f'grants.{key}', plan['grants'][key],
                                          a_grants.get(key)))
     # 完整规则/可见性口径双向相等：bare 可见性、--tools 可见工具、allow 全量、deny 全量。

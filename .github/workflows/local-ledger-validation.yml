@@ -85,6 +85,16 @@ jobs:
       - name: ZCode actual SDK adapter offline regression
         run: python tests/test_zcode_sdk_runner.py
 
+      # BW-ZCODE-FILES-S3-VALIDATION：受控逐文件 FileSystemPort 读写边界的离线回归。
+      # 先对 JS 守卫脚本做无执行语法核验，再跑 Python 三层回归（规范化/冻结/覆盖校验、
+      # 跨语言 canonical SHA 同源、真实 node 驱动受控端口放行/拒绝）。不登录 BigModel、
+      # 不访问网络、不调任何模型，仅用临时目录与合成文件，也不证明真实 ZCode 后端能力。
+      - name: ZCode file-scope guard syntax check (no execution)
+        run: node --check scripts/zcode_file_scope.mjs
+
+      - name: ZCode file-scope offline regression (no login or network)
+        run: python tests/test_zcode_file_scope.py
+
       # BW-GITHUB-CLOSEOUT-20261008-S3：CodeBuddy/WorkBuddy 直连退休为 human-relay only。
       # 生产 codebuddy_direct.main 在读配置/提示词/建输出/quota gate/Popen 前固定拒绝；
       # 旧 CB 真实 stub 传输链改由测试专用离线 harness（tests/offline_codebuddy_harness.py）
