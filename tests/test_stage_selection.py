@@ -6,6 +6,11 @@
 断言规划入口只读（读写前后文件哈希不变）、缺库/缺 schema/不可读快照不创建、冲突整项
 拒绝、退出码 0/2。S2 补：真实旧 scope 到期重选、同阶段按指定 Flash、父授权交集约束、
 跨 task/无验收/在途不重选、缺 parent、CN 不跨区、WAL 活 writer 可见、上下文缺项。
+BW-TASK-PERMISSION-S1 补：派工规划前的任务权限需求（可选 permission_grants，复用
+execution_control grants 字典结构与 CAPABILITY 能力表）过滤——精确 Edit/Bash/read_dirs
+需求下不支持的授权内候选标 permission_incompatible（与 not_authorized/zcode_unavailable
+可辨）、fixed 精确要求诚实拒绝、无需求维持旧兼容行为、临时降级/父授权重选应用当前需求、
+畸形输入拒绝、CLI 最小新输入。
 """
 import contextlib
 import hashlib
@@ -28,6 +33,7 @@ for p in (str(SCRIPTS), str(REPO / 'tests')):
         sys.path.insert(0, p)
 
 import dispatch_pool as dp  # noqa: E402
+import execution_control as ec  # noqa: E402
 import stage_selection as ss  # noqa: E402
 
 T_NIGHT = datetime(2026, 10, 8, 15, 0, 0, tzinfo=timezone.utc)  # 北京 23:00（主力窗口内）
@@ -98,10 +104,11 @@ class _Base(unittest.TestCase):
         a.update(kw)
         return a
 
-    def plan(self, auth, *, previous=None, task='T', stage='s2', ws=None, now=T_NIGHT):
+    def plan(self, auth, *, previous=None, task='T', stage='s2', ws=None, now=T_NIGHT,
+             permission_grants=None):
         return ss.plan_stage_selection(
             auth, previous=previous, store_path=self.store, task_id=task, stage=stage,
-            workspace=ws or self._ws(task), now=now)
+            workspace=ws or self._ws(task), now=now, permission_grants=permission_grants)
 
     def _digest(self):
         h = hashlib.sha256()
@@ -527,6 +534,202 @@ class ContextAndReadOnlyTests(_Base):
                             '--authorization-json', json.dumps(auth)])
         self.assertEqual(code, 2)
         self.assertEqual(json.loads(buf.getvalue())['refused'], 'store_refused')
+
+
+class PermissionGrantsTests(_Base):
+    """BW-TASK-PERMISSION-S1：派工计划生成之前的任务权限需求 × 运行时能力匹配。
+    复用 execution_control.CAPABILITY（fine_grained/read_dirs），授权与权限需求分开；
+    能力不支持的授权内候选标 permission_incompatible，绝不写成 not_authorized/quota，
+    也绝不修改 CAPABILITY 把 ZCode 伪装成 fine_grained=True。"""
+
+    FINE = {'edits': ['Edit(C:/abs/file.py)'], 'bash': ['Bash(pytest -q)'],
+            'read_dirs': []}
+
+    def _assert_capability_table_untouched(self):
+        self.assertEqual(ec.CAPABILITY['zcode'],
+                         {'fine_grained': False, 'read_dirs': False})
+        self.assertEqual(ec.CAPABILITY['qoder']['fine_grained'], True)
+
+    def test_day_fine_grants_skip_z_for_authorized_compatible_flash(self):
+        """白天 Z 健康且有全部空位，但任务需精确 Edit/Bash：Z 被能力过滤，
+        选兼容的已授权 Flash，绝不启动 Z 计划。"""
+        self.build_store()
+        r = self.plan(self.auth('auto', 'T', 's2', ALL_MAINS + ALL_FLASH),
+                      now=T_DAY, permission_grants=self.FINE)
+        self.assertEqual(r['refused'], None, r)
+        self.assertEqual(r['permission_requirements'],
+                         {'fine_grained': True, 'read_dirs': False})
+        self.assertEqual(r['selected']['pool_key'], 'qoder:Qwen3.8-Flash', r)
+        self.assertEqual(r['candidate_filters'][dp.ZCODE_POOL_KEY],
+                         'permission_incompatible')
+        self.assertEqual(r['candidate_filters']['qodercn:Qwen3.8-Flash'], 'eligible')
+        self.assertNotEqual(r['selected']['runtime'], 'zcode')
+        self._assert_capability_table_untouched()
+
+    def test_day_same_window_without_exact_rules_z_still_eligible(self):
+        """同一白天窗口、不要求精确规则（未传 grants）：Z 仍可选（旧兼容行为）。"""
+        self.build_store()
+        r = self.plan(self.auth('auto', 'T', 's2', ALL_MAINS + ALL_FLASH), now=T_DAY)
+        self.assertEqual(r['selected']['pool_key'], dp.ZCODE_POOL_KEY, r)
+        self.assertEqual(r['candidate_filters'][dp.ZCODE_POOL_KEY], 'eligible')
+        self.assertEqual(r['permission_requirements'],
+                         {'fine_grained': False, 'read_dirs': False})
+
+    def test_fixed_z_with_exact_requirement_refused_not_swapped(self):
+        """fixed 明确 ZCode 但任务要求精确 grants：诚实拒绝，不偷偷换执行器。"""
+        self.build_store()
+        auth = self.auth('fixed', 'T', 's2', [dp.ZCODE_POOL_KEY],
+                         runtime='zcode', model='GLM-5.3')
+        r = self.plan(auth, permission_grants=self.FINE)
+        self.assertEqual(r['refused'], 'fixed_candidate_unavailable', r)
+        self.assertEqual(r['refused_detail'], 'permission_incompatible', r)
+        self.assertIsNone(r['selected'])
+
+    def test_read_dirs_requirement_is_independent_capability_filter(self):
+        """外部 read_dirs 需求走独立能力过滤：只剔除无 read_dirs 能力的候选，
+        与 fine_grained 需求分别可辨（codebuddy 类不在池内，此处 Z 两能力皆无）。"""
+        self.build_store()
+        r = self.plan(self.auth('auto', 'T', 's2', ALL_MAINS + ALL_FLASH), now=T_DAY,
+                      permission_grants={'edits': [], 'bash': [],
+                                         'read_dirs': ['D:/refs']})
+        self.assertEqual(r['permission_requirements'],
+                         {'fine_grained': False, 'read_dirs': True})
+        self.assertEqual(r['candidate_filters'][dp.ZCODE_POOL_KEY],
+                         'permission_incompatible')
+        self.assertEqual(r['selected']['pool_key'], 'qoder:Qwen3.8-Flash', r)
+        self._assert_capability_table_untouched()
+
+    def test_missing_qoder_authorization_never_expands_via_permission_filter(self):
+        """能力过滤只作用于授权集合内候选：缺 Qoder 授权时精确需求绝不把候选扩到
+        Qoder，非授权池仍如实 not_authorized，需求兼容也不构成授权。"""
+        self.build_store()
+        auth = self.auth('auto', 'T', 's2', [CN_FLASH, dp.ZCODE_POOL_KEY])
+        r = self.plan(auth, permission_grants=self.FINE)
+        self.assertEqual(r['refused'], None, r)
+        self.assertEqual(r['selected']['pool_key'], CN_FLASH, r)
+        self.assertEqual(r['candidate_filters']['qoder:Qwen3.8-Flash'], 'not_authorized')
+        self.assertEqual(r['candidate_filters'][dp.ZCODE_POOL_KEY],
+                         'permission_incompatible')
+
+    def test_quota_unavailable_and_permission_incompatible_distinguishable(self):
+        """额度/availability 阻断与权限能力不兼容分别可辨：Z 被阻断且任务需精确
+        grants 时，原因记 permission_incompatible（能力门前置），而仅需 read_dirs
+        之外的 grants 变化时 zcode_unavailable 单独出现——两原因各归各，绝不混写。"""
+        self.build_store()
+        with _patch_zcode(False):
+            r = self.plan(self.auth('auto', 'T', 's2', ALL_MAINS + ALL_FLASH),
+                          permission_grants={'edits': ['Edit(C:/a.py)'],
+                                             'bash': [], 'read_dirs': []})
+            self.assertEqual(r['zcode_blocked'], True)
+            self.assertEqual(r['candidate_filters'][dp.ZCODE_POOL_KEY],
+                             'permission_incompatible', r)
+        with _patch_zcode(False):
+            r = self.plan(self.auth('auto', 'T', 's2', ALL_MAINS + ALL_FLASH))
+            self.assertEqual(r['zcode_blocked'], True)
+            self.assertEqual(r['candidate_filters'][dp.ZCODE_POOL_KEY],
+                             'zcode_unavailable', r)
+
+    def test_workspace_inflight_guards_and_readonly_hash_kept_with_grants(self):
+        """权限过滤不替代既有守卫：同任务在途/工作区冲突照旧整项拒绝；
+        带 grants 的规划仍只读，读写前后快照哈希不变。"""
+        self.build_store()
+        shared = self._ws('shared')
+        self.reserve('a', 'zcode', 'GLM-5.3', ws=shared, executor='zcode')
+        r = self.plan(self.auth('auto', 'T', 's2', ALL_MAINS + ALL_FLASH),
+                      ws=shared, permission_grants=self.FINE)
+        self.assertEqual(r['refused'], 'workspace_conflict')
+        self.reserve('T', 'zcode', 'GLM-5.3', executor='zcode')
+        before = self._digest()
+        r = self.plan(self.auth('auto', 'T', 's2', ALL_MAINS + ALL_FLASH),
+                      task='T', permission_grants=self.FINE)
+        self.assertEqual(r['refused'], 'task_in_flight')
+        self.assertEqual(before, self._digest())
+
+    def test_malformed_permission_grants_refused_and_cli_exit_two(self):
+        """严格拒绝畸形 grants：非对象/未知键/非列表/空或带空白项 →
+        invalid_permission_grants；CLI 最小新输入 --permission-grants-json 畸形
+        JSON 或拒绝结果退出码 2。"""
+        self.build_store()
+        bad = ([1, 2], {'edits': 'not-a-list'}, {'edits': ['']},
+               {'edits': [' x ']}, {'edits': [], 'tool_visibility': ['Read']},
+               {'editz': []})
+        for b in bad:
+            r = self.plan(self.auth('auto', 'T', 's2', ALL_MAINS + ALL_FLASH),
+                          permission_grants=b)
+            self.assertEqual(r['refused'], 'invalid_permission_grants', b)
+        ws = self._ws('T')
+        # 畸形 JSON 字符串输入（与 --authorization-json 同口径）：非零 SystemExit，
+        # 绝不宽容；合法 JSON 内的畸形 grants 结构则走拒收回执、退出码 2。
+        with self.assertRaises(SystemExit) as ctx:
+            with contextlib.redirect_stdout(io.StringIO()):
+                ss.main(['--store', self.store, '--task-id', 'T', '--stage', 's2',
+                         '--workspace', ws,
+                         '--authorization-json',
+                         json.dumps(self.auth('auto', 'T', 's2', ALL_MAINS)),
+                         '--permission-grants-json', '{not json'])
+        self.assertIn('invalid JSON', str(ctx.exception))
+        buf = io.StringIO()
+        with contextlib.redirect_stdout(buf):
+            code = ss.main(['--store', self.store, '--task-id', 'T', '--stage', 's2',
+                            '--workspace', ws,
+                            '--authorization-json',
+                            json.dumps(self.auth('auto', 'T', 's2', ALL_MAINS)),
+                            '--permission-grants-json', '{"edits": [" x "]}'])
+        self.assertEqual(code, 2)
+        self.assertEqual(json.loads(buf.getvalue())['refused'],
+                         'invalid_permission_grants')
+        buf = io.StringIO()
+        with contextlib.redirect_stdout(buf):
+            code = ss.main(['--store', self.store, '--task-id', 'T', '--stage', 's2',
+                            '--workspace', ws,
+                            '--authorization-json',
+                            json.dumps(self.auth('fixed', 'T', 's2',
+                                                 [dp.ZCODE_POOL_KEY],
+                                                 runtime='zcode', model='GLM-5.3')),
+                            '--permission-grants-json', json.dumps(self.FINE)])
+        self.assertEqual(code, 2)
+        self.assertEqual(json.loads(buf.getvalue())['refused'],
+                         'fixed_candidate_unavailable')
+
+    def test_temp_fallback_same_stage_and_parent_reselect_apply_current_need(self):
+        """临时降级不丢失当前阶段权限需求：同阶段指定 Flash 与旧 scope 到期经父授权
+        重选，都按**本轮** grants 应用能力过滤（Z 标 permission_incompatible），绝不从
+        旧 session 继承需求、也不因临时/父授权绕过过滤。"""
+        self.build_store()
+        # 同阶段：指定已授权且能力兼容的 CN Flash（runtime qodercn fine_grained=True）
+        # → 正常 temporary_fallback_selected；Z 在候选集合中如实标 permission_incompatible。
+        auth = self.auth('temporary_fallback', 'T', 's1', ALL_MAINS + ALL_FLASH,
+                         fallback_scope={'task_id': 'T', 'stage': 's1'},
+                         runtime='qodercn', model='Qwen3.8-Flash')
+        prev = {'task_id': 'T', 'state': 'finished', 'acceptance_reviewed': True,
+                'stage': 's1', 'runtime': 'qodercn', 'model': 'Qwen3.8-Flash'}
+        r = self.plan(auth, previous=prev, stage='s1',
+                      permission_grants={'edits': ['Edit(C:/a.py)'], 'bash': [],
+                                         'read_dirs': []})
+        self.assertEqual(r['refused'], None, r)
+        self.assertEqual(r['selected_reason'], 'temporary_fallback_selected', r)
+        self.assertEqual(r['selected']['pool_key'], CN_FLASH, r)
+        self.assertEqual(r['candidate_filters'][dp.ZCODE_POOL_KEY],
+                         'permission_incompatible')
+        # 到期经父授权重选：应用**当前**需求 → 白天三 Max/Claude 窗闭、Z 权限不兼容，
+        # 选择落兼容的已授权 Flash；旧 s1 的需求绝不反向继承或改写本轮需求。
+        parent = self.auth('auto', 'T', 's2', ALL_MAINS + ALL_FLASH)
+        auth2 = self.auth('temporary_fallback', 'T', 's1', ALL_MAINS + ALL_FLASH,
+                          fallback_scope={'task_id': 'T', 'stage': 's1'},
+                          runtime='qodercn', model='Qwen3.8-Flash',
+                          parent_authorization=parent)
+        prev2 = {'task_id': 'T', 'state': 'finished', 'acceptance_reviewed': True,
+                 'stage': 's1', 'runtime': 'qodercn', 'model': 'Qwen3.8-Flash'}
+        r = self.plan(auth2, previous=prev2, stage='s2', now=T_DAY,
+                      permission_grants=self.FINE)
+        self.assertEqual(r['refused'], None, r)
+        self.assertTrue(r['reselection_due'])
+        self.assertEqual(r['selection_mode'], 'auto')
+        self.assertEqual(r['permission_requirements'],
+                         {'fine_grained': True, 'read_dirs': False})
+        self.assertEqual(r['candidate_filters'][dp.ZCODE_POOL_KEY],
+                         'permission_incompatible')
+        self.assertEqual(r['selected']['pool_key'], 'qoder:Qwen3.8-Flash', r)
 
 
 if __name__ == '__main__':

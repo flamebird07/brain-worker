@@ -455,8 +455,51 @@ BW-MAIN-PRIORITY-20261011-S1 的 Max > Claude > GLM 优先级对本入口同样�
   迁移**；缺 `attempts`/`rotation` schema → `store_refused`。connect 成功但
   `PRAGMA`/`BEGIN` 失败时**先 close 已建连接再抛 `Refused`**，不留连接泄漏、不改库。回归用
   临时 WAL 库 + 打开的 writer 保留最新 active，规划必须真实读到它；不可读/缺 schema 时字节
-  与文件集不得改变，**绝不把过期基页当作成功**。逐候选过滤按**时段 → 明确限额 → 容量**
+  与文件集不得改变，**绝不把过期基页当作成功**。逐候选过滤按**权限能力（仅当本轮声明
+  permission_grants 精确需求）→ 时段 → 明确限额 → 容量**
   顺序只读求值；入口后续仍由正式入口**原子加锁**复核，规划快照永不代替锁。
+
+### 任务权限需求与运行时能力匹配（BW-TASK-PERMISSION-S1）
+
+派工计划生成**之前**，规划入口接受一个**可选** `permission_grants` 输入，表达当阶段
+实际所需的最小权限；它与 `authorization` 对象**完全分开**——**能力兼容不构成授权，
+授权也不隐含能力**。结构直接复用 `execution_control` 的 grants 字典（`edits`/`bash`/
+`read_dirs` 非空未带空白字符串列表，未知键/非列表/畸形一律 `invalid_permission_grants`
+严格拒绝，不做通用 schema 框架）；**工具可见性（如整工具 `Read`）不是按文件权限**，
+不接受把整工具隔离方案误当精确 grants。
+
+- **推导口径**：`fine_grained` 需求 = `edits` 或 `bash` 非空；`read_dirs` 需求 =
+  `read_dirs` 非空——与 `execution_control.preflight` 的能力判定同一口径。
+- **能力表复用**：**只读复用 `execution_control.CAPABILITY`**（按 pool_key 的 runtime
+  前缀查 `fine_grained`/`read_dirs`），**绝不修改 CAPABILITY** 把 ZCode 伪装成
+  `fine_grained=True`。ZCode 只有整工具开关：`CAPABILITY['zcode']` 两能力皆 False 是
+  事实，不是本入口的缺陷。
+- **过滤与可辨原因**：仅对**授权集合内**候选应用；不满足者标 `permission_incompatible`，
+  与 `zcode_unavailable`（availability/额度）、`not_authorized`（不在本轮输入集合）、
+  `window_closed`/`explicitly_limited`/`capacity_full` **分别可辨、绝不互相冒充**；
+  `allowed_candidates` 保留完整授权集合不改写。选择（auto/executor 关系选择、fixed、
+  temporary 同阶段与到期重选）只在能力兼容且通过既有门的候选内进行。
+- **fixed 诚实拒绝**：`fixed` 明确 `zcode:*` 而任务要求精确 grants →
+  `fixed_candidate_unavailable`（detail=`permission_incompatible`），**不偷偷换执行器**；
+  要求 ZCode 的等价保护须采用**单独验证过实际边界**的整工具隔离方案，不删除精确
+  grants 或放宽校验冒充等价保护。
+- **各模式应用当前需求**：`auto`/`executor`/`fixed`/`temporary_fallback`（同阶段与旧
+  scope 到期经父授权重选）都按**当阶段**需求过滤，**绝不从旧 session 继承需求**。
+- **旧兼容行为**：未传 `permission_grants` 或无精确需求（三类皆空）→ 能力过滤整体
+  不启用，ZCode 等候选照旧 eligible；现有时段/容量/额度/工作区/在途/正式入口检查全部
+  保留、一项不弱化。
+- **最小需求回执**：receipt 增加 `permission_requirements`
+  （`{"fine_grained": bool, "read_dirs": bool}`，未传为全 false），其余不变。
+- **规划顺序与边界**：**每次先明确当前权限需求 → 再规划 → 再按选中的 runtime 生成同
+  权限的 plan/actual 并过正式 preflight**；不可只把旧 Qoder 计划的 runtime 换成 ZCode
+  ——正式 preflight 会按 `CAPABILITY` 拒绝（`sent=false`、exit 2），该拒绝**不是模型
+  调用失败、不是额度事实**。CLI 可表达的规则 ≠ 后端实际执行能力或余额验证。
+
+```json
+{"permission_grants": {"edits": ["Edit(C:/proj/app.py)"],
+                        "bash": ["Bash(pytest -q tests/test_app.py)"],
+                        "read_dirs": []}}
+```
 
 ### 最小 receipt schema（输出 JSON，无占位）
 
@@ -475,8 +518,9 @@ BW-MAIN-PRIORITY-20261011-S1 的 Max > Claude > GLM 优先级对本入口同样�
   "source_authorization_quote": "…旧 temp 原话…",
   "source_authorization_scope": {"task_id": "T", "stage": "s1"},
   "session_reuse_allowed": false,
+  "permission_requirements": {"fine_grained": false, "read_dirs": false},
   "selected": {"runtime": "zcode", "model": "GLM-5.3", "pool_key": "zcode:GLM-5.3"},
-  "candidate_filters": {"qoder:Qwen3.8-Max": "window_closed|explicitly_limited|capacity_full|zcode_unavailable|not_authorized|eligible"},
+  "candidate_filters": {"qoder:Qwen3.8-Max": "window_closed|explicitly_limited|capacity_full|zcode_unavailable|permission_incompatible|not_authorized|eligible"},
   "zcode_blocked": false, "refused": null,
   "snapshot_note": "snapshot time is not live capacity; the authoritative entry re-checks atomically"
 }
@@ -493,17 +537,23 @@ BW-MAIN-PRIORITY-20261011-S1 的 Max > Claude > GLM 优先级对本入口同样�
 `domestic_total_full`/`fallback_scope_mismatch`/`parent_authorization_required`/
 `candidate_not_authorized`/`fixed_candidate_unavailable`/`temporary_not_flash`/
 `temporary_candidate_unavailable`/`rotation_state_unavailable`/`no_eligible_candidate`/
-`store_refused`/`store_snapshot_unavailable`。
+`invalid_permission_grants`（BW-TASK-PERMISSION-S1，畸形权限需求严格拒绝）/
+`store_refused`/`store_snapshot_unavailable`。`candidate_filters` 的逐候选取值另含
+`permission_incompatible`（能力不匹配，与 `zcode_unavailable`/`not_authorized` 可辨）。
 
 ### CLI 与示例调用（先规划，再精确参数）
 
 ```text
 python scripts/stage_selection.py --store <abs.sqlite3> --task-id T --stage s2 \
   --workspace <abs ws> --authorization-json '<authorization object>' \
+  [--permission-grants-json '<permission_grants object>'] \
   [--previous-json '<previous record>'] [--quota-store <db>]
 ```
 
 `--task-id`/`--stage`/`--workspace` 均为 **required**（缺一即 `missing_context` 拒绝）。
+`--permission-grants-json`（BW-TASK-PERMISSION-S1）与 `--authorization-json` 同为 JSON
+字符串最小新输入，**不与授权对象合并**；畸形 JSON 走既有 `_load_json_arg` 非零退出，
+畸形 grants 结构走 `invalid_permission_grants` 拒收回执（退出 2）。
 
 退出码 **0 = 选择成功 / 2 = 拒绝**（输出 JSON）。拿到 `selected.pool_key` 后，主脑再用
 精确 `runtime/model`（`reserve`/`select_and_claim` 的 `--dispatch-claim` 路径）交正式入口
@@ -519,7 +569,13 @@ executing/awaiting_acceptance` 或**未独立验收**时拒绝新选择（不抢
 > 整项拒绝、旧 scope 到期重选、父授权交集不扩权、`fallback_scope` 缺 `task_id` 拒绝、
 > 会话复用仅限同 task 组合（OTHER/missing 一律 false）、只读打开失败先 close 不泄漏、
 > 上下文缺项、WAL 活 writer 可见与不可读
-> 快照拒绝、读写前后哈希不变、缺库不创建、退休/Luna 不授权、CLI 退出码。Windows/Linux
+> 快照拒绝、读写前后哈希不变、缺库不创建、退休/Luna 不授权、CLI 退出码。
+> BW-TASK-PERMISSION-S1 另覆盖（`PermissionGrantsTests`，同临时 SQLite + mock）：白天
+> 7 候选 Z 健康有空位但任务需精确 Edit/Bash → 选兼容已授权 Flash、Z 启动计划为 0；同窗
+> 无精确规则 → Z 照旧可选；fixed Z + 精确要求 → 诚实拒绝不偷偷换；read_dirs 独立能力
+> 过滤；缺 Qoder 授权不因能力过滤扩权；`zcode_unavailable` 与 `permission_incompatible`
+> 分别可辨；工作区/同任务在途守卫与只读快照哈希在带 grants 时照旧；畸形 grants 与 CLI
+> 新输入错误拒绝；临时降级同阶段与父授权到期重选应用**当前**需求。Windows/Linux
 > CI 矩阵都跑。
 
 ## 迁移边界

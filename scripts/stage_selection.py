@@ -1,4 +1,7 @@
-"""stage_selection —— 只读的“下一阶段派工规划入口”（BW-STAGE-SELECTION-S1/S2）。
+"""stage_selection —— 只读的“下一阶段派工规划入口”（BW-STAGE-SELECTION-S1/S2；
+BW-TASK-PERMISSION-S1 增加可选 permission_grants：规划前按当阶段实际权限需求复用
+execution_control.CAPABILITY 做能力过滤，不支持的授权内候选标 permission_incompatible，
+不修改 CAPABILITY、不新增授权开关/容量/额度机制）。
 
 它不是新调度器/服务/数据库表，也**绝不** claim/reserve/select_and_claim/reconcile/
 mark/finish 任何 attempt：只以 sqlite `mode=ro` 只读打开**既有** dispatch store，复用
@@ -26,6 +29,7 @@ if str(_SCRIPTS) not in sys.path:
     sys.path.insert(0, str(_SCRIPTS))
 
 import dispatch_pool as dp  # noqa: E402
+import execution_control as ec  # noqa: E402
 
 SELECTION_MODES = ('auto', 'fixed', 'executor', 'temporary_fallback')
 EXECUTORS = ('auto', 'qoder', 'zcode', dp.CN_RUNTIME, 'claude')
@@ -111,13 +115,65 @@ def _allowed_candidate(pk) -> bool:
             and pk not in dp.LEGACY_RETIRED_POOL_KEYS and pk != dp.LUNA_KEY)
 
 
-def _filter_candidates(conn, allowed, zcode_blocked, now):
+def _normalize_permission_grants(grants):
+    """permission_grants 严格直查（与 authorization 分开，不做通用 schema 框架）：
+    复用 execution_control 的 GRANT_KEYS 字典结构（edits/bash/read_dirs 列表）。
+    None=本轮未声明需求；三键均可缺省（缺省=空列表），畸形（非对象/未知键/非列表/
+    空或带空白项）一律抛错，绝不宽容猜测——工具可见性不算按文件权限，不接受误把
+    整工具隔离当精确 grants。"""
+    if grants is None:
+        return None
+    if not isinstance(grants, dict):
+        raise ValueError('permission_grants must be a JSON object')
+    unknown = [k for k in grants if k not in ec.GRANT_KEYS]
+    if unknown:
+        raise ValueError(f'permission_grants has unknown keys: {unknown}')
+    norm = {}
+    for key in ec.GRANT_KEYS:
+        value = grants.get(key, [])
+        if not isinstance(value, list) or any(
+                not isinstance(x, str) or not x or x != x.strip() for x in value):
+            raise ValueError(f'permission_grants.{key} must be a list of '
+                             'non-empty, untrimmed strings')
+        norm[key] = value
+    return norm
+
+
+def _permission_requirements(grants):
+    """从当阶段实际所需 grants 推导能力需求：fine_grained=逐文件 Edit 或原样 Bash；
+    read_dirs=外部只读目录 grant。与 execution_control.preflight 同一口径。"""
+    if not grants:
+        return {'fine_grained': False, 'read_dirs': False}
+    return {'fine_grained': bool(grants['edits'] or grants['bash']),
+            'read_dirs': bool(grants['read_dirs'])}
+
+
+def _permission_incompatible(pk, requirements):
+    """复用 execution_control.CAPABILITY（按 pool_key 的 runtime 前缀查表）判能力匹配；
+    绝不修改 CAPABILITY 把 ZCode 伪装成 fine_grained=True。无需求时任何候选都兼容
+    （维持旧行为：ZCode 正常 eligible）。"""
+    if not (requirements['fine_grained'] or requirements['read_dirs']):
+        return False
+    cap = ec.CAPABILITY.get(pk.split(':', 1)[0])
+    if cap is None:
+        return True
+    return ((requirements['fine_grained'] and not cap['fine_grained'])
+            or (requirements['read_dirs'] and not cap['read_dirs']))
+
+
+def _filter_candidates(conn, allowed, zcode_blocked, now, requirements=None):
     """逐候选只读过滤，返回 (通过集合, {pk: 拒绝原因})。
-    未授权/时段/明确限额/容量 分开记录；ZCode 复用既有 availability 口径。"""
+    未授权/权限能力/时段/明确限额/容量 分开记录；ZCode 复用既有 availability 口径。
+    `permission_incompatible` 与 `zcode_unavailable`（额度/availability）、
+    `not_authorized`（不在授权集合）分别为可辨原因，绝不互相冒充。"""
+    requirements = requirements or {'fine_grained': False, 'read_dirs': False}
     filters, passed = {}, []
     for pk in allowed:
         if not _allowed_candidate(pk):
             filters[pk] = 'unauthorized'
+            continue
+        if _permission_incompatible(pk, requirements):
+            filters[pk] = 'permission_incompatible'
             continue
         if pk == dp.ZCODE_POOL_KEY and zcode_blocked:
             filters[pk] = 'zcode_unavailable'
@@ -178,8 +234,16 @@ def _relational_select(conn, mode, auth, allowed, passed, now):
 
 
 def plan_stage_selection(authorization, *, previous=None, store_path=None, quota_store=None,
-                         task_id=None, stage=None, workspace=None, now=None):
-    """只读规划：返回最小 receipt；任何冲突整项拒绝（selected=None + refused 原因）。"""
+                         task_id=None, stage=None, workspace=None, now=None,
+                         permission_grants=None):
+    """只读规划：返回最小 receipt；任何冲突整项拒绝（selected=None + refused 原因）。
+
+    `permission_grants`（可选，与 authorization 分开）：当阶段实际所需的最小权限
+    （edits/bash/read_dirs，复用 execution_control 的 grants 字典结构）。规划前据此
+    推导 fine_grained/read_dirs 能力需求，复用 execution_control.CAPABILITY 对授权
+    集合内候选做能力过滤（不支持的标 `permission_incompatible`）；未传或无精确需求
+    维持旧兼容行为。auto/executor/fixed/temporary_fallback（同阶段与到期重选）都
+    应用**当前**任务需求，绝不从旧 session 继承。"""
     now = now or dp.utcnow()
     auth = authorization if isinstance(authorization, dict) else {}
     mode = auth.get('selection_mode')
@@ -194,6 +258,7 @@ def plan_stage_selection(authorization, *, previous=None, store_path=None, quota
         'fallback_scope': auth.get('fallback_scope'),
         'reselection_due': False,
         'session_reuse_allowed': False,
+        'permission_requirements': None,
         'selected': None, 'selected_reason': None,
         'candidate_filters': {}, 'zcode_blocked': False, 'refused': None,
         'snapshot_note': ('snapshot time is not live capacity; the authoritative entry '
@@ -209,6 +274,13 @@ def plan_stage_selection(authorization, *, previous=None, store_path=None, quota
 
     if not isinstance(authorization, dict):
         return _refuse('missing_authorization')
+    # 权限需求严格直查：畸形输入拒绝、不猜测；与授权对象完全分开。
+    try:
+        req_grants = _normalize_permission_grants(permission_grants)
+    except ValueError as exc:
+        return _refuse('invalid_permission_grants', str(exc))
+    requirements = _permission_requirements(req_grants)
+    receipt['permission_requirements'] = requirements
     # 上下文必须齐备，否则无法核对防重/工作区
     if not task_id or not stage or not workspace:
         return _refuse('missing_context', 'task_id/stage/workspace are required')
@@ -332,7 +404,8 @@ def plan_stage_selection(authorization, *, previous=None, store_path=None, quota
             if not eff_allowed:
                 return _refuse('no_eligible_candidate')
 
-        passed, filters = _filter_candidates(conn, eff_allowed, zcode_blocked, now)
+        passed, filters = _filter_candidates(conn, eff_allowed, zcode_blocked, now,
+                                             requirements)
         receipt['candidate_filters'] = _per_candidate_view(eff_allowed, filters)
 
         if eff_mode == 'fixed':
@@ -392,6 +465,7 @@ def main(argv=None) -> int:
         prog='stage_selection',
         description='read-only next-stage dispatch planner (never claims; preview_only)')
     ap.add_argument('--authorization-json', dest='authorization_json', default=None)
+    ap.add_argument('--permission-grants-json', dest='permission_grants_json', default=None)
     ap.add_argument('--previous-json', dest='previous_json', default=None)
     ap.add_argument('--task-id', dest='task_id', required=True)
     ap.add_argument('--stage', required=True)
@@ -404,7 +478,8 @@ def main(argv=None) -> int:
         _load_json_arg(args.authorization_json),
         previous=_load_json_arg(args.previous_json),
         store_path=args.store, quota_store=args.quota_store,
-        task_id=args.task_id, stage=args.stage, workspace=args.workspace)
+        task_id=args.task_id, stage=args.stage, workspace=args.workspace,
+        permission_grants=_load_json_arg(args.permission_grants_json))
     print(json.dumps(receipt, ensure_ascii=False, indent=2))
     return 0 if receipt.get('selected') is not None else 2
 
