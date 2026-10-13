@@ -37,6 +37,11 @@ let guardedFileScopePort;
 let fileScopeDeniedSnapshot = 0;
 let fileScopeOpsSnapshot = 0;
 let fileScopeAuditSnapshot = 0;
+// BW-ZCODE-TASK-TOOLS-S4 普通任务工具授权路径（可选）：只注入任务工具 broker 的授权
+// permissionBroker，不再注入任何普通 executionPort——Bash 交给官方原生执行端口，保留 SDK
+// 自带后台/取消/prelude/shell 语义。taskToolGrantRef 是可变授予集合（拿到活 catalog、提交前
+// 填充）。与严格 command/file-scope 路径互斥、互不削弱。
+let taskToolGrantRef;
 // 官方 FileSystemPort 恰有这 10 个方法；装饰端口对外面必须完全一致，多/少即 fail-closed。
 // 提前到 main() 之前声明，避免 setupFileScope 引用 const 触发 TDZ。
 const FILE_SCOPE_PORT_METHODS = ['createDirectory', 'stat', 'readTextFile', 'readBinaryFile',
@@ -44,6 +49,8 @@ const FILE_SCOPE_PORT_METHODS = ['createDirectory', 'stat', 'readTextFile', 'rea
 // 审计行计数与状态分布（供 envelope 的独立状态使用）。
 let auditLineCount = 0;
 let auditStateCounts = {};
+// 普通任务工具授权路径的观测审计行数（task-exec-events.jsonl）。
+let taskExecLineCount = 0;
 
 // 官方 runtimeConfig.mode 允许 yolo；本入口一律拒绝构造 yolo。
 if (request.mode !== 'plan' && request.mode !== 'edit') bail(`unsupported mode: ${request.mode}`);
@@ -118,6 +125,18 @@ const envelope = {
   file_scope_ops: 0,
   file_scope_audit_events: 0,
   file_scope_methods: null,
+  // BW-ZCODE-TASK-TOOLS-S4 普通任务工具授权路径的独立状态（互不等价，任一不能由其它推断为真）：
+  // present=本次走普通授权路径（mode edit + 写/执行工具 + 无 command/file-scope 严格契约）；
+  // broker_ready=已注入公开 taskTool broker（仅授权）；granted=本轮声明∧活目录可见的内置工具。
+  // 普通路径不注入 executionPort，Bash 由官方原生端口执行；本层不做端口级 started/exit 观测，
+  // 故无 bash_exec_started/receipts 可宣称。真实测试是否执行只由 raw 工具结果
+  // （result.perf.detail.command：completed+严格整数 exit0+未超时）回读判定（见 Python 门禁）。
+  task_tool_authorization_present: Boolean(request.task_tool_authorization
+    && !request.command_contract && !request.file_scope_contract),
+  task_tool_broker_ready: false,
+  task_tool_granted: null,
+  task_tool_native_execution_port: 'sdk-default',
+  task_tool_audit_events: 0,
   errors: [],
   limitations: [],
 };
@@ -180,6 +199,18 @@ async function main() {
       injectFileSystemPort = await setupFileScope(request);
     }
 
+    // ---- BW-ZCODE-TASK-TOOLS-S4：普通已授权工程任务（mode edit + 无严格契约）----
+    // 只注入公开 permissionBroker 的任务工具授权；不注入普通 executionPort，让 createZCodeApp
+    // 用官方原生执行端口跑 Bash，完整保留 SDK 自带后台/取消/prelude/shell 语义。
+    // 授予集合在拿到活 catalog、提交前才填充（见下）。不逐字冻结命令、不逐文件登记、不强制交 Qoder。
+    let injectTaskToolBroker;
+    if (request.task_tool_authorization && !request.command_contract
+      && !request.file_scope_contract) {
+      const tta = await setupTaskToolAuthorization(request);
+      injectTaskToolBroker = tta.permissionBroker;
+      taskToolGrantRef = tta.grantRef;
+    }
+
     app = await bootstrap.createZCodeApp({
       env,
       ...(request.resume_session_id ? { sessionId: request.resume_session_id, resume: true } : {}),
@@ -190,6 +221,7 @@ async function main() {
       ...(injectExecutionPort ? { executionPort: injectExecutionPort } : {}),
       ...(injectPermissionBroker ? { permissionBroker: injectPermissionBroker } : {}),
       ...(injectFileSystemPort ? { fileSystemPort: injectFileSystemPort } : {}),
+      ...(injectTaskToolBroker ? { permissionBroker: injectTaskToolBroker } : {}),
       runtimeConfig: {
         workingDirectory: request.workspace,
         mode: request.mode,
@@ -253,8 +285,19 @@ async function main() {
     refuse('live tool registry unavailable; cannot enforce tool allowlist');
     }
 
+    // 普通任务工具授权：授予集合 = 本轮显式声明 ∧ 活目录实际可见的内置工具。
+    // 未声明/未可见/动态注册/MCP/子代理一律不在集合内，broker 据此拒绝；不持久化。
+    if (taskToolGrantRef) {
+      const declared = new Set(request.allowed_tools || []);
+      const granted = new Set();
+      for (const name of catalog) if (declared.has(name)) granted.add(name);
+      taskToolGrantRef.tools = granted;
+      envelope.task_tool_granted = [...granted].sort();
+    }
+
     envelope.selection_before_submit = observed;
     envelope.preflight_ok = true;
+    syncTaskToolStates();
     await writeJson('preflight.json', preflight);
 
     const events = [];
@@ -314,6 +357,7 @@ async function main() {
     // 命令实际执行/尝试/started 只来自闸门真实计数；绝不凭协议成功推断（见 finally 里同步）。
     syncApprovalStates();
     syncFileScopeStates();
+    syncTaskToolStates();
     await writeJson('preflight.json', preflight);
     return envelope.ok ? 0 : 3;
   } catch (error) {
@@ -344,6 +388,7 @@ async function main() {
     // F：无论成功/异常/审计写失败，都按闸门真实计数同步独立状态；不把已执行谎报为零动作。
     syncApprovalStates();
     syncFileScopeStates();
+    syncTaskToolStates();
   }
 }
 
@@ -434,6 +479,44 @@ async function resolveInnerExecutionPort() {
     failClosedApproval('created inner execution port lacks run()');
   }
   return inner;
+}
+
+// ---- BW-ZCODE-TASK-TOOLS-S2 普通任务工具授权路径 ----
+function makeTaskExecSink() {
+  const path = join(outDir, 'task-exec-events.jsonl');
+  return {
+    record(payload) {
+      const line = safeStringify(payload);
+      try {
+        appendFileSync(path, line + '\n');
+      } catch (error) {
+        // 审计写失败冒泡：broker 据规则先计数后写审计，不谎报为零动作。
+        throw new Error(`task-exec audit write failed: ${error?.message || error}`);
+      }
+      taskExecLineCount += 1;
+    },
+  };
+}
+
+// 普通授权路径只装配 task-tool 授权 broker：把公开 permissionBroker 注入 createZCodeApp，
+// 由 grantRef 在拿到活 catalog、提交前填充授予集合。**不解析、不装饰、不注入任何普通
+// executionPort**——Bash 交给官方原生端口执行，started/exit 由 raw 工具结果回读，本层不
+// 做端口级观测。严格命令审批的执行闸门走 setupCommandApproval，与此路径互斥。
+async function setupTaskToolAuthorization(req) {
+  const broker = await import(new URL('./zcode_permission_broker.mjs', import.meta.url).href);
+  const grantRef = { tools: new Set() }; // 拿到活 catalog、提交前再填充
+  const sink = makeTaskExecSink();
+  const permissionBroker = broker.createTaskToolBroker(grantRef, sink);
+  envelope.task_tool_broker_ready = true;
+  return { permissionBroker, grantRef };
+}
+
+function syncTaskToolStates() {
+  if (!request.task_tool_authorization || request.command_contract
+    || request.file_scope_contract) return;
+  // 普通路径无端口级 started/completed 观测可宣称：只上报 broker 授权审计行数。
+  // Bash 是否真执行由 Python 门禁读官方 raw 工具结果判定，绝不把 broker_ready 当 started。
+  envelope.task_tool_audit_events = taskExecLineCount;
 }
 
 // BW-ZCODE-FILES-S1 受控逐文件读写边界：独立绑定与 fail-closed。

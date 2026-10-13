@@ -560,3 +560,123 @@ def main() -> int:
 
 if __name__ == '__main__':
     raise SystemExit(main())
+
+
+# ============================================================================
+# BW-ZCODE-TASK-TOOLS-S2 入口层回归（unittest 可发现，跑真实 zcode_direct.py +
+# stub 执行载体；不联网、不调模型、临时 store 隔离，绝不碰真实 ~/.brain-worker）。
+# 覆盖：mode=edit + Bash 无严格契约 → 走普通任务工具授权（放行、落 request）；
+# plan+Bash / edit+file_scope+Bash / edit+command_contract 各自的拒绝或严格路径不变。
+# ============================================================================
+import shutil  # noqa: E402
+import tempfile  # noqa: E402
+import unittest  # noqa: E402
+
+S2_STAGE = 'BW-ZCODE-TASK-TOOLS-S2-OFFTEST'
+
+
+class TaskToolRouteEntryTests(unittest.TestCase):
+    def setUp(self):
+        self.root = Path(tempfile.mkdtemp(prefix='bw_s2_entry_'))
+        self.addCleanup(shutil.rmtree, self.root, True)
+        self.work = self.root / 'proj'
+        self.work.mkdir()
+        self.stub = HERE / 'stub_zcode_runner.py'
+        self.script = ROOT / 'scripts' / 'zcode_direct.py'
+        fixture = {'node': str(Path(sys.executable).resolve())}
+        for key, name in (('bootstrap', 'bootstrap.js'), ('tsx_loader', 'loader.mjs'),
+                          ('builtin_provider_config', 'builtin.json'),
+                          ('personal_provider_config', 'personal.json')):
+            path = self.root / name
+            path.write_text('offline fixture\n', encoding='utf-8')
+            fixture[key] = str(path)
+        self.cfg = self.root / 'entry.json'
+        self.cfg.write_text(json.dumps({
+            **fixture, 'runner': str(self.stub), 'node_args': [],
+            'environment': {'HTTPS_PROXY': 'sh-SECRET-S2'}}, ensure_ascii=False),
+            encoding='utf-8')
+        self.prompt = self.root / 'prompt.txt'
+        self.prompt.write_text('离线授权工程任务。\n', encoding='utf-8')
+        self.report = self.root / 'report.txt'
+        self.report.write_text(build_report(S2_STAGE, str(self.work)), encoding='utf-8')
+
+    def _run(self, out_name, *, extra=()):
+        out = self.root / out_name
+        env = os.environ.copy()
+        env['BRAIN_WORKER_QUOTA_STORE'] = str(self.root / 'quota.sqlite3')
+        env['BRAIN_WORKER_QUOTA_ROUTES'] = str(self.root / 'routes-absent.json')
+        env['BRAIN_WORKER_DISPATCH_STORE'] = str(self.root / f'disp-{out_name}.sqlite3')
+        env['STUB_MODE'] = 'ok'
+        env['STUB_REPORT_FILE'] = str(self.report)
+        env.pop('STUB_EVENTS_FILE', None)
+        cmd = [sys.executable, str(self.script), '--workspace', str(self.work),
+               '--prompt-file', str(self.prompt), '--output-dir', str(out),
+               '--config', str(self.cfg), '--stage', S2_STAGE, *extra]
+        proc = subprocess.run(cmd, capture_output=True, text=True, encoding='utf-8',
+                              env=env, timeout=120)
+        summary = None
+        sf = out / 'summary.json'
+        if sf.is_file():
+            summary = json.loads(sf.read_text(encoding='utf-8'))
+        req = None
+        rf = out / 'request.json'
+        if rf.is_file():
+            req = json.loads(rf.read_text(encoding='utf-8'))
+        submits = 0
+        rc = out / 'stub-receipts.jsonl'
+        if rc.is_file():
+            for line in rc.read_text(encoding='utf-8').splitlines():
+                if line.strip() and json.loads(line).get('event') == 'submit':
+                    submits += 1
+        return proc, summary, req, submits, out
+
+    def test_edit_bash_without_contract_uses_task_tool_route(self):
+        proc, summary, req, submits, out = self._run(
+            't-normal', extra=['--mode', 'edit', '--tools', 'Read,Glob,Grep,Edit,Write,Bash'])
+        self.assertEqual(proc.returncode, 0, proc.stdout + proc.stderr)
+        self.assertTrue(out.is_dir())
+        self.assertIs(req['task_tool_authorization'], True)
+        self.assertNotIn('command_contract', req)
+        self.assertNotIn('file_scope_contract', req)
+        self.assertEqual(submits, 1)
+        self.assertIs(summary['protocol_success'], True)
+        # present 是派工前 Python 决策；broker_ready/started 等执行载体回声不在离线断言范围。
+        self.assertIs(summary['task_tool_authorization_present'], True)
+        # 环境值绝不落进任何证据文件。
+        for p in out.iterdir():
+            if p.is_file():
+                self.assertNotIn('sh-SECRET-S2',
+                                 p.read_text(encoding='utf-8', errors='ignore'))
+
+    def test_plan_bash_still_refused_read_only(self):
+        proc, summary, req, submits, out = self._run(
+            't-plan', extra=['--mode', 'plan', '--tools', 'Read,Bash'])
+        self.assertEqual(proc.returncode, 2)
+        self.assertFalse(out.exists())
+        self.assertIn('plan is read-only', proc.stdout)
+
+    def test_edit_bash_with_file_scope_still_refused(self):
+        scope = self.root / 'scope.json'
+        scope.write_text(json.dumps({'workspace': str(self.work),
+                                     'readable_files': [], 'writable_files': []}),
+                         encoding='utf-8')
+        proc, summary, req, submits, out = self._run(
+            't-filescope', extra=['--mode', 'edit', '--tools', 'Read,Edit,Bash',
+                                  '--file-scope-contract', str(scope)])
+        self.assertEqual(proc.returncode, 2)
+        self.assertFalse(out.exists())
+        self.assertIn('forbids Bash', proc.stdout)
+
+    def test_edit_bash_with_command_contract_keeps_strict_route(self):
+        cc = self.root / 'cc.json'
+        cc.write_text(json.dumps({'privacy_free': False, 'commands': [
+            {'command': 'ls', 'cwd': str(self.work)}]}, ensure_ascii=False),
+            encoding='utf-8')
+        proc, summary, req, submits, out = self._run(
+            't-strict', extra=['--mode', 'edit', '--tools', 'Read,Bash',
+                               '--command-contract', str(cc)])
+        # 严格路径：带 command_contract，绝不设 task_tool_authorization。
+        self.assertEqual(proc.returncode, 0, proc.stdout + proc.stderr)
+        self.assertIn('command_contract', req)
+        self.assertNotIn('task_tool_authorization', req)
+        self.assertIs(summary['task_tool_authorization_present'], False)

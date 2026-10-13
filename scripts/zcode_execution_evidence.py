@@ -41,6 +41,7 @@ ERROR = 'tool_call_error'
 ERROR_TEXT_FIELDS = ('code', 'type', 'message', 'detail', 'stack')
 WRITE_TOOLS = ('Write', 'Edit')
 READ_TOOL = 'Read'
+BASH_TOOL = 'Bash'
 PERMISSION_MARKERS = ('permission', 'not allowed', 'denied', 'unauthorized')
 
 
@@ -352,6 +353,37 @@ def _check_test_evidence(evidence_spec, workspace, read_bytes) -> tuple:
                  'fingerprint/log SHA)'
 
 
+def _is_zero_int(v):
+    return isinstance(v, int) and not isinstance(v, bool) and v == 0
+
+
+def _bash_test_receipt_satisfied(command, bash_ok):
+    """普通任务路径的真实 Bash 执行回执判定（仅用官方 raw tool result，非登记 test_evidence）。
+
+    同 session/turn 内必须有一条 Bash 调用，其 scheduled 原文命令与 required_test_command
+    **逐字等字节**相等（不 strip）；命中只是起点。真实终态只认官方 raw result 的
+    result.perf.detail.command：status==completed、exitCode 为严格整数 0、未取消、未超时、
+    未后台化；任一字段缺失（无 perf）即视为未确认执行。失败/后台/取消/超时/非零退出/字段缺失
+    一律不通过；success=true 本身绝不作数。无匹配或匹配但未干净退出即如实 tests_not_run，
+    绝不把“未匹配命令”当已执行。"""
+    matched = [r for r in bash_ok if r['command'] == command]
+    if not matched:
+        return False, ('no Bash tool receipt in the same session/turn matches '
+                       f'required_test_command {command!r} byte-for-byte')
+    for call in matched:
+        if (call.get('has_perf') and call.get('status') == 'completed'
+                and _is_zero_int(call.get('exit_code'))
+                and not call.get('cancelled') and not call.get('timed_out')
+                and not call.get('backgrounded')):
+            return True, ('required test command executed: official raw Bash result '
+                          '(result.perf.detail.command) reports completed with strict exit 0, '
+                          'not cancelled/timed-out/backgrounded, on a byte-identical command')
+    return False, ('a byte-matching Bash call exists but its raw result does not report a '
+                   'clean foreground exit (missing perf, status not completed, non-zero/absent '
+                   'exitCode, cancelled, timed-out or backgrounded) — success=true alone is not '
+                   'proof the command actually ran to a clean exit')
+
+
 def evaluate_execution_evidence(events, contract, *, session_id, turn_id,
                                 workspace, read_bytes, baseline=None,
                                 preflight_only=False) -> dict:
@@ -472,6 +504,7 @@ def evaluate_execution_evidence(events, contract, *, session_id, turn_id,
 
     reads_ok, denied, failed, out_of_bounds = [], [], [], []
     write_evidence, undeclared_writes = [], []
+    bash_ok = []  # 成功 Bash 工具回执：同 session/turn 的真实命令 + result 内容（官方 raw result）。
     for call_id, (kind, identity, payload) in sorted(results.items()):
         success = identity[0] is True
         tool, input_json = scheduled[call_id]
@@ -493,6 +526,31 @@ def evaluate_execution_evidence(events, contract, *, session_id, turn_id,
                 denied.append({'tool': tool, 'file_path': file_path})
             else:
                 failed.append({'tool': tool, 'file_path': file_path})
+            continue
+        if tool == BASH_TOOL:
+            cmd = parsed_input.get('command') if isinstance(parsed_input, dict) else None
+            if isinstance(cmd, str) and cmd:
+                result = payload.get('result') or {}
+                # 官方 Bash raw tool result 的真实终态在 result.perf.detail.command：
+                # status/exitCode/timedOut/cancelled/backgrounded。success=true 只表示 handler
+                # 返回，绝不等于测试通过（非零退出/超时/后台仍可能 success=true）。普通路径不再
+                # 依赖任何端口级观测：只认这份官方 raw 结果，字段缺失即视为未确认执行。
+                perf = result.get('perf') if isinstance(result, dict) else None
+                detail = perf.get('detail') if isinstance(perf, dict) else None
+                structured = detail.get('command') if isinstance(detail, dict) else None
+                structured = structured if isinstance(structured, dict) else {}
+                # 命令逐字（不 strip）保留：required_test_command 与 scheduled 原文须精确等字节。
+                bash_ok.append({'tool_call_id': call_id, 'command': cmd,
+                                'status': structured.get('status'),
+                                'exit_code': structured.get('exitCode',
+                                                            structured.get('exit_code')),
+                                'cancelled': bool(structured.get('cancelled')),
+                                'timed_out': bool(structured.get('timedOut')),
+                                'backgrounded': bool(structured.get('backgrounded')),
+                                'has_perf': bool(structured),
+                                'output_sha256': hashlib.sha256(
+                                    json.dumps(result, ensure_ascii=False,
+                                               sort_keys=True).encode('utf-8')).hexdigest()})
             continue
         if tool in (READ_TOOL,) + WRITE_TOOLS and isinstance(file_path, str):
             norm = norm_within(workspace, file_path)
@@ -624,15 +682,22 @@ def evaluate_execution_evidence(events, contract, *, session_id, turn_id,
     command = contract.get('required_test_command')
     if command is not None:
         evidence_spec = contract.get('test_evidence')
-        ok, reason = (_check_test_evidence(evidence_spec, workspace, read_bytes)
-                      if isinstance(evidence_spec, dict) else (False, 'no test_evidence '
-                      'declared; Bash tool events alone cannot prove the target test ran'))
+        if isinstance(evidence_spec, dict):
+            ok, reason = _check_test_evidence(evidence_spec, workspace, read_bytes)
+        else:
+            # 普通已授权任务路径（BW-ZCODE-TASK-TOOLS-S4）：没有逐字登记的 test_evidence 时，
+            # 只复用官方 raw Bash tool result 证明目标测试确实跑过——同 session/turn 内一条
+            # scheduled 原文命令与 required_test_command 逐字等字节相等的 Bash 调用，其
+            # result.perf.detail.command 明确 completed + 严格整数 exit0 + 未取消/未超时/未后台，
+            # 即视为该命令的真实执行回执。不再引入端口级 started/cwd 观测，也不新增执行契约硬门。
+            ok, reason = _bash_test_receipt_satisfied(command, bash_ok)
         if not ok:
             out.update(execution_evidence_ok=False,
                        execution_evidence_status='tests_not_run',
                        reasons=['contract requires a test command but no verified '
-                            f'registered-test evidence exists: {reason}; reported as '
-                            'not run, never as a permission refusal or transport failure'])
+                            f'registered-test or real Bash execution evidence exists: '
+                            f'{reason}; reported as not run, never as a permission refusal '
+                            'or transport failure'])
             return out
 
     out.update(execution_evidence_ok=True, execution_evidence_status='verified',
@@ -642,5 +707,5 @@ def evaluate_execution_evidence(events, contract, *, session_id, turn_id,
                write_evidence=write_evidence,
                undeclared_workspace_writes=undeclared_writes,
                tool_counts={'scheduled': len(scheduled), 'reads': len(reads_ok),
-                            'writes': len(write_evidence)})
+                            'writes': len(write_evidence), 'bash': len(bash_ok)})
     return out

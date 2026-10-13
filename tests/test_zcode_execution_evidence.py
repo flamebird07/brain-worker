@@ -704,5 +704,127 @@ class EntryPoints(unittest.TestCase):
                          subprocess.list2cmdline(argv))
 
 
+class BashTestReceiptTests(Base):
+    """BW-ZCODE-TASK-TOOLS-S4 普通路径真实 Bash 执行回执门禁：只复用官方 raw Bash 工具结果。
+
+    普通路径不再注入观测执行端口，也没有端口级 started/exit 回执。判“已执行”唯一依据是同
+    session/turn 内一条 Bash 调用：其 scheduled 原文命令与 required_test_command **逐字等字节**
+    相等，且官方 raw result 的 result.perf.detail.command 明确 status=completed、exitCode 为严格
+    整数 0、未取消/未超时/未后台。success=true 本身绝不作数（非零退出仍可能 true）；缺 perf、
+    状态非 completed、非零/缺失 exit、cancelled/timedOut/backgrounded、跨 session/turn 或别的
+    toolCallId、原文命令多一个空格一律不通过、如实 tests_not_run。"""
+
+    def _bash(self, command, call_id='bx', success=True, status='completed',
+              exit_code=0, cancelled=False, timed_out=False, backgrounded=False,
+              with_perf=True, session='s1', turn='t1'):
+        result = {'success': success}
+        if with_perf:
+            result['perf'] = {'detail': {'command': {
+                'status': status, 'exitCode': exit_code, 'cancelled': cancelled,
+                'timedOut': timed_out, 'backgrounded': backgrounded,
+                'stdout': 'ok\n', 'stderr': ''}}}
+        return ([{'sessionId': session, 'turnId': turn, 'type': 'tool_call_scheduled',
+                  'payload': {'toolCallId': call_id, 'toolName': 'Bash',
+                              'input': {'command': command}}},
+                 {'sessionId': session, 'turnId': turn, 'type': 'tool_call_result',
+                  'payload': {'toolCallId': call_id, 'result': result}}])
+
+    def _reader(self, path):
+        path = Path(path)
+        return path.read_bytes() if path.is_file() else None
+
+    def _eval(self, events, contract):
+        baseline = zee.build_baseline(contract, str(self.work), self._reader)
+        return zee.evaluate_execution_evidence(
+            events, contract, session_id='s1', turn_id='t1', workspace=str(self.work),
+            read_bytes=self._reader, baseline=baseline)
+
+    def _reads_then_bash(self, command):
+        return self.reads_events() + self._bash(command)
+
+    def test_matching_bash_raw_result_satisfies_required_test_command(self):
+        # 正例：官方 raw result perf.detail.command completed + 严格整数 exit0。
+        cmd = 'python -m unittest discover'
+        contract = self.eng_contract(required_test_command=cmd)
+        out = self._eval(self._reads_then_bash(cmd), contract)
+        self.assertIs(out['execution_evidence_ok'], True)
+        self.assertEqual(out['execution_evidence_status'], 'verified')
+
+    def test_no_bash_event_still_tests_not_run(self):
+        # 关键回归：无 Bash 事件时，required_test_command 仍判 not run（沿用既有语义）。
+        contract = self.eng_contract(required_test_command='python -m unittest discover')
+        out = self._eval(self.reads_events(), contract)
+        self.assertEqual(out['execution_evidence_status'], 'tests_not_run')
+
+    def test_non_matching_bash_command_still_tests_not_run(self):
+        # Bash 跑了别的命令（echo），不能冒充目标测试已执行。
+        contract = self.eng_contract(required_test_command='python -m unittest discover')
+        out = self._eval(self._reads_then_bash('echo hello'), contract)
+        self.assertEqual(out['execution_evidence_status'], 'tests_not_run')
+
+    def test_whitespace_mismatch_command_is_not_byte_equal(self):
+        # scheduled 原文多一个尾随空格即与 required_test_command 不等字节 → 不匹配、不判已执行。
+        cmd = 'python -m unittest discover'
+        contract = self.eng_contract(required_test_command=cmd)
+        out = self._eval(self._reads_then_bash(cmd + ' '), contract)
+        self.assertEqual(out['execution_evidence_status'], 'tests_not_run')
+
+    def test_failed_bash_receipt_is_not_success(self):
+        cmd = 'python -m unittest discover'
+        contract = self.eng_contract(required_test_command=cmd)
+        out = self._eval(self.reads_events() + self._bash(cmd, success=False), contract)
+        self.assertEqual(out['execution_evidence_status'], 'tool_result_failed')
+
+    def test_error_terminal_bash_is_not_verified(self):
+        # 明确 error 终态（无 result.success）：归入失败，绝不判 required 测试已执行。
+        cmd = 'python -m unittest discover'
+        contract = self.eng_contract(required_test_command=cmd)
+        events = self.reads_events() + [
+            {'sessionId': 's1', 'turnId': 't1', 'type': 'tool_call_scheduled',
+             'payload': {'toolCallId': 'bx', 'toolName': 'Bash',
+                         'input': {'command': cmd}}},
+            err_event('bx')]
+        out = self._eval(events, contract)
+        self.assertEqual(out['execution_evidence_status'], 'tool_result_failed')
+
+    def test_raw_bash_nonzero_exit_with_success_true_is_not_verified(self):
+        # success=true 但结构化 exit 非 0 → 绝不判已执行（假通过根因）。
+        cmd = 'python -m unittest discover'
+        contract = self.eng_contract(required_test_command=cmd)
+        out = self._eval(self.reads_events() + self._bash(cmd, status='failed',
+                                                          exit_code=1), contract)
+        self.assertEqual(out['execution_evidence_status'], 'tests_not_run')
+
+    def test_raw_bash_missing_perf_is_not_verified(self):
+        # 缺 perf.detail.command 结构 → 无真实终态可据，未确认执行。
+        cmd = 'python -m unittest discover'
+        contract = self.eng_contract(required_test_command=cmd)
+        out = self._eval(self.reads_events() + self._bash(cmd, with_perf=False), contract)
+        self.assertEqual(out['execution_evidence_status'], 'tests_not_run')
+
+    def test_raw_bash_cancelled_timeout_or_backgrounded_not_verified(self):
+        cmd = 'python -m unittest discover'
+        contract = self.eng_contract(required_test_command=cmd)
+        for kw in ({'cancelled': True}, {'timed_out': True}, {'backgrounded': True},
+                   {'status': 'timed_out'}, {'exit_code': True}):
+            out = self._eval(self.reads_events() + self._bash(cmd, **kw), contract)
+            self.assertEqual(out['execution_evidence_status'], 'tests_not_run')
+
+    def test_raw_bash_other_session_not_counted(self):
+        # 跨 session 的匹配 Bash 不属本轮，据实 tests_not_run（不误算已执行）。
+        cmd = 'python -m unittest discover'
+        contract = self.eng_contract(required_test_command=cmd)
+        events = self.reads_events() + self._bash(cmd, session='s2', turn='t9')
+        out = self._eval(events, contract)
+        self.assertEqual(out['execution_evidence_status'], 'tests_not_run')
+
+    def test_correct_normal_bash_real_raw_result_passes(self):
+        # 再次确认唯一正例形状（官方 raw result）被判 verified。
+        cmd = 'python -m unittest discover'
+        contract = self.eng_contract(required_test_command=cmd)
+        out = self._eval(self._reads_then_bash(cmd), contract)
+        self.assertIs(out['execution_evidence_ok'], True)
+
+
 if __name__ == '__main__':
     unittest.main()

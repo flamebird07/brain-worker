@@ -855,10 +855,16 @@ class RunnerIntegrationTests(unittest.TestCase):
 class EntryLayerTests(unittest.TestCase):
     """zcode_direct 入口层：Bash 无契约拒绝、复合/越界/SHA 不符拒绝、adapters 定位。"""
 
-    def test_bash_without_contract_refused(self):
+    def test_bash_mode_edit_passes_selection_check(self):
+        # mode 校验本身不拒 edit+Bash（是否走任务工具授权在 main() 决定；见离线入口层用例）。
         reasons = zd.validate_selection(stage='S', provider='p', model='m', reasoning='low',
                                         mode='edit', tools=['Read', 'Bash'])
-        self.assertEqual(reasons, [])  # mode 校验本身不拒（契约在 main 里检查）
+        self.assertEqual(reasons, [])
+
+    def test_bash_mode_plan_still_refused_at_selection(self):
+        reasons = zd.validate_selection(stage='S', provider='p', model='m', reasoning='low',
+                                        mode='plan', tools=['Read', 'Bash'])
+        self.assertTrue(any('plan is read-only' in r for r in reasons))
 
     def test_composite_command_rejected(self):
         contract = {'privacy_free': False,
@@ -1016,6 +1022,257 @@ class EntryLayerTests(unittest.TestCase):
         _, reasons = zd.validate_command_contract(author, str(tmp))
         self.assertTrue(any(('alias' in r or 'symlink' in r or 'junction' in r) for r in reasons),
                         reasons)
+
+
+# ============================================================================
+# BW-ZCODE-TASK-TOOLS-S2 普通任务工具授权路径离线单元：真实 broker 模块 + node 双重，
+# 官方 request 形状，不联网、不调模型、不 spawn 真实进程。
+# ============================================================================
+TASKTOOL_UNIT_JS = r'''
+import { pathToFileURL } from 'node:url';
+import { readFileSync } from 'node:fs';
+import { createHash } from 'node:crypto';
+const broker = await import(pathToFileURL(process.argv[2]).href);
+const sha = (s) => createHash('sha256').update(Buffer.from(s, 'utf8')).digest('hex');
+const out = {};
+
+// ---- taskTool broker ----
+const audit = [];
+const sink = { record: p => audit.push(p) };
+const grantRef = { tools: new Set(['Read', 'Edit', 'Write', 'Bash']) };
+const tb = broker.createTaskToolBroker(grantRef, sink);
+function reqB(toolName, extra = {}) {
+  return { requestId: 'r', sessionId: 'S', turnId: 'T', toolCallId: 'tc',
+           toolName, input: { command: 'echo hi && ls > f' }, ...extra };
+}
+const bGranted = await tb.requestPermission(reqB('Bash'), {});
+const bDeniedUnknown = await tb.requestPermission(reqB('Task'), {});
+const bDeniedNoName = await tb.requestPermission({ sessionId: 'S' }, {});
+const bRace = await tb.requestPermission(reqB('Bash'), { claimResponse: () => false });
+const bRaceWin = await tb.requestPermission(reqB('Bash'), { claimResponse: () => true });
+const ac = new AbortController(); ac.abort();
+const bCancel = await tb.requestPermission(reqB('Bash'), { signal: ac.signal });
+out.broker = {
+  granted_decision: bGranted.decision, granted_state: bGranted.reason.split(':')[0],
+  unknown_decision: bDeniedUnknown.decision, unknown_reason: bDeniedUnknown.reason,
+  noname_decision: bDeniedNoName.decision, noname_reason: bDeniedNoName.reason,
+  race_decision: bRace.decision, race_state: bRace.reason.split(':')[0],
+  racewin_decision: bRaceWin.decision,
+  cancel_decision: bCancel.decision, cancel_state: bCancel.reason.split(':')[0],
+  // 绝不持久化：结果对象里不得出现任何授权更新键。
+  no_persist: !('permissionUpdates' in bGranted)
+    && !('sessionPermissionUpdates' in bGranted) && !('updatedInput' in bGranted),
+};
+
+// S4：普通路径不再自建观测执行端口——Bash 交给官方原生 executionPort。本 harness 只验证
+// 任务工具 broker 的授权语义；createObservingExecutionPort 及其 started/exit/receipt 观测
+// 能力已从代码删除，不再测端口行为（真实执行由 execution_evidence 回读官方 raw 结果判定）。
+
+console.log(JSON.stringify(out));
+'''
+
+
+class TaskToolBrokerUnitTests(unittest.TestCase):
+    def setUp(self):
+        self.tmp = tempfile.TemporaryDirectory()
+        self.base = Path(self.tmp.name).resolve()
+        self.harness = self.base / 'tasktool_unit.mjs'
+        self.harness.write_text(TASKTOOL_UNIT_JS, encoding='utf-8')
+
+    def tearDown(self):
+        self.tmp.cleanup()
+
+    def _run(self):
+        proc = run_node(self.harness, [str(BROKER)])
+        self.assertEqual(proc.returncode, 0, proc.stderr)
+        return json.loads(proc.stdout)
+
+    def test_broker_grants_only_visible_declared_tools(self):
+        b = self._run()['broker']
+        self.assertEqual(b['granted_decision'], 'allow')
+        self.assertEqual(b['granted_state'], 'approved-task-tool')
+        self.assertEqual(b['unknown_decision'], 'deny')
+        self.assertIn('deny-tool-not-granted', b['unknown_reason'])
+        self.assertEqual(b['noname_decision'], 'deny')
+        self.assertIn('deny-tool-unknown', b['noname_reason'])
+
+    def test_broker_claim_lose_and_cancel_deny_never_allow(self):
+        b = self._run()['broker']
+        self.assertEqual(b['race_decision'], 'deny')
+        self.assertEqual(b['race_state'], 'race-lost')
+        self.assertEqual(b['racewin_decision'], 'allow')
+        self.assertEqual(b['cancel_decision'], 'deny')
+        self.assertEqual(b['cancel_state'], 'cancelled')
+        # 任务工具授权不持久化、不改写 input。
+        self.assertTrue(b['no_persist'])
+
+
+# 普通任务路径集成双重：createZCodeApp 只消费注入的 permissionBroker（任务工具授权），
+# **不得收到普通 executionPort**——Bash 交给官方原生端口。submitPrompt 内驱动真实 broker：
+# 对已授予工具放行、未授予工具拒绝；并模拟官方 raw Bash 工具结果（result.perf.detail.command）
+# 产出 scheduled/result 事件，供下游 execution_evidence 回读。S4 起不再有观测端口。
+TASKTOOL_BOOTSTRAP_DOUBLE = r'''
+import { appendFileSync } from 'node:fs';
+const mark = (obj) => appendFileSync(process.env.DOUBLE_RECEIPT, JSON.stringify(obj) + '\n');
+const SEL = { providerId: 'account:bigmodel-individual-coding-plan',
+              modelId: 'GLM-5.3-Flash', options: { reasoningLevel: 'low' } };
+export async function startProcessProviderRegistryRuntime() {
+  return { runtime: { registryService: {
+    getView: () => ({ providers: [{ providerId: SEL.providerId, models: [{ modelId: SEL.modelId }] }] }),
+    validateSelection: () => ({ ok: true }) } },
+    providerRuntimeHeadersPort: {}, dispose: () => mark({ event: 'dispose' }) };
+}
+export async function createZCodeApp(options) {
+  mark({ event: 'app', has_executionPort: typeof options.executionPort?.run === 'function',
+         has_permissionBroker: typeof options.permissionBroker?.requestPermission === 'function' });
+  const broker = options.permissionBroker;
+  const ws = options.runtimeConfig.workingDirectory;
+  return {
+    sessionId: 'sess-tt-1',
+    listModels: () => [{ ref: SEL }],
+    setModel: async () => {},
+    getCurrentModelOption: () => ({ ref: SEL }),
+    getModel: () => `${SEL.providerId}/${SEL.modelId}`,
+    // 活目录含未授予的动态/联网工具，grantRef 必须只取 allowed∩catalog 的内置项。
+    runtime: { getToolRegistry: () => ({
+      list: () => ['Read', 'Glob', 'Grep', 'Edit', 'Write', 'Bash', 'js', 'Task', 'WebFetch'] }) },
+    submitPrompt: async (prompt, opts) => {
+      const CMD = 'pytest -q && echo done';
+      // 已授予工具放行；未授予工具（Task）拒绝——broker 拿到的 grantRef 已含本轮内置工具。
+      // 这一步是“broker 真的经 createZCodeApp 传到 runner 并被官方 submitPrompt 消费”的证明，
+      // 不靠 stub 文本或 Python present 回声。
+      const bash = await broker.requestPermission({ requestId: 'b', sessionId: 'sess-tt-1',
+        turnId: 'turn-tt-1', toolCallId: 'tc-bash', toolName: 'Bash', mode: 'edit',
+        input: { command: CMD } }, {});
+      const task = await broker.requestPermission({ requestId: 't', sessionId: 'sess-tt-1',
+        turnId: 'turn-tt-1', toolCallId: 'tc-task', toolName: 'Task', mode: 'edit',
+        input: {} }, {});
+      mark({ event: 'approval', bash_decision: bash.decision, task_decision: task.decision });
+      // 普通路径没有注入 executionPort：本双重不再 port.run（官方原生端口在真实现场跑 Bash）。
+      // 这里按官方 SDK 形状产出一次 Bash 的 scheduled + result(raw perf.detail.command) 事件，
+      // 让下游 execution_evidence 从 events.jsonl 回读真实执行终态（completed + exit0）。
+      opts.onEvent({ sessionId: 'sess-tt-1', turnId: 'turn-tt-1', type: 'tool_call_scheduled',
+        payload: { toolCallId: 'tc-bash', toolName: 'Bash',
+                   input: { command: CMD, cwd: ws } } });
+      opts.onEvent({ sessionId: 'sess-tt-1', turnId: 'turn-tt-1', type: 'tool_call_result',
+        payload: { toolCallId: 'tc-bash', result: { success: true,
+          perf: { detail: { command: { status: 'completed', exitCode: 0, cancelled: false,
+            timedOut: false, backgrounded: false, stdout: 'done\n', stderr: '' } } } } } });
+      opts.onEvent({ sessionId: 'sess-tt-1', turnId: 'turn-tt-1', type: 'model_request',
+        payload: { providerId: SEL.providerId, modelId: SEL.modelId } });
+      opts.onEvent({ sessionId: 'sess-tt-1', turnId: 'turn-tt-1', type: 'turn_complete',
+        payload: { resultType: 'success', response: 'done' } });
+      return { response: 'done', turnId: 'turn-tt-1', projection: { status: 'completed' },
+               usage: { inputTokens: 4, outputTokens: 3, totalTokens: 7 } };
+    },
+    close: async () => mark({ event: 'close' }),
+  };
+}
+'''
+
+
+class TaskToolRunnerIntegrationTests(unittest.TestCase):
+    def _run(self):
+        base = Path(tempfile.mkdtemp()).resolve()
+        ws = base / 'proj'
+        (ws / 'scripts').mkdir(parents=True)
+        (ws / 'scripts' / 'note.txt').write_text('seed\n', encoding='utf-8')
+        double_receipt = base / 'double-receipt.jsonl'
+        boot = base / 'tt_bootstrap.mjs'
+        boot.write_text(TASKTOOL_BOOTSTRAP_DOUBLE, encoding='utf-8')
+        out = base / 'evidence'
+        out.mkdir(parents=True, exist_ok=False)
+        request = {
+            'carrier': 'zcode-sdk', 'stage': 'BW-TASKTOOL-ITG', 'workspace': str(ws),
+            'output_dir': str(out), 'prompt': 'task', 'prompt_sha256': '0' * 64,
+            'prompt_payload': {},
+            'selection': {'providerId': 'account:bigmodel-individual-coding-plan',
+                          'modelId': 'GLM-5.3-Flash', 'options': {'reasoningLevel': 'low'}},
+            'mode': 'edit', 'allowed_tools': ['Read', 'Glob', 'Grep', 'Edit', 'Write', 'Bash'],
+            'tool_disallowlist_base': [], 'resume_session_id': None, 'preflight_only': False,
+            'entry_config': str(base / 'entry.json'), 'environment_keys': [],
+            'bootstrap': str(boot), 'builtin_provider_config': str(ws / 'scripts' / 'note.txt'),
+            'personal_provider_config': str(ws / 'scripts' / 'note.txt'),
+            'version': None, 'runner': str(RUNNER), 'argv': [],
+            'task_tool_authorization': True,
+        }
+        (base / 'entry.json').write_text(json.dumps({'environment': {}}), encoding='utf-8')
+        (out / 'request.json').write_text(json.dumps(request), encoding='utf-8')
+        env = {'DOUBLE_RECEIPT': str(double_receipt)}
+        proc = run_node(RUNNER, ['--request', str(out / 'request.json')],
+                        env_extra=env, cwd=str(ws))
+        return base, out, proc, double_receipt
+
+    def test_normal_path_injects_only_broker_no_execution_port(self):
+        b, out, proc, double_receipt = self._run()
+        self.assertEqual(proc.returncode, 0, proc.stdout + proc.stderr)
+        envelope = json.loads(proc.stdout)
+        self.assertTrue(envelope['submitted'])
+        self.assertTrue(envelope['ok'])
+        # 独立状态：present 由 runner 派生；broker_ready 注入成功；普通路径不再自报观测端口就绪。
+        self.assertTrue(envelope['task_tool_authorization_present'])
+        self.assertTrue(envelope['task_tool_broker_ready'])
+        self.assertNotIn('observing_execution_port_ready', envelope)
+        self.assertNotIn('bash_exec_started', envelope)
+        self.assertNotIn('bash_exec_receipts', envelope)
+        self.assertTrue(envelope['tool_visible_bash'])
+        # 授予集合只取本轮声明∩活目录内置项，绝不含 Task/WebFetch/js。
+        self.assertEqual(envelope['task_tool_granted'],
+                         ['Bash', 'Edit', 'Glob', 'Grep', 'Read', 'Write'])
+        dlines = [json.loads(l) for l in
+                  double_receipt.read_text(encoding='utf-8').splitlines() if l.strip()]
+        appr = next(d for d in dlines if d['event'] == 'approval')
+        self.assertEqual(appr['bash_decision'], 'allow')   # 已授予工具放行
+        self.assertEqual(appr['task_decision'], 'deny')    # 未授予工具拒绝
+        # app 只收到 permissionBroker，**绝不**收到普通 executionPort（交给官方原生端口）。
+        apprec = next(d for d in dlines if d['event'] == 'app')
+        self.assertTrue(apprec['has_permissionBroker'])
+        self.assertFalse(apprec['has_executionPort'])
+
+    def test_normal_path_emits_real_bash_tool_events_for_evidence(self):
+        b, out, proc, double_receipt = self._run()
+        self.assertEqual(proc.returncode, 0, proc.stdout + proc.stderr)
+        events = [json.loads(l) for l in
+                  (out / 'events.jsonl').read_text(encoding='utf-8').splitlines() if l.strip()]
+        sched = next(e for e in events if e['type'] == 'tool_call_scheduled'
+                     and e['payload']['toolCallId'] == 'tc-bash')
+        self.assertEqual(sched['payload']['toolName'], 'Bash')
+        self.assertEqual(sched['payload']['input']['command'], 'pytest -q && echo done')
+        res = next(e for e in events if e['type'] == 'tool_call_result'
+                   and e['payload']['toolCallId'] == 'tc-bash')
+        perf = res['payload']['result']['perf']['detail']['command']
+        self.assertEqual(perf['status'], 'completed')
+        self.assertEqual(perf['exitCode'], 0)
+        self.assertIs(perf['timedOut'], False)
+        self.assertIs(perf['backgrounded'], False)
+        # broker 授权审计落 task-exec-events.jsonl（审批态，非执行回执）；不再有端口执行回执。
+        audit = [json.loads(l) for l in
+                 (out / 'task-exec-events.jsonl').read_text(encoding='utf-8')
+                 .splitlines() if l.strip()]
+        self.assertNotIn('task_exec_receipt', {a.get('kind') for a in audit})
+        states = {a['state'] for a in audit if a.get('kind') == 'task_tool_approval'}
+        self.assertIn('approved-task-tool', states)
+        self.assertIn('rule-denied', states)
+
+    def test_normal_bash_raw_result_satisfies_evidence_gate(self):
+        # 端到端：runner 产出的 raw Bash result 必须被 execution_evidence 判为已执行。
+        import zcode_execution_evidence as zee
+        b, out, proc, double_receipt = self._run()
+        self.assertEqual(proc.returncode, 0, proc.stdout + proc.stderr)
+        envelope = json.loads(proc.stdout)
+        events = [json.loads(l) for l in
+                  (out / 'events.jsonl').read_text(encoding='utf-8').splitlines() if l.strip()]
+        contract = {'task_type': 'engineering', 'required_reads': [], 'expected_artifacts': [],
+                    'required_modified_files': [], 'allow_no_changes': True,
+                    'required_test_command': 'pytest -q && echo done'}
+        reader = lambda p: Path(p).read_bytes() if Path(p).is_file() else None
+        baseline = zee.build_baseline(contract, str(b / 'proj'), reader)
+        out_ev = zee.evaluate_execution_evidence(
+            events, contract, session_id=envelope['session_id'],
+            turn_id=envelope['turn_id'], workspace=str(b / 'proj'),
+            read_bytes=reader, baseline=baseline)
+        self.assertIs(out_ev['execution_evidence_ok'], True)
+        self.assertEqual(out_ev['execution_evidence_status'], 'verified')
 
 
 if __name__ == '__main__':

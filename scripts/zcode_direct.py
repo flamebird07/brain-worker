@@ -621,8 +621,12 @@ def main():
                          'commands:[{command, cwd, input_sha256?}]}. Only the frozen verbatim '
                          'commands with their declared in-workspace cwd may execute; the runner '
                          'injects a decorated executionPort (verbatim command+cwd gate) plus a '
-                         'permissionBroker. Bash granted without this contract is refused; no '
-                         'full-allow/yolo/bypass/auto-login. Unknown/missing fields, out-of-bound '
+                         'permissionBroker. Supplying this contract keeps the strict per-command '
+                         'gate; without it, Bash is only permitted for an authorized --mode edit '
+                         'engineering task via the official task-tool permissionBroker plus an '
+                         'observing executionPort (no verbatim freeze, no full-allow/yolo/'
+                         'bypass/auto-login). --mode plan and read-only file-scope still forbid '
+                         'Bash. Unknown/missing fields, out-of-bound '
                          'cwd, composite/variant commands (;/&&/||/|/newline/redirect/cd) and '
                          'input SHA mismatch are refused before dispatch.')
     ap.add_argument('--file-scope-contract', dest='file_scope_contract', default=None,
@@ -806,14 +810,26 @@ def main():
         command_contract = normalized
         command_contract_sha256 = hashlib.sha256(
             _canonical_json(normalized).encode('utf-8')).hexdigest()
-    if 'Bash' in tools and not args.preflight_only and command_contract is None:
-        print(json.dumps({'refused_before_dispatch': True,
-                          'reasons': ['Bash is granted without --command-contract; the '
-                                      'controlled pre-execution gate cannot be built, so '
-                                      'dispatch is refused (Bash is never enabled by default '
-                                      'and is not silently dropped into a broad permission)']},
-                         ensure_ascii=False))
-        return 2
+    # ---- 普通已授权工程任务的 Bash（BW-ZCODE-TASK-TOOLS-S4）----
+    # 放宽 Skill 人为附加的“默认必须逐字命令冻结”限制：mode=edit 且未给 command/file-scope
+    # 严格契约时，Bash 经官方公开 permissionBroker 做本轮任务工具授权；runner 只注入该 broker，
+    # 不注入普通 executionPort，交给官方原生端口执行，保留 SDK 自带后台/取消/prelude/shell 语义。
+    # 严格 command-contract / file-scope / plan 只读路径保持不变。
+    # plan+Bash 已在 validate_selection 拒绝；此处只可能是已授权的 mode=edit。
+    task_tool_authorization = False
+    if ('Bash' in tools and not args.preflight_only and command_contract is None
+            and args.file_scope_contract is None):
+        if args.mode == 'edit':
+            task_tool_authorization = True
+        else:
+            print(json.dumps({'refused_before_dispatch': True,
+                              'reasons': ['Bash granted without --command-contract and --mode '
+                                          'is not edit; the Skill only permits the task-tool '
+                                          'authorization route for an authorized --mode edit '
+                                          'engineering task, so dispatch is refused (Bash is '
+                                          'never enabled by default or silently broadened)']},
+                             ensure_ascii=False))
+            return 2
 
     # ---- 受控逐文件读写边界契约：派工前规范化真实路径并冻结 canonical SHA ----
     file_scope = None
@@ -1269,6 +1285,11 @@ def main():
             'workspace': str(work),
             'profile': 'zcode-controlled-file',
             'file_scope_sha256': file_scope_sha256}
+    if task_tool_authorization:
+        # 普通任务工具授权：runner 只注入公开 permissionBroker（task-tool 授权），不注入普通
+        # executionPort——Bash 交给官方原生端口执行，started/exit 由官方 raw tool result 回读，
+        # 本入口不再为普通路径解析公共适配器入口（那是观测端口的死代码，已删除）。
+        request['task_tool_authorization'] = True
     try:
         (out / 'request.json').write_text(json.dumps(request, ensure_ascii=False, indent=2),
                                           encoding='utf-8')
@@ -1438,6 +1459,17 @@ def main():
             'file_scope_ops': envelope.get('file_scope_ops'),
             'file_scope_audit_events': envelope.get('file_scope_audit_events'),
             'file_scope_methods': envelope.get('file_scope_methods'),
+            # BW-ZCODE-TASK-TOOLS-S4 普通任务工具授权路径独立事实：present 是派工前 Python 侧
+            # 决策（与 file_scope_present 同口径，不依赖执行载体回声）；broker_ready 来自 runner
+            # 已注入的 task-tool 授权 broker；granted 是本轮声明∧活目录可见的内置工具；
+            # audit_events 是 broker 授权审计行数。普通路径不注入 executionPort，Bash 由官方
+            # 原生端口执行：本入口不宣称端口级 started/cwd 观测，真实测试是否执行只由官方 raw
+            # tool result（result.perf.detail.command completed+严格整数 exit0）回读判定。
+            'task_tool_authorization_present': bool(request.get('task_tool_authorization')),
+            'task_tool_broker_ready': bool(envelope.get('task_tool_broker_ready')),
+            'task_tool_granted': envelope.get('task_tool_granted'),
+            'task_tool_native_execution_port': envelope.get('task_tool_native_execution_port'),
+            'task_tool_audit_events': envelope.get('task_tool_audit_events'),
         })
         summary['protocol_success'] = (child.returncode == 0
                                        and envelope.get('ok') is True
@@ -1493,6 +1525,9 @@ def main():
     events = _read_events(out / 'events.jsonl')
     disk_read = lambda p: Path(p).read_bytes() if Path(p).is_file() else None  # noqa: E731
     env_dict = envelope if isinstance(envelope, dict) else {}
+    # 普通任务工具授权路径不再写/读端口级 exec 回执：Bash 由官方原生端口执行，真实测试是否
+    # 执行只由官方 raw tool result（result.perf.detail.command）判定（见 zee 门禁）。严格
+    # command 路径的登记 test_evidence 与闸门回执走各自独立字段，不在此处。
     evidence = zee.evaluate_execution_evidence(
         events, execution_contract,
         session_id=env_dict.get('session_id'),

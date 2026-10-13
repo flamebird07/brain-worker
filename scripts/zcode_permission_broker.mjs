@@ -521,3 +521,63 @@ export function createPermissionBroker(registry, sink,
 export const BROKER_STATE_FIELDS = ['approved', 'approved-registered', 'rule-denied',
   'cancelled', 'approval-timeout', 'client-missing', 'race-lost', 'client-error',
   'no-working-directory'];
+
+// ============================================================================
+// 普通已授权工程任务路径（BW-ZCODE-TASK-TOOLS-S2）——与上面严格 command-contract
+// 路径完全独立、互不削弱。它放宽的是本 Skill 人为附加的“默认必须逐字命令冻结/逐文件
+// 登记/只读→交 Qoder”限制，不是操作系统/文件级沙箱，也不持久化授权。
+// ============================================================================
+
+// 任务工具授权 broker（公开 permissionBroker）：只放行“本轮声明且活目录实际可见”的
+// 内置工具（grantRef.tools 由 runner 在拿到 catalog、提交前填充）。未知/未授予/动态
+// 注册/MCP/子代理一律拒绝。绝不改写 input、绝不下发 permissionUpdates/
+// sessionPermissionUpdates（不授予会话/持久 always-allow）。claimResponse 唯一胜者、
+// signal 取消各自返回独立状态；无 human 客户端也对已授予工具直接给明确决定——这正是
+// “no-client default-deny 不能把 Bash 卡在缺客户端失败”的解法。
+// 审批语义与严格命令审批区分开：这里没有逐字命令匹配，只按 toolName 授权。
+export function createTaskToolBroker(grantRef, sink) {
+  async function requestPermission(request, options = {}) {
+    const started = new Date();
+    const toolName = request?.toolName;
+    const base = {
+      kind: 'task_tool_approval',
+      at_utc: started.toISOString(),
+      requestId: request?.requestId ?? null,
+      sessionId: request?.sessionId ?? null,
+      turnId: request?.turnId ?? null,
+      toolCallId: request?.toolCallId ?? null,
+      toolName: toolName ?? null,
+      claim_supported: typeof options.claimResponse === 'function',
+    };
+    const finish = (state, decision, reason) => {
+      auditOrThrow(sink, { ...base, state, decision, reason });
+      return { decision, reason: `${state}: ${reason}` };
+    };
+    // 取消优先（独立状态，非 quota/API）。
+    if (options.signal && options.signal.aborted) {
+      return finish('cancelled', 'deny', 'approval-cancelled-by-caller');
+    }
+    // 唯一胜者：claim 至多一次；输掉即 race-lost，绝不 allow（与严格路径同语义）。
+    if (typeof options.claimResponse === 'function' && options.claimResponse() !== true) {
+      return finish('race-lost', 'deny', 'another-responder-claimed-first');
+    }
+    if (typeof toolName !== 'string' || toolName === '') {
+      return finish('rule-denied', 'deny', 'deny-tool-unknown');
+    }
+    const granted = grantRef?.tools instanceof Set
+      ? grantRef.tools : new Set(grantRef?.tools || []);
+    // 只授予本轮声明 ∧ 活目录可见的内置工具；其余（未授予/动态/MCP/子代理/未知）拒绝。
+    if (!granted.has(toolName)) {
+      return finish('rule-denied', 'deny', 'deny-tool-not-granted');
+    }
+    return finish('approved-task-tool', 'allow', 'granted-visible-built-in-tool');
+  }
+  return { requestPermission };
+}
+
+// 普通已授权任务不再注入观测执行端口：S4 起普通路径交给官方原生 executionPort，
+// 保留 SDK 自带的后台/取消/prelude/shell 语义，真实执行结果改由官方 raw 工具结果回读
+// （见 zcode_execution_evidence.py 的 result.perf.detail.command 口径）。此处仅提供
+// createTaskToolBroker（授权）；严格命令审批的执行闸门另见 createGatedExecutionPort。
+export const TASK_TOOL_STATE_FIELDS = ['approved-task-tool', 'rule-denied',
+  'cancelled', 'race-lost'];

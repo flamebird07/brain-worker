@@ -327,6 +327,18 @@ TRANSPORT_INSTRUCTION_END
   `Bash` 派工前拒绝；`--mode edit` 需用户明确授权修改本项目；`yolo` 一律不构造。mcp、subagents、
   dynamic workflow、Browser、项目 hooks 与自动记忆抽取按官方 API 证据关闭。Task/子 agent、联网与
   Browser 工具对本入口不开放。
+- 普通已授权项目的默认派发口径（BW-ZCODE-TASK-TOOLS-S1/S4）：当用户本次已明确授权修改该项目、且任务
+  就是常规读写时，默认用整工具计划 `--mode edit --tools Read,Glob,Grep,Edit,Write,Bash`，不强制附带
+  `--command-contract` 或 `--file-scope-contract`，也不因缺这两份契约就在派发前把 Bash/写操作当成
+  违规拒绝（此前的「Bash 无契约派发前拒绝」只描述严格 `--command-contract` 闸门路径的 fail-closed 语义，
+  不是普通已授权任务的默认门）。严格逐字命令契约与受控逐文件契约仍是**可选加固**：用户要求精确命令/文件
+  范围、或计划本身就是精确严格计划时继续套用，语义与原样保留、不放宽也不替换。此默认口径不改动 ZCode
+  CAPABILITY `fine_grained=false`、不改国内 11 槽与模型优先级排序、不改额度、在途、同一真实工作区单一写入，
+  也不扩任何生产/GitHub/凭据/外部写入授权；普通路径只注入任务工具授权 broker、不注入普通 `executionPort`，
+  Bash 交给**官方原生 executionPort** 执行（完整保留 SDK 自带后台/取消/prelude/shell 语义），真实测试是否执行
+  只回读官方 raw Bash 结果 `result.perf.detail.command`（`execution_evidence` 门禁据实核验：`success=true`
+  本身不等于 exit0，无该结构明确 completed+严格整数 exit0 就不判已执行；不再有端口级 started/exit 观测可宣称，
+  见下）。
 - 报告：沿用九节兼容模板（与 Qoder 档案同一份模板文本，见 [ZCode 操作参考](references/zcode-direct.md)
   与 [Qoder 操作参考](references/qoder-direct.md)），主脑原样嵌入完整代码块，不得误用下方通用四节
   交付模板，也不得把本档案说成通用 API 适配器。格式指令拼在原任务之前、任务逐字保留；
@@ -380,15 +392,18 @@ canonical SHA，runner 在同一棵公开 SDK 树装饰 `createNodeFileSystemAda
   某层 `false` 限定两种情形：任务**主动不授权/不要求该层**时 false 为预期、不当失败，任务**明确要求**
   的必要执行层 false/缺失时要**拒绝完成或拒绝放行**、按证据分类归因，未知写 `null`/「未验证」；
   原始 `business_verified` 仍恒 false，主脑独立结论只写进能力快照，绝不改写运行时字段。
-- **现场放行**：同一 session/turn/toolCallId 的 gate `allowed=true`、该命令**自身独立**
+- **现场放行（显式 `--command-contract` 严格模式现场放行）**：同一 session/turn/toolCallId 的 gate
+  `allowed=true`、该命令**自身独立**
   `execution_started` 审计、严格整数 exit0 完成回执与 stdout/stderr SHA 独立回读、输入事前事后
-  未漂移齐全才可**放行成功**；**一切 Bash 调用（含只读）都须有当次 `command_contract` 并过 gate**，
+  未漂移齐全才可**放行成功**；本严格模式下**一切 Bash 调用（含只读）都须有当次 `command_contract` 并过 gate**，
   `zcode_direct.py` 在 Bash 无契约时派发前拒绝；只读可能绕过 permissionBroker 使 approval 不适用，但
   **绝不免除契约**。`summary.command_started`/回执 `started`（累计值）**不作逐命令证明**，缺该命令独立
   started 审计时即便累计>0 也不放行；单个 completed 或单个 `approved` 都不足。未登记命令须按其
   toolCallId 逐命令回读「拒绝且无 started/completed」，**不得**用累计数字反推 inner=0；
   started+真实回执即证「已执行」：非零退出（如 exit7）是**已执行但失败**，不抹成未验或零动作；未取得
   完整取证记缺证/未放行。「离线-only」只描述 REPAIR3 当前版本既有事实，不给任意缺条件案例套用。
+  **普通授权模式不要求 `command-contract`**，改用同 session/turn/toolCallId 的官方 raw Bash `perf`
+  completed、严格整数 exit0、未超时结果与产物回读验收，不宣称端口 started/cwd 证据；见普通默认段。
 - **可信 deny**：新并行计划的 `disallowed_tools` 从受信任本机入口 `build_tool_disallowlist(tools)`
   派生并与预检 actual 精确相等；runner 的 `tool_disallowlist_effective`（= base deny ∪（活 catalog −
   allowed_tools），只追加 deny）是更严格运行时边界，单列回读，不冒充预检已见 live catalog；

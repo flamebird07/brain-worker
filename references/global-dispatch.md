@@ -488,6 +488,17 @@ BW-MAIN-PRIORITY-20261011-S1 的 Max > Claude > GLM 优先级对本入口同样�
 - **旧兼容行为**：未传 `permission_grants` 或无精确需求（三类皆空）→ 能力过滤整体
   不启用，ZCode 等候选照旧 eligible；现有时段/容量/额度/工作区/在途/正式入口检查全部
   保留、一项不弱化。
+- **普通已授权项目的默认整工具计划（BW-ZCODE-TASK-TOOLS-S1/S4）**：当用户本次已明确授权修改
+  某项目、且任务只是常规读写+自行测试（无精确 `grants.edits`/`grants.bash` 细粒度规则需求）时，
+  ZCode 直接派工的默认口径是**整工具计划** `--mode edit --tools Read,Glob,Grep,Edit,Write,Bash`，
+  不强制附 `--command-contract`/`--file-scope-contract`，也不因缺这两份契约把 edit+Bash/写在派发前
+  当违规拒绝（前述严格逐字命令契约与受控逐文件契约仍是**可选加固**，用户要求精确命令/文件范围或
+  本身就是精确严格计划时继续套用、原样不放宽）。这条只降“本 Skill 自加的默认硬门”，**不改动**
+  `CAPABILITY['zcode'].fine_grained=False`、国内 11 槽、Max>Claude>GLM 优先级、额度、同真实工作区
+  单写入、在途单占位，也不扩任何生产/GitHub/凭据/外部写入授权。普通路径只注入任务工具授权 broker、
+  不注入普通 `executionPort`，Bash 交给**官方原生 executionPort** 执行；真实测试执行由 `execution_evidence`
+  门禁回读官方 raw Bash 结果 `result.perf.detail.command`（completed+严格整数 exit0）据实核验
+  （`success=true`≠exit0；不再有自建观测端口的 started/exit 计数可宣称），能力可用≠业务完成。
 - **最小需求回执**：receipt 增加 `permission_requirements`
   （`{"fine_grained": bool, "read_dirs": bool}`，未传为全 false），其余不变。
 - **受控文件 profile 例外（BW-ZCODE-FILES-S1，现场已核验）**：`CAPABILITY['zcode'].fine_grained` 仍为

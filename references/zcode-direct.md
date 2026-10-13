@@ -54,8 +54,14 @@ python <技能目录>/scripts/zcode_direct.py --workspace <项目绝对路径> -
   提交前拒绝；绑定环节再做一次精确比对。
 - `--command-contract <JSON>`：可选，声明一组**逐字登记、显式 cwd** 的可执行命令；只有登记
   的精确命令能越过执行闸门，未登记命令（含看似只读的）一律拒绝。与 `--preflight-only` 互斥
-  （预检不提交 prompt，无需审批）。未提供本契约却又在 `--tools` 里授予 `Bash` 时，入口在派工
-  前直接拒绝，绝不默认放宽权限。真实 `zcode-entry.json` 里没有 `adapters_entry`，本阶段不修改、
+  （预检不提交 prompt，无需审批）。本契约是严格命令审批路径的 fail-closed 语义：一旦选择走
+  `--command-contract`，缺该契约的登记命令即拒绝。**普通已授权任务不走这条硬门**——当用户本次
+  明确授权修改该项目、以 `--mode edit --tools Read,Glob,Grep,Edit,Write,Bash` 派发且未附
+  `--command-contract`/`--file-scope-contract` 时，入口置 `task_tool_authorization=true` 放行整工具、
+  只注入任务工具授权 broker，Bash 交给**官方原生 executionPort** 执行（见下文「普通已授权工程任务的
+  单趟执行」与 BW-ZCODE-TASK-TOOLS-S1/S4 默认口径），绝不因缺两份契约就把 edit+Bash 当违规在派工前拒绝；
+  `success=true` 本身不等于 exit0，`execution_evidence` 只认官方 raw Bash 结果
+  `result.perf.detail.command` 明确 completed+严格整数 exit0 才算已执行（不再有端口级 started 观测可宣称）。真实 `zcode-entry.json` 里没有 `adapters_entry`，本阶段不修改、
   不复制该 entry，也不重装/改动官方 CLI：runner 从**已核对的 bootstrap 绝对路径**在同一棵公共
   SDK 树里定位同级 `adapters/src/index.ts`（校验存在且导出 `createNodeExecutionAdapter` 后绑定到
   请求），找不到即 fail-closed；配置里若显式给了 `adapters_entry` 则沿用（compat 保留，须为已存在
@@ -247,6 +253,66 @@ app/adapter/dispose 关闭无泄漏——**双身不调用真实模型、
 既有 Qoder 串行登记测试；实际授权/环境/自动审批拒绝不能换执行器绕过）。
 ZCode 的 CAPABILITY `fine_grained` 维持 `false`（dispatch-plan 无法表达 `grants.edits` 与 `grants.bash`
 两种细粒度规则；`command_contract` 是另一套本地逐字命令闸门、不授文件沙箱）。
+
+## 普通已授权工程任务的单趟执行（--mode edit，BW-ZCODE-TASK-TOOLS-S2/S4）
+
+放宽的是本 Skill **人为附加的默认限制**（旧默认：普通任务也必须逐字冻结命令 / 逐文件登记，
+或计划阶段 ZCode 只读写、测试强制交 Qoder 串行——那条口径现降级为**可选的严格路由**，见上两节
+`--command-contract` 与 `--file-scope-contract`，不再是普通任务的强制前置）。一次已授权的普通工程
+任务允许由**同一次 ZCode** 读取、搜索、修改、新建、自行测试，不再逐字/逐文件登记、不强制换执行器。
+不新增安全/调度/审批服务、不加新参数、不构造 `yolo`。
+
+S4 收敛：**删掉普通模式新增的观测执行端口**，普通路径只注入授权 broker、把 Bash 交给官方**原生
+executionPort**，从而完整保留 SDK 自带的后台/取消/embedded-search `bashPrelude`/shell override
+语义，不再有自建的后台台账与端口级 started/exit 观测。真实测试是否执行只回读官方 raw 工具结果，
+不宣称新的端口 started/cwd 证据。
+
+普通用法（无需 command/file-scope 契约）：
+
+```text
+python scripts/zcode_direct.py --workspace <项目绝对路径> --prompt-file <UTF-8任务> --output-dir <新证据目录> --stage <阶段> --mode edit --tools Read,Glob,Grep,Edit,Write,Bash
+```
+
+实现只补当前 SDK 适配，不改官方源码：
+
+- **入口派工前**（`zcode_direct.py`）：仅当 `mode=edit` 且授予 `Bash`、且**未**给 `--command-contract`
+  `--file-scope-contract` 时置 `request.task_tool_authorization=true`（并保留写工具）；`plan`+`Bash`
+  仍在 `validate_selection` 拒绝，file-scope 带 `Bash` 仍拒绝，给了 `--command-contract` 则走原严格
+  闸门、**绝不**同时启用普通授权。CLI 历史默认（`plan` + 空 tools）保持不变。summary 的
+  `task_tool_authorization_present` 是 Python 派工前事实。普通路径不再解析/透传公共适配器入口
+  （那是已删除的观测端口所需的死代码）。
+- **runner 注入**（`zcode_sdk_runner.mjs`）：经公开 `createZCodeApp({ permissionBroker })` 只注入
+  一件东西——`scripts/zcode_permission_broker.mjs` 的 `createTaskToolBroker`（授权）。**不注入普通
+  `executionPort`**，让官方 `create-app` 的 `options.executionPort ?? createNodeExecutionAdapter`
+  自行选原生端口跑 Bash。授予集合 = 本轮显式声明 ∧ 活目录实际可见的**内置工具**，在拿到 catalog、
+  `submitPrompt` 前才填充（`task_tool_granted`）。
+- **授权语义（任务工具授权，不是 OS/逐文件/逐命令沙箱）**：`createTaskToolBroker` 只对已授予内置
+  工具给 `allow`；未知/未授予/动态注册/MCP/子代理一律 `deny`；只读请求不经审批保持不变。遵循官方
+  `claimResponse` 唯一胜者与 `signal` 取消（race-lost / cancelled，绝不 allow），**绝不**下发
+  `permissionUpdates`/`sessionPermissionUpdates`、不改写 `input`、不落任何持久/会话授权。无 human
+  客户端也对已授予工具直接给明确决定，因此默认拒绝不会把 `Bash` 卡在“缺审批客户端”失败。
+- **真实执行回执（交给官方原生端口）**：普通路径不再装饰执行端口、不再有 `bash_exec_started`/
+  `bash_exec_receipts` 这类端口级计数可宣称。Bash 由官方原生适配器执行，SDK 自带的后台/取消/
+  prelude/shell 语义完整保留，本层不加包装。真实测试是否执行只由 events.jsonl 里的官方 raw Bash
+  工具结果回读判定（见下条），绝不把 broker 授权成功或 `task_tool_broker_ready` 冒充“已 started”。
+- **审批回执与严格命令审批分列**：普通路径只写 `task_tool_approval`（`approved-task-tool`/
+  `rule-denied`/`cancelled`/`race-lost`）到 broker 审计（`task-exec-events.jsonl`，仅授权审计，
+  非执行回执）；严格 `command_contract` 路径仍写 `approval`/`gate`/`execution_receipt`，两套独立、
+  互不推断。
+- **隐私**：普通任务命令可能含敏感串，broker 授权审计**只落 toolName/requestId/session/turn 等非敏感
+  字段与命令 SHA**，不落原始 env/stdin；配置只引用、不复制真实条目。
+- **执行证据**（`zcode_execution_evidence.py`）：普通路径给了 `required_test_command` 但**没有**登记
+  `test_evidence` 时，**只复用官方 raw Bash 工具结果**：同 session/turn 内一条 Bash 调用，其
+  scheduled 原文命令与 `required_test_command` **逐字等字节**相等（不 strip），且其
+  `result.perf.detail.command` 明确 `status=completed`、`exitCode` 为严格整数 `0`、未取消、未超时、
+  未后台化，才算已执行。`result.success===true` 本身绝不作数（非零退出/超时/后台仍可能 success=true）；
+  缺 `perf`、状态非 completed、非零/缺失 exit、cancelled/timedOut/backgrounded 一律不通过、如实
+  `tests_not_run`（未跑不许硬判已跑）。协议/报告绑定/业务验收三态含义不变、失败文本绝不改写。严格
+  `test_evidence` 登记路径与闸门回执逻辑保持不变。
+
+以上仍是**离线**实现（真实 runner + 本地 bootstrap/adapters 双身 + stub 子进程留证，不联网、不调模型、
+不真起子进程），**不得把离线桩通过写成现场能力**；现场单趟授权执行由主脑在隔离真实 SDK 验收里确认。
+`fine_grained` 维持 `false`，正式 preflight 不删，额度/容量/在途/单写入/官方代码/配置/凭据/业务不动。
 
 ## 受控逐文件读写边界（--file-scope-contract，BW-ZCODE-FILES-S1）
 
