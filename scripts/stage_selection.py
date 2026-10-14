@@ -1,7 +1,9 @@
 """stage_selection —— 只读的“下一阶段派工规划入口”（BW-STAGE-SELECTION-S1/S2；
 BW-TASK-PERMISSION-S1 增加可选 permission_grants：规划前按当阶段实际权限需求复用
 execution_control.CAPABILITY 做能力过滤，不支持的授权内候选标 permission_incompatible，
-不修改 CAPABILITY、不新增授权开关/容量/额度机制）。
+不修改 CAPABILITY、不新增授权开关/容量/额度机制；BW-PERMISSION-SCOPE-S1 增加可选
+task_scope：普通隔离工程的文件/测试目标清单，只进回执/任务书，与硬合同 permission_grants
+分开，绝不驱动能力过滤/授权，也绝不自动降级或改动既有 grants）。
 
 它不是新调度器/服务/数据库表，也**绝不** claim/reserve/select_and_claim/reconcile/
 mark/finish 任何 attempt：只以 sqlite `mode=ro` 只读打开**既有** dispatch store，复用
@@ -139,6 +141,30 @@ def _normalize_permission_grants(grants):
     return norm
 
 
+def _normalize_task_scope(scope):
+    """task_scope（BW-PERMISSION-SCOPE-S1）：普通已授权隔离工程的文件/测试/只读参考
+    目标清单，结构复用 grants 的 edits/bash/read_dirs 字典。与 permission_grants（硬
+    合同）**完全分开**：只进回执/任务书，绝不驱动能力过滤/授权集合/fine_grained/
+    read_dirs 判定，也绝不自动授权或改动正式 grants；畸形输入严格拒绝。返回归一副本，
+    绝不突变调用方原对象。"""
+    if scope is None:
+        return None
+    if not isinstance(scope, dict):
+        raise ValueError('task_scope must be a JSON object')
+    unknown = [k for k in scope if k not in ec.GRANT_KEYS]
+    if unknown:
+        raise ValueError(f'task_scope has unknown keys: {unknown}')
+    norm = {}
+    for key in ec.GRANT_KEYS:
+        value = scope.get(key, [])
+        if not isinstance(value, list) or any(
+                not isinstance(x, str) or not x or x != x.strip() for x in value):
+            raise ValueError(f'task_scope.{key} must be a list of '
+                             'non-empty, untrimmed strings')
+        norm[key] = list(value)
+    return norm
+
+
 def _permission_requirements(grants):
     """从当阶段实际所需 grants 推导能力需求：fine_grained=逐文件 Edit 或原样 Bash；
     read_dirs=外部只读目录 grant。与 execution_control.preflight 同一口径。"""
@@ -178,6 +204,37 @@ def _permission_incompatible(pk, requirements, controlled_file_ok=False):
             return False
         return True
     return False
+
+
+def _permission_incompatibility_details(filters, requirements):
+    """仅对 permission_incompatible 候选说明实际冲突与可选路线（BW-PERMISSION-SCOPE-S1）。
+    只按本轮 grants 推导的能力需求描述**真实冲突**（逐文件 Edit/原样 Bash、read_dirs），
+    不自动拆阶段/降权限/扩候选；permission_incompatible 是能力冲突，不是模型/认证/额度
+    失败，未知可用性不由本字段验证。"""
+    details = {}
+    for pk, why in filters.items():
+        if why != 'permission_incompatible':
+            continue
+        unsupported = []
+        cap = ec.CAPABILITY.get(pk.split(':', 1)[0])
+        if cap is None:
+            unsupported.append('runtime not in CAPABILITY')
+        else:
+            if requirements['fine_grained'] and not cap['fine_grained']:
+                unsupported.append('per-file edits/verbatim Bash grants')
+            if requirements['read_dirs'] and not cap['read_dirs']:
+                unsupported.append('external read_dirs grant')
+        details[pk] = {
+            'unsupported': unsupported,
+            'note': ('hard permission_grants remain a binding contract and are not '
+                     'weakened by task_scope; ordinary_task_tools route: re-plan as '
+                     'an ordinary whole-tool edit+Bash task carrying task_scope only '
+                     '(no hard grants) before selecting this runtime; pure Edit '
+                     'controlled-file profile is the existing optional strict route '
+                     'only when bash/read_dirs are empty; a mixed Edit+Bash hard '
+                     'contract is still not directly accepted by this runtime'),
+        }
+    return details
 
 
 def _filter_candidates(conn, allowed, zcode_blocked, now, requirements=None,
@@ -255,7 +312,7 @@ def _relational_select(conn, mode, auth, allowed, passed, now):
 
 def plan_stage_selection(authorization, *, previous=None, store_path=None, quota_store=None,
                          task_id=None, stage=None, workspace=None, now=None,
-                         permission_grants=None):
+                         permission_grants=None, task_scope=None):
     """只读规划：返回最小 receipt；任何冲突整项拒绝（selected=None + refused 原因）。
 
     `permission_grants`（可选，与 authorization 分开）：当阶段实际所需的最小权限
@@ -284,6 +341,8 @@ def plan_stage_selection(authorization, *, previous=None, store_path=None, quota
         'snapshot_note': ('snapshot time is not live capacity; the authoritative entry '
                           're-checks atomically; this snapshot is never a placeholder, a '
                           'dispatch, or a real-time success proof'),
+        'task_scope': None,
+        'permission_incompatibility_details': {},
     }
 
     def _refuse(reason, detail=None):
@@ -294,6 +353,13 @@ def plan_stage_selection(authorization, *, previous=None, store_path=None, quota
 
     if not isinstance(authorization, dict):
         return _refuse('missing_authorization')
+    # task_scope 严格直查（BW-PERMISSION-SCOPE-S1）：畸形输入拒绝、不猜测；只进回执，
+    # 不参与能力过滤/授权，绝不突变调用方原对象，也绝不弱化 permission_grants 硬合同。
+    try:
+        norm_scope = _normalize_task_scope(task_scope)
+    except ValueError as exc:
+        return _refuse('invalid_task_scope', str(exc))
+    receipt['task_scope'] = norm_scope
     # 权限需求严格直查：畸形输入拒绝、不猜测；与授权对象完全分开。
     try:
         req_grants = _normalize_permission_grants(permission_grants)
@@ -432,6 +498,8 @@ def plan_stage_selection(authorization, *, previous=None, store_path=None, quota
         passed, filters = _filter_candidates(conn, eff_allowed, zcode_blocked, now,
                                              requirements, controlled_file_ok)
         receipt['candidate_filters'] = _per_candidate_view(eff_allowed, filters)
+        receipt['permission_incompatibility_details'] = _permission_incompatibility_details(
+            receipt['candidate_filters'], requirements)
 
         if eff_mode == 'fixed':
             pk = dp.pool_key(str(eff_auth.get('runtime')), str(eff_auth.get('model')))
@@ -491,6 +559,7 @@ def main(argv=None) -> int:
         description='read-only next-stage dispatch planner (never claims; preview_only)')
     ap.add_argument('--authorization-json', dest='authorization_json', default=None)
     ap.add_argument('--permission-grants-json', dest='permission_grants_json', default=None)
+    ap.add_argument('--task-scope-json', dest='task_scope_json', default=None)
     ap.add_argument('--previous-json', dest='previous_json', default=None)
     ap.add_argument('--task-id', dest='task_id', required=True)
     ap.add_argument('--stage', required=True)
@@ -504,7 +573,8 @@ def main(argv=None) -> int:
         previous=_load_json_arg(args.previous_json),
         store_path=args.store, quota_store=args.quota_store,
         task_id=args.task_id, stage=args.stage, workspace=args.workspace,
-        permission_grants=_load_json_arg(args.permission_grants_json))
+        permission_grants=_load_json_arg(args.permission_grants_json),
+        task_scope=_load_json_arg(args.task_scope_json))
     print(json.dumps(receipt, ensure_ascii=False, indent=2))
     return 0 if receipt.get('selected') is not None else 2
 

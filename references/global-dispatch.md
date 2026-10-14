@@ -506,8 +506,10 @@ BW-MAIN-PRIORITY-20261011-S1 的 Max > Claude > GLM 优先级对本入口同样�
   `stage_selection` 才把 ZCode 判为 `eligible`，并在 receipt 增加独立布尔 `controlled_file_profile_required`
   标明该路径依赖已验证绑定的 file_scope 契约；混合 Edit+Bash 仍 `permission_incompatible`。正式 preflight
   （`execution_control`）据 `--file-scope-contract` 冻结的 profile 复核契约精确覆盖 `edits`+workspace+实际工具，
-  才接受 ZCode 精确 Edit。**主脑据此把文件工作串行化为「ZCode 改文件 → 真实终态/磁盘回读 → Qoder 跑登记
-  测试」，绝不把整段混合授权交给 ZCode**。2026-10-13 4 个隔离 GLM-5.3 真 Agent 用例已在 FileSystemPort 层现场核验
+  才接受 ZCode 精确 Edit。**硬 Edit+Bash 不支持 ZCode 直接承接，但主脑可以选择能承接同一硬合同的
+  已授权兼容执行器一轮完成整段混合授权；仅当任务确有依赖且经任务授权时，才采用纯 Edit profile
+  （ZCode 改文件 → 真实终态/磁盘回读 → 兼容执行器跑登记测试）与必要的独立测试，
+  不强制串行拆分、不机械拆分**。2026-10-13 4 个隔离 GLM-5.3 真 Agent 用例已在 FileSystemPort 层现场核验
   （登记 Read/Edit/Write 成功、只读参考 Edit 拒、未登记 Write 拒、未登记 junction 拒，均 exit0+capacity_released；
   正向 `report_bound=false` 仅因路径末尾多句号、余三例 true、原件保留不为格式重跑）；TraceContext 不给 toolCallId 故不伪造、
   以 session/turn/原始工具事件关联。范围仅限登记/未登记路径与只读参考、未登记 junction，**不宣称全部重解析竞态/外部进程
@@ -522,6 +524,32 @@ BW-MAIN-PRIORITY-20261011-S1 的 Max > Claude > GLM 优先级对本入口同样�
                         "bash": ["Bash(pytest -q tests/test_app.py)"],
                         "read_dirs": []}}
 ```
+
+### 普通任务范围 task_scope 与硬合同分清（BW-PERMISSION-SCOPE-S1）
+
+普通已授权隔离工程的文件/测试目标用**可选** `task_scope`（`--task-scope-json`）表达，
+与 `permission_grants` **分别作用**：task_scope 只是"本轮普通任务要碰哪些文件/跑哪个
+测试/读哪些参考"的清单（同 `edits/bash/read_dirs` 结构，畸形严格 `invalid_task_scope`
+拒绝），**只进回执/任务书**，不驱动能力过滤、不构成授权、也绝不弱化或覆盖 hard
+grants；`permission_grants` 仍是必须强制的运行时硬合同，两者同传时 hard grants 完整
+生效。缺来源的既有精确 grants 按硬合同对待，不自动降级。receipt 另增
+`permission_incompatibility_details`：仅对 `permission_incompatible` 候选说明实际冲突
+（per-file edits/verbatim Bash grants、external read_dirs grant），并标明
+`ordinary_task_tools` 可选路线——先明确不要求硬合同、以普通整工具 edit+Bash 计划重新
+构造后再选该 runtime；纯 Edit 受控 profile 是现有可选严格路线，混合 Edit+Bash 硬合同
+仍不能直接承接。该明细不自动拆阶段/降权限/扩候选，也不是模型/认证/额度失败；正文 402
+或"无调用"等叙述不进入本入口，quota 仍只认既有 availability 口径。
+
+```json
+{"task_scope": {"edits": ["source/f1.cjs", "source/f2.cjs"],
+                "bash": ["python -m unittest discover -s tests -p test_app.py"],
+                "read_dirs": ["references/"]}}
+```
+
+主脑后续按选中 runtime 生成 formal plan 时：**用普通 task_scope 选 ZCode 的普通任务，
+formal plan 的 `grants` 为空精准列表，`tools` 声明为 Read,Glob,Grep,Edit,Write,Bash
+（整工具）**——绝不能把 task_scope 的文件名单复制进 formal grants 又变回硬合同；只有
+用户明确要求运行时强制边界才生成精确 `permission_grants` plan。
 
 ### 最小 receipt schema（输出 JSON，无占位）
 
@@ -541,6 +569,8 @@ BW-MAIN-PRIORITY-20261011-S1 的 Max > Claude > GLM 优先级对本入口同样�
   "source_authorization_scope": {"task_id": "T", "stage": "s1"},
   "session_reuse_allowed": false,
   "permission_requirements": {"fine_grained": false, "read_dirs": false},
+  "task_scope": null,
+  "permission_incompatibility_details": {},
   "selected": {"runtime": "zcode", "model": "GLM-5.3", "pool_key": "zcode:GLM-5.3"},
   "candidate_filters": {"qoder:Qwen3.8-Max": "window_closed|explicitly_limited|capacity_full|zcode_unavailable|permission_incompatible|not_authorized|eligible"},
   "zcode_blocked": false, "refused": null,
@@ -560,6 +590,7 @@ BW-MAIN-PRIORITY-20261011-S1 的 Max > Claude > GLM 优先级对本入口同样�
 `candidate_not_authorized`/`fixed_candidate_unavailable`/`temporary_not_flash`/
 `temporary_candidate_unavailable`/`rotation_state_unavailable`/`no_eligible_candidate`/
 `invalid_permission_grants`（BW-TASK-PERMISSION-S1，畸形权限需求严格拒绝）/
+`invalid_task_scope`（BW-PERMISSION-SCOPE-S1，畸形任务范围清单严格拒绝）/
 `store_refused`/`store_snapshot_unavailable`。`candidate_filters` 的逐候选取值另含
 `permission_incompatible`（能力不匹配，与 `zcode_unavailable`/`not_authorized` 可辨）。
 
@@ -569,13 +600,15 @@ BW-MAIN-PRIORITY-20261011-S1 的 Max > Claude > GLM 优先级对本入口同样�
 python scripts/stage_selection.py --store <abs.sqlite3> --task-id T --stage s2 \
   --workspace <abs ws> --authorization-json '<authorization object>' \
   [--permission-grants-json '<permission_grants object>'] \
+  [--task-scope-json '<task_scope object>'] \
   [--previous-json '<previous record>'] [--quota-store <db>]
 ```
 
 `--task-id`/`--stage`/`--workspace` 均为 **required**（缺一即 `missing_context` 拒绝）。
 `--permission-grants-json`（BW-TASK-PERMISSION-S1）与 `--authorization-json` 同为 JSON
 字符串最小新输入，**不与授权对象合并**；畸形 JSON 走既有 `_load_json_arg` 非零退出，
-畸形 grants 结构走 `invalid_permission_grants` 拒收回执（退出 2）。
+畸形 grants 结构走 `invalid_permission_grants` 拒收回执（退出 2）；`--task-scope-json`
+（BW-PERMISSION-SCOPE-S1）同口径，畸形结构走 `invalid_task_scope` 拒收回执（退出 2）。
 
 退出码 **0 = 选择成功 / 2 = 拒绝**（输出 JSON）。拿到 `selected.pool_key` 后，主脑再用
 精确 `runtime/model`（`reserve`/`select_and_claim` 的 `--dispatch-claim` 路径）交正式入口
@@ -597,8 +630,12 @@ executing/awaiting_acceptance` 或**未独立验收**时拒绝新选择（不抢
 > 无精确规则 → Z 照旧可选；fixed Z + 精确要求 → 诚实拒绝不偷偷换；read_dirs 独立能力
 > 过滤；缺 Qoder 授权不因能力过滤扩权；`zcode_unavailable` 与 `permission_incompatible`
 > 分别可辨；工作区/同任务在途守卫与只读快照哈希在带 grants 时照旧；畸形 grants 与 CLI
-> 新输入错误拒绝；临时降级同阶段与父授权到期重选应用**当前**需求。Windows/Linux
-> CI 矩阵都跑。
+> 新输入错误拒绝；临时降级同阶段与父授权到期重选应用**当前**需求。BW-PERMISSION-SCOPE-S1
+> 另覆盖（`TaskScopeTests`）：白天 Max 窗关 + Claude limited + 仅 task_scope → 选 ZCode；
+> 同 scope 加 hard Edit+Bash → Z 仍 `permission_incompatible` 且原输入不突变；legacy 仅
+> grants 行为不变；纯 hard Edit 受控 profile 一致；fixed/缺授权/availability/在途/工作区
+> 守卫不被 scope 绕过；带与不带 scope 的逐候选原因完全一致；畸形 scope 与 CLI 新输入
+> 拒绝（退出 2）；规划仍只读（哈希不变）。Windows/Linux CI 矩阵都跑。
 
 ## 迁移边界
 

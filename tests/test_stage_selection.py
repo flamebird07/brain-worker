@@ -10,7 +10,9 @@ BW-TASK-PERMISSION-S1 补：派工规划前的任务权限需求（可选 permis
 execution_control grants 字典结构与 CAPABILITY 能力表）过滤——精确 Edit/Bash/read_dirs
 需求下不支持的授权内候选标 permission_incompatible（与 not_authorized/zcode_unavailable
 可辨）、fixed 精确要求诚实拒绝、无需求维持旧兼容行为、临时降级/父授权重选应用当前需求、
-畸形输入拒绝、CLI 最小新输入。
+畸形输入拒绝、CLI 最小新输入。BW-PERMISSION-SCOPE-S1 补：task_scope（普通文件/测试
+范围清单）与硬合同 permission_grants 分清——只进回执不驱动过滤、hard grants 完整生效、
+guards 不被绕过、畸形 scope 拒绝、permission_incompatibility_details 冲突明细。
 """
 import contextlib
 import hashlib
@@ -105,10 +107,11 @@ class _Base(unittest.TestCase):
         return a
 
     def plan(self, auth, *, previous=None, task='T', stage='s2', ws=None, now=T_NIGHT,
-             permission_grants=None):
+             permission_grants=None, task_scope=None):
         return ss.plan_stage_selection(
             auth, previous=previous, store_path=self.store, task_id=task, stage=stage,
-            workspace=ws or self._ws(task), now=now, permission_grants=permission_grants)
+            workspace=ws or self._ws(task), now=now, permission_grants=permission_grants,
+            task_scope=task_scope)
 
     def _digest(self):
         h = hashlib.sha256()
@@ -760,13 +763,166 @@ class PermissionGrantsTests(_Base):
 
     def test_mixed_edit_bash_task_remains_permission_incompatible(self):
         """混合 Edit+Bash 整段任务继续 permission_incompatible：受控文件 profile 只覆盖纯精确
-        Edit，Bash 需求一律不成立，回执不标 controlled_file_profile_required，主脑须串行拆分。"""
+        Edit，Bash 需求一律不成立，回执不标 controlled_file_profile_required。硬 Edit+Bash 不支持
+        ZCode 直接承接，但可选能承接同一硬合同的已授权兼容执行器一轮完成；仅确有依赖且经任务
+        授权时采用纯 Edit profile 与必要独立测试，不强制/机械拆分。"""
         self.build_store()
         r = self.plan(self.auth('auto', 'T', 's2', ALL_MAINS + ALL_FLASH), now=T_DAY,
                       permission_grants=self.FINE)
         self.assertEqual(r['candidate_filters'][dp.ZCODE_POOL_KEY],
                          'permission_incompatible', r)
         self.assertFalse(r['controlled_file_profile_required'], r)
+
+
+class TaskScopeTests(_Base):
+    """BW-PERMISSION-SCOPE-S1：普通隔离工程的文件/测试目标 task_scope 与硬合同
+    permission_grants 分清。task_scope 只进回执/任务书，绝不驱动能力过滤/授权，
+    也绝不弱化 hard grants；permission_incompatible 是能力冲突（带实际冲突明细与
+    ordinary_task_tools 可选路线），不是模型/认证/额度失败。"""
+
+    SCOPE = {'edits': [f'source/f{i}.cjs' for i in range(1, 6)],
+             'bash': ['python -m unittest discover -s tests -p test_app.py'],
+             'read_dirs': ['references/']}
+    FINE = PermissionGrantsTests.FINE
+
+    def test_ordinary_scope_selects_zcode_when_only_route_open(self):
+        """白天三 Max 窗关、Claude 明确 limited、Z 可用有槽，同 5 文件/1 测试只是
+        task_scope（无硬 grants）：选 ZCode，requirements 全 false，Z eligible。"""
+        self.build_store()
+        self.set_limit(dp.CLAUDE_POOL_KEY)
+        r = self.plan(self.auth('auto', 'T', 's2', ALL_MAINS + ALL_FLASH), now=T_DAY,
+                      task_scope=self.SCOPE)
+        self.assertEqual(r['refused'], None, r)
+        self.assertEqual(r['selected']['pool_key'], dp.ZCODE_POOL_KEY, r)
+        self.assertEqual(r['candidate_filters'][dp.ZCODE_POOL_KEY], 'eligible')
+        self.assertEqual(r['permission_requirements'],
+                         {'fine_grained': False, 'read_dirs': False})
+        self.assertFalse(r['controlled_file_profile_required'])
+        self.assertEqual(r['task_scope'], self.SCOPE)
+        self.assertEqual(r['permission_incompatibility_details'], {})
+
+    def test_same_scope_plus_hard_grants_keeps_contract_and_inputs_untouched(self):
+        """同样 scope 再传明确 hard Edit+Bash：Z 仍 permission_incompatible，hard 合同
+        完整生效、不被 task_scope 覆盖；回执保留 task_scope；调用方原 scope/grants
+        对象不被突变。"""
+        self.build_store()
+        scope = dict(self.SCOPE)
+        grants = dict(self.FINE)
+        r = self.plan(self.auth('auto', 'T', 's2', ALL_MAINS + ALL_FLASH), now=T_DAY,
+                      permission_grants=grants, task_scope=scope)
+        self.assertEqual(r['candidate_filters'][dp.ZCODE_POOL_KEY],
+                         'permission_incompatible', r)
+        self.assertEqual(r['permission_requirements'],
+                         {'fine_grained': True, 'read_dirs': False})
+        self.assertEqual(r['task_scope'], self.SCOPE)
+        self.assertEqual(scope, self.SCOPE)   # 原输入不突变
+        self.assertEqual(grants, self.FINE)
+        details = r['permission_incompatibility_details'][dp.ZCODE_POOL_KEY]
+        self.assertIn('per-file edits/verbatim Bash grants', details['unsupported'])
+        self.assertIn('ordinary_task_tools', details['note'])
+        self._assert_readonly_with_scope()
+
+    def _assert_readonly_with_scope(self):
+        before = self._digest()
+        self.plan(self.auth('auto', 'T', 's2', ALL_MAINS + ALL_FLASH), now=T_DAY,
+                  task_scope=self.SCOPE)
+        self.assertEqual(before, self._digest())
+
+    def test_legacy_grants_only_unchanged_and_no_scope(self):
+        """legacy 仅 permission_grants 混合需求：照旧拒 Z，回执 task_scope=None、
+        明细仍给冲突说明（未传新输入完全兼容旧行为）。"""
+        self.build_store()
+        r = self.plan(self.auth('auto', 'T', 's2', ALL_MAINS + ALL_FLASH), now=T_DAY,
+                      permission_grants=self.FINE)
+        self.assertEqual(r['candidate_filters'][dp.ZCODE_POOL_KEY],
+                         'permission_incompatible', r)
+        self.assertIsNone(r['task_scope'])
+        self.assertIn(dp.ZCODE_POOL_KEY, r['permission_incompatibility_details'])
+
+    def test_pure_hard_edits_keep_controlled_profile_consistency(self):
+        """纯 hard Edit：仍 required controlled profile 与正式 preflight 同口径；
+        Z eligible 故无 incompatibility 明细。"""
+        self.build_store()
+        r = self.plan(self.auth('auto', 'T', 's2', ALL_MAINS + ALL_FLASH), now=T_DAY,
+                      permission_grants={'edits': ['Edit(source/f1.cjs)'], 'bash': [],
+                                         'read_dirs': []},
+                      task_scope={'edits': ['source/f1.cjs'], 'bash': [], 'read_dirs': []})
+        self.assertEqual(r['candidate_filters'][dp.ZCODE_POOL_KEY], 'eligible', r)
+        self.assertTrue(r['controlled_file_profile_required'], r)
+        self.assertEqual(r['permission_incompatibility_details'], {})
+
+    def test_scope_never_bypasses_existing_guards(self):
+        """fixed 不换执行器、缺 Z 授权、availability 阻断、在途、工作区冲突都不被
+        task_scope 绕过，原因照旧可辨。"""
+        self.build_store()
+        auth = self.auth('fixed', 'T', 's2', [dp.ZCODE_POOL_KEY],
+                         runtime='zcode', model='GLM-5.3')
+        r = self.plan(auth, permission_grants=self.FINE, task_scope=self.SCOPE)
+        self.assertEqual(r['refused'], 'fixed_candidate_unavailable', r)
+        r = self.plan(self.auth('auto', 'T', 's2', [CN_FLASH]), now=T_DAY,
+                      task_scope=self.SCOPE)
+        self.assertEqual(r['candidate_filters'][dp.ZCODE_POOL_KEY], 'not_authorized')
+        with _patch_zcode(False):
+            r = self.plan(self.auth('auto', 'T', 's2', ALL_MAINS + ALL_FLASH),
+                          now=T_DAY, task_scope=self.SCOPE)
+            self.assertEqual(r['candidate_filters'][dp.ZCODE_POOL_KEY],
+                             'zcode_unavailable', r)
+        self.reserve('T', 'zcode', 'GLM-5.3', executor='zcode')
+        r = self.plan(self.auth('auto', 'T', 's2', ALL_MAINS + ALL_FLASH),
+                      task_scope=self.SCOPE)
+        self.assertEqual(r['refused'], 'task_in_flight')
+        shared = self._ws('shared')
+        self.reserve('a', 'zcode', 'GLM-5.3', ws=shared, executor='zcode')
+        r = self.plan(self.auth('auto', 'T2', 's2', ALL_MAINS + ALL_FLASH), task='T2',
+                      ws=shared, task_scope=self.SCOPE)
+        self.assertEqual(r['refused'], 'workspace_conflict')
+
+    def test_scope_does_not_change_routing_reasons_or_quota_semantics(self):
+        """task_scope 不改任何逐候选原因/选择/availability 语义（带与不带完全一致）；
+        正文 402/无调用之类的叙述不进入本入口，quota 仍只认既有 availability 口径。"""
+        self.build_store()
+        allowed = self.auth('auto', 'T', 's2', ALL_MAINS + ALL_FLASH)
+        base = self.plan(allowed, now=T_DAY)
+        with_scope = self.plan(allowed, now=T_DAY, task_scope=self.SCOPE)
+        self.assertEqual(base['candidate_filters'], with_scope['candidate_filters'])
+        self.assertEqual(base['selected'], with_scope['selected'])
+        self.assertEqual(base['zcode_blocked'], with_scope['zcode_blocked'])
+        self.assertFalse(with_scope['zcode_blocked'])
+
+    def test_cli_task_scope_and_malformed_refused(self):
+        """CLI 新输入 --task-scope-json 原样进回执；畸形 scope（非对象/未知键/非列表/
+        空或带空白项）→ invalid_task_scope 拒绝、退出 2。"""
+        self.build_store()
+        ws = self._ws('T')
+        auth = self.auth('auto', 'T', 's2', [dp.ZCODE_POOL_KEY])
+        buf = io.StringIO()
+        with contextlib.redirect_stdout(buf):
+            code = ss.main(['--store', self.store, '--task-id', 'T', '--stage', 's2',
+                            '--workspace', ws,
+                            '--authorization-json', json.dumps(auth),
+                            '--task-scope-json', json.dumps(self.SCOPE)])
+        self.assertEqual(code, 0)
+        out = json.loads(buf.getvalue())
+        self.assertEqual(out['selected']['pool_key'], dp.ZCODE_POOL_KEY)
+        self.assertEqual(out['task_scope'], self.SCOPE)
+        for bad in ([1], {'edits': 'x'}, {'edits': ['']}, {'edits': [' ']},
+                    {'scope': []}):
+            buf = io.StringIO()
+            with contextlib.redirect_stdout(buf):
+                code = ss.main(['--store', self.store, '--task-id', 'T', '--stage', 's2',
+                                '--workspace', ws,
+                                '--authorization-json', json.dumps(auth),
+                                '--task-scope-json', json.dumps(bad)])
+            self.assertEqual(code, 2, bad)
+            self.assertEqual(json.loads(buf.getvalue())['refused'],
+                             'invalid_task_scope', bad)
+        with self.assertRaises(SystemExit) as ctx:
+            with contextlib.redirect_stdout(io.StringIO()):
+                ss.main(['--store', self.store, '--task-id', 'T', '--stage', 's2',
+                         '--workspace', ws,
+                         '--authorization-json', json.dumps(auth),
+                         '--task-scope-json', '{not json'])
+        self.assertIn('invalid JSON', str(ctx.exception))
 
 
 if __name__ == '__main__':

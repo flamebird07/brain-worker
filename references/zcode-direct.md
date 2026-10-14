@@ -351,6 +351,17 @@ python scripts/zcode_direct.py --workspace <项目绝对路径> --prompt-file <U
   flag、删改精确 grants 或填任意宽契约绕过。`stage_selection` 仅在本轮只需精确 Edit（无 Bash/全目录
   授权）时把 ZCode 判为可选，并在回执标 `controlled_file_profile_required`；混合 Edit+Bash 继续
   `permission_incompatible`，由主脑串行拆分为「ZCode 改文件 → 真实终态/回读 → Qoder 跑登记测试」。
+- **普通任务范围与硬合同分清（BW-PERMISSION-SCOPE-S1）**：普通已授权隔离工程的文件/测试
+  目标用 `stage_selection` 的可选 `task_scope`（`--task-scope-json`，同 `edits/bash/read_dirs`
+  结构清单）表达，只进回执/任务书——它**不是** SDK 路径沙箱、不构成授权、也不弱化 hard
+  `permission_grants`（两者同传时 hard grants 完整生效）。示例：`--task-scope-json
+  '{"edits": ["source/f1.cjs", "source/f2.cjs"], "bash": ["python -m unittest discover -s
+  tests -p test_app.py"], "read_dirs": []}'` → 白天窗内选 ZCode；再叠加 hard
+  Edit+Bash grants → Z 仍 `permission_incompatible`（回执
+  `permission_incompatibility_details` 给实际冲突与 `ordinary_task_tools` 重规划路线）。
+  主脑据此选 ZCode 后生成的 formal plan：`grants` 为**空精准列表**、`tools` 声明
+  `Read,Glob,Grep,Edit,Write,Bash` 整工具（普通模式），**绝不把 task_scope 文件名单复制进
+  formal grants 又变回硬合同**；确需运行时强制逐文件边界才用上面受控 file_scope 契约路径。
 - **现场事实（2026-10-13，4 个隔离 GLM-5.3 真 Agent 用例）**：以上此前仅离线回归（真实 guard/port 面 +
   真实 runner 注入路径 + Python 规范化 + 跨语言 SHA 同源）；现已在真实 GLM-5.3 Agent 现场核验登记/未登记
   路径与只读参考、未登记 junction：登记路径 Read/Edit/Write 成功（positive 有 `writeTextFile` `allowed=true`
