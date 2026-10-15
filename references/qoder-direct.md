@@ -43,6 +43,16 @@ BW-AVAILABILITY-20261009-B4：受信任主脑明确授权的 **`executor='qoder'
 - 兼容回退：未提供 `--allowed-tools` 时，脚本把 `--tools` 的工具名逐项转成允许规则，这会允许该工具的广泛使用；需要限定范围的派工必须显式传规则，不能只传 `--tools`。显式规则完全替代回退，不追加裸工具权限。Python 调用 `build_argv(..., allowed_tools=[])` 可指定零允许规则；CLI 默认空工具也不生成允许规则。
 - `--permission-mode` 固定为 `dont_ask`，绝不启用 `bypass_permissions`。
 
+CN 专项（BW-CN-PERMISSION-STOP-20261015T155930Z-S1，只动 `--runtime qodercn` 分支）：CN 正式入口在
+Popen 前额外拒绝裸/整工具通配 Edit/Write/NotebookEdit/Bash **allow** 规则（含 `--tools` 兼容回退
+生成的同名规则），要求 `Edit(/<工作区相对具体文件>)` 与 `Bash(<登记原样命令>)`；并经官方
+`--session-id` 只读增量监视本会话 jsonl（现场路径
+`projects/<workspace-key>/<精确sessionId>.jsonl`；只认事件顶层/块内的结构化
+`toolDenialKind=permission-rule`，或工具结果**起始处**直接构成的固定拒绝文案，允许可选 `Error:`
+前缀，输出中间引用同一句不误停），真实审批拒绝即停本 child（详见
+[Qoder CN 本机原生直连](qodercn-direct.md)）。国际路径的 argv 与通信一字不变；静态门只证明规则
+形状，不声称真实权限成功。
+
 遇到 Qoder 拒绝某动作时，执行 Agent 报告具体未执行的动作、被拒规则和证据，停止同类无效尝试；不重复询问已有授权，也不宣称修复成功——是否放行由主脑按隔离验证判断，不由执行 Agent 自报。扩展纪律（含认证失败分型、拒绝处置与隔离输出审查）见 [执行中断分类与接续](execution-interruption.md)。
 
 认证失败的边界（BW-INTERRUPTION-20261015-S1）：真实终态文案如 "Custom model authentication failed. Please check if your API Key is correctly configured and valid."（exit 1）属**认证失败**，与上文“明确限额落标与识别”中 `401`/`invalid api key`/`unauthorized` 同类**绝不落限额标记**；只确认 auth failed、保留原文与 exit code，不断言密钥失效，本任务内不重复同 `runtime:model`/config 版本，处理与接续规则见 [执行中断分类与接续](execution-interruption.md)。

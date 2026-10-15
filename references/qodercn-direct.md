@@ -135,6 +135,68 @@ CN 接续**至少拒绝把国际原件/session 当作 CN 续用**：无 `--resum
   `qfmodel` 身份、未独立确认，费用未知。**本条只证明这一次这一组逐文件 `Edit(...)` + `Write` 可见性的现场
   组合被放行，不断言所有官方版本的内部匹配器都存在同一故障或都会同样放行。**
 
+## CN 裸 mutation 规则静态门与会话权限拒绝监视（2026-10-15，BW-CN-PERMISSION-STOP-20261015T155930Z-S1）
+
+- **原始故障（保留、不改写）**：一次 CN 派工只带裸工具名 allow 规则（Read/Glob/Grep/Edit/Write/Bash，
+  plan.grants 的 edits/bash 为空），`dont_ask` 下 Write 新建嵌套目标被拒；模型随后改用 Bash
+  touch/ls/rm（实际临时写）与重定向（再次被拒）反复试写，主脑 1 分 55 秒后人工终止。根因**不能**
+  简化成"所有 CN 版本 bare 规则必然无效"——官方当前文档说路径写入用 `Edit(...)`（同时覆盖
+  Edit/Write/NotebookEdit）；既有 `build_cn_argv` 只拒绝 `Write(/path)` 形状，未防本次裸规则派工。
+- **静态规则门（`validate_cn_allow_rule_shapes`，只动 CN）**：CN 正式 main 在容量 claim、占位、
+  建输出目录、Popen **之前**校验有效 allow 规则：裸工具名或整工具通配 `Tool(*)` 的
+  Edit/Write/NotebookEdit/Bash 一律拒绝（含 `--tools` 兼容回退生成的同名规则），错误信息明确要求
+  `Edit(/<工作区相对具体文件>)` 与 `Bash(<登记原样命令>)`。绝不自动改写/扩大规则；Read/Glob/Grep
+  裸规则、deny 规则、显式空 allow、`--tools` 可见性里的 Write（无写入权限的只读调用）一律不受影响；
+  国际 `build_argv` 与 dont_ask 口径一字不变。**静态门只证明规则形状，不声称真实权限成功**——
+  规则范围明确不等于 CN 审批匹配器必然放行（旧节既有口径保持）。
+- **会话权限拒绝监视（`scripts/qoder_permission_watch.py`，纯标准库，只给 CN 增加）**：
+  - 新调用生成并记录一个独立 UUID，经官方 `--session-id` 下发（主脑已核对 CN 当前官方 help 支持
+    该参数；本阶段未联网复验）；`request.json` 的 `cn_session_watch` 记录 session_id、来源
+    （generated/resume）、精确文件与基线。resume 沿用已验证原 session（`--resume`）。
+  - 只在现场核实的 `config_dir/projects/<workspace-key>/<精确sessionId>.jsonl` 这**一个**文件上按
+    精确 UUID 文件名定位（只读目录项，不扫描其它会话正文）并增量读取（基线偏移冻结；resume 旧事件
+    绝不重扫触发），文件可能在 Popen 之后才出现时按 0 基线读；容忍分段 JSON 行，坏行只记事实不断
+    监视，文件缩短（轮转/重写）记录事实并重新基线。原始会话文件保留不改。（旧版本文档写的
+    `projects/<sessionId>.jsonl` 路径是错的，已按现场回放纠正。）
+  - 仅接受 `sessionId` 精确一致、`cwd` 真实路径归一（含 Windows 8.3 短名）与本工作区一致、
+    `type=user` 的真实 `message.content` tool_result；结构化 `toolDenialKind=permission-rule` 按
+    **事件顶层**（现场真实事件即顶层标记，兼容 tool_result 块内/块 content 内同名字段）读取；或
+    命中 tool_result **起始处**直接构成的固定拒绝文案——允许可选 `Error:` 前缀，含现场真实的
+    `This action needs approval, and the "Don't ask" permission mode does not prompt.` 与
+    codebuddy-direct 档案记录的同系 CLI 文案 `Permission to use … has been denied`——即停止本 child。
+    固定文案只在结果起始处命中，**绝不扫描输出中间对同一句的引用、用户/助手叙述或 tool_result 之外
+    的结构**；`is_error=false` 不掩盖真实拒绝；普通工具错误、402/429、取消文案都不是审批拒绝。
+  - 停止只经**本次 Popen 对象** terminate → 等待真实退出（超时升级 kill），绝不按进程名杀进程、
+    绝不碰别的 attempt/槽；communicate 仍由子线程**恰好一次**携 input 调用（正确送 stdin），
+    超时/停止后绝不重发 input；主线程约 0.2 秒短轮询。终态无法确认仍 `mark_unknown` 保留占位。
+  - 监视读错/降级只记录事实（`permission-stop.json` 的 `monitor_facts`），绝不悄悄当保护成功；
+    **不宣称零延迟或零后续工具竞态**——拒绝发生后、终止生效前 child 仍可能执行有限动作。
+  - 留证不只在发生拒绝时：**CN 所有已知终态都随 `summary.cn_watch_facts` 存本轮监视事实**（实际
+    是否找到/观察到会话、精确位置、degraded、错误与读取进度）；无拒绝的正常结束也必须能回读监控
+    状态，unknown 分支同样返回事实。**未找到文件时如实 `session_observed=false`，绝不写成已观察
+    成功**；仅补留证，不新增定时器/DB/前置探针/全局健康门/新授权开关。
+  - 若模型在监视器读取前已自然结束但会话流里有拒绝：如实分类为 `observed_after_exit`
+    （不伪称已终止、不强行改写自然成功终态），事实仍入 `summary.permission_stop`。
+- **终止语义**：监视器终止时 `protocol_success=false`、`report_bound=false`（即使部分 stdout 恰好
+  可解析也不绑定）；`permission_stop`（kind/工具ID/来源/行号/观察时间/真实 exit）保留在 summary 与
+  report-state，后续 stdout 解析失败只能追加 `parse_error`，**绝不把权限停止覆盖成 API/模型故障**；
+  最小拒绝补入 `permission_denials` 供失败分型；**绝不落 quota 标记**；实际已退出才释放本 attempt；
+  部分 stdout/stderr 原样保存，最小原始拒绝事件（匹配的 tool_result 块+身份头）单独落
+  `permission-stop.json`，不整份拷贝私人会话流。
+- **国际路径不受影响**：无 `--session-id`、无 `cn_session_watch`、无监视器，`communicate` 默认行为
+  与旧 argv 一字不变（`tests/test_qoder_permission_stop.py::InternationalUnchangedTests` 回归）。
+- **离线回归**：`tests/test_qoder_permission_stop.py`（tools-only/显式裸 mutation 0 Popen/0 claim/
+  零证据目录；`Edit(/nested/created.txt)`+Write 可见性放行；国际不变；session/cwd 绑定、resume 旧
+  事件不触发、分段行、is_error=false、普通错误/叙述不误停；固定文案起始锚定——真实 dont_ask 原文
+  识别、输出中间引用同一句不误停；假 child 终止/自然退出/unknown 三态；无拒绝的正常结束可回读
+  `cn_watch_facts`；全部会话文件按 `projects/<workspace-key>/<sid>.jsonl` 真实布局统一；
+  本地无网络真实合成子进程写指定 native session + 延迟 sentinel，证明拒绝后终止、sentinel 未执行、
+  普通错误继续）。`tests/test_qoder_cn_direct_offline.py` 同步更新（假 Popen 补 poll/wait/terminate/
+  kill 表面；裸 Write 放行用例改为拒绝；正向用例 Write 仅留可见性）。**离线桩不证明真实 CN CLI
+  行为**；`--session-id` 官方支持、真实拒绝文案全集与监视时延由主脑独立真实验收。本阶段（S3）
+  修正的路径/字段层级/固定文案锚定已通过离线回归并由主脑原件回放，但**尚未最终现场验收**，
+  本文件不宣称真实通过。
+
 ## ZCode 限额自动跳过（复用，不改额度系统）
 
 本轮**禁止修改** `quota_control.py`/`zcode_direct.py`、查剩余额度/账单、加历史导入/冷却/恢复探针/
@@ -147,7 +209,8 @@ CN 接续**至少拒绝把国际原件/session 当作 CN 续用**：无 `--resum
 ## 离线验证
 
 ```text
-python tests/test_qoder_cn_direct_offline.py    # 国际 argv 不变 / CN 映射 / 缺映射 0 Popen / CN 接续拒绝 / CN 路径限定 Write(...) 规则拒绝与 Edit(...) 原样放行
+python tests/test_qoder_cn_direct_offline.py    # 国际 argv 不变 / CN 映射 / 缺映射 0 Popen / CN 接续拒绝 / CN 路径限定 Write(...) 规则拒绝与 Edit(...) 原样放行 / 裸 mutation 规则拒绝
+python tests/test_qoder_permission_stop.py      # CN 裸 mutation 门 0 Popen / --session-id 会话监视绑定 / 拒绝即停与 unknown 占位 / 真实合成子进程 sentinel 证明 / 国际不变
 python tests/test_dispatch_pool_qodercn.py      # CN 池/总 10、自定义主力时段门同内置（用例经夜间 T0 claim）、跨区域并行、同区互斥、跨 runtime 拒、终态释放、Z hold 跳过
 ```
 

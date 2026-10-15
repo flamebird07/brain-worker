@@ -307,8 +307,11 @@ class CnArgvRuleGateTests(unittest.TestCase):
            'model_ids': {'DeepSeek-Flash': 'real-id-123'}}
 
     def _build(self, **kw):
+        # 默认 --tools 只带只读工具：裸 Write 回退会先触发 BW-CN-PERMISSION-STOP-S1 的
+        # mutation 门，掩盖本组用例各自要测的门。
+        sid = kw.pop('session_id', None)
         return qd.build_cn_argv(self.CFG, '/abs/cfg', 'real-id-123', '/abs/ws',
-                               kw.pop('tools', 'Read,Write'), None, **kw)
+                               kw.pop('tools', 'Read'), sid, **kw)
 
     @staticmethod
     def _rules(argv):
@@ -324,22 +327,56 @@ class CnArgvRuleGateTests(unittest.TestCase):
                 self.assertRaises(ValueError, self._build, disallowed_tools=[rule])
 
     def test_tool_level_write_and_edit_rules_pass_through_verbatim(self):
-        """有效 Edit 逐文件规则 + Write 可见性必须原样到达 argv：不拆逗号、不改前缀、不追加默认。"""
+        """BW-CN-PERMISSION-STOP-S1 起裸/整工具通配 mutation allow 规则被 CN 门拒绝（原始
+        故障：裸规则下 Write 被 dont_ask 拒绝后模型改用 Bash touch/重定向反复试写）。
+        逐文件 Edit(...) 规则 + Write 仅作 --tools 可见性原样放行：不拆逗号、不改前缀、
+        不追加默认。"""
+        for bad in ('Write', 'Write(*)', 'Edit', 'Edit(*)', 'Bash', 'Bash(*)',
+                    'NotebookEdit', 'NotebookEdit(*)'):
+            with self.subTest(rule=bad):
+                with self.assertRaises(ValueError) as ctx:
+                    self._build(tools='Read,Write',
+                                allowed_tools=['Edit(/scripts/qoder_direct.py)', bad])
+                msg = str(ctx.exception)
+                self.assertIn(repr(bad), msg)
+                # 明确要求具体形状：Edit(/工作区相对具体文件) 与 Bash(登记原样命令)。
+                self.assertIn('Edit(/<workspace-relative specific file>)', msg)
+                self.assertIn('Bash(<registered verbatim command>)', msg)
+                # 静态门只证明规则形状，不声称真实权限成功。
+                self.assertIn('does not claim', msg)
         argv = self._build(tools='Read,Write',
-                           allowed_tools=['Edit(/scripts/qoder_direct.py)', 'Write',
-                                          'Write(*)'],
+                           allowed_tools=['Edit(/scripts/qoder_direct.py)'],
                            disallowed_tools=['Write'])
         self.assertEqual(argv[:1], ['/abs/qodercn.exe'])
-        self.assertEqual(self._rules(argv), ['Edit(/scripts/qoder_direct.py)', 'Write',
-                                             'Write(*)'])
+        self.assertEqual(self._rules(argv), ['Edit(/scripts/qoder_direct.py)'])
+        # deny 是收紧不是授权：裸 Write deny 原样保留，不受 mutation 门影响。
         self.assertEqual(self._denies(argv), ['Write'])
         self.assertEqual(argv[argv.index('--tools') + 1], 'Read,Write')
         self.assertEqual(argv[argv.index('--permission-mode') + 1], 'dont_ask')
 
     def test_legacy_tools_fallback_bare_write_is_not_a_path_rule(self):
-        """未显式给 allowed_tools 时按 --tools 逗号回退成裸工具名：裸 Write 合法、不拒绝。"""
-        argv = self._build(tools='Read,Write')
-        self.assertEqual(self._rules(argv), ['Read', 'Write'])
+        """未显式给 allowed_tools 时按 --tools 逗号回退成裸工具名：回退生成的裸 mutation
+        规则（Write/Edit/Bash）同样被拒（含 tools-only 兼容回退）；只读回退照常放行。"""
+        with self.assertRaises(ValueError) as ctx:
+            self._build(tools='Read,Write')
+        self.assertIn('Write', str(ctx.exception))
+        with self.assertRaises(ValueError):
+            self._build(tools='Read,Glob,Grep,Edit,Write,Bash')
+        argv = self._build(tools='Read,Glob,Grep')
+        self.assertEqual(self._rules(argv), ['Read', 'Glob', 'Grep'])
+
+    def test_cn_argv_new_session_uuid_and_resume_flags(self):
+        """BW-CN-PERMISSION-STOP-S1：新会话可传 session_uuid → 官方 --session-id；resume
+        仍走 --resume；两者都不传时 argv 无会话 flag。"""
+        argv = self._build(tools='Read', allowed_tools=['Read'],
+                           session_uuid='0f0e0d0c-1111-2222-3333-444455556666')
+        self.assertEqual(argv[-2:], ['--session-id', '0f0e0d0c-1111-2222-3333-444455556666'])
+        argv = self._build(tools='Read', allowed_tools=['Read'],
+                           session_id='0f0e0d0c-1111-2222-3333-444455556666')
+        self.assertEqual(argv[-2:], ['--resume', '0f0e0d0c-1111-2222-3333-444455556666'])
+        argv = self._build(tools='Read', allowed_tools=['Read'])
+        self.assertNotIn('--session-id', argv)
+        self.assertNotIn('--resume', argv)
 
     def test_international_build_argv_unchanged_for_path_scoped_write(self):
         """国际路径不受本门影响（本轮明确禁止改国际行为）。"""
@@ -370,11 +407,13 @@ class CnMainWriteRuleRefusalTests(_NoPopen):
         cfg = self.write_cn_config({'DeepSeek-Flash': 'real-id-123'})
         ws, pf = self.make_prompt()
         out_dir = self.tmp / ('out-' + tag)
+        # BW-CN-PERMISSION-STOP-S1 起 --tools 回退含裸 Write 会先触发 mutation 门；本组
+        # 用例专测路径限定 Write(...) 规则拒绝，故 --tools 只带只读工具（裸 Read 合法）。
         argv = ['--runtime', 'qodercn', '--cn-config', str(cfg),
                 '--workspace', str(ws), '--prompt-file', str(pf),
                 '--output-dir', str(out_dir), '--stage', 'BW-CN-WRITE-RULE-' + tag,
                 '--model', 'Qwen3.8-Flash', '--dispatch-store',
-                str(self.tmp / 'pool.sqlite3'), '--tools', 'Read,Write', *extra]
+                str(self.tmp / 'pool.sqlite3'), '--tools', 'Read', *extra]
         return argv, out_dir
 
     def test_main_refuses_path_scoped_write_rule_zero_popen(self):
@@ -400,8 +439,10 @@ class CnMainWriteRuleRefusalTests(_NoPopen):
                                      'refusal must not consume a capacity claim')
 
     def test_main_accepts_edit_rule_with_write_visibility(self):
-        """正向对照：同一 CN 入口在 Edit(...) 逐文件规则 + Write 可见性下照常走到 Popen 前逻辑，
-        绝不被新门误伤（假 Popen 抛哨兵，证明 argv 已带该规则原样到达外部进程入口）。"""
+        """正向对照：同一 CN 入口在 Edit(...) 逐文件规则 + Write 仅作 --tools 可见性下照常
+        走到 Popen 前逻辑，绝不被新门误伤（假 Popen 抛哨兵，证明 argv 已带该规则原样到达
+        外部进程入口）。BW-CN-PERMISSION-STOP-S1 起裸 `Write` allow 规则本身被门拒绝，
+        故正向用例不再携带裸 Write 规则（Write 只保留在可见性里）。"""
         cfg = self.write_cn_config({'DeepSeek-Flash': 'real-id-123'})
         ws, pf = self.make_prompt()
         out_dir = self.tmp / 'out-edit-rule'
@@ -418,8 +459,7 @@ class CnMainWriteRuleRefusalTests(_NoPopen):
                     '--output-dir', str(out_dir), '--stage', 'BW-CN-WRITE-RULE-OK',
                     '--model', 'Qwen3.8-Flash', '--tools', 'Read,Write',
                     '--allowed-tools', 'Edit(/scripts/qoder_direct.py)',
-                    '--allowed-tools', 'Write', '--dispatch-store',
-                    str(self.tmp / 'pool.sqlite3')]
+                    '--dispatch-store', str(self.tmp / 'pool.sqlite3')]
         try:
             with redirect_stdout(io.StringIO()):
                 rc = qd.main()
@@ -428,8 +468,14 @@ class CnMainWriteRuleRefusalTests(_NoPopen):
         self.assertIn('argv', captured, f'rule gate must not block valid Edit rules (rc={rc})')
         argv = captured['argv']
         rules = [argv[i + 1] for i, a in enumerate(argv) if a == '--allowed-tools']
-        self.assertEqual(rules, ['Edit(/scripts/qoder_direct.py)', 'Write'])
+        self.assertEqual(rules, ['Edit(/scripts/qoder_direct.py)'])
         self.assertEqual(argv[argv.index('--tools') + 1], 'Read,Write')
+        # 新会话：官方 --session-id 携带入口生成的 UUID（供会话权限拒绝监视精确定位）。
+        self.assertIn('--session-id', argv)
+        sid = argv[argv.index('--session-id') + 1]
+        request = json.loads((out_dir / 'request.json').read_text(encoding='utf-8'))
+        self.assertEqual(request['cn_session_watch']['session_id'], sid)
+        self.assertEqual(request['cn_session_watch']['source'], 'generated')
 
 
 # ============================================================================
@@ -581,7 +627,11 @@ _CN_LIMIT_TEXT = 'Your personal Credits have been exhausted. Please check your p
 
 class _SyntheticChild:
     """合成子进程：只承担"外部进程"这一件事——把终态 envelope 原样写进 stdout 句柄，
-    再按预设退出码退出。绝不参与限额判定、落标或释放逻辑。"""
+    再按预设退出码退出。绝不参与限额判定、落标或释放逻辑。
+    BW-CN-PERMISSION-STOP-S1：CN 正式 main 现经 qoder_permission_watch 与子进程交互
+    （子线程 communicate + 主线程轮询 + 可能 terminate/kill），假 Popen 需补齐真实
+    Popen 对象的 poll/wait/terminate/kill 表面（任务书允许的必要 fixture 调整；
+    生产行为不在测试里绕开监视）。"""
 
     def __init__(self, pid, stdout_handle, payload, returncode, on_exit):
         self.pid = pid
@@ -600,6 +650,22 @@ class _SyntheticChild:
         self.terminated = True
         self._on_exit()  # 真实进程结束：让终态探针如实回报 dead
         return (None, None)
+
+    def poll(self):
+        return self.returncode
+
+    def wait(self, timeout=None):
+        return self.returncode
+
+    def terminate(self):
+        # 只模拟"经本对象发出的停止信号落地"：进程立刻退出、退出码与真实 OS 终止一致非零。
+        if self.returncode is None:
+            self.returncode = 1
+        self.terminated = True
+        self._on_exit()
+
+    def kill(self):
+        self.terminate()
 
 
 class MainForceLimitRealEntryTests(_NoPopen):

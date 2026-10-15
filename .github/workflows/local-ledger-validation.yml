@@ -158,6 +158,15 @@ jobs:
       - name: Qoder CN direct offline regression (no login or network)
         run: python tests/test_qoder_cn_direct_offline.py
 
+      # BW-CN-PERMISSION-STOP-20261015T155930Z-S1/S3：CN 权限派工静态门 + 会话权限拒绝监视的
+      # 离线回归——固定路径 `projects/<workspace-key>/<sessionId>.jsonl` 只读增量读取、固定拒绝
+      # 文案起始锚定（输出中间引用不误停）、监视/终止/自然退出/unknown 四态、无拒绝的正常结束
+      # 也随 summary 留 `cn_watch_facts`、本地合成子进程真实终止 sentinel 未执行。纯标准库、每
+      # 用例独立临时目录与临时 SQLite、假 Popen/合成 stub：无网络、不登录、不调模型、不读真实
+      # config_dir/stub 池；Windows/Linux 矩阵都跑。
+      - name: Qoder CN permission stop watch offline regression (no login or network)
+        run: python tests/test_qoder_permission_stop.py
+
       # BW-CLAUDE-DEEPSEEK-S2/S3/S4：Claude Code CLI / deepseek-flash 第 11 主力槽（AUTO 可选、
       # 独立第三公平组、总 11 硬守卫含 claude）的离线回归，Windows/Linux 矩阵都跑。全部纯标准库、
       # 每用例独立临时 SQLite、FakePopen/可注入探针：绝不访问网络、不读凭据、不查真实额度、

@@ -10,6 +10,19 @@
 - 正文格式检查与最终绑定分离：analyze_report 只做机械正文核对（body_ok），
   finalize_binding 再综合协议终态、session_id、resume 精确一致与哈希回读
   得出最终 bound；机械正文合格不冒充已绑定。
+- BW-CN-PERMISSION-STOP-20261015T155930Z-S1（仅 CN 分支）：Popen 前静态拒绝裸/整工具
+  通配 Edit/Write/NotebookEdit/Bash allow 规则；新会话经官方 --session-id 下发独立 UUID，
+  qoder_permission_watch 增量监视本会话原生 jsonl，真实审批拒绝即经本次 Popen 对象终止
+  并等待真实退出（终态不明确保 unknown 占位；国际路径 argv/通信不变）。
+- BW-CN-PERMISSION-STOP-20261015T155930Z-S2（仅 CN 分支）：监视器改为按现场核实的
+  `config_dir/projects/<workspace-key>/<sessionId>.jsonl` 精确文件名定位（兼容文件在 Popen
+  之后才出现），`_norm_path` 改按真实路径 + 平台大小写语义归一（Windows 8.3 短名与长名
+  指向同一工作区时必须一致）；CN 生成的 session id 与 envelope.session_id 不一致时如实记录
+  并拒绝绑报告（不当认证/额度事实）。国际路径与既有行为不变。
+- BW-CN-PERMISSION-STOP-20261015T155930Z-S3（仅 CN 分支）：固定拒绝文案改为只接受工具结果
+  **起始处**（允许可选 `Error:` 前缀）直接构成拒绝的锚定形状，绝不误停输出中间对同一句的引用；
+  CN 所有已知终态都随 `summary.cn_watch_facts`/unknown 输出留本轮监视事实（无拒绝的正常结束也
+  可回读，未找到文件如实 `session_observed=false`）。国际路径与既有行为不变。
 """
 import argparse
 import hashlib
@@ -18,6 +31,7 @@ import os
 import re
 import subprocess
 import sys
+import uuid
 from datetime import datetime, timezone
 from pathlib import Path
 
@@ -27,6 +41,7 @@ if str(_SCRIPTS_DIR) not in sys.path:
 import execution_control as ec  # noqa: E402 任务级控制面（同目录，标准库）
 import prompt_contract as pc  # noqa: E402 三入口共享九节契约（标准库，不反向导入本模块）
 import dispatch_pool as dp  # noqa: E402 跨会话并发容量池（同目录，标准库 sqlite3）
+import qoder_permission_watch as qpw  # noqa: E402 CN 会话权限拒绝监视（同目录，标准库）
 
 DEFAULT_CONFIG = _SCRIPTS_DIR / 'local-entry.json'
 DEFAULT_CN_CONFIG = _SCRIPTS_DIR / 'local-entry-cn.json'
@@ -255,19 +270,72 @@ def validate_cn_permission_rules(allowed_tools, disallowed_tools) -> None:
         'visibility. Refusing to auto-widen or auto-translate this rule.')
 
 
+# BW-CN-PERMISSION-STOP-20261015T155930Z-S1：CN dont_ask 派工里禁止的 mutation 工具名。
+# 原始故障：一次 CN 派工只带裸工具名 allow 规则（plan.grants edits/bash 为空），Write 新建
+# 嵌套目标被 dont_ask 拒绝后，模型改用 Bash touch/ls/rm 与重定向反复试写（再次被拒），主脑
+# 1 分 55 秒后人工终止。根因不能简化成"所有 CN 版本 bare 规则必然无效"（官方当前文档说路径
+# 写入用 Edit(...)，同时覆盖 Edit/Write/NotebookEdit）；本门只拒绝危险形状并要求调用方显式
+# 点单具体范围，不自动改写/扩大任何规则。
+_CN_MUTATION_TOOL_NAMES = ('Edit', 'Write', 'NotebookEdit', 'Bash')
+
+
+def cn_bare_mutation_allow_rules(allowed_tools) -> list[str]:
+    """挑出 CN 派工不允许的 mutation allow 规则形状：裸工具名或整工具通配
+    `Tool(*)` 的 Edit/Write/NotebookEdit/Bash（含 --tools 兼容回退生成的同名规则）。
+    只看 allow 侧；deny 是收紧不是授权，原样保留。"""
+    hits = []
+    for rule in allowed_tools or ():
+        if not isinstance(rule, str):
+            continue
+        core = rule.strip()
+        for tool in _CN_MUTATION_TOOL_NAMES:
+            if core == tool or core == tool + '(*)':
+                hits.append(rule)
+                break
+    return hits
+
+
+def validate_cn_allow_rule_shapes(allowed_tools) -> None:
+    """CN 正式派工的 mutation 规则形状门（在容量 claim、建证据目录、Popen 之前）：
+    拒绝裸/整工具通配的 Edit/Write/NotebookEdit/Bash allow 规则，明确要求
+    `Edit(/<工作区相对具体文件>)` 与 `Bash(<登记原样命令>)`。不自动改写或扩大规则；
+    只读调用（Read/Glob/Grep 裸规则、显式空 allow、deny、Write 仅在 --tools 可见性里）
+    一律不受影响。静态门只证明规则形状，不声称真实权限成功。"""
+    bad = cn_bare_mutation_allow_rules(allowed_tools)
+    if not bad:
+        return
+    raise ValueError(
+        'Qoder CN dispatch refuses bare or whole-tool-wildcard mutation allow rules: '
+        + ', '.join(repr(r) for r in bad)
+        + '. Under --permission-mode dont_ask these shapes cannot be approved mid-run; '
+        'the observed real failure mode is the model retrying denied writes via Bash '
+        'touch/ls/rm and redirection. Require explicit scoped rules instead: '
+        'Edit(/<workspace-relative specific file>) for file writes and '
+        'Bash(<registered verbatim command>) for shell commands; keep Write in --tools '
+        'for tool visibility only. Read/Glob/Grep bare rules, deny rules and an '
+        'explicitly empty allow list stay legal; rules are never auto-rewritten or '
+        'widened here. This static gate only proves rule shape — it does not claim the '
+        'real CN permission matcher will accept any rule.')
+
+
 def build_cn_argv(cfg: dict, config_dir: str, model_id: str, workspace: str, tools: str,
                   session_id: str | None, *,
                   allowed_tools=None, disallowed_tools=None,
-                  add_dirs=None) -> list[str]:
+                  add_dirs=None, session_uuid=None) -> list[str]:
     """Qoder CN 原生 EXE 调用的安全参数数组（无 shell），与国际 build_argv 严格区分：
     - 首元素是原生 `cli`（非 node + qodercli.js）；
     - `--config-dir` 承载本机登录态所在配置目录（显式传入、不读默认用户目录）；
     - `--model` 下发的是 config.model_ids 映射出的**真实模型 ID**（非友好名、非 Qwen）。
-    权限/工具可见性/续接口径与国际一致，permission-mode 固定 dont_ask；唯一差异是 CN 在构造
-    argv **之前**拒绝路径限定 Write(...) allow/deny 规则（见 validate_cn_permission_rules）。"""
+    权限/工具可见性/续接口径与国际一致，permission-mode 固定 dont_ask；CN 在构造 argv
+    **之前**运行两个规则门：拒绝路径限定 Write(...) allow/deny 规则
+    （validate_cn_permission_rules），并拒绝裸/整工具通配 mutation allow 规则
+    （validate_cn_allow_rule_shapes，BW-CN-PERMISSION-STOP-S1）。session_id 走官方
+    `--resume`；新会话可经 session_uuid 传官方 `--session-id <UUID>`（主脑已核对官方
+    help 支持该参数；本阶段未联网复验），供会话权限拒绝监视精确定位本会话 jsonl。"""
     perms = effective_permission_rules(tools, allowed_tools,
                                         disallowed_tools, add_dirs)
     validate_cn_permission_rules(perms['allowed_tools'], perms['disallowed_tools'])
+    validate_cn_allow_rule_shapes(perms['allowed_tools'])
     argv = [cfg['cli'], '--config-dir', config_dir,
             '--cwd', workspace, '--model', model_id,
             '--tools', tools, '--permission-mode', 'dont_ask',
@@ -281,14 +349,21 @@ def build_cn_argv(cfg: dict, config_dir: str, model_id: str, workspace: str, too
         argv += ['--add-dir', d]
     if session_id:
         argv += ['--resume', session_id]
+    elif session_uuid:
+        argv += ['--session-id', session_uuid]
     return argv
 
 
 def _norm_path(p: str) -> str:
+    """真实路径 + 平台大小写语义归一（与 qoder_permission_watch._norm_path 同口径）。
+
+    先解析真实路径（Windows 8.3 短名/符号链接等同指针路径归一一致），再按平台大小写语义
+    规范（os.path.normcase）。绝不为了对齐测试而删除工作区/cwd 身份核验。"""
     try:
-        return os.path.normpath(str(Path(p.strip().strip('"')))).rstrip(os.sep).lower()
+        raw = str(p).strip().strip('"')
+        return os.path.normcase(os.path.realpath(raw)).rstrip('\\/')
     except Exception:
-        return p.strip().lower()
+        return str(p).strip().lower()
 
 
 def _extract_field(body: str, names) -> tuple[str | None, str | None]:
@@ -570,6 +645,36 @@ def _explicit_quota_limit_hit(summary):
     return False, None
 
 
+def _minimal_permission_stop(watch_outcome: dict) -> dict:
+    """从监视结果提取最小拒绝事实（不含私人会话正文）。"""
+    denial = watch_outcome.get('denial') or {}
+    return {'terminated_by_watch': bool(watch_outcome.get('terminated_by_watch')),
+            'observed_after_exit': bool(watch_outcome.get('observed_after_exit')),
+            'exit_confirmed': bool(watch_outcome.get('exit_confirmed')),
+            'kind': denial.get('kind'),
+            'tool_use_id': denial.get('tool_use_id'),
+            'observed_at_utc': denial.get('observed_at_utc')}
+
+
+def _save_permission_stop_evidence(out: Path, watch_outcome: dict, watcher) -> str:
+    """保存最小原始拒绝事件/来源/工具ID/观察时间与监视器就绪/错误/停止事实；原始会话
+    文件保留不改，绝不整份拷贝私人流。"""
+    payload = {'saved_at_utc': datetime.now(timezone.utc).isoformat(),
+               'stop': _minimal_permission_stop(watch_outcome),
+               'stop_signal': watch_outcome.get('stop_signal'),
+               'stop_signal_error': watch_outcome.get('stop_signal_error'),
+               'communicate_error': watch_outcome.get('communicate_error'),
+               'exit_wait_error': watch_outcome.get('exit_wait_error'),
+               'denial': watch_outcome.get('denial'),
+               'monitor_facts': watcher.facts(),
+               'note': 'minimal raw denial event only (matched tool_result block + '
+                       'identifying header); the native session jsonl file itself is '
+                       'kept unmodified and is never copied in full'}
+    path = out / 'permission-stop.json'
+    path.write_text(json.dumps(payload, ensure_ascii=False, indent=2), encoding='utf-8')
+    return str(path)
+
+
 def main():
     ap = argparse.ArgumentParser()
     ap.add_argument('--workspace', required=True)
@@ -712,6 +817,18 @@ def main():
                                   'exit_code': 2, 'runtime': RUNTIME_CN,
                                   'reasons': [src_reason]}, ensure_ascii=False))
                 return 2
+        # BW-CN-PERMISSION-STOP-S1：会话权限拒绝监视的会话身份。resume 沿用已验证原
+        # session（--resume）；新调用生成一个独立 UUID 经官方 --session-id 下发并记录。
+        # session id 形状非法（路径逃逸防护）一律拒绝，零 Popen、零证据目录。
+        if args.session_id and not qpw.is_safe_session_id(args.session_id):
+            print(json.dumps({'cn_resume_rejected': True, 'sent': False,
+                              'exit_code': 2, 'runtime': RUNTIME_CN,
+                              'reasons': [f'resume session id is not a safe session '
+                                          f'identifier: {args.session_id!r}']},
+                             ensure_ascii=False))
+            return 2
+        cn_watch_session_id = args.session_id or str(uuid.uuid4())
+        cn_watch_source = 'resume' if args.session_id else 'generated'
     else:
         cfg = load_entry_config(args.config)
     work = Path(args.workspace).resolve(strict=True)
@@ -726,11 +843,14 @@ def main():
     if is_cn:
         # 规则门在容量 claim、建证据目录、Popen 之前：不兼容即受控未派发（sent=false、rc=2、
         # 零 Popen、零输出目录），绝不把崩溃 traceback 留给调用方，也不放宽权限重试。
+        # 新会话同时把生成的独立 UUID 经官方 --session-id 下发（供监视器精确定位本会话）。
         try:
             argv = build_cn_argv(cfg, cn_config_dir, cn_model_id, str(work), args.tools,
                                  args.session_id, allowed_tools=perms['allowed_tools'],
                                  disallowed_tools=perms['disallowed_tools'],
-                                 add_dirs=perms['add_dirs'])
+                                 add_dirs=perms['add_dirs'],
+                                 session_uuid=(None if args.session_id
+                                               else cn_watch_session_id))
         except ValueError as exc:
             print(json.dumps({'cn_permission_rule_rejected': True, 'sent': False,
                               'exit_code': 2, 'runtime': RUNTIME_CN,
@@ -838,6 +958,28 @@ def main():
         # 安全释放（start_failed）再退出，绝不泄漏容量、绝不误抢别人的名额。
         _release_claim('start_failed')
         raise
+    # BW-CN-PERMISSION-STOP-S1：CN 会话权限拒绝监视器（纯标准库、只读会话 jsonl、零网络）。
+    # 在 Popen 之前创建以冻结基线偏移：resume 的旧事件绝不重扫触发。国际路径不建监视器，
+    # 默认 communicate 行为一字不变。
+    watcher = None
+    if is_cn:
+        try:
+            watcher = qpw.SessionDenialWatcher(cn_config_dir, cn_watch_session_id, str(work))
+        except Exception as exc:  # noqa: BLE001 - 形状/IO 异常一律受控未启动，不放宽不重试
+            rel = _release_claim('start_failed')
+            print(json.dumps({'dispatch_failed': True, 'sent': False,
+                              'capacity_released': bool(rel.get('released')),
+                              'reasons': [f'CN permission watch init failed before '
+                                          f'Popen: {exc!r}']}, ensure_ascii=False))
+            return 3
+
+    def _watch_facts_field():
+        """CN 本轮监视事实（是否找到/观察到会话、精确位置、degraded、错误与读取进度）；无监视器
+        （国际路径或监视器未建成）返回空字典，绝不改变国际侧输出形状。**仅留证，不冒充已观察到
+        会话**——未找到会话文件时如实为 session_observed=false；正常结束没有拒绝时也必须能回读
+        本轮监控状态。不新增定时器/DB/前置探针/全局健康门/授权开关。"""
+        return {} if watcher is None else {'cn_watch_facts': watcher.facts()}
+
     # Popen 前的所有准备/序列化/落盘（载荷、契约、request.json）失败都属"已知未启动"：
     # 统一带 owner 身份 settle start_failed、sent=false、零 Popen、只释放本占位，绝不泄漏。
     try:
@@ -880,6 +1022,25 @@ def main():
             request['runtime_name'] = RUNTIME_CN
             request['model_id'] = cn_model_id
             request['resume_verifiable'] = True
+            # 会话权限拒绝监视留证：精确 session 文件、来源（generated/resume）、基线偏移。
+            # 现场布局为 projects/<workspace-key>/<sessionId>.jsonl；新会话文件可能在 Popen
+            # 之后才出现，此时 projects_file=None 且 session_observed=false（绝不宣称已观察到）。
+            request['cn_session_watch'] = {
+                'session_id': cn_watch_session_id,
+                'source': cn_watch_source,
+                'projects_dir': str(Path(cn_config_dir) / 'projects'),
+                'projects_file': str(watcher.path) if watcher.path is not None else None,
+                'session_observed': watcher.path is not None,
+                'baseline_bytes': watcher.baseline_bytes,
+                'baseline_line_number': watcher.baseline_line_number,
+                'poll_interval_seconds': qpw.POLL_INTERVAL_SECONDS,
+                'note': 'incremental watch of exactly this one session jsonl, located by '
+                        'exact uuid filename under config_dir/projects/<workspace-key>/ '
+                        '(never by scanning other sessions); the file may appear after '
+                        'start (new session) with baseline 0 so new events are not '
+                        'swallowed; only sessionId/cwd-bound type=user tool_result '
+                        'permission denials stop the child; monitor facts are recorded, '
+                        'degraded watch is never claimed as protection'}
         if plan_block is not None:
             request['dispatch_plan'] = plan_block
         (out / 'request.json').write_text(json.dumps(request, ensure_ascii=False, indent=2),
@@ -888,7 +1049,8 @@ def main():
         rel = _release_claim('start_failed')
         print(json.dumps({'dispatch_failed': True, 'sent': False,
                           'capacity_released': bool(rel.get('released')),
-                          'reasons': [f'pre-start prep/write failed before Popen: {exc!r}']},
+                          'reasons': [f'pre-start prep/write failed before Popen: {exc!r}'],
+                          **_watch_facts_field()},
                          ensure_ascii=False))
         return 3
     child = None
@@ -905,12 +1067,37 @@ def main():
                 print(json.dumps({'dispatch_failed': True, 'sent': True,
                                   'terminal_state': 'unknown', 'capacity_held': True,
                                   'reasons': [f'could not bind child to claim: '
-                                              f'{bind.get("reasons") or bind.get("reason")}']},
+                                              f'{bind.get("reasons") or bind.get("reason")}'],
+                                  **_watch_facts_field()},
                                  ensure_ascii=False))
                 return 3
             (out / 'process.json').write_text(json.dumps({'pid': child.pid, 'state': 'running'}),
                                               encoding='utf-8')
-            child.communicate(input=stdin_payload)
+            watch_outcome = None
+            if watcher is not None:
+                # CN：communicate 仍恰好一次携 input 送 stdin；主线程 ~0.2s 轮询会话
+                # jsonl，发现真实审批拒绝即只经本 child 对象终止并等待真实退出。
+                watch_outcome = qpw.communicate_with_permission_watch(
+                    child, stdin_payload, watcher,
+                    poll_interval=qpw.POLL_INTERVAL_SECONDS,
+                    stop_grace=qpw.STOP_GRACE_SECONDS)
+                if watch_outcome.get('denial') is not None:
+                    # 先落最小拒绝证据（原始事实），再做终态处置；原始会话文件不动。
+                    _save_permission_stop_evidence(out, watch_outcome, watcher)
+                if not watch_outcome.get('exit_confirmed'):
+                    # 终态无法确认：只标 unknown 继续占容量，绝不释放、绝不误抢；证据已落盘。
+                    dp.mark_unknown(dispatch_store, claim_token)
+                    print(json.dumps({'dispatch_failed': True, 'sent': True,
+                                      'terminal_state': 'unknown', 'capacity_held': True,
+                                      'permission_stop': _minimal_permission_stop(watch_outcome),
+                                      **_watch_facts_field(),
+                                      'reasons': ['child exit could not be confirmed '
+                                                  'after the CN permission-watch stop; '
+                                                  'capacity held as unknown']},
+                                     ensure_ascii=False))
+                    return 3
+            else:
+                child.communicate(input=stdin_payload)
     except KeyboardInterrupt:
         # 中断时子进程存活未知：只标 unknown 继续占容量，绝不释放、绝不误抢，交由 reconcile。
         dp.mark_unknown(dispatch_store, claim_token)
@@ -922,30 +1109,67 @@ def main():
             rel = _release_claim('start_failed')
             print(json.dumps({'dispatch_failed': True, 'sent': False,
                               'capacity_released': bool(rel.get('released')),
-                              'reasons': [f'child launch failed before start: {exc}']},
+                              'reasons': [f'child launch failed before start: {exc}'],
+                              **_watch_facts_field()},
                              ensure_ascii=False))
             return 3
         # 子进程已启动但终态无法确认（communicate 异常）：只标 unknown，保留占位，绝不释放。
         dp.mark_unknown(dispatch_store, claim_token)
         print(json.dumps({'dispatch_failed': True, 'sent': True, 'terminal_state': 'unknown',
                           'capacity_held': True,
-                          'reasons': [f'subprocess terminal state could not be confirmed: {exc}']},
+                          'reasons': [f'subprocess terminal state could not be confirmed: {exc}'],
+                          **_watch_facts_field()},
                          ensure_ascii=False))
         return 3
     # 子进程真实结束 → 先解析真实终态（原始错误/输出完整保留），判定是否明确限额；若明确
     # 限额且真实为三个 Qoder Max 主力之一，则**先落限额标记，再释放本占位**。顺序保证：占位
-    # 未释放（槽仍占用）时先写标记，避免槽一释放另一个 chat 立刻向已知限额池重复提交；落标记
+    # 未释放（槽仍占用）时先写标记，避免槽一释放另一个 chat 立刻向已知限额池重复提交；落标
     # 或任何后续保存失败也必须做真实终态释放（带 owner 身份、不泄漏锁、不谎称已释放）。
+    # BW-CN-PERMISSION-STOP-S1：监视器观察到审批拒绝时，permission_stop 与最小
+    # permission_denials 先行汇入 summary——后续 stdout 解析失败（被终止时往往是部分字节）
+    # 只能追加 parse_error，绝不把权限停止覆盖成 API/模型故障。
+    permission_stop = None
+    if watch_outcome is not None and watch_outcome.get('denial') is not None:
+        _d = watch_outcome['denial']
+        permission_stop = {'terminated_by_watch': bool(watch_outcome.get('terminated_by_watch')),
+                           'observed_after_exit': bool(watch_outcome.get('observed_after_exit')),
+                           'kind': _d.get('kind'),
+                           'tool_use_id': _d.get('tool_use_id'),
+                           'source_file': _d.get('source'),
+                           'line_number': _d.get('line_number'),
+                           'observed_at_utc': _d.get('observed_at_utc'),
+                           'exit_code': child.returncode,
+                           'evidence_file': str(out / 'permission-stop.json'),
+                           'partial_outputs': ('stdout.json/stderr.log saved as-is '
+                                               '(possibly partial because the child was '
+                                               'stopped mid-run)')}
+    stopped_by_watch = bool(permission_stop and permission_stop['terminated_by_watch'])
     summary = {'exit_code': child.returncode, 'finished_at': datetime.now(timezone.utc).isoformat(),
                'model_requested': args.model, 'protocol_success': False,
                'business_verified': False, 'output_dir': str(out)}
+    # BW-CN-PERMISSION-STOP-S3：CN 所有已知终态都随 summary 存本轮监视事实（是否找到/观察到
+    # 会话、位置、degraded、错误与读取进度）——无拒绝的正常结束也必须能回读监控状态；无监视器
+    # 的国际路径不新增字段（形状不变）。
+    summary.update(_watch_facts_field())
+    if permission_stop is not None:
+        summary['permission_stop'] = permission_stop
+    if watch_outcome is not None and watch_outcome.get('communicate_error'):
+        # communicate 在子线程内如实捕获的异常（如 stdin 早关）：终态已另行经 poll/wait
+        # 确认，不掩盖，也不谎称通道无异常。
+        summary['cn_watch_communicate_error'] = watch_outcome['communicate_error']
     report_state = None
     stdout_bytes = None
+    # BW-CN-PERMISSION-STOP-S2：CN 会话身份一致性。入口生成/接续的 session id 必须与最终
+    # envelope.session_id 一致，绝不"监视 A 而接受 B 的报告"。不一致如实记录（不当作认证或
+    # 额度事实），并拒绝对该报告做绑定。国际路径不设该检查，行为一字不变。
+    cn_identity = None
+    cn_identity_ok = True
     try:
         try:
             stdout_bytes = (out / 'stdout.json').read_bytes()
             result = json.loads(stdout_bytes.decode('utf-8'))
-            summary.update(protocol_success=(child.returncode == 0 and result.get('type') == 'result'
+            summary.update(protocol_success=(child.returncode == 0 and not stopped_by_watch
+                                             and result.get('type') == 'result'
                                              and result.get('subtype') == 'success' and result.get('is_error') is False
                                              and result.get('stop_reason') == 'end_turn'),
                            session_id=result.get('session_id'), stop_reason=result.get('stop_reason'),
@@ -953,6 +1177,20 @@ def main():
                            permission_denials=result.get('permission_denials'),
                            result_errors=result.get('errors'),
                            result_errors_info=result.get('errors_info'))
+            if is_cn:
+                env_session_id = summary.get('session_id')
+                cn_identity_ok = (env_session_id is None
+                                  or str(env_session_id) == cn_watch_session_id)
+                cn_identity = {
+                    'watched_session_id': cn_watch_session_id,
+                    'watch_source': cn_watch_source,
+                    'envelope_session_id': env_session_id,
+                    'match': cn_identity_ok,
+                    'note': 'the CN session id generated/resumed by this entry must equal the '
+                            'envelope session_id; a mismatch is recorded honestly and the '
+                            'report is not bound to the watched session — it is never '
+                            'treated as an auth or quota fact'}
+                summary['cn_session_identity'] = cn_identity
             response = result.get('result')
             if isinstance(response, str):
                 (out / 'response.md').write_bytes(response.encode('utf-8'))
@@ -984,6 +1222,45 @@ def main():
             report_state = {'bound': False, 'body_ok': False,
                             'reasons': [f'stdout parse error: {exc}'],
                             'carrier_missing': True}
+        if permission_stop is not None and not summary.get('permission_denials'):
+            # envelope 未自带 permission_denials 时补最小监视拒绝（envelope 自带则原样
+            # 保留）；失败分型据此得出 permission_rule_denied，不被 parse_error 独占。
+            summary['permission_denials'] = [
+                {'tool_use_id': permission_stop['tool_use_id'],
+                 'reason': f"CN session watch observed a real {permission_stop['kind']} "
+                           f"tool denial",
+                 'source': permission_stop['evidence_file']}]
+        if permission_stop is not None and report_state is not None:
+            report_state['permission_stop'] = {
+                k: permission_stop[k] for k in ('terminated_by_watch', 'observed_after_exit',
+                                                'kind', 'tool_use_id', 'evidence_file')}
+            if stopped_by_watch:
+                # 监视器终止的 child：协议按未完成处理，报告一律不绑定（即使部分 stdout
+                # 里碰巧有可解析正文）；permission_stop 事实保留，不因解析结果被改写。
+                report_state['protocol_success'] = False
+                report_state['bound'] = False
+                report_state.setdefault('reasons', []).append(
+                    'CN permission watch terminated this child; protocol incomplete and '
+                    'report binding is refused')
+                _binding = dict(report_state.get('binding') or {})
+                _binding['bound'] = False
+                _binding['protocol_success'] = False
+                _binding.setdefault('reasons', []).append(
+                    'CN permission watch terminated this child; report binding refused')
+                report_state['binding'] = _binding
+        if is_cn and not cn_identity_ok and report_state is not None:
+            # 监视的会话与 envelope 报告的会话不是同一个：如实记录，拒绝把该报告绑到本会话。
+            _identity_reason = ('CN session identity mismatch: the envelope session_id does '
+                                'not match the session this entry watched; the report is not '
+                                'bound to the watched session and is not treated as an auth '
+                                'or quota fact')
+            report_state['cn_session_identity'] = cn_identity
+            report_state['bound'] = False
+            report_state['reasons'] = list(report_state.get('reasons') or []) + [_identity_reason]
+            _binding = dict(report_state.get('binding') or {})
+            _binding['bound'] = False
+            _binding['reasons'] = list(_binding.get('reasons') or []) + [_identity_reason]
+            report_state['binding'] = _binding
         if report_state is not None:
             report_state.setdefault('protocol_success', summary['protocol_success'])
             report_state.setdefault('session_id', summary.get('session_id'))
@@ -996,7 +1273,8 @@ def main():
         # 且 runtime/model 真实为三个 Qoder Max 主力之一时落标。先落标再释放占位，杜绝另一
         # chat 在槽释放后立刻重复提交；落标异常绝不阻断真实终态释放（不泄漏锁）。原始错误与
         # 同时发生的 permission_denials 一并保留，落标不消去任何审批拒绝。
-        if not summary.get('protocol_success'):
+        # 权限监视终止的 attempt 绝不落 quota 标记（拒绝不是额度事实）。
+        if not summary.get('protocol_success') and not stopped_by_watch:
             hit, evidence = _explicit_quota_limit_hit(summary)
             limited_pk = _qoder_max_pool_key(args.runtime, args.model) if hit else None
             if limited_pk is not None:

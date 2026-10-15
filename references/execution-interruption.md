@@ -17,6 +17,19 @@
 - 主脑验收**必须读取原始工具结果与会话/事件流**，不能只看 `permission_denials` 汇要或 exit 0 就放行；汇报中要写清拒绝数量、未完成动作与接续方式。
 - 权限拒绝不得通过更换执行器绕过；也不因一个被拒的额外 `ls` 泛化否定整个测试能力。
 - 不新增未实现的自动杀进程或即时拦截能力宣称；拦截靠流程纪律与验收回读。
+- CN 传输层例外（BW-CN-PERMISSION-STOP-20261015T155930Z-S1/S3，范围仅 `scripts/qoder_direct.py`
+  的 `--runtime qodercn` 分支 + `scripts/qoder_permission_watch.py`）：CN 直连入口现实现**有界
+  机械监视**——Popen 前静态拒绝裸/整工具通配 mutation allow 规则（要求逐文件 `Edit(...)` 与
+  `Bash(原样命令)`），运行期经官方 `--session-id` 按现场路径
+  `projects/<workspace-key>/<精确sessionId>.jsonl` 只读增量读取本会话原生 jsonl，只认 sessionId/cwd
+  绑定的 `type=user` tool_result 且**事件顶层/块内**结构化 `toolDenialKind=permission-rule`、或工具
+  结果**起始处**直接构成的固定拒绝文案（允许可选 `Error:` 前缀；输出中间引用同一句不误停），即经
+  本次 Popen 对象终止并等待真实退出；终态不明确保留 unknown 占位。这不改变本节流程纪律：CN 所有
+  已知终态都随 `summary.cn_watch_facts` 留本轮监控事实（是否找到/观察到会话、degraded、错误与读取
+  进度；未找到即 `session_observed=false`，绝不冒充已观察），监视按约 0.2 秒轮询属非零延迟、读错只
+  记事实不冒充保护、不承诺零后续工具竞态；主脑验收仍必须读原始工具结果与会话流（最小拒绝证据在证据
+  目录 `permission-stop.json`，原始会话文件不改）。实现与边界见
+  [Qoder CN 本机原生直连](qodercn-direct.md)；国际入口与其它执行器无此机制。
 
 ## 3. 真实字段合同（外部接口字段类型）
 
