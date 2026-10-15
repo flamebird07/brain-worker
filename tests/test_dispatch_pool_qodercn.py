@@ -12,12 +12,14 @@ qodercn:Qwen3.8-Max（主力，1 槽）与 qodercn:Qwen3.8-Flash（同级兜底�
 2. CN 与国际跨区域不同 workspace 可并行；同一真实 workspace 仍单写入（互斥）。
 3. 跨 runtime 绝不消费旧 claim（CN token 不能被国际入口消费，反之亦然）。
 4. 子进程真实结束立即释放 CN 名额（终态释放）。
-5. ZCode 被持久 availability hard_hold 时 AUTO 绝不选中 Z（跳过 Z）。
+5. BW-SIMPLE-PRIORITY-RETRY-S4：ZCode 被持久 availability hard_hold 时 AUTO 仍按最高优先级
+   真实尝试（诊断不挡新轮）；显式 executor='zcode' 权威入口同样不再据历史 hold 拒绝。
 
 绝不读写真实/共享池：每例显式临时 store；真实额度/账单不在范围内。
 """
 from __future__ import annotations
 
+import contextlib
 import sys
 import tempfile
 import unittest
@@ -339,27 +341,38 @@ class ZcodeHoldSkipTests(_Store):
                                        classification=classification, now=T0)
         return quota
 
-    def test_auto_skips_zcode_when_hard_hold(self):
+    def test_auto_no_longer_skips_zcode_under_hard_hold(self):
+        # BW-SIMPLE-PRIORITY-RETRY-S5：Z 不再因历史 hard_hold 被剔除候选（`_eligible_main_forces`
+        # 仍含 Z）；但 AUTO 遵循 BW-MAIN-PRIORITY-20261011-S1 层序（三 Qoder Max 层 0 优先于
+        # ZCode 层 2），故 AUTO 请求 Z 会被 routing_required 改派到 QMax（层 0 优先），
+        # 零 Z 启动。放开旧 hold 只代表 Z 合格，不代表 Z 抢过空闲 QMax——显式
+        # executor='zcode' 权威入口仍直接 claim Z，成功/失败 CAS 与 availability 诊断保留不变。
         quota = self._hold()
-        # AUTO 请求 Z 但被 hard_hold → 绝不选中 Z，改道可用主力/溢出。
         r = dp.select_and_claim(self.store, task_id='h', runtime='zcode', model='GLM-5.3',
                                 workspace=self.ws('h'), prompt_sha256='p',
                                 executor='auto', quota_store=quota, now=T0,
                                 _preclaim=False)
-        self.assertFalse(r.get('allowed'))
-        if r.get('routing_required'):
-            self.assertNotEqual(r['selected']['pool_key'], ZCODE)
-        # 显式 executor='zcode' 权威门：被阻断 → zcode_unavailable（不改道 CN/别的）。
+        self.assertFalse(r.get('allowed'), r)
+        self.assertTrue(r.get('routing_required'), r)
+        self.assertEqual(r['selected']['pool_key'], QMAX, r)
+        self.assertEqual(self.active(ZCODE), 0)
+        # Z 仍合格：新政策下 _eligible_main_forces 不据历史 hold 剔除 Z。
+        with contextlib.closing(dp.connect(self.store)) as conn:
+            elig = dp._eligible_main_forces(conn, zcode_blocked=True, now=T0)
+        self.assertIn(ZCODE, elig)
+        # 显式 executor='zcode' 权威入口同样不再据历史 hold 拒绝，直接真实尝试 ZCode 池。
         z = dp.select_and_claim(self.store, task_id='hz', runtime='zcode', model='GLM-5.3',
                                 workspace=self.ws('hz'), prompt_sha256='p',
                                 executor='zcode', quota_store=quota, now=T0,
                                 _preclaim=False)
-        self.assertFalse(z['allowed'])
-        self.assertEqual(z['reason'], 'zcode_unavailable')
+        self.assertTrue(z['allowed'], z)
+        self.assertEqual(z['pool_key'], ZCODE, z)
+        # 历史 availability 诊断原样保留（不假装 healthy、不清 hold）。
+        self.assertTrue(qc.zcode_blocking_rows(quota, now=T0))
 
     def test_cn_claimable_independently_while_zcode_held(self):
         quota = self._hold()
-        # Z 被阻断不影响 CN 内置 Max 独立 claim。
+        # Z 的历史 hold 只是诊断，不挡 CN 独立 claim；新轮 CN 也照常最高优先。
         self.assertTrue(self.cn('cnz')['allowed'])
         self.assertEqual(self.active(CN_MAX), 1)
 

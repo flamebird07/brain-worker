@@ -2,6 +2,8 @@
 
 用户临时停用（BW-CUSTOM-MAX-PAUSE-20261015，覆盖下方旧容量/候选说明）：自2026-10-15起，`qodercn:Qwen-3.8-Max`（Qoder CN自定义、带连字符）暂停所有新派工，直到用户明确恢复。主脑每轮生成AUTO、明确指定或临时兜底计划前，须从实际授权候选集合中排除此精确组合；旧计划、旧会话或夜间时段均不构成恢复授权。若被明确指定或旧预留指向它，应在调用入口前报告“用户已停用，未派发”，不得启动、试调用或静默恢复。只暂停这2个新派工名额，不改派给其他池：原11槽配置保留，当前按授权可新派工最多9槽，既有在途/unknown继续占位直至真实终态自然释放，不终止或抢占。内置`qodercn:Qwen3.8-Max`、国际Max、两区Flash及其他既有规则不变；不删除自定义模型、密钥或历史，不记成额度/认证故障，不查询余额。实现方式为沿用现有授权候选范围裁决；本次未新增脚本级暂停闸门，不宣称旧程序会自动硬拦绕过最新技能的手工调用。
 
+每轮按优先级重试（BW-SIMPLE-PRIORITY-RETRY-S3，覆盖下方旧的「availability/限额先剔除」叙述）：每个新调度轮都从时段/容量/权限/授权与明确停用仍合格的**最高优先级**候选起真实尝试；同一 `runtime:model` 本轮最多一次，真实失败才在本轮换下一个，下一新轮重新从最高优先级起。`dispatch_pool` 的 AUTO 普通候选集合不再据历史 ZCode availability 或三 Qoder Max/Claude `main_force_limits` 剔除（`_eligible_main_forces`/`_domestic_policy` 只保留时段/容量/总守卫/工作区/unknown/权限门）；历史标记仅作诊断，真实尝试失败才落库、成功仍 epoch/attempt CAS，不假装 healthy、不清旧 hold、不伪造成功，普通入口无需 recovery probe。显式 `executor='zcode'` 权威原子门与 `purpose='probe'` 生命周期保持原样兼容。本轮失败列表由主脑经 `stage_selection` 的 authorization JSON（`round_failed_candidates`）维护，仅作本轮内存过滤、绝不落新库/定时器/自动监控，也不扩大 `allowed_candidates` 授权集合；当轮所有已授权候选都试过则诚实无候选、不再派。
+
 
 > 本文件描述 brain-worker 跨会话共享的**并发容量池**：`scripts/dispatch_pool.py`（纯标准库
 > `sqlite3`，**无常驻调度服务**）。它解决的是“同一时刻全系统允许几个真实执行器在跑”，与

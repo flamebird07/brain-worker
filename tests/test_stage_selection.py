@@ -186,12 +186,15 @@ class WindowAndLimitTests(_Base):
         self.assertEqual(r['candidate_filters'][dp.CLAUDE_POOL_KEY], 'eligible')
         self.assertEqual(r['candidate_filters'][dp.ZCODE_POOL_KEY], 'eligible')
 
-    def test_explicit_limit_skips_candidate_without_claiming(self):
+    def test_explicit_limit_no_longer_blocks_new_round(self):
+        """BW-SIMPLE-PRIORITY-RETRY-S3 新用户政策：历史明确限额不再挡一个正常新轮次的
+        真实尝试——QMAX 带限额标记在本轮仍 eligible，绝不因历史标记永久/到期后剔除；
+        真实 429/失败才落诊断、成功/失败 CAS 结算不变。"""
         self.build_store()
         self.set_limit('qoder:Qwen3.8-Max')
         r = self.plan(self.auth('auto', 'T', 's2', ALL_MAINS + ALL_FLASH), now=T_NIGHT)
-        self.assertEqual(r['candidate_filters']['qoder:Qwen3.8-Max'], 'explicitly_limited')
-        self.assertNotEqual(r['selected']['pool_key'], 'qoder:Qwen3.8-Max')
+        self.assertEqual(r['candidate_filters']['qoder:Qwen3.8-Max'], 'eligible')
+        self.assertNotEqual(r['selected']['pool_key'], None)
 
     def test_capacity_full_filter_and_fallback(self):
         self.build_store()
@@ -206,10 +209,10 @@ class NightAutoCustomMaxRegression(_Base):
     """BW-CANDIDATE-SCOPE-S1 需求 3：独立夜间 AUTO 候选回归。绝不查询额度、不扩权、
     不把某 runtime:model 失败泛化成整个 executor，也不把 not_authorized 说成用户撤权。"""
 
-    def test_night_auto_selects_cn_custom_max_when_builtins_limited(self):
-        """7 候选全授权、内置 CN 与国际 Max 已明确限额、Claude 合格时，按既有
-        Max>Claude>Z 优先级选择 CN 自定义 Max，绝不落到 Claude 或 Flash，也不因内置
-        失败泛化到自定义（自定义独立评估）。allowed 全集与逐候选原因如实保留。"""
+    def test_night_auto_no_longer_drops_builtins_with_history_limit(self):
+        """BW-SIMPLE-PRIORITY-RETRY-S3：历史明确限额不再挡新轮——内置 CN/国际 Max 即便带
+        限额标记，本轮仍 eligible，绝不因历史标记把它们剔除；按既有 Max>Claude>Z 优先级
+        选择最高优先层的空位池。allowed 全集与逐候选原因如实保留，不缩权、不假装撤权。"""
         self.build_store()
         self.set_limit('qoder:Qwen3.8-Max')
         self.set_limit('qodercn:Qwen3.8-Max')
@@ -217,12 +220,16 @@ class NightAutoCustomMaxRegression(_Base):
         r = self.plan(self.auth('auto', 'T', 's2', allowed), now=T_NIGHT)
         self.assertEqual(r['refused'], None, r)
         self.assertEqual(sorted(r['allowed_candidates']), sorted(allowed))  # 不缩权
-        self.assertEqual(r['selected']['pool_key'], dp.CN_CUSTOM_MAX_POOL_KEY, r)
+        self.assertEqual(r['candidate_filters']['qoder:Qwen3.8-Max'], 'eligible')
+        self.assertEqual(r['candidate_filters']['qodercn:Qwen3.8-Max'], 'eligible')
+        self.assertEqual(r['candidate_filters'][dp.CN_CUSTOM_MAX_POOL_KEY], 'eligible')
+        self.assertNotIn('explicitly_limited', set(r['candidate_filters'].values()))
+        # 最高优先层（三 Max）有空位即被选中，绝不下探 Claude/Flash/Z
+        self.assertIn(r['selected']['pool_key'], ['qoder:Qwen3.8-Max',
+                                                   'qodercn:Qwen3.8-Max',
+                                                   dp.CN_CUSTOM_MAX_POOL_KEY], r)
         self.assertNotEqual(r['selected']['pool_key'], dp.CLAUDE_POOL_KEY)
         self.assertNotIn(r['selected']['pool_key'], ALL_FLASH)
-        self.assertEqual(r['candidate_filters']['qoder:Qwen3.8-Max'], 'explicitly_limited')
-        self.assertEqual(r['candidate_filters']['qodercn:Qwen3.8-Max'], 'explicitly_limited')
-        self.assertEqual(r['candidate_filters'][dp.CN_CUSTOM_MAX_POOL_KEY], 'eligible')
 
     def test_auto_narrow_cn_scope_stays_cn_others_not_authorized(self):
         """合法用户把 AUTO 范围收窄到只 CN：选择仍在 CN 内，其余区/池如实 not_authorized
@@ -614,24 +621,25 @@ class PermissionGrantsTests(_Base):
         self.assertEqual(r['candidate_filters'][dp.ZCODE_POOL_KEY],
                          'permission_incompatible')
 
-    def test_quota_unavailable_and_permission_incompatible_distinguishable(self):
-        """额度/availability 阻断与权限能力不兼容分别可辨：Z 被阻断且任务需精确
-        grants 时，原因记 permission_incompatible（能力门前置），而仅需 read_dirs
-        之外的 grants 变化时 zcode_unavailable 单独出现——两原因各归各，绝不混写。"""
+    def test_permission_incompatible_and_availability_now_orthogonal(self):
+        """BW-SIMPLE-PRIORITY-RETRY-S3：历史 availability 阻断不再作为普通新轮的过滤
+        原因——Z 被 blocked 时若无精确权限需求，本轮仍 eligible（真实尝试失败才落诊断、
+        CAS 结算不变）；只有真正的权限能力冲突才记 permission_incompatible。两口径互不
+        冒充：zcode_blocked 仅作 receipt 只读诊断，绝不假装 healthy 或清除 hold。"""
         self.build_store()
         with _patch_zcode(False):
-            # 混合 Edit+Bash：无法进受控文件 profile（bash 必须为空），能力门前置，
-            # 即便 Z 被阻断仍记 permission_incompatible；与下面纯 availability 阻断相区分。
+            # 混合 Edit+Bash：无法进受控文件 profile（bash 必须为空），能力冲突前置。
             r = self.plan(self.auth('auto', 'T', 's2', ALL_MAINS + ALL_FLASH),
                           permission_grants=self.FINE)
             self.assertEqual(r['zcode_blocked'], True)
             self.assertEqual(r['candidate_filters'][dp.ZCODE_POOL_KEY],
                              'permission_incompatible', r)
         with _patch_zcode(False):
+            # 无精确权限需求：旧的 availability 阻断不再挡新轮，Z 仍 eligible。
             r = self.plan(self.auth('auto', 'T', 's2', ALL_MAINS + ALL_FLASH))
             self.assertEqual(r['zcode_blocked'], True)
-            self.assertEqual(r['candidate_filters'][dp.ZCODE_POOL_KEY],
-                             'zcode_unavailable', r)
+            self.assertEqual(r['candidate_filters'][dp.ZCODE_POOL_KEY], 'eligible', r)
+            self.assertNotIn('zcode_unavailable', set(r['candidate_filters'].values()))
 
     def test_workspace_inflight_guards_and_readonly_hash_kept_with_grants(self):
         """权限过滤不替代既有守卫：同任务在途/工作区冲突照旧整项拒绝；
@@ -863,10 +871,12 @@ class TaskScopeTests(_Base):
                       task_scope=self.SCOPE)
         self.assertEqual(r['candidate_filters'][dp.ZCODE_POOL_KEY], 'not_authorized')
         with _patch_zcode(False):
+            # BW-SIMPLE-PRIORITY-RETRY-S3：历史 availability 阻断不再挡普通新轮，
+            # task_scope/重试都不改变这点——Z 本轮仍 eligible（诊断 zcode_blocked 保留）。
             r = self.plan(self.auth('auto', 'T', 's2', ALL_MAINS + ALL_FLASH),
                           now=T_DAY, task_scope=self.SCOPE)
-            self.assertEqual(r['candidate_filters'][dp.ZCODE_POOL_KEY],
-                             'zcode_unavailable', r)
+            self.assertEqual(r['zcode_blocked'], True)
+            self.assertEqual(r['candidate_filters'][dp.ZCODE_POOL_KEY], 'eligible', r)
         self.reserve('T', 'zcode', 'GLM-5.3', executor='zcode')
         r = self.plan(self.auth('auto', 'T', 's2', ALL_MAINS + ALL_FLASH),
                       task_scope=self.SCOPE)

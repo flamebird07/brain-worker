@@ -935,27 +935,13 @@ def _resolve_quota_store(quota_store=None):
 
 
 def _zcode_availability_blocked(quota_store=None, now=None, routes_path=None):
-    """只读查询持久 ZCode availability 状态：ZCode:GLM-5.3 是否当前不可用。
-    - BW-AVAILABILITY-20261009-B5：quota_store 未显式给出时，经 `_resolve_quota_store`
-      解析 env/默认持久路径（qc 缺席或无法解析才不查询）；缺库/缺表由只读回核当作"无记录"
-      （可用），绝不建库/建表；
-    - qc 缺席 → 不查询（dp 层旧行为保留）；查询异常 → fail-closed（保守视为不可用）；
-    - 有 blocking 行（backoff 未到期 / hard_hold / recovery_unverified）→ 不可用。
-    绝不写 availability 状态（写入只发生在真实 ZCode 入口的终态结算）。"""
-    store = _resolve_quota_store(quota_store)
-    if store is None or qc is None:
-        return None
-    try:
-        rows = qc.zcode_blocking_rows(store, now=now)
-    except Exception as exc:  # noqa: BLE001 - fail-closed, never assume available
-        return {'blocked': True, 'fail_closed': True,
-                'reasons': ['zcode availability lookup failed; treating ZCode as '
-                            f'unavailable (fail-closed): {exc!r}']}
-    if rows:
-        return {'blocked': True, 'fail_closed': False, 'channels': rows,
-                'reasons': [f'{r.get("channel_key")}: state={r.get("state")} '
-                            f'kind={r.get("kind")} until={r.get("blocked_until_utc")}'
-                            for r in rows]}
+    """BW-SIMPLE-PRIORITY-RETRY-S4 用户政策：普通新一轮**不再据历史 ZCode availability
+    阻断**——每轮从最高优先级真实候选起真实尝试，真实失败才落 availability 诊断、成功仍
+    epoch/attempt CAS 结算。这里对新派工直接返回 None（视为未阻断），且**不读取真实 quota
+    库**（避免每个旧容量测试误读/依赖本机共享状态，也不谎称 provider 侧 healthy/免费）。
+    历史 availability 诊断仍由 qc.zcode_availability_status / qc.zcode_blocking_rows 保留
+    可查；显式 recovery probe（purpose='probe'）生命周期与 epoch CAS 结算完全不变，仅在
+    普通工程路径不再作为派工前置闸。绝不因本函数而永久或到期后挡新轮真实尝试。"""
     return None
 
 
@@ -990,13 +976,15 @@ def _eligible_main_forces(conn, zcode_blocked, now=None):
       时间非 22:00（含）至 08:00（不含）时段的**新派工候选**里剔除（`_max_window_blocks`）；
       ZCode 主力不受时段约束，两地区 Flash 兜底永不被时段/限额误挡。
     先过滤合格候选，再在可用主力间做 best-effort 平衡（绝不把名额分给不可用/已限额/
-    非时段的主力）。"""
+    非时段的主力）。
+    BW-SIMPLE-PRIORITY-RETRY-S3 用户政策：普通 AUTO 轮次不再据**历史** ZCode availability
+    或三 Qoder Max/Claude 的**明确限额**标记剔除候选——每轮直接从最高优先级真实候选起，
+    真实 429/失败才落库保留诊断原件、成功/失败 CAS 结算不变；历史 availability/限额仅作
+    诊断记录，不再永久或到期后挡新轮真实尝试。这里**只保留时段门**（窗口/容量/权限/工作区
+    /unknown/审批拒绝照常，绝不过滤绕过）。`zcode_blocked` 入参保留仅为兼容旧签名/其它
+    调用点与显式 purpose=probe 生命周期；普通候选集不再据此剔除。"""
     eligible = set()
     for k in MAIN_FORCE_KEYS:
-        if k == ZCODE_POOL_KEY and zcode_blocked:
-            continue
-        if _main_force_limit_active(conn, k):
-            continue
         if _max_window_blocks(k, now):
             continue
         eligible.add(k)
@@ -1182,8 +1170,8 @@ def _domestic_policy(conn, requested_pk, now, executor='auto', eligible=None,
                 return 'full', None
             if _max_window_blocks(CLAUDE_POOL_KEY, now):
                 return 'main_force_window_closed', None
-            if _main_force_limit_active(conn, CLAUDE_POOL_KEY):
-                return 'full', None
+            # BW-SIMPLE-PRIORITY-RETRY-S3：历史明确限额标记不再挡普通新一轮（真实尝试失败
+            # 才落诊断、CAS 结算不变）；claude 仍受总守卫与时段门约束，绝不误放第 12 个。
             if _count_active(conn, CLAUDE_POOL_KEY) < capacity_for(CLAUDE_POOL_KEY):
                 return 'claim', CLAUDE_POOL_KEY
             return 'full', None
@@ -1200,11 +1188,12 @@ def _domestic_policy(conn, requested_pk, now, executor='auto', eligible=None,
             # 绝不静默换成同区 Flash，也不为旧测试放宽生产规则。AUTO 改派另由 eligible 过滤。
             if _max_window_blocks(QMAX_POOL_KEY, now):
                 return 'main_force_window_closed', None
-            if not _main_force_limit_active(conn, QMAX_POOL_KEY):
-                cap = capacity_for(requested_pk)
-                if cap is not None and _count_active(conn, requested_pk) < cap:
-                    return 'claim', requested_pk
-            # Max 被明确限额或已满 → 同执行器 Flash 兜底（Max→Flash），绝不复活限额 Max。
+            # BW-SIMPLE-PRIORITY-RETRY-S3：历史明确限额不挡新一轮真实尝试（失败才落诊断、
+            # CAS 结算不变）；Max 有空位即 claim，满了才同执行器 Flash 兜底（Max→Flash），
+            # 绝不跨执行器。
+            cap = capacity_for(requested_pk)
+            if cap is not None and _count_active(conn, requested_pk) < cap:
+                return 'claim', requested_pk
             if capacity_for(QFLASH_POOL_KEY) is not None \
                     and _count_active(conn, QFLASH_POOL_KEY) < capacity_for(QFLASH_POOL_KEY):
                 return 'routing', QFLASH_POOL_KEY
@@ -1222,11 +1211,11 @@ def _domestic_policy(conn, requested_pk, now, executor='auto', eligible=None,
             # reserve/select_and_claim/consume 一律如实拒绝新启动，绝不静默换成同区 CN Flash。
             if _max_window_blocks(CN_MAX_POOL_KEY, now):
                 return 'main_force_window_closed', None
-            if not _main_force_limit_active(conn, CN_MAX_POOL_KEY):
-                cap = capacity_for(requested_pk)
-                if cap is not None and _count_active(conn, requested_pk) < cap:
-                    return 'claim', requested_pk
-            # CN 内置 Max 被明确限额或已满 → CN Flash 兜底（Max→Flash），绝不误挡 Flash。
+            # BW-SIMPLE-PRIORITY-RETRY-S3：历史明确限额不挡新一轮真实尝试；CN 内置 Max
+            # 有空即 claim，满了才 CN Flash 兜底（Max→Flash），绝不误挡 Flash、绝不跨执行器。
+            cap = capacity_for(requested_pk)
+            if cap is not None and _count_active(conn, requested_pk) < cap:
+                return 'claim', requested_pk
             if capacity_for(CN_FLASH_POOL_KEY) is not None \
                     and _count_active(conn, CN_FLASH_POOL_KEY) < capacity_for(CN_FLASH_POOL_KEY):
                 return 'routing', CN_FLASH_POOL_KEY
@@ -1239,10 +1228,12 @@ def _domestic_policy(conn, requested_pk, now, executor='auto', eligible=None,
             # Flash 兜底，绝不误挡 Flash、绝不跨执行器。
             if _max_window_blocks(CN_CUSTOM_MAX_POOL_KEY, now):
                 return 'main_force_window_closed', None
-            if not _main_force_limit_active(conn, CN_CUSTOM_MAX_POOL_KEY):
-                cap = capacity_for(requested_pk)
-                if cap is not None and _count_active(conn, requested_pk) < cap:
-                    return 'claim', requested_pk
+            # BW-SIMPLE-PRIORITY-RETRY-S3：历史明确限额不挡新一轮真实尝试；自定义 CN Max
+            # 有空即 claim，满了才 CN Flash 兜底，绝不误挡 Flash、绝不跨执行器。用户明确
+            # 暂停该自定义组合仍由候选授权范围（不在 allowed/scope 内）体现，不由此限额门表达。
+            cap = capacity_for(requested_pk)
+            if cap is not None and _count_active(conn, requested_pk) < cap:
+                return 'claim', requested_pk
             if capacity_for(CN_FLASH_POOL_KEY) is not None \
                     and _count_active(conn, CN_FLASH_POOL_KEY) < capacity_for(CN_FLASH_POOL_KEY):
                 return 'routing', CN_FLASH_POOL_KEY
@@ -1257,11 +1248,11 @@ def _domestic_policy(conn, requested_pk, now, executor='auto', eligible=None,
     if executor == 'zcode':
         if requested_pk != ZCODE_POOL_KEY:
             return 'executor_conflict', None
-        if zcode_blocked and not probe_allowed:
-            return 'zcode_unavailable', None
-        # 缺陷 4：持有效验过的真实 bound probe 票据时，即便渠道处于 recovery_unverified
-        # （availability 门刚授予本次唯一在飞 probe）也放行这一次有界无副作用 probe 落到
-        # 真实 ZCode 池（受容量/工作区/去重照常约束）；正常派工仍走上面的 zcode_unavailable。
+        # BW-SIMPLE-PRIORITY-RETRY-S4 用户政策：普通新一轮即便调用方/mock 传入历史
+        # availability blocked，也**不因此拒绝**——直接尝试真实 ZCode 池（受容量/工作区/
+        # 去重/unknown 在途照常约束，绝不抢占别人的在途名额）。真实失败才落 availability
+        # 诊断、成功仍 epoch/attempt CAS 结算，不假装 healthy。显式 recovery probe 的
+        # 生命周期/陈旧成功保护由 quota_control 入口与结算独立保证，不在此前置拦截。
         cap = capacity_for(requested_pk)
         if cap is not None and _count_active(conn, requested_pk) < cap:
             return 'claim', requested_pk
@@ -1269,12 +1260,10 @@ def _domestic_policy(conn, requested_pk, now, executor='auto', eligible=None,
 
     # executor == 'auto'
     if requested_pk in MAIN_FORCE_KEYS:
-        if requested_pk == ZCODE_POOL_KEY and zcode_blocked:
-            # 请求 ZCode 但被持久 availability 阻断：改派到可用主力/兜底 Flash，绝不复活 ZCode。
-            target, _ = _select_main_force(conn, requested_pk, now, eligible=elig)
-            if target is not None:
-                return 'routing', target
-            return _flash_fallback_or_full(conn, requested_pk)
+        # BW-SIMPLE-PRIORITY-RETRY-S3：普通 AUTO 不再因历史 availability 把 ZCode 改派走；
+        # ZCode 与其它主力一样进 elig（已不含 availability/限额剔除），按优先级层选择：
+        # 有空位且为最高优先层的候选直接 claim（真实尝试），选中≠请求才 routing，绝不因旧
+        # hard_hold/backoff 标记永久挡新轮。时段/容量/总守卫/unknown/工作区仍照常。
         target, _ = _select_main_force(conn, requested_pk, now, eligible=elig)
         if target is not None:
             if target == requested_pk:
@@ -1720,69 +1709,12 @@ def consume_for_entry(store_path=None, *, task_id, runtime, model, workspace,
                             'reason': 'claim_invalid', 'pool_key': pool_key(runtime, model),
                             'task_id': task_id, 'reasons': check['reasons'],
                             'drift': check['drift']}
-                # BW-AVAILABILITY-20261009-B2：消费已预留 token 前，对 ZCode 组合再核验
-                # 一次持久 availability（预留与消费之间 ZCode 可能刚被真实终态判为不可用）。
-                # 不可用 → 在同一事务内把本 attempt 自己预留的占位（state=reserved）释放为
-                # start_failed（绝不泄漏本任务占位、绝不误抢别人的名额），拒绝启动。
-                if runtime == 'zcode':
-                    zcode_blocked = _zcode_availability_blocked(
-                        quota_store, now=now, routes_path=quota_routes)
-                    # 缺陷 4：消费预留 token 前，若携带经真实 CAS 状态核验过的 bound probe
-                    # 票据，则这次是唯一的有界无副作用 probe，即便 recovery_unverified 也放行
-                    # （不按 unavailable 释放）；正常派工仍按不可用释放本占位。
-                    if zcode_blocked and not _probe_allowed(quota_store, probe_ticket,
-                                                            now=now):
-                        conn.execute(
-                            "UPDATE attempts SET state='start_failed', "
-                            "terminal='start_failed', ended_at_utc=? WHERE token=? "
-                            "AND state='reserved'", (_iso(now), claim_token))
-                        conn.execute('COMMIT')
-                        return {'allowed': False, 'sent': False, 'claimed': False,
-                                'token': None, 'routing_required': False,
-                                'reason': 'zcode_unavailable',
-                                'pool_key': pool_key(runtime, model), 'task_id': task_id,
-                                'capacity_released': True,
-                                'reasons': ['ZCode availability re-check before consuming '
-                                            'the reserved token found ZCode unavailable; '
-                                            'released this attempt\'s own reserved '
-                                            'placeholder (never leaked, never preempting '
-                                            'another task) and refused the start']
-                                + (zcode_blocked.get('reasons') or [])}
-                # BW-POOL-SPLIT-20261010-S5 需求 1：消费已预留 token 前，若本 attempt 的
-                # pool_key 命中主力明确限额标记（仅两个 Qoder Max），在同一事务内把本次
-                # reserved 释放为 start_failed（绝不泄漏本任务占位、绝不抢占别人的名额），
-                # 拒绝启动。非限额池（ZCode/Flash/退休/Luna）永不命中，行为不变。
-                if _main_force_limit_active(conn, row['pool_key']):
-                    cur = conn.execute(
-                        "UPDATE attempts SET state='start_failed', "
-                        "terminal='start_failed', ended_at_utc=? WHERE token=? "
-                        "AND state='reserved'", (_iso(now), claim_token))
-                    if cur.rowcount != 1:
-                        # 本 token 已不在 reserved（running/unknown 旧在途）：CAS 命中 0 行，
-                        # 绝不谎称释放。保留原状态与占位，只拒绝重复启动。
-                        conn.execute('ROLLBACK')
-                        return {'allowed': False, 'sent': False, 'claimed': False,
-                                'token': None, 'routing_required': False,
-                                'reason': 'main_force_limited',
-                                'pool_key': row['pool_key'], 'task_id': task_id,
-                                'capacity_released': False,
-                                'reasons': ['the pool this attempt reserved into carries an '
-                                            'explicit main-force limit marker, but this '
-                                            'attempt is no longer reserved (state='
-                                            + str(row['state']) + '); its original state and '
-                                            'in-flight placeholder are preserved and the '
-                                            'duplicate start is refused (no false release)']}
-                    conn.execute('COMMIT')
-                    return {'allowed': False, 'sent': False, 'claimed': False,
-                            'token': None, 'routing_required': False,
-                            'reason': 'main_force_limited',
-                            'pool_key': row['pool_key'], 'task_id': task_id,
-                            'capacity_released': True,
-                            'reasons': ['the pool this attempt reserved into carries an '
-                                        'explicit main-force limit marker; released this '
-                                        'attempt\'s own reserved placeholder to '
-                                        'start_failed (never leaked, never preempting '
-                                        'another task) and refused the start']}
+                # BW-SIMPLE-PRIORITY-RETRY-S4 用户政策：消费已预留 token 前**不再**据历史
+                # ZCode availability 或主力明确限额（main_force_limits）把本 reserved 释放为
+                # start_failed 并拒绝启动——每轮从最高优先级真实尝试，真实失败才落诊断、成功
+                # 仍 epoch/attempt CAS 结算，不假装 healthy、不清旧 hold。历史 availability /
+                # 限额标记仅作诊断保留（qc.*、main_force_limits 表、status 快照不改）。时段门
+                # （_max_window_blocks）与 unknown 在途/单写入/去重照常，见下方与既有守卫。
                 # BW-MAX-WINDOW-20261010-S1：消费已预留 token 前，若本 attempt 落在两个
                 # Qoder 内置 Max 而当前已不在北京时间主力时段（22:00 含至 08:00 不含）——
                 # 即预留发生在窗口内、真正启动时已跨过 08:00——在同一事务内把本次 reserved

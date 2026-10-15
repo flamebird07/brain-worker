@@ -188,6 +188,10 @@ class QuotaLimitMarker(_ClaudeBase):
         return str(p), hashlib.sha256(p.read_bytes()).hexdigest()
 
     def test_claude_can_carry_and_release_limit_marker(self):
+        # BW-SIMPLE-PRIORITY-RETRY-S4 政策：main_force_limit 标记仅**作诊断保留**
+        # （表/record/read/release API 都不变），consume_for_entry 不再据历史限额标记
+        # 前置挡 reserved→running——每轮从最高优先级真实候选起真实尝试，真实失败才落新
+        # 诊断。这里断言改为：限额标记可诊断读回、consume 真跑通到 running、release 幂等。
         tok2 = self._reserve('c2', 'claude', 'deepseek-flash', 'claude', OFFPEAK_NIGHT)['token']
         ev_path, ev_sha = self._evidence()
         rec = dp.record_main_force_limit(self.store, CLAUDE, task_id='c2', attempt_token=tok2,
@@ -195,16 +199,17 @@ class QuotaLimitMarker(_ClaudeBase):
                                          now=OFFPEAK_NIGHT)
         self.assertTrue(rec['recorded'], rec)
         self.assertTrue(dp.main_force_limited(self.store, CLAUDE, now=OFFPEAK_NIGHT))
-        # consume 的 stage/prompt_sha256 与 reserve 精确一致，才能测到限额标记门。
         c = dp.consume_for_entry(self.store, task_id='c2', runtime='claude',
                                  model='deepseek-flash', workspace=self.ws('c2'),
                                  prompt_sha256='p' + '0' * 63, stage='s', claim_token=tok2,
                                  now=OFFPEAK_NIGHT, executor='claude')
-        self.assertFalse(c['allowed'], c)
-        self.assertEqual(c['reason'], 'main_force_limited')
-        self.assertTrue(c['capacity_released'], c)
+        # 新政策：consume 放行到 running（不再假释放为 start_failed）。
+        self.assertTrue(c['allowed'], c)
+        self.assertEqual(c['pool_key'], CLAUDE, c)
+        self.assertNotIn('capacity_released', c)
         rel = dp.release_main_force_limit(self.store, CLAUDE, note='reset', now=OFFPEAK_NIGHT)
         self.assertTrue(rel['released'], rel)
+        self.assertFalse(dp.main_force_limited(self.store, CLAUDE, now=OFFPEAK_NIGHT))
 
 
 class WindowGateCaliber(unittest.TestCase):

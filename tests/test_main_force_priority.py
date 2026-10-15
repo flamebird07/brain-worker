@@ -166,18 +166,22 @@ class NightMaxPriorityTests(_Base):
         self.seed(CLAUDE, 1)                      # claude 容量 1 → 满
         self.assertEqual(self.select(ZCODE, GAP)[0], ZCODE)
 
-    def test_zcode_when_claude_explicitly_limited(self):
+    def test_claude_history_limit_no_longer_yields_to_zcode(self):
+        # BW-SIMPLE-PRIORITY-RETRY-S3：历史明确限额不再挡普通新轮——claude 带限额标记
+        # 仍进候选集合，按 Max>Claude>Z 优先级仍优先于 Z（并非降回 Z）。
         self.limit(CLAUDE)
-        self.assertEqual(self.select(ZCODE, GAP)[0], ZCODE)
+        self.assertEqual(self.select(ZCODE, GAP)[0], CLAUDE)
 
     def test_zcode_when_claude_peak_window_closed(self):
         # PEAK：Max 窗外 + claude 高峰门关 → 只剩 Z（ZCode 全天，不受时段门）
         self.assertEqual(self.select(ZCODE, PEAK)[0], ZCODE)
 
-    def test_all_mains_unavailable_returns_full(self):
+    def test_history_zcode_hold_no_longer_makes_auto_full(self):
+        # BW-SIMPLE-PRIORITY-RETRY-S3：旧 availability 阻断不再把 Z 从候选剔除；PEAK 下
+        # 三 Max 窗外、claude 高峰关，但 Z 全天可派 → AUTO 新轮直接落 Z，绝不再 main_force_full。
         target, reason = self.select(QMAX, PEAK, zcode_blocked=True)
-        self.assertIsNone(target)
-        self.assertEqual(reason, 'main_force_full')
+        self.assertEqual(target, ZCODE)
+        self.assertEqual(reason, 'main_force_selected')
 
 
 class SameTierBalanceTests(_Base):

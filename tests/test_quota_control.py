@@ -1388,15 +1388,21 @@ class ZCodeEntryReplayTests(unittest.TestCase):
         # 缺原始报告如实保留：无 response.md → 不宣称 bound，不补写报告。
         self.assertFalse(summary['report_bound'])
         self.assertFalse((out1 / 'response.md').exists())
-        # 第二次独立新 output 被 availability hard_hold 挡住：sent=false、退出 2、零 Popen
-        # （counter 不变）、零输出目录（不写 summary.json）。绝不复活不可用的 ZCode。
+        # 第二次独立新 output：BW-SIMPLE-PRIORITY-RETRY-S4 用户政策——普通新一轮不再据历史
+        # availability 挡真实尝试。qc.zcode_availability_gate(purpose='dispatch') 允许通过、
+        # dp.consume_for_entry 消费成功，正式入口第二次仍会真实调用 Popen（每轮从最高优先级
+        # 真实候选起，失败换下一个）。真实失败仍落 availability 诊断（epoch CAS 结算），绝
+        # 不假装 healthy、不清旧 hold；本用例仍要求旧 cooldowns 表不落、unknown-shared 不出现。
         out2 = self.tmp / 'out-1308-again'
-        code2, _, stdout2 = self._run(out2, stdout_bytes, self.REAL_STDERR_FRAME,
-                                      5, counter)
-        self.assertEqual(counter['n'], 1)  # 第二次未派工：availability 门在 Popen 前拒绝
-        self.assertEqual(code2, 2)         # 门禁拒绝退出码（sent=false），非模型 429 的 3
-        self.assertIn('zcode_availability_rejected', stdout2)
-        self.assertFalse((out2 / 'summary.json').exists())
+        code2, summary2, stdout2 = self._run(out2, stdout_bytes, self.REAL_STDERR_FRAME,
+                                             5, counter)
+        self.assertEqual(counter['n'], 2)  # 新轮真实尝试，不再被历史 hold 前置挡
+        self.assertEqual(code2, 3, summary2)  # 真实失败退出（非门前拒 2）
+        self.assertNotIn('zcode_availability_rejected', stdout2)
+        # 独立 availability 诊断：第二次真实 429 再次落 hard_hold（epoch 前进、CAS 结算）。
+        rec2 = summary2['zcode_availability_recorded']
+        self.assertTrue(rec2['recorded'], rec2)
+        self.assertEqual(rec2['state'], 'hard_hold')
         self.assertNotIn(qc.UNKNOWN_SHARED_GROUP, qc.get_status(self.store)['cooldowns'])
 
     def test_structured_stdout_429_empty_stderr_binds_stdout_envelope(self):

@@ -278,11 +278,27 @@ class AvailabilityClassifyTests(_TmpBase):
                          None)
 
     def test_alias_rename_conservative_blocking(self):
-        # routes 缺失 → group=unknown-shared；即便以另一 provider 别名查询，同 group 行仍阻断。
+        # BW-SIMPLE-PRIORITY-RETRY-S4：普通 purpose='dispatch' 现按新政策放行——不据历史
+        # hard_hold/别名同 group 行挡新轮真实尝试；granted_epoch/渠道精确回读、历史诊断
+        # 仍原样在库（不假装 healthy、不清 hold）。旧保守别名跨 provider 匹配只对显式
+        # purpose='probe' 生命周期继续生效：无恢复证据时仍拒绝，绝不凭空授 probe 资格。
         self._hold_zcode()
         g = qc.zcode_availability_gate(self.quota, provider=PROVIDER + '-alias',
                                        routes_path=self.routes, purpose='dispatch', now=T0)
-        self.assertFalse(g['allowed'])
+        self.assertTrue(g['allowed'], g)
+        self.assertFalse(g['probe_granted'], g)
+        # 精确回读当前渠道与 epoch（新别名无精确 availability 行，epoch 为初始 0）。
+        self.assertEqual(g['channel_key'], g['granted_channel_key'], g)
+        self.assertEqual(g['quota_group'], g['granted_quota_group'], g)
+        self.assertEqual(g['availability_epoch'], 0, g)
+        # 诊断原样：blocked rows 仍有 hard_hold 行，未清、未假 healthy。
+        blocking = qc.zcode_blocking_rows(self.quota, now=T0)
+        self.assertTrue(any(r['state'] == 'hard_hold' for r in blocking), blocking)
+        # 显式 purpose='probe' 在无 recovery_unverified 前仍严格拒绝（不放松 probe 状态机）。
+        denied_probe = qc.zcode_availability_gate(self.quota, provider=PROVIDER + '-alias',
+                                                  routes_path=self.routes, purpose='probe',
+                                                  now=T0)
+        self.assertFalse(denied_probe['allowed'], denied_probe)
 
 
 # ============================================================ B. 资格过滤路由
@@ -296,15 +312,23 @@ class DispatchRoutingTests(_TmpBase):
                          (zcode, qoder, qc._iso(T0)))
 
     def test_auto_skips_unavailable_zcode_routes_to_qoder_zero_z_starts(self):
+        # BW-SIMPLE-PRIORITY-RETRY-S4：历史 hard_hold 不再作候选剔除——Z 仍在
+        # `_eligible_main_forces` 里；但 AUTO 仍按主力优先级层（三 Qoder Max > claude > Z）
+        # 择最高，Z 不抢空闲 QMAX。这里断言 Z 未被旧 hold 挡、AUTO 正常路由 QMAX。
+        # 真实失败才落诊断、成功 epoch/attempt CAS 结算保留，不假装 healthy、不清 hold。
         self._hold_zcode()
+        with contextlib.closing(dp.connect(self.dispatch)) as conn:
+            elig = dp._eligible_main_forces(conn, zcode_blocked=None, now=T0)
+        self.assertIn(ZCODE, elig, elig)  # 旧 hold 不再把 Z 从候选集剔除
         out = dp.select_and_claim(self.dispatch, task_id='t1', runtime='zcode',
                                   model='GLM-5.3', workspace=str(self._ws_for('t1')),
                                   prompt_sha256='p', stage='s1', chat_id='c1',
                                   executor='auto', quota_store=self.quota, now=T0)
-        self.assertFalse(out['allowed'])
-        self.assertTrue(out['routing_required'])
-        self.assertEqual(out['selected']['pool_key'], QMAX)
-        self.assertEqual(self._active(ZCODE), 0)  # 零 ZCode 启动
+        # AUTO 按最高优先级层选：QMAX 空位优先于 Z（Z 不抢 Max）。
+        self.assertFalse(out['allowed'], out)
+        self.assertTrue(out['routing_required'], out)
+        self.assertEqual(out['selected']['pool_key'], QMAX, out)
+        self.assertEqual(self._active(ZCODE), 0)  # Z 本轮未被 AUTO 抢，等下一新轮/显式入口
 
     def test_explicit_qoder_not_one_on_one_rerouted_to_zcode(self):
         # 历史 committed_zcode 远高于 qoder，但显式 Qoder 入口有空位一律直接 claim Max。
@@ -318,26 +342,36 @@ class DispatchRoutingTests(_TmpBase):
         self.assertEqual(self._active(ZCODE), 0)
 
     def test_auto_balances_eligible_only(self):
+        # BW-SIMPLE-PRIORITY-RETRY-S4：历史 hard_hold 不再作候选剔除，Z 仍在
+        # `_eligible_main_forces` 里；但 AUTO 按主力优先级层选择，Z 不抢空闲 QMAX——
+        # 反复 AUTO 请求 Z 都如实路由 QMax（真实最高优先），绝不因旧 hold 挡新轮、也
+        # 绝不因 Z 合格就跳过 Max。真实失败才落诊断、成功仍 epoch/attempt CAS 结算。
         self._hold_zcode()
-        # 反复 auto 派工只会落到 Qwen3.8-Max（ZCode 不合格），绝不落 ZCode。
+        with contextlib.closing(dp.connect(self.dispatch)) as conn:
+            elig = dp._eligible_main_forces(conn, zcode_blocked=None, now=T0)
+        self.assertIn(ZCODE, elig, elig)
         for i in range(2):
             out = dp.select_and_claim(self.dispatch, task_id=f'a{i}', runtime='zcode',
                                       model='GLM-5.3', workspace=str(self._ws_for(f'a{i}')),
                                       prompt_sha256='p', stage='s1',
                                       executor='auto', quota_store=self.quota, now=T0)
-            self.assertTrue(out['routing_required'])
-            self.assertEqual(out['selected']['pool_key'], QMAX)
+            self.assertTrue(out['routing_required'], out)
+            self.assertEqual(out['selected']['pool_key'], QMAX, out)
+        # Z 未被 AUTO 抢，等下一轮/显式入口；候选资格仅通过 _eligible_main_forces 体现。
         self.assertEqual(self._active(ZCODE), 0)
 
     def test_zcode_executor_refused_when_unavailable(self):
+        # BW-SIMPLE-PRIORITY-RETRY-S4：显式 executor='zcode' 权威入口不再据历史 availability
+        # 拒绝——直接真实尝试 ZCode 主力池（时段/容量/工作区/unknown 在途/审批拒绝照常）。
+        # 真实失败才落 availability 诊断、成功仍 epoch/attempt CAS 结算；不假装 healthy。
         self._hold_zcode()
         out = dp.consume_for_entry(self.dispatch, task_id='z1', runtime='zcode',
                                    model='GLM-5.3', workspace=str(self._ws_for('z1')),
                                    prompt_sha256='p', stage='s1',
                                    executor='zcode', quota_store=self.quota, now=T0)
-        self.assertFalse(out['allowed'])
-        self.assertEqual(out['reason'], 'zcode_unavailable')
-        self.assertEqual(self._active(ZCODE), 0)
+        self.assertTrue(out['allowed'], out)
+        self.assertEqual(out['pool_key'], ZCODE, out)
+        self.assertEqual(self._active(ZCODE), 1)
 
     def test_executor_conflict(self):
         out = dp.consume_for_entry(self.dispatch, task_id='x1', runtime='zcode',
@@ -348,34 +382,54 @@ class DispatchRoutingTests(_TmpBase):
         self.assertEqual(out['reason'], 'executor_conflict')
 
     def test_consume_token_recheck_releases_placeholder_no_leak(self):
-        # 先用可验证的固定 Z 预留（显式 executor='zcode'，绕过 AUTO 跨层改派
-        # BW-MAIN-PRIORITY-S1），再落 hold 让 availability 发生新阻断，消费时必须再核验并
-        # 释放本占位。
+        # BW-SIMPLE-PRIORITY-RETRY-S4 用户政策：consume_for_entry 消费已预留 token 前
+        # **不再**据历史 ZCode availability 复核释放本占位——每轮直接从最高优先级真实尝试，
+        # 真实失败才落 availability 诊断、成功仍 epoch/attempt CAS 结算，不假装 healthy、
+        # 不清旧 hold（qc.* 状态表/诊断行原样保留）。reserved→running 正常放行，容量真实
+        # 被本次 attempt 占用；结束后走 finish 才释放，无泄漏。时段/工作区/unknown 在途/审批
+        # 拒绝等守卫仍照常，不在本政策撤回范围内。consume/finish 必须携带同一真实 owner
+        # 身份（os.getpid() + process_identity），finish 才能凭 owner 亲证 cancel 释放；
+        # 绝不放松 unknown/owner 校验。
         r = dp.reserve(self.dispatch, task_id='tk', runtime='zcode', model='GLM-5.3',
                        workspace=str(self._ws_for('tk')), prompt_sha256='p', stage='s1',
                        chat_id='c1', executor='zcode', now=T0)
         self.assertTrue(r['reserved'], r)
         self.assertEqual(self._active(ZCODE), 1)
         self._hold_zcode()
+        owner_pid = os.getpid()
+        owner_created = dp.process_identity(owner_pid).get('created')
         out = dp.consume_for_entry(self.dispatch, task_id='tk', runtime='zcode',
                                    model='GLM-5.3', workspace=str(self._ws_for('tk')),
                                    prompt_sha256='p', stage='s1', chat_id='c1',
                                    claim_token=r['token'], executor='zcode',
+                                   wrapper_pid=owner_pid, wrapper_created=owner_created,
                                    quota_store=self.quota, now=T0)
-        self.assertFalse(out['allowed'])
-        self.assertEqual(out['reason'], 'zcode_unavailable')
-        self.assertTrue(out['capacity_released'])
-        # 占位已释放（start_failed），不再占容量：无泄漏。
+        self.assertTrue(out['allowed'], out)
+        self.assertEqual(out['pool_key'], ZCODE, out)
+        self.assertNotIn('capacity_released', out)
+        # 消费后仍在途（running），未因历史 hold 被虚假释放；容量仍被本次 attempt 占用，
+        # 只有真正 finish 才释放——绝不泄漏、绝不双派。owner 身份必须与 consume 一致。
+        self.assertEqual(self._active(ZCODE), 1)
+        fin = dp.finish(self.dispatch, r['token'], terminal='cancelled',
+                        wrapper_pid=owner_pid, wrapper_created=owner_created, now=T0)
+        self.assertTrue(fin['released'], fin)
         self.assertEqual(self._active(ZCODE), 0)
 
     def test_reclaim_skips_blocked_zcode(self):
-        # 降级票据（capacity）只在受信任候选确实排空时记录；claim_due 原子回收只选可用主力
-        # （跳过被 blocked 的 ZCode）。BW-CLAUDE-DEEPSEEK-S4：ZCode blocked 后合格候选
-        # 为两内置 Max（各 1）+ CN 自定义 Max（2）+ 两地区 Flash（各 2）+ claude 第 11 槽
-        # （1）——先把它们全部占满，再释放一个 QMax 名额，回收才会原子落到 QMax，
-        # Z 始终保持 blocked（claude 空槽时降级/回收都必须先如实优先 claude）。
+        # BW-SIMPLE-PRIORITY-RETRY-S4 政策：历史 hold 不再作候选剔除，capacity 降级必须
+        # **真实**填满所有 11 槽（含 ZCode×2）才能记录票据；靠旧 hold 假装 Z 不可用已失效。
+        # 夹具改成在同一临时 dispatch 库上真实 reserved ZCode 两个占位（无真实进程/模型
+        # 调用），再按原意填满其余非 Z 槽 → ask_record 记录 capacity 降级 → 释放一个
+        # QMax 名额 → claim_due 原子回收落到 QMax，Z 仍满不吞新槽。绝不新增机制。
         self._hold_zcode()
         toks = []
+        # 追加 ZCode×2 真实 reserved 占位（同 temp 库、无真实进程）。
+        for i in range(2):
+            r = dp.reserve(self.dispatch, task_id=f'z{i}', runtime='zcode',
+                           model='GLM-5.3', workspace=str(self._ws_for(f'z{i}')),
+                           prompt_sha256='p', stage='s1', now=T0, executor='zcode')
+            self.assertTrue(r.get('allowed') and r.get('token'), r)
+            toks.append(r['token'])
         r = dp.reserve(self.dispatch, task_id='q0', runtime='qoder',
                       model='Qwen3.8-Max', workspace=str(self._ws_for('q0')),
                       prompt_sha256='p', stage='s1', now=T0, executor='qoder')
@@ -416,14 +470,18 @@ class DispatchRoutingTests(_TmpBase):
                             degradation_detail='no available main force for this task',
                             quota_store=self.quota)
         self.assertTrue(ask['recorded'], ask)
-        # 释放一个 QMax 名额 → 合格候选出现空位 → 原子回收落到 QMax（绝不落 ZCode）。
-        self._free_slot(toks[0])
+        # 释放一个 QMax 名额（toks[2] 现是 q0，因为前两位是 Z 占位）→ 合格候选出现空位 →
+        # 原子回收落到 QMax（绝不落 ZCode，Z 仍满不吞新槽）。
+        qmax_tok = toks[2]
+        self._free_slot(qmax_tok)
         out = dp.claim_due(self.dispatch, task_id='rc', now=T0, quota_store=self.quota)
         self.assertTrue(out['claimed'], out)
         self.assertEqual(out['mode'], 'domestic_reclaim')
         self.assertEqual(out['pool_key'], QMAX)
-        # ZCode 保持 blocked：回收从不因 availability hold 被绕开。
-        self.assertEqual(self._active(ZCODE), 0)
+        # 新政策：回收落在被释放的 QMax（不是 Z），Z 的两个真实占位仍在途未被吞并。
+        # availability hold 不再挡新轮，这里通过 out['pool_key']==QMAX 与 Z 保持 2 在途
+        # 表达"回收不会绕开真实在途数把新槽塞给 Z"。
+        self.assertEqual(self._active(ZCODE), 2)
 
 
 # ============================================================ C. Luna 状态机
@@ -504,12 +562,27 @@ class LunaStateMachineTests(_TmpBase):
         self.assertEqual(self._luna_active(), 0)
 
     def test_degradation_ask_allowed_below_six_full_with_evidence(self):
-        self._hold_zcode()
+        """BW-SIMPLE-PRIORITY-RETRY-S5：历史 ZCode hold 不再作为客观证据——S3 起普通轮
+        仍会真实尝试 Z，quota-only ask 必须被拒。这里先真实填满 11 槽，再用
+        degradation_reason='capacity' 记录票据；同时保留对 quota-only ask 的拒绝断言，
+        证明新政策下旧 availability 不足以冒充耗尽。"""
+        # 真实填满 11 槽（含 Z 的两个占位）→ capacity 降级有客观证据。
+        self._fill_six()
         ask = dp.ask_record(self.dispatch, task_id='dg', scope=self._scope('dg'),
-                            ask_message_id='m1', now=T0, degradation_reason='quota',
-                            degradation_detail='ZCode hard hold; Qwen3.8-Max pool full',
+                            ask_message_id='m1', now=T0, degradation_reason='capacity',
+                            degradation_detail='all 11 domestic slots are in-flight',
                             quota_store=self.quota)
         self.assertTrue(ask['recorded'], ask)
+        # 独立任务：即使 _hold_zcode 也不足以支撑 quota-only ask（客观证据必须真实）。
+        self._hold_zcode()
+        quota_only = dp.ask_record(self.dispatch, task_id='dgz', scope=self._scope('dgz'),
+                                   ask_message_id='m1q', now=T0,
+                                   degradation_reason='quota',
+                                   degradation_detail='legacy ZCode hard hold',
+                                   quota_store=self.quota)
+        self.assertFalse(quota_only['recorded'], quota_only)
+        self.assertTrue(any('objective evidence' in r for r in quota_only['reasons']),
+                        quota_only['reasons'])
 
     def test_degradation_quota_without_evidence_refused(self):
         ask = dp.ask_record(self.dispatch, task_id='dg2', scope=self._scope('dg2'),
@@ -519,24 +592,35 @@ class LunaStateMachineTests(_TmpBase):
         self.assertTrue(any('objective evidence' in r for r in ask['reasons']), ask['reasons'])
 
     def test_degradation_timeout_never_substitutes_luna_authorization(self):
+        """S5：quota-only ask（把历史 hold 冒充客观证据）必须被拒；一旦 ask 未记录，
+        就没有票据可到期——超时绝不自动授权 Luna，也不产生任何降级 reason 字段。
+        旧语义"quota 类降级不允许纯超时冒充授权"以新形式（拒录 → 无票据 → 无授权）保留；
+        不删除断言。"""
         self._hold_zcode()
-        dp.ask_record(self.dispatch, task_id='dg3', scope=self._scope('dg3'),
-                      ask_message_id='m1', now=T0, degradation_reason='quota',
-                      degradation_detail='ZCode hard hold', quota_store=self.quota)
-        # 填满六席以进入 Luna 分支（否则国内回收）。
-        self._fill_six()
+        ask = dp.ask_record(self.dispatch, task_id='dg3', scope=self._scope('dg3'),
+                            ask_message_id='m1', now=T0, degradation_reason='quota',
+                            degradation_detail='ZCode hard hold', quota_store=self.quota)
+        self.assertFalse(ask['recorded'], ask)
+        self.assertTrue(any('objective evidence' in r for r in ask['reasons']),
+                        ask['reasons'])
+        # 独立任务下用真实填满 11 槽 + capacity 记录票据（默认 ask 语义）。这里再补一层
+        # 语义：即便有 capacity 票据且已过 301s 截止、无用户回复，也不得由"超时"直接
+        # 授权 Luna——只有用户明确 reply='luna' 才允许（见 test_degradation_explicit_luna_reply_claims）。
+        # 但为保留"超时非授权"的字面语义并与既有 auto-Luna-after-deadline 用例区分，
+        # 此处不建票，只测 quota 拒绝路径 → 无票 → 无 Luna。
         out = dp.claim_due(self.dispatch, task_id='dg3',
                            now=T0 + timedelta(seconds=400), quota_store=self.quota)
         self.assertFalse(out['claimed'], out)
-        self.assertEqual(out.get('degradation_reason'), 'quota')
+        self.assertNotEqual(out.get('degradation_reason'), 'quota')
         self.assertEqual(self._luna_active(), 0)
 
     def test_degradation_explicit_luna_reply_claims(self):
-        self._hold_zcode()
-        dp.ask_record(self.dispatch, task_id='dg4', scope=self._scope('dg4'),
-                      ask_message_id='m1', now=T0, degradation_reason='quota',
-                      degradation_detail='ZCode hard hold', quota_store=self.quota)
+        """S5：capacity 降级 + 用户明确回复 luna 才允许接管；旧 quota-only 路径已作废。"""
         self._fill_six()
+        dp.ask_record(self.dispatch, task_id='dg4', scope=self._scope('dg4'),
+                      ask_message_id='m1', now=T0, degradation_reason='capacity',
+                      degradation_detail='all 11 domestic slots in-flight',
+                      quota_store=self.quota)
         dp.reply(self.dispatch, task_id='dg4', choice='luna', now=T0)
         out = dp.claim_due(self.dispatch, task_id='dg4', now=T0, quota_store=self.quota)
         self.assertTrue(out['claimed'], out)
@@ -635,6 +719,10 @@ class ZCodeEntryAvailabilityTests(_TmpBase):
                 'errors_info': None, 'event_count': 0}
 
     def test_hard_frame_records_hold_and_blocks_second_dispatch(self):
+        # BW-SIMPLE-PRIORITY-RETRY-S4 政策：一次真实 429/1310 仍落 hard_hold 诊断（epoch
+        # 前进、CAS 结算保留），但**新一轮普通派工不再被历史 hold 前置挡**——qc.dispatch 门
+        # 允许、正式入口再次真实尝试；失败仍落新代际 hold，成功仍 epoch CAS 清 healthy。
+        # 绝不假装 healthy、不清旧 hold、不查余额、不自动 probe。
         counter = {'n': 0}
         stdout = json.dumps(self._env_429(), ensure_ascii=False).encode('utf-8')
         out1 = self.tmp / 'o1'
@@ -646,13 +734,15 @@ class ZCodeEntryAvailabilityTests(_TmpBase):
         self.assertEqual(rec['state'], 'hard_hold')
         # 旧 cooldowns 表不落（ZCode 自动冷却禁用）。
         self.assertEqual(qc.get_status(self.quota, now=T0)['cooldowns'], {})
-        # 第二次独立新 output 被 availability 门在 Popen 前挡住：sent=false、退出 2、零 Popen。
+        # 新轮再次真实尝试：入口不再返回 zcode_availability_rejected，Popen 计数 +1。
         out2 = self.tmp / 'o2'
         code2, summary2, stdout2 = self._run(out2, stdout, self.FRAME_1310, 5, counter)
-        self.assertEqual(counter['n'], 1)
-        self.assertEqual(code2, 2)
-        self.assertIn('zcode_availability_rejected', stdout2)
-        self.assertIsNone(summary2)
+        self.assertEqual(counter['n'], 2)
+        self.assertNotIn('zcode_availability_rejected', stdout2)
+        self.assertEqual(code2, 3, summary2)
+        # 新一轮真实 429 又落 hard_hold（诊断保留，不假装 healthy、不清 hold）。
+        rec2 = summary2['zcode_availability_recorded']
+        self.assertTrue(rec2['recorded'] and rec2['state'] == 'hard_hold', rec2)
 
     def test_cancel_exit_code_not_recorded(self):
         counter = {'n': 0}
@@ -678,16 +768,22 @@ class ZCodeEntryAvailabilityTests(_TmpBase):
         stdout = json.dumps(self._env_429(), ensure_ascii=False).encode('utf-8')
         self._run(self.tmp / 'r1', stdout, self.FRAME_1310, 5, counter)
         self.assertEqual(counter['n'], 1)
-        # 人工重置（绑定证据）→ recovery_unverified。
+        # 人工重置（绑定证据）→ recovery_unverified。BW-SIMPLE-PRIORITY-RETRY-S4：普通新一轮
+        # 不再据 recovery_unverified/hard_hold 前置挡——直接真实尝试，失败落新代际 hold、
+        # 成功 epoch CAS 清 healthy。qc 层 purpose='probe' 的单赢家 CAS 与陈旧成功保护照常。
         qc.zcode_manual_reset(self.quota, provider=PROVIDER, quota_group=self.group,
                               routes_path=self.routes, evidence_ref='user-reset',
                               now=T0)
-        # 完整派工仍被拒（必须先过单次 probe）。
         out2 = self.tmp / 'r2'
         code2, _, stdout2 = self._run(out2, stdout, self.FRAME_1310, 5, counter)
-        self.assertEqual(code2, 2)
-        self.assertEqual(counter['n'], 1)
-        self.assertIn('zcode_availability_rejected', stdout2)
+        self.assertNotIn('zcode_availability_rejected', stdout2)
+        self.assertEqual(counter['n'], 2)  # 新轮真实尝试，不再被历史 recovery 前置挡
+        # S5：第二次真实 429 已把上一轮 user-reset 证据失效（epoch 前进、重新 hard_hold）。
+        # probe 资格必须来自**新的**人工重置证据，且与当前 epoch 匹配——沿用旧 evidence_ref
+        # 或放松 probe 状态机/CAS 都不允许。之后成功结算清 healthy，普通派工照常放行。
+        qc.zcode_manual_reset(self.quota, provider=PROVIDER, quota_group=self.group,
+                              routes_path=self.routes, evidence_ref='user-reset-2',
+                              now=T0)
         # 直接把 availability 结算为 healthy（模拟一次成功 probe 核验）。
         st = qc.zcode_availability_status(self.quota, now=T0)
         key = qc.zcode_channel_key(PROVIDER, self.group)
@@ -706,7 +802,7 @@ class ZCodeEntryAvailabilityTests(_TmpBase):
         ok_stdout = json.dumps(ok_env, ensure_ascii=False).encode('utf-8')
         out3 = self.tmp / 'r3'
         code3, summary3, _ = self._run(out3, ok_stdout, b'', 0, counter)
-        self.assertEqual(counter['n'], 2)  # 第三次确实派工（probe 后放行）
+        self.assertEqual(counter['n'], 3)  # 第三次也真实派工（healthy 后放行）
         self.assertEqual(qc.zcode_blocking_rows(self.quota, now=T0), [])
 
     # ---- BW-AVAILABILITY-20261009-B5 缺陷 2：真实 probe 在 Popen 处抛错（child=None） ----
@@ -1057,8 +1153,10 @@ class B4RecoveryEligibilityTests(_TmpBase):
 
 class B4ProbeCapacityGateTests(_TmpBase):
     def test_bound_probe_ticket_passes_capacity_gate(self):
-        # 缺陷 4：持真实绑定 probe 票据时容量门放行这一次有界 probe 落到 ZCode 池；
-        # 无票据的普通派工仍按 zcode_unavailable 拒绝。绝不信任自报 probe 布尔。
+        # BW-SIMPLE-PRIORITY-RETRY-S4 政策：普通派工不再据历史 availability 拒绝；有/无
+        # 有效绑定 probe 票据都真实 claim 到 ZCode 池（时段/容量/工作区/unknown 在途照常）。
+        # 显式 purpose='probe' 生命周期仍由 quota_control 层严格 CAS 保证（stale replay/单次
+        # 赢家/已消耗资格不再凭空重探），与本入口容量门完全独立，绝不信任自报 probe 布尔。
         self._hold_zcode()
         qc.zcode_manual_reset(self.quota, provider=PROVIDER, quota_group=self.group,
                               routes_path=self.routes, evidence_ref='ev', now=T0)
@@ -1067,33 +1165,52 @@ class B4ProbeCapacityGateTests(_TmpBase):
         self.assertTrue(g['probe_granted'])
         ticket = {'provider': PROVIDER, 'channel_key': g['granted_channel_key'],
                   'attempt_id': g['attempt_id'], 'epoch': g['availability_epoch']}
-        # 无票据 → zcode_unavailable
-        denied = dp.select_and_claim(self.dispatch, task_id='p0', runtime='zcode',
-                                     model='GLM-5.3', workspace=str(self._ws_for('p0')),
-                                     prompt_sha256='p', stage='s1', executor='zcode',
-                                     quota_store=self.quota, now=T0)
-        self.assertFalse(denied['allowed'])
-        self.assertEqual(denied['reason'], 'zcode_unavailable')
-        # 有有效票据 → 放行 claim 到 ZCode 池
+        # 无票据 → 新政策下同样 claim 到 ZCode 池（不再前置挡）。
+        plain = dp.select_and_claim(self.dispatch, task_id='p0', runtime='zcode',
+                                    model='GLM-5.3', workspace=str(self._ws_for('p0')),
+                                    prompt_sha256='p', stage='s1', executor='zcode',
+                                    quota_store=self.quota, now=T0)
+        self.assertTrue(plain['allowed'], plain)
+        self.assertEqual(plain['pool_key'], ZCODE, plain)
+        self.assertEqual(self._active(ZCODE), 1)
+        # 有有效票据也允许 claim（票据本身不再被容量门信任，只是 qc 层保留 CAS 生命周期）。
         ok = dp.select_and_claim(self.dispatch, task_id='p1', runtime='zcode',
                                  model='GLM-5.3', workspace=str(self._ws_for('p1')),
                                  prompt_sha256='p', stage='s1', executor='zcode',
                                  quota_store=self.quota, probe_ticket=ticket, now=T0)
         self.assertTrue(ok['allowed'], ok)
         self.assertEqual(ok['pool_key'], ZCODE)
-        self.assertEqual(self._active(ZCODE), 1)
+        self.assertEqual(self._active(ZCODE), 2)
 
     def test_forged_probe_bool_is_still_denied(self):
-        # 缺陷 4：伪造的 probe_ticket（attempt 不匹配真实在飞 probe）仍被拒。
+        # BW-SIMPLE-PRIORITY-RETRY-S4：普通入口已不再据历史 availability 前置拒绝；伪造
+        # probe_ticket 不影响新政策的正常 claim。这里改为断言：真正的严格性由 qc 层 purpose=
+        # 'probe' CAS 保证（陈旧 attempt_id/epoch 一律被 qc 拒绝），与容量门解耦。
         self._hold_zcode()
+        qc.zcode_manual_reset(self.quota, provider=PROVIDER, quota_group=self.group,
+                              routes_path=self.routes, evidence_ref='ev', now=T0)
         bad = {'provider': PROVIDER, 'channel_key': qc.zcode_channel_key(PROVIDER, self.group),
                'attempt_id': 'not-a-real-attempt', 'epoch': 0}
+        # qc 层：伪造票据绝不给 probe 资格（陈旧/错配 attempt_id 一律拒）。
+        denied_probe = qc.zcode_availability_gate(self.quota, provider=PROVIDER,
+                                                  routes_path=self.routes, purpose='probe',
+                                                  now=T0)
+        self.assertTrue(denied_probe['allowed'] and denied_probe['probe_granted'],
+                        denied_probe)
+        forged_ticket = {'provider': PROVIDER,
+                         'channel_key': denied_probe['granted_channel_key'],
+                         'attempt_id': bad['attempt_id'], 'epoch': bad['epoch']}
+        self.assertFalse(qc.zcode_probe_ticket_valid(
+            self.quota, provider=forged_ticket['provider'],
+            channel_key=forged_ticket['channel_key'],
+            attempt_id=forged_ticket['attempt_id'], epoch=forged_ticket['epoch'], now=T0))
+        # dp 层：伪造票据不再被信任，但也不再前置挡正常入口——直接 claim 到 ZCode 池。
         out = dp.select_and_claim(self.dispatch, task_id='p2', runtime='zcode',
                                   model='GLM-5.3', workspace=str(self._ws_for('p2')),
                                   prompt_sha256='p', stage='s1', executor='zcode',
-                                  quota_store=self.quota, probe_ticket=bad, now=T0)
-        self.assertFalse(out['allowed'])
-        self.assertEqual(out['reason'], 'zcode_unavailable')
+                                  quota_store=self.quota, probe_ticket=forged_ticket, now=T0)
+        self.assertTrue(out['allowed'], out)
+        self.assertEqual(out['pool_key'], ZCODE, out)
 
 
 class B4LunaReplyAndConstraintTests(_TmpBase):
@@ -1139,19 +1256,21 @@ class B4LunaReplyAndConstraintTests(_TmpBase):
         self.assertEqual(out['scope'].get('executor'), 'qoder')
 
     def test_zcode_bound_scope_waits_not_luna_when_zcode_blocked(self):
-        # 缺陷 7：scope 明确绑 ZCode，但 ZCode 当前 blocked → 国内回收保持 pending，不 Luna。
+        # S5：历史 hold 不再前置挡本轮——scope 明确绑 ZCode 且 Z 有空位时，直接 claim
+        # 走国内 Z（真实尝试），绝不落 Luna、不扩 scope、不把旧 availability 冒充耗尽。
+        # 用 select_and_claim(executor='zcode') 表达"scope 只 Z"的确定组合。
         self._hold_zcode()
-        sc = self._scope('zb')
-        sc = {**sc, 'executor': 'zcode', 'runtime': 'zcode', 'model': 'GLM-5.3'}
-        ask = dp.ask_record(self.dispatch, task_id='zb', scope=sc, ask_message_id='m1',
-                            now=T0, degradation_reason='quota',
-                            degradation_detail='ZCode hard hold', quota_store=self.quota)
-        self.assertTrue(ask['recorded'], ask)
-        out = dp.claim_due(self.dispatch, task_id='zb', now=T0, quota_store=self.quota)
-        self.assertFalse(out['claimed'], out)
-        self.assertTrue(any('pins this task to ZCode' in r for r in out['reasons']),
-                        out['reasons'])
+        out = dp.select_and_claim(self.dispatch, task_id='zb', runtime='zcode',
+                                  model='GLM-5.3', workspace=str(self._ws_for('zb')),
+                                  prompt_sha256='p', stage='s1', executor='zcode',
+                                  quota_store=self.quota, now=T0)
+        self.assertTrue(out.get('allowed'), out)
+        self.assertEqual(out['pool_key'], ZCODE)
+        # 不产生 Luna、不扩 scope：Z 直接 claim，Luna 池 active=0。
         self.assertEqual(dp.status(self.dispatch, now=T0)['pools'][dp.LUNA_KEY]['active'], 0)
+        self.assertEqual(self._active(ZCODE), 1)
+        # 且旧诊断行仍在（availability hold 保留为诊断，不冒充 healthy、也不挡本轮真实回收）。
+        self.assertTrue(qc.zcode_blocking_rows(self.quota, now=T0))
 
 
 class B4ComboExplicitTests(_TmpBase):
@@ -1386,19 +1505,31 @@ class B5ReconcileIdentityTests(_TmpBase):
 
 
 class B5DefaultAvailabilityTests(_TmpBase):
-    """缺口 5：默认（env/无显式参）AUTO 也读取共享 availability，过滤不可用 Z、缺库零写。"""
+    """BW-SIMPLE-PRIORITY-RETRY-S4 政策：默认（env/无显式参）AUTO 也不再据历史 availability
+    过滤不可用 ZCode——每轮从最高优先级真实候选起真实尝试；缺库零写仍成立（qc 只读、无写）；
+    绝不因旧 hard_hold 挡新轮、也绝不假装 healthy。"""
 
     def test_default_auto_filters_unavailable_zcode_from_env(self):
-        self._hold_zcode()  # hard_hold 写进 self.quota
+        # S5：历史 hold 不再作为候选剔除，但 AUTO 仍按 BW-MAIN-PRIORITY-20261011-S1 层序
+        # 走最高优先级真实候选（Qoder Max 层 0 优先于 ZCode 层 2）；Z 保留在
+        # _eligible_main_forces 中（不被历史 hold 剔除），AUTO 会 routing_required 到 QMax，
+        # 零 Z 启动；qc 层旧 hard_hold 诊断行仍原样保留（不假称 healthy、也不冒充耗尽）。
+        self._hold_zcode()
         with mock.patch.dict(os.environ, {'BRAIN_WORKER_QUOTA_STORE': str(self.quota)}):
             out = dp.select_and_claim(self.dispatch, task_id='dz', runtime='zcode',
                                       model='GLM-5.3', workspace=str(self._ws_for('dz')),
                                       prompt_sha256='p', stage='s1', executor='auto',
                                       now=T0)
-        self.assertEqual(self._active(ZCODE), 0, out)  # 默认也过滤：零 ZCode 启动
         self.assertFalse(out['allowed'], out)
-        self.assertTrue(out['routing_required'], out)
-        self.assertEqual(out['selected']['pool_key'], QMAX)
+        self.assertTrue(out.get('routing_required'), out)
+        self.assertEqual(out['selected']['pool_key'], QMAX, out)
+        self.assertEqual(self._active(ZCODE), 0)
+        # Z 依然合格：新政策下 _eligible_main_forces 不据历史 hold 剔除 Z。
+        with contextlib.closing(dp.connect(self.dispatch)) as conn:
+            elig = dp._eligible_main_forces(conn, zcode_blocked=True, now=T0)
+        self.assertIn(ZCODE, elig)
+        # 历史 hold 诊断保留，未清、未假称 healthy。
+        self.assertTrue(qc.zcode_blocking_rows(self.quota, now=T0))
 
     def test_default_missing_db_zero_writes_keeps_zcode_eligible(self):
         missing = self.tmp / 'no-quota.sqlite3'

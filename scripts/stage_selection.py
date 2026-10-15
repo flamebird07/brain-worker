@@ -141,6 +141,31 @@ def _normalize_permission_grants(grants):
     return norm
 
 
+def _normalize_round_failed(raw):
+    """本轮已真实尝试失败的 pool_key 列表（BW-SIMPLE-PRIORITY-RETRY）：由**主脑当前轮**
+    在 authorization JSON 里维护的内存入参，只作本轮过滤输入，不落新库/表/服务/定时器，
+    下一新轮不传或传空即重新从最高优先级开始。严格校验，绝不猜：
+    - None/缺省 → 空列表（新轮，无历史失败）；
+    - 裸字符串一律拒绝（防把 'zcode:GLM-5.3' 逐字符当 set）；
+    - 必须是非空 pool_key 字符串列表，空白/非字符串元素拒绝；
+    - 只过滤本轮，绝不改变完整 allowed_candidates 授权集合，也不因失败项扩权。
+    返回归一后的列表副本，绝不突变调用方原对象。"""
+    if raw is None:
+        return []
+    if isinstance(raw, str):
+        raise ValueError('round_failed_candidates must be a list of pool_key strings, '
+                         'not a bare string (would be split char-by-char)')
+    if not isinstance(raw, list):
+        raise ValueError('round_failed_candidates must be a JSON list')
+    out = []
+    for x in raw:
+        if not isinstance(x, str) or not x or x != x.strip():
+            raise ValueError('round_failed_candidates must contain non-empty, '
+                             'untrimmed pool_key strings')
+        out.append(x)
+    return out
+
+
 def _normalize_task_scope(scope):
     """task_scope（BW-PERMISSION-SCOPE-S1）：普通已授权隔离工程的文件/测试/只读参考
     目标清单，结构复用 grants 的 edits/bash/read_dirs 字典。与 permission_grants（硬
@@ -238,12 +263,24 @@ def _permission_incompatibility_details(filters, requirements):
 
 
 def _filter_candidates(conn, allowed, zcode_blocked, now, requirements=None,
-                       controlled_file_ok=False):
+                       controlled_file_ok=False, round_failed=None):
     """逐候选只读过滤，返回 (通过集合, {pk: 拒绝原因})。
-    未授权/权限能力/时段/明确限额/容量 分开记录；ZCode 复用既有 availability 口径。
-    `permission_incompatible` 与 `zcode_unavailable`（额度/availability）、
-    `not_authorized`（不在授权集合）分别为可辨原因，绝不互相冒充。"""
+    未授权/权限能力/本轮已试/时段/容量 分开记录。
+    `permission_incompatible`（能力冲突）与 `not_authorized`（不在授权集合）分别为可辨
+    原因，绝不互相冒充。
+    BW-SIMPLE-PRIORITY-RETRY-S3 用户政策：普通轮次不再据**历史** ZCode availability
+    （`zcode_blocked`）或**明确限额**标记（`main_force_limits`）剔除候选——每轮都从最高
+    优先级真实候选起，真实 429/失败才落库保留诊断原件、成功/失败 CAS 结算不变；历史
+    标记仅作诊断，不再挡新轮真实尝试。`zcode_blocked` 仍作只读诊断回显在 receipt，
+    但不再产生 `zcode_unavailable` 过滤原因。时段/容量/权限能力/明确 model 约束/
+    workspace/unknown 在途/审批拒绝**照常**，绝不通过重试绕过。
+    调用方传入本轮已真实尝试失败的 pool_key 列表 `round_failed_candidates`（内存入参，
+    不落新库/新表/新服务）时，本轮命中者标 `already_tried_this_round`，同一 runtime:model
+    本轮最多一次；下一新轮调用者不传或传空列表即重新从最高优先级开始，绝不永久挡新轮。
+    allowed_candidates 授权集合本身不变，仍完整回显；失败项若本就不在授权集合内只是被
+    忽略，绝不因此扩大授权集合。"""
     requirements = requirements or {'fine_grained': False, 'read_dirs': False}
+    failed_this_round = set(round_failed or [])
     filters, passed = {}, []
     for pk in allowed:
         if not _allowed_candidate(pk):
@@ -252,14 +289,11 @@ def _filter_candidates(conn, allowed, zcode_blocked, now, requirements=None,
         if _permission_incompatible(pk, requirements, controlled_file_ok):
             filters[pk] = 'permission_incompatible'
             continue
-        if pk == dp.ZCODE_POOL_KEY and zcode_blocked:
-            filters[pk] = 'zcode_unavailable'
+        if pk in failed_this_round:
+            filters[pk] = 'already_tried_this_round'
             continue
         if dp._max_window_blocks(pk, now):
             filters[pk] = 'window_closed'
-            continue
-        if dp._main_force_limit_active(conn, pk):
-            filters[pk] = 'explicitly_limited'
             continue
         cap = dp.capacity_for(pk)
         if cap is not None and dp._count_active(conn, pk) >= cap:
@@ -312,7 +346,8 @@ def _relational_select(conn, mode, auth, allowed, passed, now):
 
 def plan_stage_selection(authorization, *, previous=None, store_path=None, quota_store=None,
                          task_id=None, stage=None, workspace=None, now=None,
-                         permission_grants=None, task_scope=None):
+                         permission_grants=None, task_scope=None,
+                         round_failed_candidates=None):
     """只读规划：返回最小 receipt；任何冲突整项拒绝（selected=None + refused 原因）。
 
     `permission_grants`（可选，与 authorization 分开）：当阶段实际所需的最小权限
@@ -332,6 +367,7 @@ def plan_stage_selection(authorization, *, previous=None, store_path=None, quota
         'authorization_quote': auth.get('quote'),
         'authorization_scope': auth.get('authorization_scope'),
         'allowed_candidates': list(auth.get('allowed_candidates') or []),
+        'round_failed_candidates': [],
         'fallback_scope': auth.get('fallback_scope'),
         'reselection_due': False,
         'session_reuse_allowed': False,
@@ -353,6 +389,18 @@ def plan_stage_selection(authorization, *, previous=None, store_path=None, quota
 
     if not isinstance(authorization, dict):
         return _refuse('missing_authorization')
+    # 本轮失败列表 BW-SIMPLE-PRIORITY-RETRY-S3：优先取调用方显式关键字入参，否则从
+    # authorization JSON 的 round_failed_candidates 读取（主脑当前轮维护、CLI 经
+    # --authorization-json 传入）。严格校验、畸形拒绝、绝不猜；只在授权集合内做本轮
+    # 过滤，绝不扩大 allowed_candidates，下一新轮不传即空、重新从最高优先级开始。
+    raw_round_failed = (round_failed_candidates
+                        if round_failed_candidates is not None
+                        else auth.get('round_failed_candidates'))
+    try:
+        round_failed = _normalize_round_failed(raw_round_failed)
+    except ValueError as exc:
+        return _refuse('invalid_round_failed_candidates', str(exc))
+    receipt['round_failed_candidates'] = list(round_failed)
     # task_scope 严格直查（BW-PERMISSION-SCOPE-S1）：畸形输入拒绝、不猜测；只进回执，
     # 不参与能力过滤/授权，绝不突变调用方原对象，也绝不弱化 permission_grants 硬合同。
     try:
@@ -496,7 +544,8 @@ def plan_stage_selection(authorization, *, previous=None, store_path=None, quota
                 return _refuse('no_eligible_candidate')
 
         passed, filters = _filter_candidates(conn, eff_allowed, zcode_blocked, now,
-                                             requirements, controlled_file_ok)
+                                             requirements, controlled_file_ok,
+                                             round_failed=round_failed)
         receipt['candidate_filters'] = _per_candidate_view(eff_allowed, filters)
         receipt['permission_incompatibility_details'] = _permission_incompatibility_details(
             receipt['candidate_filters'], requirements)

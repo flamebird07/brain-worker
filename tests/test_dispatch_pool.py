@@ -1000,41 +1000,39 @@ class MainForceLimitTests(_PoolBase):
         self.assertIsNone(snap['release_note'])
 
     def test_consume_for_entry_releases_reserved_on_limited(self):
-        """consume 前发现本池已 limited → 在同一事务内把本次 reserved CAS 到
-        start_failed；返回 allowed=False/sent=False/capacity_released=True；
-        另一 attempt 的 reserved 完全不受影响（不越权释放别人的占位）。"""
-        # 先用显式 executor 把 QMax 名额 reserved 出来（此时尚未落标 → claim OK）
+        """BW-SIMPLE-PRIORITY-RETRY-S4 政策：consume_for_entry 消费已预留 token 前不再据
+        main_force_limit 释放本 reserved 拒启动——新一轮从最高优先级真实尝试，历史限额标记
+        仅作诊断（main_force_limits 表/limited 状态/limits API 均原样保留）。同 workspace 单
+        写、时段门、unknown 在途、审批拒绝等守卫照常，本用例只验证 consume 真跑通到 running、
+        不越权释放别人的占位。"""
         tok = self.reserve_exec('c1', 'qoder', 'Qwen3.8-Max', 'qoder', pk=self.QMAX)
-        # 独立池 CN Max 的另一个 reserved：本用例结束后必须仍是 reserved（不被越权释放）。
         tok_cn = self.reserve_exec('c2', 'qodercn', 'Qwen3.8-Max', 'qodercn',
                                    pk=self.CNMAX)
-        # 再对该 QMax 池落标（绑定当前 attempt 与真实证据文件）
         ev, sha = self._evidence('c1.json', payload='limited evidence\n')
         rec = dp.record_main_force_limit(self.store, self.QMAX, task_id='c1',
                                          attempt_token=tok, evidence_path=ev,
                                          evidence_sha256=sha, now=T0)
         self.assertTrue(rec['recorded'], rec)
+        # 诊断口径：main_force_limited 仍如实反映限额行（不清、不假称 healthy）。
         self.assertTrue(dp.main_force_limited(self.store, self.QMAX, now=T0))
-        # consume 前先查限额命中 → 释放本次 reserved 到 start_failed，拒启动。
+        # 但入口 consume 不再据此前置挡：reserved→running 正常放行、capacity 由本 attempt 持有。
         out = dp.consume_for_entry(self.store, task_id='c1', runtime='qoder',
                                    model='Qwen3.8-Max',
                                    workspace=str(self._ws_for('c1')),
                                    prompt_sha256='p', claim_token=tok,
                                    now=T0 + timedelta(seconds=2))
-        self.assertFalse(out['allowed'], out)
-        self.assertFalse(out['sent'], out)
-        self.assertFalse(out['claimed'], out)
-        self.assertEqual(out['reason'], 'main_force_limited', out)
+        self.assertTrue(out['allowed'], out)
+        self.assertTrue(out['claimed'], out)
         self.assertEqual(out['pool_key'], self.QMAX, out)
-        self.assertTrue(out['capacity_released'], out)
-        # 本次 reserved 已释放到 start_failed（不泄漏）。
-        self.assertEqual(self._state(tok), 'start_failed')
-        # 别人的 CN Max reserved 完全不动。
+        self.assertNotIn('capacity_released', out)
+        self.assertEqual(self._state(tok), 'running')
+        # 别人的 CN Max reserved 完全不动（同 workspace 单写/去重仍照常）。
         self.assertEqual(self._state(tok_cn), 'reserved')
 
     def test_consume_for_entry_running_token_not_falsely_released(self):
-        """running 旧 token 遇限额：UPDATE WHERE state=reserved 命中 0 行，绝不谎称
-        capacity_released。保留原 running 状态与在途占位，只拒绝重复启动。"""
+        """BW-SIMPLE-PRIORITY-RETRY-S4：consume 不再据 main_force_limit 前置挡；running
+        旧 token 重放仍走 CAS reserved→running 单赢家路径，UPDATE WHERE state=reserved 命中
+        0 行 → 拒重复启动、绝不谎称 capacity_released，保留原 running 状态与在途占位。"""
         tok = self.reserve_exec('rn', 'qoder', 'Qwen3.8-Max', 'qoder', pk=self.QMAX)
         ws = str(self._ws_for('rn'))
         first = dp.consume_for_entry(self.store, task_id='rn', runtime='qoder',
@@ -1055,15 +1053,17 @@ class MainForceLimitTests(_PoolBase):
                                    now=T0 + timedelta(seconds=2))
         self.assertFalse(out['allowed'], out)
         self.assertFalse(out['sent'], out)
-        self.assertEqual(out['reason'], 'main_force_limited', out)
+        # CAS 命中 0 行 → 拒重复消费，绝不假释放。
+        self.assertEqual(out['reason'], 'consume_conflict', out)
         self.assertEqual(out['pool_key'], self.QMAX, out)
-        self.assertFalse(out['capacity_released'], out)
+        self.assertNotIn('capacity_released', out)
         self.assertEqual(self._state(tok), 'running')
         self.assertEqual(dp.status(self.store, now=T0)['pools'][self.QMAX]['active'], 1)
 
     def test_consume_for_entry_unknown_token_not_falsely_released(self):
-        """ACTIVE_STATES 实际含 'unknown'（非 launch_unknown）：unknown 旧 token 遇限额同样
-        不得假释放，保留原 unknown 状态与占位，拒绝重复启动。"""
+        """BW-SIMPLE-PRIORITY-RETRY-S4：consume 不再据 main_force_limit 前置挡；unknown
+        旧 token 重放走 CAS reserved→running 单赢家路径，UPDATE WHERE state=reserved 命中 0
+        行 → 拒重复启动，绝不假释放，保留原 unknown 状态与在途占位。"""
         self.assertIn('unknown', dp.ACTIVE_STATES)
         tok = self.reserve_exec('uk', 'qoder', 'Qwen3.8-Max', 'qoder', pk=self.QMAX)
         ws = str(self._ws_for('uk'))
@@ -1082,9 +1082,9 @@ class MainForceLimitTests(_PoolBase):
                                    now=T0 + timedelta(seconds=2))
         self.assertFalse(out['allowed'], out)
         self.assertFalse(out['sent'], out)
-        self.assertEqual(out['reason'], 'main_force_limited', out)
+        self.assertEqual(out['reason'], 'consume_conflict', out)
         self.assertEqual(out['pool_key'], self.QMAX, out)
-        self.assertFalse(out['capacity_released'], out)
+        self.assertNotIn('capacity_released', out)
         self.assertEqual(self._state(tok), 'unknown')
         self.assertEqual(dp.status(self.store, now=T0)['pools'][self.QMAX]['active'], 1)
 
@@ -1129,8 +1129,11 @@ class MainForceLimitTests(_PoolBase):
         self.assertFalse(dp.main_force_limited(self.store, self.CUSTOMMAX, now=T0))
 
     def test_consume_for_entry_custom_max_limited_releases_to_start_failed(self):
-        """自定义 CN 主力命中限额：consume_for_entry 前查限额，把本 reserved 释放为
-        start_failed（真释放不泄漏），拒启动；同区内置 CN Max 的 reserved 完全不动。"""
+        """BW-SIMPLE-PRIORITY-RETRY-S4：consume_for_entry 不再据 main_force_limit 前置挡。
+        用户对自定义 CN 主力 qodercn:Qwen-3.8-Max 的**明确暂停**通过候选授权范围
+        （allowed_candidates 不含该组合）实现——不是靠历史限额标记。限额标记仅作诊断保留
+        （record/read/release API 与 main_force_limits 表原样存在）。同区内置 CN Max 的
+        reserved 完全不受影响。"""
         tok_cx = self.reserve_exec('cxl', 'qodercn', 'Qwen-3.8-Max', 'qodercn',
                                    pk=self.CUSTOMMAX)
         tok_cn = self.reserve_exec('cnkeep', 'qodercn', 'Qwen3.8-Max', 'qodercn',
@@ -1144,12 +1147,12 @@ class MainForceLimitTests(_PoolBase):
                                    workspace=str(self._ws_for('cxl')),
                                    prompt_sha256='p', claim_token=tok_cx,
                                    now=T0 + timedelta(seconds=2))
-        self.assertFalse(out['allowed'], out)
-        self.assertFalse(out['sent'], out)
-        self.assertEqual(out['reason'], 'main_force_limited', out)
+        # 新政策：consume 正常放行到 running，绝不因历史限额标记虚假释放为 start_failed。
+        self.assertTrue(out['allowed'], out)
+        self.assertTrue(out['claimed'], out)
         self.assertEqual(out['pool_key'], self.CUSTOMMAX, out)
-        self.assertTrue(out['capacity_released'], out)
-        self.assertEqual(self._state(tok_cx), 'start_failed')
+        self.assertNotIn('capacity_released', out)
+        self.assertEqual(self._state(tok_cx), 'running')
         # 内置 CN Max 的 reserved 不受自定义限额影响。
         self.assertEqual(self._state(tok_cn), 'reserved')
 

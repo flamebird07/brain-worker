@@ -703,9 +703,31 @@ def zcode_availability_gate(store_path, *, provider, routes_path=None, identity=
     group = resolution['quota_group']
     key = zcode_channel_key(provider, group)
     attempt_id = uuid.uuid4().hex
+    # BW-SIMPLE-PRIORITY-RETRY-S2 用户最新政策：普通派工（purpose='dispatch'）不再据
+    # 历史 zcode_availability 行挡新轮真实尝试——每轮直接从最高优先级候选起，真实 429
+    # 落库保留诊断原件、成功/失败 CAS 结算不变，只是不再作为派工前置闸。显式
+    # purpose='probe'（--quota-recovery-probe）仍走下方原有 recovery_unverified + 单次
+    # CAS 单赢家 + 已消耗资格不再凭空重探的严格生命周期，保持陈旧成功保护。
     with closing(_connect(store_path)) as conn:
         conn.execute('BEGIN IMMEDIATE')
         try:
+            if purpose == 'dispatch':
+                exact = conn.execute('SELECT * FROM zcode_availability WHERE '
+                                     'channel_key=?', (key,)).fetchone()
+                granted_epoch = exact['epoch'] if exact is not None else 0
+                state_now = exact['state'] if exact is not None else 'available'
+                conn.execute('COMMIT')
+                return {'allowed': True, 'sent': False, 'provider': provider,
+                        'quota_group': group, 'channel_key': key,
+                        'granted_channel_key': key, 'granted_quota_group': group,
+                        'granted_provider': provider,
+                        'resolution': resolution, 'purpose': purpose,
+                        'attempt_id': attempt_id, 'availability_epoch': granted_epoch,
+                        'probe_granted': False, 'state': state_now, 'reasons': [],
+                        'note': ('BW-SIMPLE-PRIORITY-RETRY-S2: normal dispatch no longer '
+                                 'consults historical availability; real 429 still '
+                                 'recorded as new state, success still CAS on epoch; '
+                                 'no healthy claim about provider-side quota/billing')}
             rows = conn.execute('SELECT * FROM zcode_availability').fetchall()
             matching = [r for r in rows
                         if r['provider'] == provider or r['quota_group'] == group]

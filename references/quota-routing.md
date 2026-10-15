@@ -1,5 +1,18 @@
 # Quota Routing & Persistent Cooldown（BW-QUOTA-20261008-S1，S2/S3 修订）
 
+> **最新政策覆盖（BW-SIMPLE-PRIORITY-RETRY-S3，优先于下文旧叙述）：** 用户决定「反复试不是
+> 问题，每轮从优先级最高的候选起，不做复杂设计」。每个新调度轮都从时段/容量/权限/授权与明确
+> 停用仍合格的**最高优先级**候选开始真实尝试；同一 `runtime:model` 本轮最多试一次，真实调用
+> 失败才在本轮换下一个，下一新轮重新从最高优先级起。历史 ZCode availability（旧 hard_hold /
+> 退避 / 未来时间）与三 Qoder Max/Claude 的 `main_force_limits` **不再挡普通新一轮**：诊断原件
+> 保留，成功仍 epoch/attempt CAS、失败仍记录真实错误，不假装 healthy、不清旧 hold、不伪造
+> 成功。普通入口**无需** recovery probe；显式 `purpose='probe'` 生命周期与陈旧成功保护按原样
+> 兼容保留。本轮失败列表 `round_failed_candidates` 只是**主脑当前轮**在 authorization JSON 里
+> 维护的内存过滤入参（不落新库/表/服务/定时器/自动监控）；不查询余额、不自动探测、不另发恢复
+> probe、不搞无限轮询重试或新持久化状态系统。时段/容量/明确 model 约束/同 workspace 单写/
+> unknown 在途/硬审批拒绝/用户明确暂停的 CN 自定义 `qodercn:Qwen-3.8-Max`（按候选授权范围
+> 排除）**照常**，绝不通过重试或改派绕过。
+
 > **退休说明（2026-10-08 最新决定）：** CodeBuddy/WorkBuddy 直连已改为 human-relay only，生产
 > `codebuddy_direct` 已彻底移除可执行传输（不再 `import subprocess`、不再有 `dispatch_core`），
 > `main` 对任何新直连在读配置/建输出/进入额度门禁前固定拒绝，不再进入实际额度门禁派发。下文

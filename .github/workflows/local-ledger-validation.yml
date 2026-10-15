@@ -222,6 +222,12 @@ jobs:
       - name: Stage selection read-only planner offline regression (temp SQLite, no real pool)
         run: python -m unittest discover -s tests -p "test_stage_selection.py" -v
 
+      # BW-SIMPLE-PRIORITY-RETRY-S4：每轮按优先级从最高合格候选真实试一次，本轮失败换下一
+      # 个，新轮重新最高优先；历史 availability/限额只作诊断，绝不永久挡新轮。Windows/Linux
+      # 矩阵都跑。
+      - name: Simple per-round priority retry offline regression (temp SQLite, no real pool)
+        run: python -m unittest discover -s tests -p "test_simple_priority_retry.py" -v
+
       # BW-MAIN-PRIORITY-20261011-S1：主力优先级（三 Qoder Max > claude:deepseek-flash >
       # zcode:GLM-5.3，同层在途平衡）专项离线回归。临时 SQLite + mock Z 可用函数，零真实
       # 模型/凭据/池；覆盖夜间 Max 优先压过更高 committed 历史、Max 满/限额换另一 Max、
