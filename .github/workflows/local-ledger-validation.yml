@@ -74,6 +74,12 @@ jobs:
       - name: Qoder direct permissions regression (no login or network)
         run: python tests/test_qoder_direct_permissions_offline.py
 
+      # BW-INTERRUPTION-20261015-S3：Qoder 结构化失败错误载体中明确认证失败文案
+      # （Custom model authentication failed.）分型为 authentication_failure 的
+      # 离线认证回归（函数级合成样例，不读凭据/私有原始流，不发真实 CLI 请求）。
+      - name: Qoder authentication failure classification offline regression (no login or network)
+        run: python -m unittest tests.test_qoder_authentication_offline -v
+
       # BW-ZCODE-INSTALL-01：ZCode 官方运行时入口的离线回归。真实子进程 stub 承载，
       # 不登录 BigModel、不访问网络、不调用任何模型，也不证明真实 ZCode 后端能力。
       - name: ZCode direct transport regression (no login or network)

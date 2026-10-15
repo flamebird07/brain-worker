@@ -471,13 +471,24 @@ def _qoder_failure_facts(summary: dict) -> dict:
     permission_denied = isinstance(perms, (list, dict)) and bool(perms)
     quota_429 = ec.explicit_429(summary.get('result_errors'),
                                 summary.get('result_errors_info'))
+    # BW-INTERRUPTION-20261015-S2：仅当真实结构化失败错误载体里出现明确认证失败文案
+    # （Custom model authentication failed.，忽略大小写与首尾空白）才识别
+    # authentication_failure；仍以 protocol_success=false 的失败为前提，不扫描
+    # prompt/response/正常结果文本或整份 summary。quota/permission/parse 分类
+    # 保持原语义可并存，认证失败不再归入 model_execution_failure。
+    auth_failure = (not summary.get('protocol_success')
+                    and not parse_failure
+                    and ec.explicit_authentication_failure(
+                        summary.get('result_errors'),
+                        summary.get('result_errors_info')))
     model_execution = (not summary.get('protocol_success')
                        and not parse_failure and not permission_denied
-                       and not quota_429)
+                       and not quota_429 and not auth_failure)
     return {'quota_429': quota_429,
             'protocol_parse_failure': parse_failure,
             'permission_rule_denied': permission_denied,
             'model_execution_failure': bool(model_execution),
+            'authentication_failure': bool(auth_failure),
             'reset_hint': ec.extract_reset_hint(summary.get('result_errors'),
                                                 summary.get('result_errors_info')),
             'evidence': {'stop_reason': summary.get('stop_reason'),

@@ -35,7 +35,8 @@ from datetime import datetime, timezone
 from pathlib import Path
 
 FAILURE_TYPES = ('quota_429', 'permission_rule_denied', 'permission_client_missing',
-                 'protocol_parse_failure', 'model_execution_failure', 'test_failure')
+                 'protocol_parse_failure', 'model_execution_failure',
+                 'authentication_failure', 'test_failure')
 
 # 各运行时的真实能力：fine_grained 表示能否表达逐文件 Edit(/原样 Bash()) 规则；
 # read_dirs 表示是否有外部只读目录 grant。ZCode 只有整工具开关，不能假称细粒度文件权限。
@@ -470,6 +471,43 @@ def explicit_429(errors, errors_info) -> bool:
     return hit(errors_info) or hit(errors)
 
 
+_AUTH_MARKER_RE = _re.compile(r'custom\s+model\s+authentication\s+failed',
+                              _re.IGNORECASE)
+
+
+def _auth_marker_text(text) -> bool:
+    return isinstance(text, str) and bool(_AUTH_MARKER_RE.search(text.strip()))
+
+
+def explicit_authentication_failure(errors, errors_info) -> bool:
+    """仅认结构化失败错误载体里明确的认证失败文案（如 Qoder 的
+    "Custom model authentication failed. Please check if your API Key is
+    correctly configured and valid."）。只按已有载体形状取文本：条目字符串、
+    dict 的 message 字段、以及 dict 下嵌套 error.errors/message 的一层 message；
+    不递归扫描任意键。凭据不可用、且不凭 401/403/429 数字、取消退出码
+    (4294967295) 或 quota 字样推断认证失败。"""
+    def hit(container):
+        if not isinstance(container, list):
+            return False
+        for item in container:
+            if isinstance(item, str):
+                if _auth_marker_text(item):
+                    return True
+            elif isinstance(item, dict):
+                if _auth_marker_text(item.get('message')):
+                    return True
+                nested = item.get('error')
+                if isinstance(nested, dict):
+                    if _auth_marker_text(nested.get('message')):
+                        return True
+                    inner = nested.get('errors')
+                    if (isinstance(inner, dict)
+                            and _auth_marker_text(inner.get('message'))):
+                        return True
+        return False
+    return hit(errors_info) or hit(errors)
+
+
 def extract_reset_hint(errors, errors_info):
     """从错误/拒绝结构文本里原样提取“将在 … 重置”窗口；无则 None，不臆造。"""
     pool = []
@@ -564,6 +602,11 @@ def diagnose(facts) -> dict:
         types.append('protocol_parse_failure')
     if facts.get('model_execution_failure'):
         types.append('model_execution_failure')
+    # 只有调用方从真实结构化失败错误载体（如 result_errors/result_errors_info）中
+    # 识别到明确认证失败文案后传入的布尔标记；本函数不扫描 prompt/report 文本，
+    # 也不凭 401/403/429 数字或取消退出码推断认证失败。
+    if facts.get('authentication_failure'):
+        types.append('authentication_failure')
     # 两个业务证据分类：只接受调用方从结构化执行证据门禁结果（如
     # zcode_execution_evidence 的 status）传入的布尔标记，不从提示/报告文本推断。
     if facts.get('no_required_execution'):
