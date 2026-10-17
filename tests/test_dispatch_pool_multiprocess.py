@@ -187,12 +187,14 @@ class _SpawnMixin(unittest.TestCase):
             return [dict(r) for r in conn.execute(sql, params).fetchall()]
 
     def _fill_six_via_api(self):
-        """真实 API 填满十二满基线（BW-CLAUDE-CAPACITY2：zcode×2 + 两内置 Max 各
-        1 + CN 自定义 Max×2 + 两地区 Flash 各 2 + claude 第 11–12 槽×2；claude 容量由 1
-        增至 2；T0=北京周四 23:00 claude offhours）。全部经显式 executor 逐一 claim 保证确定性
-        （CN 池只能经 executor='qodercn'，claude 经 executor='claude'，AUTO 轮换不保证落某特定主力），返回 12 个 token。"""
+        """真实 API 填满十三满基线（BW-CODEBUDDY-MAIN-S3：codebuddy×1 + zcode×2 + 两内置
+        Max 各 1 + CN 自定义 Max×2 + 两地区 Flash 各 2 + claude 2；T0=北京周四 23:00
+        claude offhours）。全部经显式 executor 逐一 claim 保证确定性（CN 池只能经
+        executor='qodercn'，claude 经 executor='claude'，codebuddy 经 executor='codebuddy'，
+        AUTO 轮换不保证落某特定主力），返回 13 个 token。"""
         toks = []
-        plan = [('zcode', 'GLM-5.3', 'zcode'), ('zcode', 'GLM-5.3', 'zcode'),
+        plan = [('codebuddy', 'deepseek-v4.1-flash', 'codebuddy'),
+                ('zcode', 'GLM-5.3', 'zcode'), ('zcode', 'GLM-5.3', 'zcode'),
                 ('qoder', 'Qwen3.8-Max', 'qoder'),
                 ('qodercn', 'Qwen3.8-Max', 'qodercn'),
                 ('qodercn', 'Qwen-3.8-Max', 'qodercn'),
@@ -528,8 +530,10 @@ class TestAdoptLegacyOffline(_SpawnMixin, unittest.TestCase):
         nxt = dp.select_and_claim(self.store, task_id='after', runtime='qoder',
                                   model='Qwen3.8-Max', workspace='C:/mp',
                                   prompt_sha256='z' * 64, stage='as', chat_id='ac',
-                                  now=T0, _preclaim=False)
-        # Max 池不受影响可 claim；但请求 zcode 已 3>2 必须被阻止（不许丢老 worker）。
+                                  executor='qoder', now=T0, _preclaim=False)
+        # Max 池不受影响可 claim（显式 executor='qoder' 固定该组合：CodeBuddy 空位存在时
+        # AUTO 会 routing_required 改派，与本例“旧债务不挡新派发”的目标无关）；但请求 zcode
+        # 已 3>2 必须被阻止（不许丢老 worker）。
         self.assertTrue(nxt['allowed'], nxt)
         z = dp.select_and_claim(self.store, task_id='after2', runtime='zcode',
                                 model='GLM-5.3', workspace='C:/mp/after2',

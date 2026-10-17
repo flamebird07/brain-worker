@@ -1,37 +1,60 @@
-# CodeBuddy Code CLI 本机直连（历史解析档案）
+# CodeBuddy Code CLI 本机直连（当前精确模型恢复 + 历史解析档案）
 
-> **当前状态（2026-10-08 起）：CodeBuddy/WorkBuddy 直连已退休，改为 human-relay only。**
-> 生产入口 `scripts/codebuddy_direct.py` **已彻底移除可执行传输**：不再 `import subprocess`、
-> 不再有 `dispatch_core`，生产路径结构上无法 `Popen` 任何真实 CLI，只保留纯解析/终态诊断/
-> 历史取证函数。`main()` 在读配置/提示词、创建输出目录、进入额度门禁之前，对任何新的直接调用
-> 一律固定拒绝（`sent=false`、`manual_relay_only`、非成功退出码）；无 plan、带 plan、resume、
-> probe、配置存在/缺失都不能绕过，也不提供重新启用参数、环境变量或隐藏入口。控制面
-> `execution_control.preflight` 对 CodeBuddy/WorkBuddy 计划同样拒绝。当前操作**只**产出一份完整
-> 可复制提示词，由人工交给外部 Agent 处理；提示词生成不记成已派发。本文其余内容保留为历史
-> 解析/诊断档案（含原调用形状、事件流、额度冷却与错误分类口径），仅供离线证据回放（真实传输
-> 管线已整体迁到**仅测试**的 `tests/offline_codebuddy_harness.py::replay_dispatch`，在隔离合成
-> stub 下重放旧失败链；harness 只认 `sys.executable` + 仓库可信固定 stub + 声明的内容 SHA-256，
-> 禁止真实 node、禁止任意 stub 目录里的真实 CLI、禁止生产默认用户配置），不再作为当前可直接
-> 执行的命令指引。
+> **当前状态（2026-10-17，BW-CODEBUDDY-MAIN-S3）：仅精确模型 `codebuddy:deepseek-v4.1-flash`
+> 恢复为正式主力（1 槽、最高优先、无时段门、计入国内总 13）。**
+> 正式可执行传输只在 `scripts/codebuddy_live.py`：由 `scripts/codebuddy_direct.py` 的 `main()`
+> 在**仅当 `--model` 精确等于 `deepseek-v4.1-flash`** 时惰性移交；其它 CodeBuddy 旧模型
+> （含旧 GLM）与 WorkBuddy 仍在读配置/提示词、建输出目录、额度门禁或 Popen 之前无条件拒绝
+> （`sent=false`、`manual_relay_only`、非成功退出码、零副作用），只生成可复制提示词人工转交。
+> 控制面 `execution_control.preflight` 同样只对精确模型放行，其余仍拒绝。旧模型/WorkBuddy
+> 的历史 `manual-relay` 语义与旧限流/冷却记录不删不改；旧额度冷却**不挡**这个新模型（本轮只
+> 试一次，失败换下一候选，下一新轮重新从最高优先开始）。本文其余内容保留为历史解析/诊断
+> 档案（原调用形状、事件流、额度冷却与错误分类口径），真实传输管线仍保留在**仅测试**的
+> `tests/offline_codebuddy_harness.py::replay_dispatch`，在隔离合成 stub 下回放旧失败链。
 
-## 人工转交方式（当前唯一路径）
+## 当前正式入口（codebuddy_live，精确模型）
+
+- 池与优先级：`capacity=1`，AUTO 最高层（高于全部 Qwen3.8-Max/Claude/ZCode），**不套** Max
+  北京夜间窗或 Claude 离峰窗；显式 `executor='codebuddy'` 只认该精确组合，绝不跨模型回退。
+  总配置 13；CN 自定义 Max 2 槽仍按用户暂停令排除在可新派授权之外（当前授权可新派上限 11）。
+- 容量生命周期：`consume_for_entry(executor='codebuddy')` 认领 → `mark_running` → `bind_child`
+  （必须 `bound=true`）→ 真实退出后 `finish`；启动前失败 `start_failed` 释放；已启动但终态
+  无法确认 `mark_unknown` 保留占位。绝不误清别人的锁、不删真实锁、不新建冷却表/服务。
+- **超时口径（2026-10-17 修正）**：普通新派发**没有**默认 30 分钟或最长 2 小时限制；
+  `--timeout-seconds` 省略即向 `communicate(timeout=None)` 传 None。只有显式**正数**才生效；
+  `<=0` 在创建目录/认领/Popen 之前诚实拒绝（`timeout_out_of_bounds`，退出 2）。显式超时仍
+  保留 kill + 回收 + 失败结算 + 真实释放/unknown 保留，绝不写 healthy。
+- **时间口径**：`request.json` 同时记录真实 `started_at_utc`（Popen 前）与 `finished_at_utc`
+  （communicate 返回后）；显式注入 `now` 的离线用例两个时点都取注入值以保持确定性。终态
+  `finish` 使用真实结束时钟，绝不把派工开始时间一直当结束时间。
+- **工具证据口径**：`execution_evidence` 公开 `tool_call_count`/`tool_result_count`/
+  `successful_tool_receipts`/`missing_tool_receipts`/`execution_evidence_ok`。它只证明原始
+  tool_use 有同 ID 成功 tool_result；**不是**业务验收，也不证明真实文件系统结果。零工具纯
+  文本任务仍可合法通过传输（`protocol_success`/`report_bound` 语义不变），但格式合格的零工具
+  “工程报告”没有工程执行证据，绝不据此宣称已实施；`business_verified` 恒 false。
+
+## 历史人工转交方式（旧模型/WorkBuddy 仍适用）
 
 1. 用 `scripts/prompt_contract.py` 生成含完整九节契约的可复制提示词文本（与任务原文一并给出）。
-2. 由人工把该提示词复制到外部 CodeBuddy/WorkBuddy Agent 执行，主脑/Skill/CLI 不提交新的直连调用。
+2. 由人工把该提示词复制到外部 CodeBuddy/WorkBuddy Agent 执行；除精确 `deepseek-v4.1-flash`
+   外，主脑/Skill/CLI 不提交新的直连调用。
 3. 记录只标 `manual_relay_only`/`sent=false`，不得把“生成了提示词”当作“已派发/已验收”。
 
-## 历史直连调用形状（已停用，仅存档）
+## 历史直连调用形状（仅存档）
 
-以下为退休前 `scripts/codebuddy_direct.py` 的真实派发形状，现已被生产入口固定拒绝，只作历史
-解析档案保留，**不要**据此再执行新的直接调用：
+以下为退休前的调用形状；现在**只有** `--model deepseek-v4.1-flash` 会经
+`codebuddy_direct.main()` 移交 `codebuddy_live.main()`（新增 `--task-id`，证据/容量/超时
+参数见该入口 `--help`），其它模型仍被生产入口固定拒绝。历史形状只作解析档案：
 
 ```text
-# 已停用：生产入口现固定拒绝，不执行新直连；仅离线 harness 在合成 stub 下回放解析/终态。
+# 仅精确模型 deepseek-v4.1-flash 由 codebuddy_live 承接；其它模型仍固定拒绝。
 python scripts/codebuddy_direct.py --workspace <项目绝对路径> --prompt-file <UTF-8提示词文件> --output-dir <不存在的新证据目录> --stage <非空阶段编号> --model <模型ID>
 ```
 
-`--model` 必填，无默认、无 auto、无 fallback。`--resume-session-id` 可选，内部传
-官方 `--resume`。不自动重装、登录、重试、后台取消或通知；主脑不开第二个 CLI 主脑。
+`--model` 在历史入口必填、无 auto/fallback；当前 `codebuddy_live` 缺省即精确模型
+`deepseek-v4.1-flash`，但任何其它值仍在任何 IO 前拒绝。`--resume-session-id` 在历史入口
+可选（内部传官方 `--resume`），当前恢复入口**拒绝** session resume（接续不等于授权）。
+不自动重装、登录、重试、后台取消或通知；主脑不开第二个 CLI 主脑。
 
 ## 统一契约与哈希口径
 
@@ -232,8 +255,9 @@ https://www.codebuddy.cn/docs/cli/iam 。字段若与真实 CLI 回读不同，�
   静默或心跳不等于死锁、429 或工具执行；Windows 退出码 `4294967295` 不是 HTTP 429。
   `CODEBUDDY_MAX_RETRIES` 是子进程有界生成前重试，**不是**总模型次数，也**不是**全程时限；
   `CODEBUDDY_RETRY_WATCHDOG=0` 关掉无限 watchdog。用户选择继续等待的**在途任务**不得追溯套用
-  新超时、换模型或重派；超时与增量流参数只作为**未来显式配置**，须事先授权并通过兼容性验证
-  后才启用——本轮不实现新超时、不新增 CLI 流参数。
+  新超时、换模型或重派。当前 `codebuddy_live` 的墙钟口径仅为**显式可选**：省略
+  `--timeout-seconds` 即不设限制（不新增 30 分钟/2 小时默认）；显式正数才启用 kill/回收，
+  `<=0` 派工前诚实拒绝。不得把该显式参数追溯套到旧在途任务。
 - 能力分面独立记录：模型路由、工具可见、审批组件/端口 ready、`command_started`、真实退出、
   输出回执。CodeBuddy `dontAsk` 与 ZCode SDK permissionBroker、宿主自动审批分属不同机制，
   分别归型；`--permission-mode dontAsk` 下对越权/未授权动作的拒绝不代表整套测试不可用，更不

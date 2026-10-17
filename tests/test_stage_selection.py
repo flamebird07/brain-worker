@@ -43,6 +43,11 @@ T_DAY = datetime(2026, 10, 8, 2, 0, 0, tzinfo=timezone.utc)     # 北京 10:00�
 
 ALL_MAINS = list(dp.MAIN_FORCE_KEYS)
 ALL_FLASH = list(dp.OVERFLOW_KEYS)
+# BW-CODEBUDDY-MAIN-S3：本文件大量用例验证的是 CodeBuddy 恢复前的旧层序
+# （三 Qoder Max > claude > zcode）。这些用例把授权候选明确收窄为“不含 CodeBuddy”的
+# 旧集合，从而原样验证旧层序而不放宽任何断言；CodeBuddy 作为新最高层由独立
+# tests/test_codebuddy_reactivation.py 验证（含自动/显式入口与容量）。
+LEGACY_MAINS = [k for k in ALL_MAINS if k != dp.CODEBUDDY_POOL_KEY]
 CN_MAINS = [k for k in ALL_MAINS if k.startswith('qodercn:')]
 CN_FLASH = 'qodercn:Qwen3.8-Flash'
 
@@ -174,7 +179,7 @@ class AuthorizationTests(_Base):
 class WindowAndLimitTests(_Base):
     def test_day_drops_gated_max_and_claude_keeps_zcode(self):
         self.build_store()
-        r = self.plan(self.auth('auto', 'T', 's2', ALL_MAINS + ALL_FLASH), now=T_DAY)
+        r = self.plan(self.auth('auto', 'T', 's2', LEGACY_MAINS + ALL_FLASH), now=T_DAY)
         self.assertEqual(r['selected']['pool_key'], dp.ZCODE_POOL_KEY, r)
         self.assertEqual(r['candidate_filters']['qoder:Qwen3.8-Max'], 'window_closed')
         self.assertEqual(r['candidate_filters'][dp.CLAUDE_POOL_KEY], 'window_closed')
@@ -200,7 +205,7 @@ class WindowAndLimitTests(_Base):
         self.build_store()
         self.reserve('a', 'zcode', 'GLM-5.3', executor='zcode')
         self.reserve('b', 'zcode', 'GLM-5.3', executor='zcode')
-        r = self.plan(self.auth('auto', 'T', 's2', ALL_MAINS + ALL_FLASH), now=T_NIGHT)
+        r = self.plan(self.auth('auto', 'T', 's2', LEGACY_MAINS + ALL_FLASH), now=T_NIGHT)
         self.assertEqual(r['candidate_filters'][dp.ZCODE_POOL_KEY], 'capacity_full')
         self.assertEqual(r['selected']['pool_key'], 'qoder:Qwen3.8-Max', r)
 
@@ -216,7 +221,7 @@ class NightAutoCustomMaxRegression(_Base):
         self.build_store()
         self.set_limit('qoder:Qwen3.8-Max')
         self.set_limit('qodercn:Qwen3.8-Max')
-        allowed = ALL_MAINS + ALL_FLASH
+        allowed = LEGACY_MAINS + ALL_FLASH
         r = self.plan(self.auth('auto', 'T', 's2', allowed), now=T_NIGHT)
         self.assertEqual(r['refused'], None, r)
         self.assertEqual(sorted(r['allowed_candidates']), sorted(allowed))  # 不缩权
@@ -564,7 +569,7 @@ class PermissionGrantsTests(_Base):
         """白天 Z 健康且有全部空位，但任务需精确 Edit/Bash：Z 被能力过滤，
         选兼容的已授权 Flash，绝不启动 Z 计划。"""
         self.build_store()
-        r = self.plan(self.auth('auto', 'T', 's2', ALL_MAINS + ALL_FLASH),
+        r = self.plan(self.auth('auto', 'T', 's2', LEGACY_MAINS + ALL_FLASH),
                       now=T_DAY, permission_grants=self.FINE)
         self.assertEqual(r['refused'], None, r)
         self.assertEqual(r['permission_requirements'],
@@ -579,7 +584,7 @@ class PermissionGrantsTests(_Base):
     def test_day_same_window_without_exact_rules_z_still_eligible(self):
         """同一白天窗口、不要求精确规则（未传 grants）：Z 仍可选（旧兼容行为）。"""
         self.build_store()
-        r = self.plan(self.auth('auto', 'T', 's2', ALL_MAINS + ALL_FLASH), now=T_DAY)
+        r = self.plan(self.auth('auto', 'T', 's2', LEGACY_MAINS + ALL_FLASH), now=T_DAY)
         self.assertEqual(r['selected']['pool_key'], dp.ZCODE_POOL_KEY, r)
         self.assertEqual(r['candidate_filters'][dp.ZCODE_POOL_KEY], 'eligible')
         self.assertEqual(r['permission_requirements'],
@@ -724,7 +729,10 @@ class PermissionGrantsTests(_Base):
                          'permission_incompatible')
         # 到期经父授权重选：应用**当前**需求 → 白天三 Max/Claude 窗闭、Z 权限不兼容，
         # 选择落兼容的已授权 Flash；旧 s1 的需求绝不反向继承或改写本轮需求。
-        parent = self.auth('auto', 'T', 's2', ALL_MAINS + ALL_FLASH)
+        # 父授权明确保留旧候选集（不含 CodeBuddy）：CodeBuddy 全天可派且为最高层，若纳入
+        # 父候选会先于 Flash 被选中，这与本例“临时 fallback 到期重裁决按当前权限需求过滤”
+        # 的旧语义无关；CodeBuddy 的自动/显式入口由 test_codebuddy_reactivation.py 独立验证。
+        parent = self.auth('auto', 'T', 's2', LEGACY_MAINS + ALL_FLASH)
         auth2 = self.auth('temporary_fallback', 'T', 's1', ALL_MAINS + ALL_FLASH,
                           fallback_scope={'task_id': 'T', 'stage': 's1'},
                           runtime='qodercn', model='Qwen3.8-Flash',
@@ -798,7 +806,7 @@ class TaskScopeTests(_Base):
         task_scope（无硬 grants）：选 ZCode，requirements 全 false，Z eligible。"""
         self.build_store()
         self.set_limit(dp.CLAUDE_POOL_KEY)
-        r = self.plan(self.auth('auto', 'T', 's2', ALL_MAINS + ALL_FLASH), now=T_DAY,
+        r = self.plan(self.auth('auto', 'T', 's2', LEGACY_MAINS + ALL_FLASH), now=T_DAY,
                       task_scope=self.SCOPE)
         self.assertEqual(r['refused'], None, r)
         self.assertEqual(r['selected']['pool_key'], dp.ZCODE_POOL_KEY, r)

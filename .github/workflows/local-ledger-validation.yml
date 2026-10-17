@@ -101,12 +101,21 @@ jobs:
       - name: ZCode file-scope offline regression (no login or network)
         run: python tests/test_zcode_file_scope.py
 
-      # BW-GITHUB-CLOSEOUT-20261008-S3：CodeBuddy/WorkBuddy 直连退休为 human-relay only。
-      # 生产 codebuddy_direct.main 在读配置/提示词/建输出/quota gate/Popen 前固定拒绝；
-      # 旧 CB 真实 stub 传输链改由测试专用离线 harness（tests/offline_codebuddy_harness.py）
-      # 调 dispatch_core 在隔离合成 stub 下回放，不接真实运行时/账号。无网络、不调模型。
+      # BW-GITHUB-CLOSEOUT-20261008-S3：CodeBuddy/WorkBuddy 直连退休为 human-relay only；
+      # BW-CODEBUDDY-MAIN-S3 仅 codebuddy:deepseek-v4.1-flash 恢复为最高优先主力，其它
+      # CodeBuddy 旧模型与 WorkBuddy 仍退休。生产 codebuddy_direct.main 在读配置/提示词/
+      # 建输出/quota gate/Popen 前固定拒绝非精确模型；旧 CB 真实 stub 传输链改由测试专用
+      # 离线 harness（tests/offline_codebuddy_harness.py）调 dispatch_core 在隔离合成 stub
+      # 下回放，不接真实运行时/账号。无网络、不调模型。
       - name: CodeBuddy legacy pipeline offline replay (retired direct, synthetic stub)
         run: python tests/test_codebuddy_direct.py
+
+      # BW-CODEBUDDY-MAIN-S3：CodeBuddy 精确模型恢复的专项离线回归——池 capacity=1 /
+      # 新最高层 / 无时段门 / 总 13 / 旧模型与 WorkBuddy 仍退休 / codebuddy_live 合成
+      # Popen 句柄的成功读写回执、零工具与缺回执证据口径、超时缺省与 <=0 拒绝、真实起止
+      # 时间；全部临时 SQLite + 进程内 stub，零真实子进程/网络/账号/模型。
+      - name: CodeBuddy reactivation and live transport offline regression (temp SQLite, synthetic stub)
+        run: python -m unittest discover -s tests -p "test_codebuddy_reactivation.py" -v
 
       - name: Manual-relay retirement refusal regression (control plane + production CLI)
         run: python tests/test_manual_relay_routing.py
@@ -124,7 +133,7 @@ jobs:
         shell: bash
         run: |
           set -o pipefail
-          for f in tests/stub_qodercli.py tests/offline_codebuddy_stub.py tests/stub_zcode_runner.py; do
+          for f in tests/stub_qodercli.py tests/offline_codebuddy_stub.py tests/stub_zcode_runner.py tests/stub_codebuddy_live.py; do
             test -f "$f" || { echo "missing packaged stub: $f" >&2; exit 1; }
           done
           python - <<'EOF'

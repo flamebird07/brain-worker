@@ -984,29 +984,39 @@ def build_parser():
 
 
 def main():
-    """生产 CLI 公开入口：CodeBuddy/WorkBuddy 直连已退休为 human-relay only。
+    """生产 CLI 公开入口（CodeBuddy 正式 main）。
 
-    在读取配置/提示词、创建输出目录、进入额度门禁或 Popen 之前无条件固定拒绝任何
-    新的直接调用，返回明确 JSON 人工转交状态（sent=false、manual_relay_only）与非
-    成功退出码。无 plan、带 plan、resume、probe、配置存在/缺失一律不能绕过；本入口
-    不提供重新启用参数、环境变量或生产配置通道，也不把旧调用迁移到隐藏入口。
+    BW-CODEBUDDY-MAIN-S3：仅独立 CodeBuddy CLI 的**精确模型 deepseek-v4.1-flash**
+    （界面名 Deepseek-V4.1-Flash）被恢复为正式主力——它把本次直接调用移交生产传输入口
+    `codebuddy_live.main()`（consume_for_entry 容量认领 + 绑定自身子 PID + 真实终态释放，
+    shell=False、stdin 完整契约、cwd 隔离、MCP 空、hooks 禁用、无自动登录/升级/子代理/
+    回退模型）。**其它任何 CodeBuddy 旧模型（含旧 GLM）与 WorkBuddy 一律保持既有
+    manual_relay_only 拒绝**：在读取配置/提示词、创建输出目录、进入额度门禁或 Popen 之前
+    无条件拒绝，返回 sent=false/manual_relay_only 的 JSON 与非成功退出码，零副作用。模型判定
+    只读 argv（parse_known_args），不读配置/凭据，也不提供任何重新启用旧模型的参数。
 
-    本生产模块已**彻底移除可执行传输**：不再有 dispatch_core，也不再 import subprocess，
-    因此生产路径无法 Popen 任何真实 CLI。旧真实传输（Popen + 额度结算 + 终态留证）已
-    完整搬到测试专用 tests/offline_codebuddy_harness.py 的 replay_dispatch，只在隔离
-    合成 stub 下回放历史失败。本模块只保留纯解析/终态诊断/历史证据函数
-    （parse_stream/_cb_failure_facts/_cb_write_receipts/build_argv/load_entry_config/
-    effective_permission_rules 等），供 harness 与离线单测复用。"""
-    build_parser().parse_args()  # 参数解析（含 --help）正常，但解析后一律拒绝派发
+    本模块仍**不 import subprocess**、不携带可执行传输；真实传输只在 `codebuddy_live` 内，
+    且只认这一精确模型。历史诊断/纯解析函数（parse_stream/build_argv/权限契约/失败留证）
+    继续留在本模块供离线单测与 codebuddy_live 复用。"""
+    probe = argparse.ArgumentParser(add_help=False)
+    probe.add_argument('--model', default=None)
+    probe_args, _unknown = probe.parse_known_args()
+    if probe_args.model == 'deepseek-v4.1-flash':
+        # 精确恢复模型：移交正式生产传输入口（其它约束在 codebuddy_live 内继续强制）。
+        import codebuddy_live  # 惰性导入，避免与本模块的相互依赖
+        return codebuddy_live.main()
+    build_parser().parse_args()  # 参数解析（含 --help）正常，但非精确模型一律拒绝派发
     print(json.dumps({
         'manual_relay_only': True,
         'status': 'manual_relay_only',
         'sent': False,
         'dispatch_refused': True,
-        'reason': 'CodeBuddy/WorkBuddy direct dispatch retired: emit a complete '
-                  'copy-paste prompt and hand it to an external agent by hand. No '
-                  'new direct CodeBuddy call is submitted from the Skill/CLI/control '
-                  'plane. Prompt generation is NOT recorded as a dispatch.',
+        'reason': 'CodeBuddy/WorkBuddy direct dispatch retired for every model except the '
+                  'reactivated exact deepseek-v4.1-flash: emit a complete copy-paste prompt '
+                  'and hand it to an external agent by hand. No new direct CodeBuddy call '
+                  'for any other model (old GLM included) or WorkBuddy is submitted from '
+                  'the Skill/CLI/control plane. Prompt generation is NOT recorded as a '
+                  'dispatch.',
         'exit_code': 2}, ensure_ascii=False))
     return 2
 

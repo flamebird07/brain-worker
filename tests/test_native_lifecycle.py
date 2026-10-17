@@ -58,12 +58,13 @@ class NativeLifecycleTests(unittest.TestCase):
     # routing_required 拒绝（fixture 不能反向松生产轮转）；合法顺序 Z,Max,Z,Max,
     # Flash,Flash，每次独立 workspace 并逐一核验 allowed/token/pool_key。
     def _fill_domestic(self):
-        # BW-CLAUDE-CAPACITY2 十二满：zcode×2 + 两内置 Max 各 1 + CN 自定义 Max×2
-        # + 两地区 Flash 各 2 + claude:deepseek-flash×2（第 11–12 主力槽；claude 容量由 1
-        # 增至 2；T0=北京周四 23:00，主力时段内且 claude offhours，真实 API 直接 claim）。
-        # 全部经显式 executor 逐一确定性 claim（CN 池只能 executor='qodercn'，claude 只能
-        # executor='claude'，AUTO 轮换不保证落某特定主力），每次核验 allowed/token/pool_key。
-        plan = [('zcode', 'GLM-5.3', 'zcode'), ('zcode', 'GLM-5.3', 'zcode'),
+        # BW-CODEBUDDY-MAIN-S3 十三满：codebuddy×1 + zcode×2 + 两内置 Max 各 1 + CN 自定义 Max×2
+        # + 两地区 Flash 各 2 + claude:deepseek-flash×2（T0=北京周四 23:00，主力时段内且 claude
+        # offhours，真实 API 直接 claim）。全部经显式 executor 逐一确定性 claim（CN 池只能
+        # executor='qodercn'，claude 只能 executor='claude'，codebuddy 只能 executor='codebuddy'，
+        # AUTO 轮换不保证落某特定主力），每次核验 allowed/token/pool_key。
+        plan = [('codebuddy', 'deepseek-v4.1-flash', 'codebuddy'),
+                ('zcode', 'GLM-5.3', 'zcode'), ('zcode', 'GLM-5.3', 'zcode'),
                 ('qoder', 'Qwen3.8-Max', 'qoder'),
                 ('qodercn', 'Qwen3.8-Max', 'qodercn'),
                 ('qodercn', 'Qwen-3.8-Max', 'qodercn'),
@@ -137,19 +138,25 @@ class NativeLifecycleTests(unittest.TestCase):
         with dp.closing(dp.connect(self.store)) as conn:
             conflict = dp._workspace_conflict(conn, 'ws-luna')
         self.assertIsNone(conflict, conflict)
-        # task 已释放：腾一个国内名额后，同 task 可重新 claim（不被旧 attempt 挡）。
-        dp.finish(self.store, self._attempt_tokens()[0], terminal='cancelled',
+        # task 已释放：腾一个 zcode 名额后，同 task 可重新 claim（不被旧 attempt 挡）。
+        # 本例验的是原生结算后的生命周期释放，不是 AUTO 优先级，故释放 zcode 行并以显式
+        # executor='zcode' 重新 claim 同一组合（AUTO 新 reserve 会被 CodeBuddy 空位改派）。
+        dp.finish(self.store, self._zcode_token(), terminal='cancelled',
                   now=T0 + timedelta(seconds=901))
         out2 = dp.reserve(self.store, task_id='task-luna', runtime='zcode',
                           model='GLM-5.3', workspace='ws-luna',
-                          prompt_sha256='f' * 64,
+                          prompt_sha256='f' * 64, executor='zcode',
                           now=T0 + timedelta(seconds=902))
         self.assertTrue(out2.get('token'), out2)
 
-    def _attempt_tokens(self):
+    def _zcode_token(self):
         with dp.closing(dp.connect(self.store)) as conn:
-            return [r['token'] for r in conn.execute(
-                "SELECT token FROM attempts WHERE origin='reserve'").fetchall()]
+            row = conn.execute(
+                "SELECT token FROM attempts WHERE origin='reserve' "
+                "AND pool_key='zcode:GLM-5.3' AND state IN ('reserved','running') "
+                "ORDER BY rowid LIMIT 1").fetchone()
+        self.assertIsNotNone(row)
+        return row['token']
 
     def test_settle_failure_records_native_failed(self):
         tok = self._luna_claimed()
@@ -300,12 +307,13 @@ class NativeLifecycleTests(unittest.TestCase):
         dp.settle_native(self.store, task_id='task-luna', token=luna_tok,
                          agent_id='agent-real-1', terminal='finished',
                          receipt=RECEIPT, now=T0 + timedelta(seconds=900))
-        # 腾一个国内名额后建一个真实国内 attempt。
-        dp.finish(self.store, self._attempt_tokens()[0], terminal='cancelled',
+        # 腾一个 zcode 名额后建一个真实国内 attempt（显式 executor='zcode' 保留原组合，
+        # 不因 CodeBuddy 空位被 AUTO 改派）。
+        dp.finish(self.store, self._zcode_token(), terminal='cancelled',
                   now=T0 + timedelta(seconds=901))
         out = dp.reserve(self.store, task_id='dom-n', runtime='zcode',
                          model='GLM-5.3', workspace='ws-n', prompt_sha256='a' * 64,
-                         now=T0 + timedelta(seconds=902))
+                         executor='zcode', now=T0 + timedelta(seconds=902))
         self.assertTrue(out.get('token'), out)
         dom_tok = out['token']
         later = T0 + timedelta(seconds=903)

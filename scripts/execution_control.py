@@ -56,6 +56,10 @@ CAPABILITY = {
 # 外部 Agent。此处不删除/清理历史 sqlite 行、锁、既有认证/模型配置，也不杀旧进程；
 # 历史诊断、额度结算与已存在占位保持可用，Qoder/ZCode 正常派发不受影响。
 RETIRED_DIRECT_RUNTIMES = ('codebuddy', 'workbuddy')
+# BW-CODEBUDDY-MAIN-S3：仅独立 CodeBuddy CLI 的**这一精确模型**恢复为正式主力，控制面对
+# 它放行（其余仍退休）。WorkBuddy、CodeBuddy 其它旧模型（含旧 GLM）一律继续走 manual-relay
+# 拒绝，旧回归用例对它们的覆盖不变。
+REACTIVATED_CODEBUDDY_MODEL = 'deepseek-v4.1-flash'
 
 # 控制面五状态（不用第六 verified）：待派发/执行中/卡住/待验收/完成。
 TASK_STATES = ('pending', 'executing', 'blocked', 'awaiting_acceptance', 'completed')
@@ -336,7 +340,14 @@ def preflight(plan, actual, *, active_tasks=None, max_concurrency=None) -> dict:
     retired_reasons = []
     for label, obj in (('plan', plan), ('actual', actual)):
         rt = obj.get('runtime') if isinstance(obj, dict) else None
+        mdl = obj.get('model') if isinstance(obj, dict) else None
         if isinstance(rt, str) and rt.lower() in RETIRED_DIRECT_RUNTIMES:
+            # BW-CODEBUDDY-MAIN-S3：仅当 runtime=codebuddy 且 model 精确等于已恢复的
+            # deepseek-v4.1-flash 时才放行；其它 CodeBuddy 旧模型（含旧 GLM）与 WorkBuddy
+            # 一律继续拒绝（旧 manual-relay 回归不变）。
+            if rt.lower() == 'codebuddy' and isinstance(mdl, str) \
+                    and mdl == REACTIVATED_CODEBUDDY_MODEL:
+                continue
             retired_reasons.append(
                 f'{label} runtime {rt!r} is retired to manual relay: no new '
                 f'CodeBuddy/WorkBuddy direct dispatch is accepted from the control '

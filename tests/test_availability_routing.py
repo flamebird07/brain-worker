@@ -67,6 +67,17 @@ class _TmpBase(unittest.TestCase):
         self.ws.mkdir()
         # 绝不使用真实/共享池：显式临时库，且断言不是默认路径。
         self.assertNotEqual(str(self.dispatch), str(dp.default_store_path()))
+        # BW-CODEBUDDY-MAIN-S3：本文件的历史层序/满池断言（Max > claude > Z、总 N 满）
+        # 都是在 CodeBuddy 恢复之前写的。这里先真实占住 CodeBuddy 唯一名额，使 AUTO 仍
+        # 按旧层序选择、`_fill_six` 补满其余 12 槽后总量正好 13；CodeBuddy 作为新最高层
+        # 由独立 tests/test_codebuddy_reactivation.py 验证，绝不放宽任何安全断言。
+        with contextlib.closing(dp.connect(self.dispatch)) as conn:
+            conn.execute('INSERT INTO attempts(token, task_id, runtime, model, pool_key, '
+                         "state, reserved_at_utc) VALUES(?,?,?,?,?,?,?)",
+                         ('cb-fixture', 'cb-fixture-task', 'codebuddy',
+                          'deepseek-v4.1-flash', dp.CODEBUDDY_POOL_KEY, 'reserved',
+                          dp._iso(T0)))
+            conn.execute('PRAGMA journal_mode=DELETE')
 
     def tearDown(self):
         self._tmp.cleanup()
@@ -1007,9 +1018,12 @@ class QoderEntryRoutingTests(_TmpBase):
         summary = json.loads((out / 'summary.json').read_text(encoding='utf-8'))
         self.assertTrue(summary['protocol_success'], summary)
         # 落库 attempt 必须是 qoder:Qwen3.8-Max，绝无 ZCode attempt。
+        # 只取本测试任务（task_id=stage）自己的行：setUp 占住 CodeBuddy 名额的真实 fixture
+        # 行同样在 attempts 内，不能把整表都当成 Qoder 入口提交的行。
         with contextlib.closing(dp.connect(self.dispatch)) as conn:
             rows = [dict(r) for r in conn.execute(
-                'SELECT runtime, model, pool_key FROM attempts').fetchall()]
+                'SELECT runtime, model, pool_key FROM attempts WHERE task_id=?',
+                (stage,)).fetchall()]
         self.assertTrue(rows)
         self.assertTrue(all(r['runtime'] == 'qoder' for r in rows), rows)
         self.assertFalse(any(r['runtime'] == 'zcode' for r in rows), rows)

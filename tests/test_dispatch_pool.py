@@ -49,6 +49,18 @@ class _PoolBase(unittest.TestCase):
         self.saved_env = os.environ.pop('BRAIN_WORKER_DISPATCH_STORE', None)
         # 单写入者用例可复用的默认目录。
         self.ws = self._ws_for('default')
+        # BW-CODEBUDDY-MAIN-S3：本文件验证的是**旧层序**（三 Qoder Max > claude > zcode）、
+        # 旧满池与生命周期守卫；CodeBuddy 现为新的最高层。为不放宽任何断言地保留旧层序，
+        # 这里先真实占住 CodeBuddy 唯一名额（reserved 行），使 `_select_main_force` 因
+        # active>=capacity=1 跳过它；CodeBuddy 作为新最高层由独立
+        # tests/test_codebuddy_reactivation.py 验证。总量 13 = 本占位 1 + fill 12。
+        with closing(dp.connect(self.store)) as conn:
+            conn.execute('INSERT INTO attempts(token, task_id, runtime, model, pool_key, '
+                         "state, reserved_at_utc) VALUES(?,?,?,?,?,?,?)",
+                         ('cb-fixture', 'cb-fixture-task', 'codebuddy',
+                          'deepseek-v4.1-flash', dp.CODEBUDDY_POOL_KEY, 'reserved',
+                          dp._iso(T0)))
+            conn.execute('PRAGMA journal_mode=DELETE')
         self.addCleanup(self._tmp.cleanup)
 
     def tearDown(self):
@@ -117,11 +129,12 @@ class _PoolBase(unittest.TestCase):
         return r['token']
 
     def fill_domestic(self):
-        """把十二个国内名额填满（BW-CLAUDE-CAPACITY2 真实八主力槽 + 两地区 Flash 12 槽）：主力
-        zcode:GLM-5.3=2、qoder:Qwen3.8-Max=1、qodercn:Qwen3.8-Max=1、qodercn:Qwen-3.8-Max=2、
-        claude:deepseek-flash=2，同级兜底 qoder:Qwen3.8-Flash=2、qodercn:Qwen3.8-Flash=2。全部经
-        显式 executor 逐一 claim 以保证确定性（CN 池只能经 executor='qodercn' 入口，claude 经
-        executor='claude'；AUTO 永不自动选中 CN 内置）。返回 token 列表，顺序为
+        """补满 12 个非 CodeBuddy 国内名额（setUp 已真实占住 CodeBuddy 1 槽 → 合计 13）：
+        主力 zcode:GLM-5.3=2、qoder:Qwen3.8-Max=1、qodercn:Qwen3.8-Max=1、
+        qodercn:Qwen-3.8-Max=2、claude:deepseek-flash=2，同级兜底 qoder:Qwen3.8-Flash=2、
+        qodercn:Qwen3.8-Flash=2。全部经显式 executor 逐一 claim 以保证确定性（CN 池只能经
+        executor='qodercn' 入口，claude 经 executor='claude'；AUTO 永不自动选中 CN 内置）。
+        返回 token 列表，顺序为
         [zcode, zcode, qoderMax, cnMax, cnCustomA, cnCustomB, claude, claude,
          qoderFlash, qoderFlash, cnFlash, cnFlash]。
         """
@@ -153,9 +166,9 @@ class _PoolBase(unittest.TestCase):
 
 class CapacityAndKnownPoolTests(_PoolBase):
     def test_capacity_table_matches_allocation_decision(self):
-        # BW-CLAUDE-CAPACITY2 真实八主力槽 + 两地区 Flash 12 槽：ZCode=2、两内置 Max 各 1、
-        # CN 自定义 Max=2、claude:deepseek-flash=2、两地区 Flash 各 2；CN DeepSeek-Flash 已退出
-        # 正常池，保留池名但 capacity=0。
+        # BW-CODEBUDDY-MAIN-S3 真实九主力 + 两地区 Flash 13 槽：ZCode=2、两内置 Max 各 1、
+        # CN 自定义 Max=2、claude:deepseek-flash=2、codebuddy:deepseek-v4.1-flash=1、两地区
+        # Flash 各 2；CN DeepSeek-Flash 已退出正常池，保留池名但 capacity=0。
         self.assertEqual(dp.capacity_for('zcode:GLM-5.3'), 2)
         self.assertEqual(dp.capacity_for('qoder:Qwen3.8-Max'), 1)
         self.assertEqual(dp.capacity_for('qodercn:Qwen3.8-Max'), 1)
@@ -166,7 +179,8 @@ class CapacityAndKnownPoolTests(_PoolBase):
         self.assertEqual(dp.capacity_for('qodercn:DeepSeek-Flash'), 0)
         self.assertIsNone(dp.capacity_for('luna:native'))
         self.assertEqual(dp.capacity_for('qoder:Unknown-Model'), 0)
-        self.assertEqual(dp.DOMESTIC_TOTAL_CAPACITY, 12)
+        self.assertEqual(dp.capacity_for('codebuddy:deepseek-v4.1-flash'), 1)
+        self.assertEqual(dp.DOMESTIC_TOTAL_CAPACITY, 13)
 
     def test_is_known_pool(self):
         for pk in ('zcode:GLM-5.3', 'qoder:Qwen3.8-Max',
@@ -809,8 +823,8 @@ class StatusTests(_PoolBase):
         self.reserve('q', 'qoder', 'Qwen3.8-Max')
         st = dp.status(self.store, now=T0)
         self.assertEqual(set(st['pools']), set(dp.CAPACITY))
-        self.assertEqual(st['domestic']['capacity'], 12)
-        self.assertEqual(st['domestic']['active'], 2)
+        self.assertEqual(st['domestic']['capacity'], 13)
+        self.assertEqual(st['domestic']['active'], 3)   # 2 本次 + 1 CodeBuddy 基线占位
         self.assertEqual(st['domestic']['free'], 10)
         self.assertFalse(st['domestic']['full'])
         self.assertEqual(st['rotation']['committed_zcode'], 1)
@@ -823,8 +837,8 @@ class StatusTests(_PoolBase):
         dp.claim_due(self.store, task_id='L', now=T0 + timedelta(seconds=400),
                      _preclaim=False)
         st = dp.status(self.store, now=T0)
-        # Luna 在途不占国内名额口径（国内仍为 12/12，Luna 单列且无上限）。
-        self.assertEqual(st['domestic']['active'], 12)
+        # Luna 在途不占国内名额口径（国内仍为 13/13，Luna 单列且无上限）。
+        self.assertEqual(st['domestic']['active'], 13)
         self.assertEqual(st['pools'][dp.LUNA_KEY]['active'], 1)
 
 

@@ -1,11 +1,11 @@
 """BW-CLAUDE-DEEPSEEK-S3 / BW-CLAUDE-CAPACITY2 离线回归：claude:deepseek-flash AUTO 可选主力槽。
 
-覆盖：物理 DOMESTIC_TOTAL_CAPACITY=12；claude 在 MAIN_FORCE_KEYS 且容量 2（第 2 个请求可认领、
+覆盖：物理 DOMESTIC_TOTAL_CAPACITY=13（含 CodeBuddy 最高层 1 槽）；claude 在 MAIN_FORCE_KEYS 且容量 2（第 2 个请求可认领、
 第 3 个满且绝不回退别模型；完成释放后可再用；同 workspace 仍拒绝；reserved/running/unknown 均
 正确占位）；AUTO 在其它主力占满时可选中 claude（无需用户显式点名）；claude 在途计入国内总在途
 聚合、但绝不污染 committed_qoder；显式 executor='claude' 点名；时段门（工作日高峰拒 / 周末 /
-2026 假日 / 夜间放行）；跨高峰 reserve→consume 只释放本 token；明确限额落标/释放；总 12 守卫
-包含历史迁移占位且绝不派第 13 个。全部显式临时 sqlite store，绝不读写真实 ~/.brain-worker。
+2026 假日 / 夜间放行）；跨高峰 reserve→consume 只释放本 token；明确限额落标/释放；总 13 守卫
+包含历史迁移占位且绝不派第 14 个。全部显式临时 sqlite store，绝不读写真实 ~/.brain-worker。
 零网络/零模型。
 """
 import hashlib
@@ -59,7 +59,10 @@ class _ClaudeBase(unittest.TestCase):
                           now=now, executor=executor, _preclaim=False)
 
     def occupy_non_claude_mains(self, now=OFFPEAK_NIGHT):
-        """占满 6 个非 claude 主力槽（zcode2 + qoder Max1 + cn Max1 + cn 自定义 Max2）。"""
+        """占满 7 个非 claude 主力槽（codebuddy 1 + zcode 2 + qoder Max 1 + cn Max 1 +
+        cn 自定义 Max 2），使 AUTO 在 claude 仍空闲时按旧层序落到 claude。"""
+        self.assertTrue(self._reserve('cb', 'codebuddy', 'deepseek-v4.1-flash',
+                                      'codebuddy', now).get('allowed'))
         for i in range(2):
             self.assertTrue(self._reserve(f'z{i}', 'zcode', 'GLM-5.3', 'zcode', now).get('allowed'))
         self.assertTrue(self._reserve('qm', 'qoder', 'Qwen3.8-Max', 'qoder', now).get('allowed'))
@@ -78,8 +81,8 @@ class CapacityAndRouting(_ClaudeBase):
                          dp.MAIN_FORCE_CAPACITY[dp.CLAUDE_POOL_KEY])
         self.assertIn(CLAUDE, dp.MAIN_FORCE_KEYS)
 
-    def test_physical_domestic_total_is_twelve(self):
-        self.assertEqual(dp.DOMESTIC_TOTAL_CAPACITY, 12)
+    def test_physical_domestic_total_is_thirteen(self):
+        self.assertEqual(dp.DOMESTIC_TOTAL_CAPACITY, 13)
         self.assertEqual(dp.DOMESTIC_TOTAL_CAPACITY,
                          sum(dp.MAIN_FORCE_CAPACITY.values())
                          + sum(dp.OVERFLOW_CAPACITY.values()))
@@ -150,7 +153,8 @@ class CapacityAndRouting(_ClaudeBase):
         self.assertEqual(r4['reason'], 'capacity_full', r4)
 
     def test_auto_selects_claude_when_other_mains_full(self):
-        # 另一主力的 AUTO 请求（未点名 claude）：其余 6 个主力槽占满、claude 空闲 → 选中 claude
+        # 另一主力的 AUTO 请求（未点名 claude）：其余 7 个主力槽（含 CodeBuddy）占满、
+        # claude 空闲 → 选中 claude
         self.occupy_non_claude_mains()
         r = dp.select_and_claim(self.store, task_id='auto', runtime='qoder',
                                 model='Qwen3.8-Max', workspace=self.ws('auto'),
@@ -174,7 +178,10 @@ class CapacityAndRouting(_ClaudeBase):
 
     def test_auto_claude_entry_does_not_bypass_fair_selection(self):
         # BW-CLAUDE-DEEPSEEK-S4 反例：AUTO 的 claude 入口请求绝不绕过公平选择直接认领
-        # 自己那槽——空库三组 committed 全 0 时 claude 平票排 Z2/Qoder 之后 → routing_required。
+        # 自己那槽——先占住最高层 CodeBuddy（新最高层由独立回归验证），claude 请求按旧层序
+        # routing 到 qoder Max，绝不偷认领自己。
+        self.assertTrue(self._reserve('cb', 'codebuddy', 'deepseek-v4.1-flash',
+                                      'codebuddy').get('allowed'))
         r = dp.select_and_claim(self.store, task_id='afc', runtime='claude',
                                 model='deepseek-flash', workspace=self.ws('afc'),
                                 prompt_sha256='p' + '0' * 63, stage='s',
@@ -190,9 +197,9 @@ class CapacityAndRouting(_ClaudeBase):
         self.assertEqual(r['reason'], 'main_force_window_closed')
 
     def test_total_guard_blocks_claude_with_migration_debt(self):
-        # BW-CLAUDE-CAPACITY2：真实国内在途已达总 12（10 个非 claude 在容量的在途 +
-        # 1 个 claude 在途 + 1 条 retired 池超额迁移在途），claude 自身按容量看似仍空
-        # （1/2），但总守卫对 claude 同样生效，绝不派第 13 个。显式点名 claude 也如实拒绝。
+        # BW-CODEBUDDY-MAIN-S3：真实国内在途已达总 13（7 个非 claude 主力含 CodeBuddy +
+        # 4 个 Flash + 1 个 claude 在途 + 1 条 retired 池超额迁移在途），claude 自身按容量
+        # 看似仍空（1/2），但总守卫对 claude 同样生效，绝不派第 14 个。显式点名也如实拒绝。
         self.occupy_non_claude_mains()
         for i in range(2):
             self.assertTrue(self._reserve(f'of{i}', 'qoder', 'Qwen3.8-Flash',
@@ -207,7 +214,7 @@ class CapacityAndRouting(_ClaudeBase):
                           'qodercn:DeepSeek-Flash', 'running',
                           dp._iso(OFFPEAK_NIGHT)))
         st = dp.status(self.store, now=OFFPEAK_NIGHT)
-        self.assertEqual(st['domestic']['active'], 12, st['domestic'])
+        self.assertEqual(st['domestic']['active'], 13, st['domestic'])
         self.assertEqual(st['pools'][CLAUDE]['active'], 1, st['pools'][CLAUDE])
         r = self.claim_claude('late', executor='claude')
         self.assertFalse(r.get('allowed'), r)

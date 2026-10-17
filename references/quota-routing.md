@@ -13,20 +13,23 @@
 > unknown 在途/硬审批拒绝/用户明确暂停的 CN 自定义 `qodercn:Qwen-3.8-Max`（按候选授权范围
 > 排除）**照常**，绝不通过重试或改派绕过。
 
-> **退休说明（2026-10-08 最新决定）：** CodeBuddy/WorkBuddy 直连已改为 human-relay only，生产
-> `codebuddy_direct` 已彻底移除可执行传输（不再 `import subprocess`、不再有 `dispatch_core`），
-> `main` 对任何新直连在读配置/建输出/进入额度门禁前固定拒绝，不再进入实际额度门禁派发。下文
-> 提到的 CodeBuddy 冷却/结算路径现仅由**仅测试**的 `tests/offline_codebuddy_harness.py::
-> replay_dispatch` 在离线回放（合成 stub）中保留，历史 sqlite 行、既有占位与 CodeBuddy 记录
-> 都不删除、不覆盖、不清冷却。当前实际直连派发的额度门禁只对 Qoder 与 ZCode 生效；ZCode 手动
-> 额度、工作区单写入与通道单在途规则不变。ZCode 另有跨会话共享的**并发容量池**
-> （`scripts/dispatch_pool.py`，见 [global-dispatch](global-dispatch.md)）：容量并发 ≠ 额度冷却，
-> 两个 ZCode workspace 走同一 provider 时经**已校验的容量 claim**放行，同 workspace 单写入与
-> unknown/在途保护不变，不删通道行、不禁用门禁、不伪造 claim。
+> **当前状态（2026-10-17，BW-CODEBUDDY-MAIN-S3 覆盖 2026-10-08 全退休说明）：** 仅精确模型
+> `codebuddy:deepseek-v4.1-flash` 恢复正式主力，传输在 `scripts/codebuddy_live.py`（1 槽、最高
+> 优先、无时段门）；其它 CodeBuddy 旧模型（含旧 GLM）与 WorkBuddy 仍 human-relay，生产
+> `codebuddy_direct.main()` 对它们仍在读配置/建输出/进入额度门禁前固定拒绝。旧 CodeBuddy
+> 冷却/结算路径继续由**仅测试**的 `tests/offline_codebuddy_harness.py::replay_dispatch` 在离线
+> 回放中保留；历史 sqlite 行、既有占位与冷却记录不删除、不覆盖、不清除。**旧额度冷却不挡
+> 新模型**：新模型每轮只试一次，真实失败换下一候选，下一新轮重新从最高优先开始；不查余额、
+> 不新增冷却。当前实际直连派发的额度门禁只对 Qoder 与 ZCode 生效；CodeBuddy 精确模型不查
+> 余额、不写冷却，旧 CodeBuddy 冷却记录不参与其路由。ZCode 手动额度、工作区单写入与通道单在途规则不变。ZCode 另有跨会话共享的
+> **并发容量池**（`scripts/dispatch_pool.py`，见 [global-dispatch](global-dispatch.md)）：容量
+> 并发 ≠ 额度冷却，两个 ZCode workspace 走同一 provider 时经**已校验的容量 claim**放行，同
+> workspace 单写入与 unknown/在途保护不变，不删通道行、不禁用门禁、不伪造 claim。
 
 `scripts/quota_control.py` 提供 brain-worker 的持久额度冷却与路由门禁；`zcode_direct.py` 与
 `qoder_direct.py` 在**所有 Popen 之前**（含不传 `--dispatch-plan` 的兼容路径）调用它
-（CodeBuddy 生产入口已在额度门禁之前固定拒绝，其额度路径只在测试离线回放中保留）。
+（CodeBuddy 仅精确模型经 `codebuddy_live` 传输，不调用额度门禁、不写冷却；其它模型在额度门禁
+之前固定拒绝，旧额度路径只在测试离线回放中保留）。
 本文件是口径说明；实现以代码与其内注释为准。
 
 ## 1. 持久状态库

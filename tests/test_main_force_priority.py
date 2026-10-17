@@ -7,7 +7,7 @@
 - Max 全不可用时，Claude 允许窗且有空位优先于 Z；Claude 满/限额/峰值才 Z；
 - 同层内保持现有在途平衡与 tie 方式；rotation 历史计数照旧保留；
 - 全部主力无可用槽才 Flash；只允许 Z / 固定 Flash 时不强制 Max；CN 约束不跨区；
-- 12 总槽、unknown 在途、workspace 冲突、北京 22/08 边界与 DeepSeek 独立时间门不变；
+- 13 总槽、unknown 在途、workspace 冲突、北京 22/08 边界与 DeepSeek 独立时间门不变；
 - stage_selection 复用单一权威 `_select_main_force`，同一新优先级。
 """
 import sys
@@ -50,6 +50,12 @@ GAP = datetime(2026, 10, 12, 4, 30, 0, tzinfo=timezone.utc)
 ALL_MAINS = list(dp.MAIN_FORCE_KEYS)
 ALL_FLASH = list(dp.OVERFLOW_KEYS)
 SHA = 'p' + '0' * 63
+# BW-CODEBUDDY-MAIN-S3：本文件验证的是**旧层序**（三 Qoder Max > claude > zcode）与各守卫；
+# CodeBuddy 现为新的最高层。为不放宽任何断言地保留旧层序验证，本文件在共享夹具里先**占用
+# CodeBuddy 唯一名额**（capacity=1 置满），使其在 `_select_main_force` 因 active>=cap 被剔除，
+# 于是旧层序用例继续照原断言成立；CodeBuddy 作为新最高层由独立的
+# tests/test_codebuddy_reactivation.py 单独验证。
+CODEBUDDY = 'codebuddy:deepseek-v4.1-flash'
 
 
 class _Base(unittest.TestCase):
@@ -73,6 +79,14 @@ class _Base(unittest.TestCase):
     def build_store(self):
         with closing(dp.connect(self.store)) as conn:
             dp._rotation_row(conn)
+            # 占用 CodeBuddy 最高层唯一名额，保留旧层序断言原样成立（见模块常量注释）。
+            self._seed_n += 1
+            conn.execute(
+                'INSERT INTO attempts(token, task_id, runtime, model, pool_key, '
+                'state, child_pid, reserved_at_utc) VALUES(?,?,?,?,?,?,?,?)',
+                (f'tok-cb-{self._seed_n}', f'task-cb-{self._seed_n}',
+                 'codebuddy', 'deepseek-v4.1-flash', CODEBUDDY, 'reserved', None,
+                 dp._iso(NIGHT)))
             conn.execute('PRAGMA journal_mode=DELETE')
 
     def ws(self, tid):
@@ -286,7 +300,8 @@ class HighLevelDispatchTests(_Base):
         self.assertEqual(r2['reason'], 'workspace_in_flight')
 
     def test_total_capacity_and_slots(self):
-        self.assertEqual(dp.DOMESTIC_TOTAL_CAPACITY, 12)
+        self.assertEqual(dp.DOMESTIC_TOTAL_CAPACITY, 13)
+        self.assertEqual(dp.capacity_for(CODEBUDDY), 1)
         self.assertEqual(dp.capacity_for(ZCODE), 2)
         self.assertEqual(dp.capacity_for(QMAX), 1)
         self.assertEqual(dp.capacity_for(CN_MAX), 1)

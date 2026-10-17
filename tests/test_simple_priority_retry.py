@@ -105,11 +105,13 @@ class _Base(unittest.TestCase):
             conn.execute('PRAGMA journal_mode=DELETE')
 
     def fill(self, pk, task):
-        """真实占用该池一个在途名额（走既有 reserve 路径），使容量门按事实收紧。"""
+        """真实占用该池一个在途名额（走既有 reserve 路径），使容量门按事实收紧。
+        显式点名该池所属执行器：fixture 要占的是指定池，不能让 AUTO 在 CodeBuddy 有空位
+        时改派（routing_required），否则夹具本身就占不到目标池。"""
         runtime, model = pk.split(':', 1)
         r = dp.reserve(self.store, task_id=task, runtime=runtime, model=model,
                        workspace=self.ws(task), prompt_sha256='p', stage='s',
-                       now=T_NIGHT, _preclaim=False)
+                       executor=runtime, now=T_NIGHT, _preclaim=False)
         self.assertTrue(r.get('reserved') or r.get('allowed'), r)
         self._normalize()
 

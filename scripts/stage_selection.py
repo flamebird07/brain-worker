@@ -34,7 +34,7 @@ import dispatch_pool as dp  # noqa: E402
 import execution_control as ec  # noqa: E402
 
 SELECTION_MODES = ('auto', 'fixed', 'executor', 'temporary_fallback')
-EXECUTORS = ('auto', 'qoder', 'zcode', dp.CN_RUNTIME, 'claude')
+EXECUTORS = ('auto', 'qoder', 'zcode', dp.CN_RUNTIME, 'claude', dp.CODEBUDDY_RUNTIME)
 TERMINAL_PREVIOUS_STATES = ('finished', 'start_failed', 'cancelled', 'reconciled_exit',
                             'native_failed', 'failed')
 BLOCKING_PREVIOUS_STATES = ('reserved', 'running', 'unknown', 'executing',
