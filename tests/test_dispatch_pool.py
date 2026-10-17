@@ -117,12 +117,12 @@ class _PoolBase(unittest.TestCase):
         return r['token']
 
     def fill_domestic(self):
-        """把十一个国内名额填满（BW-CLAUDE-DEEPSEEK-S3 真实七主力 + 两地区 Flash 11 槽）：主力
+        """把十二个国内名额填满（BW-CLAUDE-CAPACITY2 真实八主力槽 + 两地区 Flash 12 槽）：主力
         zcode:GLM-5.3=2、qoder:Qwen3.8-Max=1、qodercn:Qwen3.8-Max=1、qodercn:Qwen-3.8-Max=2、
-        claude:deepseek-flash=1，同级兜底 qoder:Qwen3.8-Flash=2、qodercn:Qwen3.8-Flash=2。全部经
+        claude:deepseek-flash=2，同级兜底 qoder:Qwen3.8-Flash=2、qodercn:Qwen3.8-Flash=2。全部经
         显式 executor 逐一 claim 以保证确定性（CN 池只能经 executor='qodercn' 入口，claude 经
         executor='claude'；AUTO 永不自动选中 CN 内置）。返回 token 列表，顺序为
-        [zcode, zcode, qoderMax, cnMax, cnCustomA, cnCustomB, claude,
+        [zcode, zcode, qoderMax, cnMax, cnCustomA, cnCustomB, claude, claude,
          qoderFlash, qoderFlash, cnFlash, cnFlash]。
         """
         plan = [('f0', 'zcode', 'GLM-5.3', 'zcode'),
@@ -132,10 +132,11 @@ class _PoolBase(unittest.TestCase):
                 ('f4', 'qodercn', 'Qwen-3.8-Max', 'qodercn'),
                 ('f5', 'qodercn', 'Qwen-3.8-Max', 'qodercn'),
                 ('f6', 'claude', 'deepseek-flash', 'claude'),
-                ('f7', 'qoder', 'Qwen3.8-Flash', 'qoder'),
+                ('f7', 'claude', 'deepseek-flash', 'claude'),
                 ('f8', 'qoder', 'Qwen3.8-Flash', 'qoder'),
-                ('f9', 'qodercn', 'Qwen3.8-Flash', 'qodercn'),
-                ('f10', 'qodercn', 'Qwen3.8-Flash', 'qodercn')]
+                ('f9', 'qoder', 'Qwen3.8-Flash', 'qoder'),
+                ('f10', 'qodercn', 'Qwen3.8-Flash', 'qodercn'),
+                ('f11', 'qodercn', 'Qwen3.8-Flash', 'qodercn')]
         toks = [self.reserve_exec(t, rt, md, ex) for (t, rt, md, ex) in plan]
         st = dp.status(self.store, now=T0)
         self.assertEqual(st['domestic']['active'], dp.DOMESTIC_TOTAL_CAPACITY)
@@ -144,7 +145,7 @@ class _PoolBase(unittest.TestCase):
         self.assertEqual(st['pools']['qoder:Qwen3.8-Max']['active'], 1)
         self.assertEqual(st['pools']['qodercn:Qwen3.8-Max']['active'], 1)
         self.assertEqual(st['pools']['qodercn:Qwen-3.8-Max']['active'], 2)
-        self.assertEqual(st['pools']['claude:deepseek-flash']['active'], 1)
+        self.assertEqual(st['pools']['claude:deepseek-flash']['active'], 2)
         self.assertEqual(st['pools']['qoder:Qwen3.8-Flash']['active'], 2)
         self.assertEqual(st['pools']['qodercn:Qwen3.8-Flash']['active'], 2)
         return toks
@@ -152,20 +153,20 @@ class _PoolBase(unittest.TestCase):
 
 class CapacityAndKnownPoolTests(_PoolBase):
     def test_capacity_table_matches_allocation_decision(self):
-        # BW-CLAUDE-DEEPSEEK-S3 真实七主力 + 两地区 Flash 11 槽：ZCode=2、两内置 Max 各 1、
-        # CN 自定义 Max=2、claude:deepseek-flash=1、两地区 Flash 各 2；CN DeepSeek-Flash 已退出
+        # BW-CLAUDE-CAPACITY2 真实八主力槽 + 两地区 Flash 12 槽：ZCode=2、两内置 Max 各 1、
+        # CN 自定义 Max=2、claude:deepseek-flash=2、两地区 Flash 各 2；CN DeepSeek-Flash 已退出
         # 正常池，保留池名但 capacity=0。
         self.assertEqual(dp.capacity_for('zcode:GLM-5.3'), 2)
         self.assertEqual(dp.capacity_for('qoder:Qwen3.8-Max'), 1)
         self.assertEqual(dp.capacity_for('qodercn:Qwen3.8-Max'), 1)
         self.assertEqual(dp.capacity_for('qodercn:Qwen-3.8-Max'), 2)
-        self.assertEqual(dp.capacity_for('claude:deepseek-flash'), 1)
+        self.assertEqual(dp.capacity_for('claude:deepseek-flash'), 2)
         self.assertEqual(dp.capacity_for('qoder:Qwen3.8-Flash'), 2)
         self.assertEqual(dp.capacity_for('qodercn:Qwen3.8-Flash'), 2)
         self.assertEqual(dp.capacity_for('qodercn:DeepSeek-Flash'), 0)
         self.assertIsNone(dp.capacity_for('luna:native'))
         self.assertEqual(dp.capacity_for('qoder:Unknown-Model'), 0)
-        self.assertEqual(dp.DOMESTIC_TOTAL_CAPACITY, 11)
+        self.assertEqual(dp.DOMESTIC_TOTAL_CAPACITY, 12)
 
     def test_is_known_pool(self):
         for pk in ('zcode:GLM-5.3', 'qoder:Qwen3.8-Max',
@@ -231,8 +232,9 @@ class MainForceRotationTests(_PoolBase):
         r2 = self.select('t2', 'zcode', 'GLM-5.3')
         self.assertRouting(r2, 'claude:deepseek-flash')
         self.assertFalse(r2.get('sent', True))
-        # claude 层也满后，请求 zcode → 命中 zcode 自身层，直接 claim（高层全满才落最低层）。
+        # claude 层也满（容量 2）后，请求 zcode → 命中 zcode 自身层，直接 claim（高层全满才落最低层）。
         self.reserve_exec('c0', 'claude', 'deepseek-flash', 'claude')
+        self.reserve_exec('c1', 'claude', 'deepseek-flash', 'claude')
         r3 = self.select('t3', 'zcode', 'GLM-5.3')
         self.assertClaimed(r3, 'zcode:GLM-5.3')
 
@@ -242,7 +244,7 @@ class MainForceRotationTests(_PoolBase):
         self.assertClaimed(r, 'qoder:Qwen3.8-Max')
 
     def test_select_when_both_main_full_routes_to_overflow(self):
-        # 全部主力填满（zcode×2 + 两内置 Max 各 1 + CN 自定义 Max×2 + claude×1）后经显式
+        # 全部主力填满（zcode×2 + 两内置 Max 各 1 + CN 自定义 Max×2 + claude×2）后经显式
         # executor 确定性占位，AUTO select zcode 主力全满 → 同级 Flash 兜底，两区平票按
         # pool_key stable tie 选国际 Flash。
         self.reserve_exec('m0', 'zcode', 'GLM-5.3', 'zcode')
@@ -252,6 +254,7 @@ class MainForceRotationTests(_PoolBase):
         self.reserve_exec('m4', 'qodercn', 'Qwen-3.8-Max', 'qodercn')
         self.reserve_exec('m5', 'qodercn', 'Qwen-3.8-Max', 'qodercn')
         self.reserve_exec('m6', 'claude', 'deepseek-flash', 'claude')
+        self.reserve_exec('m7', 'claude', 'deepseek-flash', 'claude')
         r = self.select('of', 'zcode', 'GLM-5.3')
         self.assertRouting(r, 'qoder:Qwen3.8-Flash')
 
@@ -279,6 +282,7 @@ class OverflowRoutingTests(_PoolBase):
         self.reserve_exec('m4', 'qodercn', 'Qwen-3.8-Max', 'qodercn')
         self.reserve_exec('m5', 'qodercn', 'Qwen-3.8-Max', 'qodercn')
         self.reserve_exec('m6', 'claude', 'deepseek-flash', 'claude')
+        self.reserve_exec('m7', 'claude', 'deepseek-flash', 'claude')
         r = self.select('fok', 'qoder', 'Qwen3.8-Flash')
         self.assertClaimed(r, 'qoder:Qwen3.8-Flash')
 
@@ -290,6 +294,7 @@ class OverflowRoutingTests(_PoolBase):
         self.reserve_exec('m4', 'qodercn', 'Qwen-3.8-Max', 'qodercn')
         self.reserve_exec('m5', 'qodercn', 'Qwen-3.8-Max', 'qodercn')
         self.reserve_exec('m6', 'claude', 'deepseek-flash', 'claude')
+        self.reserve_exec('m7', 'claude', 'deepseek-flash', 'claude')
         self.reserve_exec('f0', 'qoder', 'Qwen3.8-Flash', 'qoder')
         self.reserve_exec('f1', 'qoder', 'Qwen3.8-Flash', 'qoder')
         # AUTO 入口请求国际 Flash：三主力与国际 Flash 均满，CN Flash 同级兜底仍有空位 →
@@ -804,9 +809,9 @@ class StatusTests(_PoolBase):
         self.reserve('q', 'qoder', 'Qwen3.8-Max')
         st = dp.status(self.store, now=T0)
         self.assertEqual(set(st['pools']), set(dp.CAPACITY))
-        self.assertEqual(st['domestic']['capacity'], 11)
+        self.assertEqual(st['domestic']['capacity'], 12)
         self.assertEqual(st['domestic']['active'], 2)
-        self.assertEqual(st['domestic']['free'], 9)
+        self.assertEqual(st['domestic']['free'], 10)
         self.assertFalse(st['domestic']['full'])
         self.assertEqual(st['rotation']['committed_zcode'], 1)
         self.assertEqual(st['rotation']['committed_qoder'], 1)
@@ -818,8 +823,8 @@ class StatusTests(_PoolBase):
         dp.claim_due(self.store, task_id='L', now=T0 + timedelta(seconds=400),
                      _preclaim=False)
         st = dp.status(self.store, now=T0)
-        # Luna 在途不占国内名额口径（国内仍为 11/11，Luna 单列且无上限）。
-        self.assertEqual(st['domestic']['active'], 11)
+        # Luna 在途不占国内名额口径（国内仍为 12/12，Luna 单列且无上限）。
+        self.assertEqual(st['domestic']['active'], 12)
         self.assertEqual(st['pools'][dp.LUNA_KEY]['active'], 1)
 
 
@@ -1224,7 +1229,7 @@ class BeijingMainForceWindowTests(_PoolBase):
         # ZCode 两槽占满 + 真实工作日高峰（北京周一 10:00：两内置 Max 时段外、claude 高峰
         # 门关闭，均为不可选候选）+ 自定义 Max 也占满 → AUTO 请求内置 Max 应兜底到同级
         # Flash，绝不落任一个 Qoder 内置 Max，也绝不因 NOON(12:00) 恰在 claude 高峰
-        # 排除端点外（12:00–14:00 午间可派）而把 AUTO 选中到第 11 槽 claude。用显式
+        # 排除端点外（12:00–14:00 午间可派）而把 AUTO 选中到 claude 槽。用显式
         # executor 逐一确定性填满 ZCode 与自定义 Max（AUTO 轮换会先派内置 Max，此处不受影响）。
         WEEKDAY_PEAK = datetime(2026, 10, 12, 2, 0, 0, tzinfo=timezone.utc)  # 北京 10:00 周一
         self.reserve_exec('z1', 'zcode', 'GLM-5.3', 'zcode', pk='zcode:GLM-5.3')

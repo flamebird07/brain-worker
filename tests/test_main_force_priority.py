@@ -7,7 +7,7 @@
 - Max 全不可用时，Claude 允许窗且有空位优先于 Z；Claude 满/限额/峰值才 Z；
 - 同层内保持现有在途平衡与 tie 方式；rotation 历史计数照旧保留；
 - 全部主力无可用槽才 Flash；只允许 Z / 固定 Flash 时不强制 Max；CN 约束不跨区；
-- 11 总槽、unknown 在途、workspace 冲突、北京 22/08 边界与 DeepSeek 独立时间门不变；
+- 12 总槽、unknown 在途、workspace 冲突、北京 22/08 边界与 DeepSeek 独立时间门不变；
 - stage_selection 复用单一权威 `_select_main_force`，同一新优先级。
 """
 import sys
@@ -163,7 +163,7 @@ class NightMaxPriorityTests(_Base):
         self.assertEqual(target, CLAUDE)
 
     def test_zcode_only_when_claude_full_or_limited_or_peak(self):
-        self.seed(CLAUDE, 1)                      # claude 容量 1 → 满
+        self.seed(CLAUDE, 2)                      # claude 容量 2 → 满
         self.assertEqual(self.select(ZCODE, GAP)[0], ZCODE)
 
     def test_claude_history_limit_no_longer_yields_to_zcode(self):
@@ -244,8 +244,9 @@ class HighLevelDispatchTests(_Base):
         for i in range(2):
             self.assertTrue(self.reserve(f'cx{i}', 'qodercn', 'Qwen-3.8-Max',
                                          'qodercn').get('allowed'))
-        self.assertTrue(self.reserve('cl', 'claude', 'deepseek-flash',
-                                     'claude').get('allowed'))
+        for i in range(2):
+            self.assertTrue(self.reserve(f'cl{i}', 'claude', 'deepseek-flash',
+                                         'claude').get('allowed'))
 
     def test_flash_only_when_all_mains_unavailable(self):
         self.occupy_all_mains()
@@ -284,13 +285,13 @@ class HighLevelDispatchTests(_Base):
         self.assertFalse(r2.get('allowed'), r2)
         self.assertEqual(r2['reason'], 'workspace_in_flight')
 
-    def test_total_capacity_and_slots_unchanged(self):
-        self.assertEqual(dp.DOMESTIC_TOTAL_CAPACITY, 11)
+    def test_total_capacity_and_slots(self):
+        self.assertEqual(dp.DOMESTIC_TOTAL_CAPACITY, 12)
         self.assertEqual(dp.capacity_for(ZCODE), 2)
         self.assertEqual(dp.capacity_for(QMAX), 1)
         self.assertEqual(dp.capacity_for(CN_MAX), 1)
         self.assertEqual(dp.capacity_for(CN_CUSTOM_MAX), 2)
-        self.assertEqual(dp.capacity_for(CLAUDE), 1)
+        self.assertEqual(dp.capacity_for(CLAUDE), 2)
         self.assertEqual(dp.capacity_for(QFLASH), 2)
         self.assertEqual(dp.capacity_for(CN_FLASH), 2)
 

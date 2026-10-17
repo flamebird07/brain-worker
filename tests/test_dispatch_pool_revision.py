@@ -94,13 +94,13 @@ class TempStoreMixin:
                 (token, task_id, runtime, model, pool, state, child_pid, child_created,
                  wrapper_pid, wrapper_created))
 
-    def fill_domestic(self, prefix='seed', n=11):
-        # BW-CLAUDE-DEEPSEEK-S3 真实七主力 + 两地区 Flash 11 槽：zcode×2 + 两内置 Max 各 1 +
-        # CN 自定义 Max×2 + claude:deepseek-flash×1 + 两地区 Flash 各 2（CN DeepSeek-Flash 已
-        # retired，不再作为在途基线）。
+    def fill_domestic(self, prefix='seed', n=12):
+        # BW-CLAUDE-CAPACITY2 真实七主力 + 两地区 Flash 12 槽：zcode×2 + 两内置 Max 各 1 +
+        # CN 自定义 Max×2 + claude:deepseek-flash×2（容量由 1 增至 2）+ 两地区 Flash 各 2
+        # （CN DeepSeek-Flash 已 retired，不再作为在途基线）。
         pools = ['zcode:GLM-5.3'] * 2 + ['qoder:Qwen3.8-Max'] \
             + ['qodercn:Qwen3.8-Max'] + ['qodercn:Qwen-3.8-Max'] * 2 \
-            + ['claude:deepseek-flash'] \
+            + ['claude:deepseek-flash'] * 2 \
             + ['qoder:Qwen3.8-Flash'] * 2 + ['qodercn:Qwen3.8-Flash'] * 2
         for i in range(n):
             self.seed_attempt(f'{prefix}-{i}', f'{prefix}-task-{i}', pools[i])
@@ -142,9 +142,9 @@ class TestUnifiedPolicy(TempStoreMixin, unittest.TestCase):
         self.assertEqual(out['reason'], 'luna_requires_ticket')
 
     def test_fill_all_slots_then_one_more_rejected(self):
-        # BW-CLAUDE-DEEPSEEK-S3 真实七主力 + 两 Flash 共 11 槽：经显式 executor 逐槽确定性 claim
-        # （各池不超自身容量），每次 assert allowed；填满 11 后任何 AUTO 国内组合才 capacity_full
-        # 且 domestic_full。Z4：不同 task 用独立 workspace 目录（真实单写入守卫）。
+        # BW-CLAUDE-CAPACITY2 真实七主力 + 两 Flash 共 12 槽（claude×2）：经显式 executor 逐槽
+        # 确定性 claim（各池不超自身容量），每次 assert allowed；填满 12 后任何 AUTO 国内组合才
+        # capacity_full 且 domestic_full。Z4：不同 task 用独立 workspace 目录（真实单写入守卫）。
         fill = [('t0', 'zcode', 'GLM-5.3', 'zcode'),
                 ('t1', 'zcode', 'GLM-5.3', 'zcode'),
                 ('t2', 'qoder', 'Qwen3.8-Max', 'qoder'),
@@ -152,6 +152,7 @@ class TestUnifiedPolicy(TempStoreMixin, unittest.TestCase):
                 ('t3a', 'qodercn', 'Qwen-3.8-Max', 'qodercn'),
                 ('t3b', 'qodercn', 'Qwen-3.8-Max', 'qodercn'),
                 ('t3c', 'claude', 'deepseek-flash', 'claude'),
+                ('t3d', 'claude', 'deepseek-flash', 'claude'),
                 ('t4', 'qoder', 'Qwen3.8-Flash', 'qoder'),
                 ('t5', 'qoder', 'Qwen3.8-Flash', 'qoder'),
                 ('t6', 'qodercn', 'Qwen3.8-Flash', 'qodercn'),
@@ -161,7 +162,8 @@ class TestUnifiedPolicy(TempStoreMixin, unittest.TestCase):
                                       workspace=f'C:/w/{tid}', prompt_sha256='p' * 64,
                                       executor=ex, now=T0, _preclaim=False)
             self.assertTrue(out['allowed'], out)
-        self.assertEqual(dp.status(self.store, now=T0)['domestic']['active'], 11)
+        self.assertEqual(dp.status(self.store, now=T0)['domestic']['active'],
+                         dp.DOMESTIC_TOTAL_CAPACITY)
         # 全部槽已满 → 再一个 AUTO 国内组合 capacity_full 且 domestic_full。
         out = dp.select_and_claim(self.store, task_id='t9', runtime='zcode',
                                   model='GLM-5.3', workspace='C:/w/t9',
@@ -614,12 +616,12 @@ class TestOverflowNotSubstitutedZ2(TempStoreMixin, unittest.TestCase):
     """Z2-2：两主力满时请求 Z/Max 必须 routing_required，绝不偷换成 Flash 落库。"""
 
     def _fill_mains(self):
-        # 全部主力填满：zcode×2 + 两内置 Max 各 1 + CN 自定义 Max×2 + claude×1
-        # （BW-CLAUDE-DEEPSEEK-S3：claude 是第 11 槽主力，须一并占满才回落到 Flash）。
+        # 全部主力填满：zcode×2 + 两内置 Max 各 1 + CN 自定义 Max×2 + claude×2
+        # （BW-CLAUDE-CAPACITY2：claude 容量由 1 增至 2，第 11–12 槽主力，须一并占满才回落到 Flash）。
         for i, pool in enumerate(['zcode:GLM-5.3'] * 2 + ['qoder:Qwen3.8-Max']
                                  + ['qodercn:Qwen3.8-Max']
                                  + ['qodercn:Qwen-3.8-Max'] * 2
-                                 + ['claude:deepseek-flash']):
+                                 + ['claude:deepseek-flash'] * 2):
             self.seed_attempt(f'm-{i}', f'm-task-{i}', pool)
 
     def test_select_and_claim_main_full_routes_to_flash_no_substitution(self):

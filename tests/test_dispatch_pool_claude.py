@@ -1,10 +1,12 @@
-"""BW-CLAUDE-DEEPSEEK-S3 离线回归：claude:deepseek-flash 作为第 11 个 AUTO 可选主力槽。
+"""BW-CLAUDE-DEEPSEEK-S3 / BW-CLAUDE-CAPACITY2 离线回归：claude:deepseek-flash AUTO 可选主力槽。
 
-覆盖：物理 DOMESTIC_TOTAL_CAPACITY=11；claude 在 MAIN_FORCE_KEYS 且容量 1（第 2 请求满、绝不
-回退别模型）；AUTO 在其它主力占满时可选中 claude（无需用户显式点名）；claude 在途计入国内总在途
+覆盖：物理 DOMESTIC_TOTAL_CAPACITY=12；claude 在 MAIN_FORCE_KEYS 且容量 2（第 2 个请求可认领、
+第 3 个满且绝不回退别模型；完成释放后可再用；同 workspace 仍拒绝；reserved/running/unknown 均
+正确占位）；AUTO 在其它主力占满时可选中 claude（无需用户显式点名）；claude 在途计入国内总在途
 聚合、但绝不污染 committed_qoder；显式 executor='claude' 点名；时段门（工作日高峰拒 / 周末 /
-2026 假日 / 夜间放行）；跨高峰 reserve→consume 只释放本 token；明确限额落标/释放；以及既有
-10 槽关键守卫不被破坏。全部显式临时 sqlite store，绝不读写真实 ~/.brain-worker。零网络/零模型。
+2026 假日 / 夜间放行）；跨高峰 reserve→consume 只释放本 token；明确限额落标/释放；总 12 守卫
+包含历史迁移占位且绝不派第 13 个。全部显式临时 sqlite store，绝不读写真实 ~/.brain-worker。
+零网络/零模型。
 """
 import hashlib
 import sys
@@ -68,26 +70,84 @@ class _ClaudeBase(unittest.TestCase):
 
 
 class CapacityAndRouting(_ClaudeBase):
-    def test_claude_is_known_main_force_with_capacity_one(self):
+    def test_claude_is_known_main_force_with_capacity_two(self):
         self.assertTrue(dp.is_known_pool(CLAUDE))
-        self.assertEqual(dp.capacity_for(CLAUDE), 1)
+        self.assertEqual(dp.capacity_for(CLAUDE), 2)
+        self.assertEqual(dp.CLAUDE_CAPACITY, 2)
+        self.assertEqual(dp.CLAUDE_CAPACITY,
+                         dp.MAIN_FORCE_CAPACITY[dp.CLAUDE_POOL_KEY])
         self.assertIn(CLAUDE, dp.MAIN_FORCE_KEYS)
 
-    def test_physical_domestic_total_is_eleven(self):
-        self.assertEqual(dp.DOMESTIC_TOTAL_CAPACITY, 11)
+    def test_physical_domestic_total_is_twelve(self):
+        self.assertEqual(dp.DOMESTIC_TOTAL_CAPACITY, 12)
+        self.assertEqual(dp.DOMESTIC_TOTAL_CAPACITY,
+                         sum(dp.MAIN_FORCE_CAPACITY.values())
+                         + sum(dp.OVERFLOW_CAPACITY.values()))
 
     def test_explicit_claude_claim(self):
         r = self.claim_claude('c1')
         self.assertTrue(r.get('allowed'), r)
         self.assertEqual(r['pool_key'], CLAUDE)
 
-    def test_second_concurrent_claude_is_full(self):
+    def test_two_concurrent_claude_slots_then_third_is_full(self):
         r1 = self.claim_claude('a')
-        r2 = self.claim_claude('b')  # 容量 1 → 第 2 个并发 claude 满，绝不回退别模型
+        r2 = self.claim_claude('b')   # 容量 2 → 第 2 个并发 claude 仍可认领
+        r3 = self.claim_claude('c')   # 第 3 个满，绝不回退别模型
+        self.assertTrue(r1.get('allowed'), r1)
+        self.assertTrue(r2.get('allowed'), r2)
+        self.assertEqual(r1['pool_key'], CLAUDE)
+        self.assertEqual(r2['pool_key'], CLAUDE)
+        self.assertFalse(r3.get('allowed'), r3)
+        self.assertEqual(r3['reason'], 'capacity_full')
+        self.assertIn('capacity', r3['reasons'][0].lower())
+        self.assertEqual(dp.status(self.store, now=OFFPEAK_NIGHT)['pools'][CLAUDE]['active'], 2)
+
+    def test_same_workspace_second_claude_still_refused(self):
+        ws = self.ws('shared')
+        r1 = dp.select_and_claim(self.store, task_id='w1', runtime='claude',
+                                 model='deepseek-flash', workspace=ws,
+                                 prompt_sha256='p' + '0' * 63, stage='s',
+                                 now=OFFPEAK_NIGHT, executor='claude', _preclaim=False)
+        r2 = dp.select_and_claim(self.store, task_id='w2', runtime='claude',
+                                 model='deepseek-flash', workspace=ws,
+                                 prompt_sha256='p' + '0' * 63, stage='s',
+                                 now=OFFPEAK_NIGHT, executor='claude', _preclaim=False)
         self.assertTrue(r1.get('allowed'), r1)
         self.assertFalse(r2.get('allowed'), r2)
-        self.assertEqual(r2['reason'], 'capacity_full')
-        self.assertIn('capacity', r2['reasons'][0].lower())
+        self.assertEqual(r2['reason'], 'workspace_in_flight', r2)
+
+    def test_terminal_release_allows_claude_reuse(self):
+        r1 = self.claim_claude('a')
+        r2 = self.claim_claude('b')
+        self.assertTrue(r1.get('allowed'), r1)
+        self.assertTrue(r2.get('allowed'), r2)
+        rel = dp.finish(self.store, r1['token'], terminal='cancelled',
+                        now=OFFPEAK_NIGHT)
+        self.assertTrue(rel['released'], rel)
+        r3 = self.claim_claude('c')
+        self.assertTrue(r3.get('allowed'), r3)
+        self.assertEqual(dp.status(self.store, now=OFFPEAK_NIGHT)['pools'][CLAUDE]['active'], 2)
+
+    def test_reserved_running_unknown_all_occupy_claude_capacity(self):
+        r1 = self._reserve('r1', 'claude', 'deepseek-flash', 'claude', OFFPEAK_NIGHT)
+        r2 = self._reserve('r2', 'claude', 'deepseek-flash', 'claude', OFFPEAK_NIGHT)
+        self.assertTrue(r1.get('allowed'), r1)
+        self.assertTrue(r2.get('allowed'), r2)
+        # reserved 两条已占满 → 第 3 条拒绝。
+        r3 = self.claim_claude('r3')
+        self.assertFalse(r3.get('allowed'), r3)
+        self.assertEqual(r3['reason'], 'capacity_full', r3)
+        # 把两条真实占位分别推进到 running / unknown：仍占位，绝不因状态变化被漏算。
+        with closing(dp.connect(self.store)) as conn:
+            conn.execute("UPDATE attempts SET state='running' WHERE token=?",
+                         (r1['token'],))
+            conn.execute("UPDATE attempts SET state='unknown' WHERE token=?",
+                         (r2['token'],))
+        st = dp.status(self.store, now=OFFPEAK_NIGHT)
+        self.assertEqual(st['pools'][CLAUDE]['active'], 2, st['pools'][CLAUDE])
+        r4 = self.claim_claude('r4')
+        self.assertFalse(r4.get('allowed'), r4)
+        self.assertEqual(r4['reason'], 'capacity_full', r4)
 
     def test_auto_selects_claude_when_other_mains_full(self):
         # 另一主力的 AUTO 请求（未点名 claude）：其余 6 个主力槽占满、claude 空闲 → 选中 claude
@@ -101,9 +161,10 @@ class CapacityAndRouting(_ClaudeBase):
 
     def test_claude_inflight_counted_in_domestic_aggregate(self):
         self.claim_claude('c1')
+        self.claim_claude('c2')
         st = dp.status(self.store, now=OFFPEAK_NIGHT)
-        self.assertEqual(st['domestic']['active'], 1)   # claude 在途计入国内总数
-        self.assertEqual(st['pools'][CLAUDE]['active'], 1)
+        self.assertEqual(st['domestic']['active'], 2)   # claude 在途计入国内总数
+        self.assertEqual(st['pools'][CLAUDE]['active'], 2)
 
     def test_claude_does_not_pollute_committed_qoder(self):
         self.claim_claude('c1')
@@ -129,15 +190,16 @@ class CapacityAndRouting(_ClaudeBase):
         self.assertEqual(r['reason'], 'main_force_window_closed')
 
     def test_total_guard_blocks_claude_with_migration_debt(self):
-        # BW-CLAUDE-DEEPSEEK-S4 反例：真实国内在途已达总 11（10 个在容量的在途 +
-        # 1 条 retired 池超额迁移在途），claude 自身按容量看似仍空（0/1），但总守卫
-        # 对 claude 同样生效，绝不派第 12 个。显式点名 claude 也如实拒绝。
+        # BW-CLAUDE-CAPACITY2：真实国内在途已达总 12（10 个非 claude 在容量的在途 +
+        # 1 个 claude 在途 + 1 条 retired 池超额迁移在途），claude 自身按容量看似仍空
+        # （1/2），但总守卫对 claude 同样生效，绝不派第 13 个。显式点名 claude 也如实拒绝。
         self.occupy_non_claude_mains()
         for i in range(2):
             self.assertTrue(self._reserve(f'of{i}', 'qoder', 'Qwen3.8-Flash',
                                           'qoder').get('allowed'))
             self.assertTrue(self._reserve(f'cf{i}', 'qodercn', 'Qwen3.8-Flash',
                                           'qodercn').get('allowed'))
+        self.assertTrue(self.claim_claude('pre').get('allowed'))
         with closing(dp.connect(self.store)) as conn:
             conn.execute('INSERT INTO attempts(token, task_id, runtime, model, pool_key, '
                          "state, reserved_at_utc) VALUES(?,?,?,?,?,?,?)",
@@ -145,8 +207,8 @@ class CapacityAndRouting(_ClaudeBase):
                           'qodercn:DeepSeek-Flash', 'running',
                           dp._iso(OFFPEAK_NIGHT)))
         st = dp.status(self.store, now=OFFPEAK_NIGHT)
-        self.assertEqual(st['domestic']['active'], 11, st['domestic'])
-        self.assertEqual(st['pools'][CLAUDE]['active'], 0, st['pools'][CLAUDE])
+        self.assertEqual(st['domestic']['active'], 12, st['domestic'])
+        self.assertEqual(st['pools'][CLAUDE]['active'], 1, st['pools'][CLAUDE])
         r = self.claim_claude('late', executor='claude')
         self.assertFalse(r.get('allowed'), r)
         self.assertEqual(r['reason'], 'capacity_full', r)

@@ -163,7 +163,7 @@ except ImportError:  # isolated revision tree / standalone tests
 
 # ------------------------------------------------------------------ 池定义
 # BW-POOL-SPLIT-20261010-S2 + BW-MAX-WINDOW-20261010-S2 用户 2026-10-10 最新分配：
-#   六池布局、调度总数 10：
+#   六池布局（BW-CLAUDE-CAPACITY2 起含 claude 2 槽）、当前调度总数 12：
 #   主力（四池共 6 槽，同属 best-effort 1:1 的两个组）：
 #     zcode:GLM-5.3=2（Z 组）、qoder:Qwen3.8-Max=1、qodercn:Qwen3.8-Max=1（国际/CN 内置
 #     Max，属 Qoder 组，仅北京时间 22:00 含至次日 08:00 不含作主力）、
@@ -178,9 +178,9 @@ except ImportError:  # isolated revision tree / standalone tests
 # 过滤再排序）。历史 committed 计数（rotation 两列 committed_zcode / committed_qoder 与
 # claude 提交历史）仍照旧记账并保留，但**不再参与跨层排序**，低层绝不能凭历史计数抢高层名额。
 # 不新增记分系统，复用既有 rotation 列与 `_count_active` 即足够。
-# BW-CLAUDE-DEEPSEEK-S3：Claude Code / deepseek-flash（claude:deepseek-flash，容量 1）纳入
-# 主力候选与 AUTO 可派集合，成为**独立第三公平组 claude**（与 Z2 组、Qoder 组并列），
-# 物理调度总数 DOMESTIC_TOTAL_CAPACITY = 6 + 4 + 1 = 11。
+# BW-CLAUDE-DEEPSEEK-S3：Claude Code / deepseek-flash 纳入主力候选与 AUTO 可派集合，成为
+# **独立第三公平组 claude**（与 Z2 组、Qoder 组并列）；BW-CLAUDE-CAPACITY2：容量由 1 增至 2，
+# 物理调度总数 DOMESTIC_TOTAL_CAPACITY = 6 + 2 + 4 = 12（其余池容量/优先级/时段不变）。
 MAIN_FORCE_POOLS = (('zcode', 'GLM-5.3'),
                     ('qoder', 'Qwen3.8-Max'),
                     ('qodercn', 'Qwen3.8-Max'),
@@ -190,7 +190,7 @@ MAIN_FORCE_CAPACITY = {'zcode:GLM-5.3': 2,
                        'qoder:Qwen3.8-Max': 1,
                        'qodercn:Qwen3.8-Max': 1,
                        'qodercn:Qwen-3.8-Max': 2,
-                       'claude:deepseek-flash': 1}
+                       'claude:deepseek-flash': 2}
 OVERFLOW_POOLS = (('qoder', 'Qwen3.8-Flash'), ('qodercn', 'Qwen3.8-Flash'))
 OVERFLOW_CAPACITY = {'qoder:Qwen3.8-Flash': 2, 'qodercn:Qwen3.8-Flash': 2}
 # BW-POOL-SPLIT-20261010-S2：CN DeepSeek-Flash 从正常池退出，但保留池名与 0 容量条目，
@@ -201,7 +201,7 @@ LUNA_RUNTIME = 'luna'
 LUNA_MODEL = 'native'
 LUNA_ASK_TIMEOUT_SECONDS = 300
 DOMESTIC_TOTAL_CAPACITY = (sum(MAIN_FORCE_CAPACITY.values())
-                           + sum(OVERFLOW_CAPACITY.values()))  # 7 + 4 = 11
+                           + sum(OVERFLOW_CAPACITY.values()))  # 8 + 4 = 12
 
 # pool_key -> capacity（None 表示无上限，仅 Luna；0 表示已退出正常池但保留历史真实在途）。
 CAPACITY = {}
@@ -210,20 +210,22 @@ CAPACITY.update(OVERFLOW_CAPACITY)
 for _rk in LEGACY_RETIRED_POOL_KEYS:
     CAPACITY[_rk] = 0
 CAPACITY['luna:native'] = None
-# BW-CLAUDE-DEEPSEEK-S3：claude:deepseek-flash 已并入 MAIN_FORCE_POOLS/CAPACITY 成为第 11 个
-# 可派工槽（独立第三公平组 claude，容量 1），故其容量已在上面 CAPACITY.update 中登记，无需重复。
+# BW-CLAUDE-DEEPSEEK-S3：claude:deepseek-flash 已并入 MAIN_FORCE_POOLS/CAPACITY（独立第三公平组
+# claude），故其容量已在上面 CAPACITY.update 中登记；BW-CLAUDE-CAPACITY2 起容量为 2。
 # 关键口径：
-#  - DOMESTIC_TOTAL_CAPACITY = 11，claude 在途计入国内总在途（_domestic_active 只排除 Luna）；
+#  - DOMESTIC_TOTAL_CAPACITY = 12，claude 在途计入国内总在途（_domestic_active 只排除 Luna）；
 #  - _select_main_force 现按主力优先级层排序（BW-MAIN-PRIORITY-20261011-S1：三 Qoder Max >
 #    claude:deepseek-flash > zcode:GLM-5.3）：claude 的 committed 仍由 attempts 中 child_pid
 #    非空的真实提交历史计算并保留记账，但只作历史计数、不再参与跨层排序（claude 处于中间层，
 #    仅当最高层三 Qoder Max 全部不合格或无空位时才轮到它，绝不凭历史计数抢更高层名额）；
 #  - claude 受 deepseek_offpeak 的北京时间工作日高峰门约束（高峰不得新派，offhours/周末/假日
-#    全天可派），且仅经 claude 自身 capacity=1 约束，无任何跨模型回退。
+#    全天可派），且仅经 claude 自身 capacity=2 约束，无任何跨模型回退。
 CLAUDE_RUNTIME = 'claude'
 CLAUDE_MODEL = 'deepseek-flash'
 CLAUDE_POOL_KEY = f'{CLAUDE_RUNTIME}:{CLAUDE_MODEL}'
-CLAUDE_CAPACITY = 1
+# 容量单一可信来源：MAIN_FORCE_CAPACITY（上面 CAPACITY.update 也取自它），此处只做同步引用，
+# 避免两处常量漂移。
+CLAUDE_CAPACITY = MAIN_FORCE_CAPACITY[CLAUDE_POOL_KEY]
 MAIN_FORCE_KEYS = tuple(f'{r}:{m}' for r, m in MAIN_FORCE_POOLS)
 OVERFLOW_KEYS = tuple(f'{r}:{m}' for r, m in OVERFLOW_POOLS)
 # 兼容既有引用名（CN_KEYS/CN_POOL_KEY 保留为空元组/空串，代码不再据此派工）；
@@ -688,7 +690,7 @@ def _domestic_active(conn) -> int:
     """国内总在途保护计数（BW-POOL-SPLIT-20261010-S3 + BW-CLAUDE-DEEPSEEK-S3）：统计**所有
     非 Luna 的在途 attempt**，含 claude:deepseek-flash 以及仍在途的 retired DeepSeek 与超额
     旧 Max（迁移债务）。这样即便某个新池按各自容量看似有空位，只要真实总在途已达物理总容量
-    （现为 11：六池主力含 claude + 两地区 Flash 各 2），就不会派出超额的国内槽；减少容量不杀
+    （现为 12：主力含 claude 2 + 两地区 Flash 各 2），就不会派出超额的国内槽；减少容量不杀
     老任务，老任务依真实终态自然释放后计数才下降。Luna（救援池、无上限）不计入国内总额。"""
     row = conn.execute(
         'SELECT COUNT(*) AS n FROM attempts WHERE pool_key != ? AND state IN (%s)'
@@ -1042,7 +1044,7 @@ def _scope_allowed_candidates(scope, zcode_blocked):
     if executor == CN_RUNTIME:
         return [CN_MAX_POOL_KEY, CN_CUSTOM_MAX_POOL_KEY, CN_FLASH_POOL_KEY]
     if executor == 'claude':
-        # 显式指定 claude 入口：只有独立第 11 槽自身，绝不跨到国内 10 槽或 Flash/回退模型。
+        # 显式指定 claude 入口：只有独立 claude 池自身，绝不跨到其它国内槽或 Flash/回退模型。
         return [CLAUDE_POOL_KEY]
     mains = [k for k in MAIN_FORCE_KEYS
              if not (k == ZCODE_POOL_KEY and zcode_blocked)]
@@ -1058,7 +1060,8 @@ def _select_main_force(conn, requested_pk, now, eligible=None):
     2. 只保留**当前真实有空位**的池（capacity_for > `_count_active`）——绝不因历史
        committed 计数拦有空位的候选；
     3. 排序第一键 = 主力优先级层：三 Qoder Max（qoder:Qwen3.8-Max /
-       qodercn:Qwen3.8-Max / qodercn:Qwen-3.8-Max）=0，claude:deepseek-flash=1，
+       qodercn:Qwen3.8-Max / qodercn:Qwen-3.8-Max）=0，claude:deepseek-flash=1（层号，
+       容量为 2），
        zcode:GLM-5.3=2。历史 committed、请求池偏好与在途数**绝不能**让低层抢高层名额；
        最高层全部不合格或无空位才落到下一层；
     4. 同层内保持现有在途平衡：当前真实在途数（`_count_active`）少者优先，平票才优先
@@ -1146,15 +1149,15 @@ def _domestic_policy(conn, requested_pk, now, executor='auto', eligible=None,
       绕过轮转；选中≠请求 → routing；主力都不可用/已满/已限额 → 两地区 Flash 同级兜底；
       两 Flash 也满才 full。
     - 迁移债务总额守卫（BW-CLAUDE-DEEPSEEK-S4 起对全部国内池生效，含 claude）：真实国内在途
-      （含在途 retired DeepSeek 与超额旧 Max）已达总 11 时，即便某池按各自容量看似有空也
-      一律 full，绝不派第 12 个。"""
+      （含在途 retired DeepSeek 与超额旧 Max）已达总 12 时，即便某池按各自容量看似有空也
+      一律 full，绝不派第 13 个。"""
     if requested_pk == LUNA_KEY:
         return 'reject_luna', None
     if requested_pk in LEGACY_RETIRED_POOL_KEYS:
         return 'unknown_pool', None
-    # BW-CLAUDE-DEEPSEEK-S4：claude 已计入 DOMESTIC_TOTAL_CAPACITY=11（第 11 槽），总守卫
-    # 必须同样约束 claude：真实国内在途（含迁移债务/旧超额在途）已满 11 时，即便 claude
-    # 按自身容量看似有空也绝不派第 12 个。显式点名 claude（executor='claude' 或 None）保持
+    # BW-CLAUDE-DEEPSEEK-S4：claude 已计入 DOMESTIC_TOTAL_CAPACITY=12，总守卫必须同样约束
+    # claude：真实国内在途（含迁移债务/旧超额在途）已满 12 时，即便 claude 按自身容量看似
+    # 有空也绝不派第 13 个。显式点名 claude（executor='claude' 或 None）保持
     # 精确组合：时段/限额/总守卫都过且有空位才 claim，否则如实拒绝，绝不回退国内模型；
     # AUTO 请求 claude（executor='auto'）绝不绕过三组公平选择——落入下方 auto 分支，与
     # 其它主力一样经 `_eligible_main_forces`（高峰/限额剔除）+ `_select_main_force` 轮转。
@@ -1171,12 +1174,13 @@ def _domestic_policy(conn, requested_pk, now, executor='auto', eligible=None,
             if _max_window_blocks(CLAUDE_POOL_KEY, now):
                 return 'main_force_window_closed', None
             # BW-SIMPLE-PRIORITY-RETRY-S3：历史明确限额标记不再挡普通新一轮（真实尝试失败
-            # 才落诊断、CAS 结算不变）；claude 仍受总守卫与时段门约束，绝不误放第 12 个。
+            # 才落诊断、CAS 结算不变）；claude 仍受总守卫与时段门约束，绝不误放第 13 个。
             if _count_active(conn, CLAUDE_POOL_KEY) < capacity_for(CLAUDE_POOL_KEY):
                 return 'claim', CLAUDE_POOL_KEY
             return 'full', None
-    # 迁移债务总额守卫（BW-POOL-SPLIT-20261010-S3）：总在途已满 10 → 任何新国内 claim 都
-    # 不得放行（减少容量不杀老任务，老任务真实终态自然释放后计数才下降）。
+    # 迁移债务总额守卫（BW-POOL-SPLIT-20261010-S3）：总在途已满 DOMESTIC_TOTAL_CAPACITY
+    # （现为 12）→ 任何新国内 claim 都不得放行（减少容量不杀老任务，老任务真实终态自然
+    # 释放后计数才下降）。
     if _domestic_active(conn) >= DOMESTIC_TOTAL_CAPACITY:
         return 'full', None
     elig = eligible if eligible is not None else set(MAIN_FORCE_KEYS)
@@ -1473,9 +1477,10 @@ def select_and_claim(store_path=None, *, task_id, runtime, model, workspace,
                 conn.execute('ROLLBACK')
                 if pk == CLAUDE_POOL_KEY:
                     full_reasons = [f'{pk} (Claude Code / deepseek-flash) is at its capacity '
-                                    'of 1 — a second concurrent dispatch to this single '
-                                    'independent slot is refused and never falls back to '
-                                    'another model; wait for the real terminal release']
+                                    f'of {CLAUDE_CAPACITY} — an additional concurrent '
+                                    'dispatch to this independent pool is refused and never '
+                                    'falls back to another model; wait for the real terminal '
+                                    'release']
                 else:
                     full_reasons = ['the sanctioned domestic candidate set for this combo is '
                                     'fully occupied; ask the user (external agent or Luna) and '
@@ -1586,9 +1591,9 @@ def reserve(store_path=None, *, task_id, runtime, model, workspace, prompt_sha25
                 conn.execute('ROLLBACK')
                 if pk == CLAUDE_POOL_KEY:
                     full_reason = (f'{pk} (Claude Code / deepseek-flash) is at its capacity '
-                                   'of 1 — the second concurrent dispatch to this single '
-                                   'independent slot is refused and never falls back to any '
-                                   'other model or the domestic pools')
+                                   f'of {CLAUDE_CAPACITY} — an additional concurrent '
+                                   'dispatch to this independent pool is refused and never '
+                                   'falls back to any other model or the domestic pools')
                 else:
                     full_reason = f'{pk} and every other domestic pool is at capacity'
                 return _reject('capacity_full', task_id, pk,

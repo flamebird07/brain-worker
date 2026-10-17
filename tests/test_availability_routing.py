@@ -90,16 +90,16 @@ class _TmpBase(unittest.TestCase):
         return dp.status(self.dispatch, now=T0)['pools'][pk]['active']
 
     def _fill_six(self):
-        # BW-CLAUDE-DEEPSEEK-S4 十一满基线：zcode×2 + 两内置 Max 各 1 + CN 自定义 Max×2
-        # + 两地区 Flash 各 2 + claude:deepseek-flash×1（第 11 主力槽；T0=北京周四 23:00
-        # offhours，时段门放行）。全部经显式 executor 逐一确定性 claim。
+        # BW-CLAUDE-CAPACITY2 十二满基线：zcode×2 + 两内置 Max 各 1 + CN 自定义 Max×2
+        # + 两地区 Flash 各 2 + claude:deepseek-flash×2（T0=北京周四 23:00 offhours，
+        # 时段门放行）。全部经显式 executor 逐一确定性 claim。
         toks = []
         combos = [('zcode', 'GLM-5.3'), ('zcode', 'GLM-5.3'),
                   ('qoder', 'Qwen3.8-Max'), ('qodercn', 'Qwen3.8-Max'),
                   ('qodercn', 'Qwen-3.8-Max'), ('qodercn', 'Qwen-3.8-Max'),
                   ('qoder', 'Qwen3.8-Flash'), ('qoder', 'Qwen3.8-Flash'),
                   ('qodercn', 'Qwen3.8-Flash'), ('qodercn', 'Qwen3.8-Flash'),
-                  ('claude', 'deepseek-flash')]
+                  ('claude', 'deepseek-flash'), ('claude', 'deepseek-flash')]
         for i, (rt, md) in enumerate(combos):
             ex = ('zcode' if rt == 'zcode' else
                   'claude' if rt == 'claude' else
@@ -417,7 +417,7 @@ class DispatchRoutingTests(_TmpBase):
 
     def test_reclaim_skips_blocked_zcode(self):
         # BW-SIMPLE-PRIORITY-RETRY-S4 政策：历史 hold 不再作候选剔除，capacity 降级必须
-        # **真实**填满所有 11 槽（含 ZCode×2）才能记录票据；靠旧 hold 假装 Z 不可用已失效。
+        # **真实**填满所有 12 槽（含 ZCode×2）才能记录票据；靠旧 hold 假装 Z 不可用已失效。
         # 夹具改成在同一临时 dispatch 库上真实 reserved ZCode 两个占位（无真实进程/模型
         # 调用），再按原意填满其余非 Z 槽 → ask_record 记录 capacity 降级 → 释放一个
         # QMax 名额 → claim_due 原子回收落到 QMax，Z 仍满不吞新槽。绝不新增机制。
@@ -458,12 +458,13 @@ class DispatchRoutingTests(_TmpBase):
                            prompt_sha256='p', stage='s1', now=T0, executor='qodercn')
             self.assertTrue(r.get('allowed') and r.get('token'), r)
             toks.append(r['token'])
-        # claude 第 11 槽也必须真实占住：只要它还空着，capacity 降级就是伪造耗尽。
-        r = dp.reserve(self.dispatch, task_id='cl0', runtime='claude',
-                       model='deepseek-flash', workspace=str(self._ws_for('cl0')),
-                       prompt_sha256='p', stage='s1', now=T0, executor='claude')
-        self.assertTrue(r.get('allowed') and r.get('token'), r)
-        toks.append(r['token'])
+        # claude 两个槽也必须真实占住：只要还有空位，capacity 降级就是伪造耗尽。
+        for i in range(2):
+            r = dp.reserve(self.dispatch, task_id=f'cl{i}', runtime='claude',
+                           model='deepseek-flash', workspace=str(self._ws_for(f'cl{i}')),
+                           prompt_sha256='p', stage='s1', now=T0, executor='claude')
+            self.assertTrue(r.get('allowed') and r.get('token'), r)
+            toks.append(r['token'])
         sc = self._scope('rc')
         ask = dp.ask_record(self.dispatch, task_id='rc', scope=sc, ask_message_id='m1',
                             now=T0, degradation_reason='capacity',
@@ -563,14 +564,14 @@ class LunaStateMachineTests(_TmpBase):
 
     def test_degradation_ask_allowed_below_six_full_with_evidence(self):
         """BW-SIMPLE-PRIORITY-RETRY-S5：历史 ZCode hold 不再作为客观证据——S3 起普通轮
-        仍会真实尝试 Z，quota-only ask 必须被拒。这里先真实填满 11 槽，再用
+        仍会真实尝试 Z，quota-only ask 必须被拒。这里先真实填满 12 槽，再用
         degradation_reason='capacity' 记录票据；同时保留对 quota-only ask 的拒绝断言，
         证明新政策下旧 availability 不足以冒充耗尽。"""
-        # 真实填满 11 槽（含 Z 的两个占位）→ capacity 降级有客观证据。
+        # 真实填满 12 槽（含 Z 的两个占位）→ capacity 降级有客观证据。
         self._fill_six()
         ask = dp.ask_record(self.dispatch, task_id='dg', scope=self._scope('dg'),
                             ask_message_id='m1', now=T0, degradation_reason='capacity',
-                            degradation_detail='all 11 domestic slots are in-flight',
+                            degradation_detail='all 12 domestic slots are in-flight',
                             quota_store=self.quota)
         self.assertTrue(ask['recorded'], ask)
         # 独立任务：即使 _hold_zcode 也不足以支撑 quota-only ask（客观证据必须真实）。
@@ -603,7 +604,7 @@ class LunaStateMachineTests(_TmpBase):
         self.assertFalse(ask['recorded'], ask)
         self.assertTrue(any('objective evidence' in r for r in ask['reasons']),
                         ask['reasons'])
-        # 独立任务下用真实填满 11 槽 + capacity 记录票据（默认 ask 语义）。这里再补一层
+        # 独立任务下用真实填满 12 槽 + capacity 记录票据（默认 ask 语义）。这里再补一层
         # 语义：即便有 capacity 票据且已过 301s 截止、无用户回复，也不得由"超时"直接
         # 授权 Luna——只有用户明确 reply='luna' 才允许（见 test_degradation_explicit_luna_reply_claims）。
         # 但为保留"超时非授权"的字面语义并与既有 auto-Luna-after-deadline 用例区分，
@@ -619,7 +620,7 @@ class LunaStateMachineTests(_TmpBase):
         self._fill_six()
         dp.ask_record(self.dispatch, task_id='dg4', scope=self._scope('dg4'),
                       ask_message_id='m1', now=T0, degradation_reason='capacity',
-                      degradation_detail='all 11 domestic slots in-flight',
+                      degradation_detail='all 12 domestic slots in-flight',
                       quota_store=self.quota)
         dp.reply(self.dispatch, task_id='dg4', choice='luna', now=T0)
         out = dp.claim_due(self.dispatch, task_id='dg4', now=T0, quota_store=self.quota)
