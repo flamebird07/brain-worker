@@ -1,15 +1,18 @@
 # 并行执行控制面（BW-PARALLEL-UPGRADE）
 
-> **当前运行时口径（2026-10-08 最新决定）：直连派发只保留 Qoder 与 ZCode。WorkBuddy 与
-> CodeBuddy 改为 human-relay only。** `execution_control.preflight` 对 plan 或 actual 真实
-> runtime 为 `codebuddy`/`workbuddy` 的计划一律明确拒绝（返回 `sent=false`、
-> `manual_relay_only`，不派发）；生产 `codebuddy_direct.main` 亦在读配置/建输出/Popen 前固定
-> 拒绝。下文 `runtime` 枚举与能力表中出现的 `codebuddy`、以及旧“三入口”派发示例，均保留为
-> **历史/离线说明**：选择 CodeBuddy/WorkBuddy 时只生成完整可复制提示词、由人工交外部 Agent，
-> 生成提示词不记成已派发。Qoder/ZCode 的实际并行、重叠、grants 精确比对与额度结算继续有效。
+> **当前运行时口径（2026-10-17 更新，BW-USAGE-AUDIT-20261017-S3）：直连派发保留国际
+> Qoder、Qoder CN、ZCode、Claude 与 `codebuddy:deepseek-v4.1-flash` 精确模型。WorkBuddy 与
+> CodeBuddy 其它旧模型（含旧 GLM）仍 human-relay only。** `execution_control.preflight` 对
+> runtime 为 `workbuddy` 的计划及未命中精确模型的 `codebuddy` 计划明确拒绝（返回
+> `sent=false`、`manual_relay_only`，不派发）；生产 `codebuddy_direct.main` 亦在读配置/建输出/
+> Popen 前固定拒绝非精确模型。下文能力表中的 `codebuddy` 行仅对精确模型有效；旧“三入口”
+> 派发示例与旧枚举保留为**历史/离线说明**。选择 WorkBuddy/旧 CodeBuddy 模型时只生成完整可
+> 复制提示词、由人工交外部 Agent，生成提示词不记成已派发。各直连入口的实际并行、重叠、
+> grants 精确比对与额度结算继续有效。
 
 本文件描述 brain-worker 新增的任务级控制面：`scripts/execution_control.py`（纯标准库，
-**无常驻调度服务**）与两个直连执行入口（Qoder/ZCode）新增的可选 `--dispatch-plan`。控制面做的是**主脑快照
+**无常驻调度服务**）与各直连执行入口（国际 Qoder、Qoder CN、ZCode、Claude、
+`codebuddy:deepseek-v4.1-flash` 精确模型）新增的可选 `--dispatch-plan`。控制面做的是**主脑快照
 预检**，不是原子跨进程锁：它比对“计划 JSON”与“实际入口选择/工具 grant/cwd/argv”，
 拒绝缺 grant 或扩大权限，并在 Popen 之前退出 2。真正的进程串行化仍靠主脑看板与人工
 纪律，不靠本模块抢锁；也不提供跨轮自动唤醒——并行推进依赖主脑在会话内主动派工、观察
@@ -35,7 +38,7 @@
 {
   "task_id": "T01",                       // 稳定不复用；绑定提示词/看板/报告
   "stage": "BW-PARALLEL-UPGRADE-20261006-01",  // 与 --stage 精确一致
-  "runtime": "qoder",                     // qoder | codebuddy | zcode
+  "runtime": "qoder",                     // qoder | qodercn | claude | zcode | codebuddy（仅精确模型）
   "model": "Qwen3.8-Flash",               // 与 --model 精确一致（请求值，不证明后端版本）
   "workspace": "C:\\abs\\ws-T01",          // 与 --workspace 解析后精确一致
   "cwd": "C:\\abs\\ws-T01",                // 实际工作目录，与入口 cwd 一致
@@ -98,6 +101,7 @@ catalog**。被派发前拒绝（`sent=false`/退出 2）不计模型轮次；�
 
 - Qoder：任务 stdin 与官方 append-system-prompt 契约各自保存实际 UTF-8 字节和哈希，不冒称已知服务端如何合并两通道。
 - CodeBuddy：契约与任务拼接后的 stdin 字节留证。
+- Claude：stdin 任务原文与官方 `--append-system-prompt` 契约分别保存实际 UTF-8 字节和哈希（`sent-task.md`、`sent-contract.md`）。
 - ZCode：JSON 的 `request.prompt` 解码文本所对应的 UTF-8 字节留证，SDK 消费该文本；JSON 文件本身的哈希不是 prompt 的哈希。
 
 换行转换及契约注入写入请求元数据；磁盘原文件、任务文本和完整载荷的哈希可能不同，也可能相同。预检按原文件字节一致性核对，错误计划在创建证据目录和 Popen 前拒绝。
@@ -106,7 +110,7 @@ catalog**。被派发前拒绝（`sent=false`/退出 2）不计模型轮次；�
 
 本地 CLI/SDK 载荷证据不证明服务端最终文本，也不证明业务产出或模型恢复。实际留证文件与字段由各入口的请求元数据指明。
 
-请求中的 `prompt_payload` 保存 `task_text_utf8_sha256`、`contract_sha256`、`sent_payload_sha256`、`readback_match`、`newline_conversion` 与 `channels`。Qoder 保存 `sent-payload-stdin.bin` 和 `sent-contract-system-prompt.txt`，CodeBuddy 保存 `sent-payload-stdin.bin`，ZCode 保存 `sent-task-payload.bin`。Qoder/CodeBuddy 任务保留原字节；ZCode CRLF/CR 归一 LF，不回写原文件。ZCode 纯预检的文件是计划载荷，`submit_channel=none`、`payload_role=planned_request_prompt`，不算实际提交。
+请求中的 `prompt_payload` 保存 `task_text_utf8_sha256`、`contract_sha256`、`sent_payload_sha256`、`readback_match`、`newline_conversion` 与 `channels`。Qoder 保存 `sent-payload-stdin.bin` 和 `sent-contract-system-prompt.txt`，CodeBuddy 保存 `sent-payload-stdin.bin`，Claude 保存 `sent-task.md` 和 `sent-contract.md`，ZCode 保存 `sent-task-payload.bin`。Qoder/CodeBuddy 任务保留原字节；ZCode CRLF/CR 归一 LF，不回写原文件。ZCode 纯预检的文件是计划载荷，`submit_channel=none`、`payload_role=planned_request_prompt`，不算实际提交。
 
 
 ## 各运行时真实能力（不要臆造官方参数）
@@ -114,7 +118,9 @@ catalog**。被派发前拒绝（`sent=false`/退出 2）不计模型轮次；�
 | runtime | fine_grained（逐文件 Edit/原样 Bash） | read_dirs（外部只读目录） |
 | --- | --- | --- |
 | qoder | 是（`--allowed-tools Edit(...)`/`Bash(...)`、`--add-dir`） | 是 |
-| codebuddy | 是（`--allowedTools` 规则；无外部只读目录参数） | 否 |
+| qodercn | 是（同国际 Qoder 的规则表达；入口分支不同） | 是 |
+| claude | 是（逐文件 Edit(...)/原样 Bash(...)、`--add-dir`） | 是 |
+| codebuddy | 是（`--allowedTools` 规则；无外部只读目录参数；**仅 `deepseek-v4.1-flash` 放行**） | 否 |
 | zcode | **否**（只有整工具开关） | 否 |
 
 ZCode 的工具名白名单**不能假称细粒度文件权限**。当计划要求 ZCode 表达不了的逐文件/逐命令
@@ -211,17 +217,27 @@ python scripts/execution_control.py preflight --plan <plan.json> --actual <actua
 ## 并行检查与隔离
 
 任务**五状态**：`pending / executing / blocked / awaiting_acceptance / completed`（不再有
-第六 `verified` 状态）。其中 `executing / awaiting_acceptance / blocked` 是占用 task_id 与
-并发槽位、门禁不能被绕过的“在途”态。两个真实直连入口（Qoder/ZCode；CodeBuddy/WorkBuddy 已
-退役为 human-relay，仅提示词人工中继，不进池）接受可选 `--active-tasks <json>`（数组
-`{task_id,state,...}`）或在 plan 里带 `active_tasks`，都传给 `ec.preflight`；并行 plan 缺
-`active_tasks` 会被 `validate_plan` 拒绝，**缺失不当作“没有在途工作”**。
+第六 `verified` 状态）。需区分两类“在途”语义（以 `execution_control.py` 为准）：
+`HELD_STATES = executing / awaiting_acceptance / blocked` 占用 task_id、保留原工作区，并令门禁
+（同任务去重/锁定提示词、同工作区写入冲突、共享写冲突）不能被绕过；但**占用 task_id/工作区保留
+≠ 占用一个真实活进程并发槽**。真实活进程容量只看 `LIVE_PROCESS_STATES = executing / blocked`：
+`awaiting_acceptance` 表示子进程已退出、只等业务验收，仍保护原任务/原工作区，**但不占用真实进程
+并发槽**，从而允许为另一工作区分配新执行器。把 `awaiting_acceptance` 写成占真实进程槽是错误的。
+真实直连入口（国际 Qoder、Qoder CN、ZCode、Claude 与
+`codebuddy:deepseek-v4.1-flash` 精确模型；WorkBuddy 与 CodeBuddy 旧模型为 human-relay，仅
+提示词人工中继，不进池）接受可选 `--active-tasks <json>`（数组 `{task_id,state,...}`）或在
+plan 里带 `active_tasks`，都传给 `ec.preflight`；并行 plan 缺 `active_tasks` 会被
+`validate_plan` 拒绝，**缺失不当作“没有在途工作”**。
 
-`ec.check_parallel` 的快照并发闸只统计**国内 qoder/zcode** 的活进程槽（`executing/blocked`）：
-Luna 救援通道无上限、绝不占用国内六名额，已退休的 CodeBuddy/WorkBuddy 直连与其它非国内池同样
-排除——旧的全局快照 max 绝不把 Luna/旧 CB/其它池当成统一容量闸（否则会出现 domestic=0、6 个
-Luna executing 却误报“concurrency limit 6 exceeded”）。真实国内容量上限另由 `dispatch_pool`
-原子池权威强制；同 task/同 workspace/共享写/依赖的快照保护仍独立维持，不因容量分离而放宽。
+`ec.check_parallel` 的快照并发闸只统计**国内 qoder/zcode** 的活进程槽（`LIVE_PROCESS_STATES =
+executing/blocked`，`awaiting_acceptance` 不计入）：Luna 救援通道无上限、绝不占用国内名额，
+CodeBuddy（含精确模型，容量由独立原子池强制）、WorkBuddy、claude 与其它非国内 qoder/zcode 池
+同样排除——旧的全局快照 max 绝不把 Luna/CodeBuddy/其它池当成统一容量闸（否则会出现 domestic=0、
+6 个 Luna executing 却误报“concurrency limit 6 exceeded”）。**旧“国内六名额”说明与该示例中的
+`6` 属历史/旧快照边界（早期 `max_concurrency` 演练值），不改变本快照算法**；真实共享国内容量上限
+另由 `dispatch_pool` 原子池权威强制（当前名义 13、CN 自定义 Max 2 槽暂停、授权可新派 11，见
+[global-dispatch](global-dispatch.md)），本快照闸只是业务二级保护。同 task/同 workspace/共享写/
+依赖的快照保护仍由 `HELD_STATES` 独立维持，不因容量分离而放宽。
 
 - 允许有价值的并行，不凑并发数量：并发上限服务于独立成果的真实节省；没有独立可验收
   成果就不并行，不为凑数拆任务。

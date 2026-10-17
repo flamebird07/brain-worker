@@ -40,6 +40,8 @@ FAILURE_TYPES = ('quota_429', 'permission_rule_denied', 'permission_client_missi
 
 # 各运行时的真实能力：fine_grained 表示能否表达逐文件 Edit(/原样 Bash()) 规则；
 # read_dirs 表示是否有外部只读目录 grant。ZCode 只有整工具开关，不能假称细粒度文件权限。
+# 当前正式直连 runtime 包括 qoder、qodercn、claude、zcode 与精确模型 codebuddy
+# （codebuddy 仅 deepseek-v4.1-flash 放行）；WorkBuddy 与 codebuddy 其它旧模型仍人工转交。
 CAPABILITY = {
     'qoder': {'fine_grained': True, 'read_dirs': True},
     'qodercn': {'fine_grained': True, 'read_dirs': True},
@@ -47,14 +49,15 @@ CAPABILITY = {
     'zcode': {'fine_grained': False, 'read_dirs': False},
     # BW-CLAUDE-DEEPSEEK-S2：Claude Code CLI 支持逐文件 Edit(...)/原样 Bash(...) 细粒度授权
     # 与 --add-dir 外部只读目录，故 fine_grained/read_dirs 均为 True。这只是让控制面接受
-    # claude 计划/精确工具授权；退休入口（codebuddy/workbuddy）的拒绝逻辑完全不受影响。
+    # claude 计划/精确工具授权；其它被退休组合的拒绝逻辑完全不受影响。
     'claude': {'fine_grained': True, 'read_dirs': True},
 }
 
-# CodeBuddy/WorkBuddy 直连已退休为 human-relay only：控制面对**新**的直接派发计划
-# 一律明确拒绝（同时检查 plan 与 actual 的真实 runtime），只允许生成可复制提示词交
-# 外部 Agent。此处不删除/清理历史 sqlite 行、锁、既有认证/模型配置，也不杀旧进程；
-# 历史诊断、额度结算与已存在占位保持可用，Qoder/ZCode 正常派发不受影响。
+# WorkBuddy 与 CodeBuddy 旧模型的直接派发仍属 retired/manual-relay：控制面对**新**的
+# 直接派发计划明确拒绝（同时检查 plan 与 actual 的真实 runtime），只允许生成可复制提示词
+# 交外部 Agent。codebuddy 的精确恢复模型由下方 REACTIVATED_CODEBUDDY_MODEL 单独放行。
+# 此处不删除/清理历史 sqlite 行、锁、既有认证/模型配置，也不杀旧进程；历史诊断、额度结算
+# 与已存在占位保持可用，Qoder/CN/ZCode/Claude 正常派发不受影响。
 RETIRED_DIRECT_RUNTIMES = ('codebuddy', 'workbuddy')
 # BW-CODEBUDDY-MAIN-S3：仅独立 CodeBuddy CLI 的**这一精确模型**恢复为正式主力，控制面对
 # 它放行（其余仍退休）。WorkBuddy、CodeBuddy 其它旧模型（含旧 GLM）一律继续走 manual-relay

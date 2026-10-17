@@ -1,30 +1,31 @@
 # Claude Code / deepseek-flash 直连入口（claude-direct）
 
-> 本文件描述 brain-worker 的第 11–12 槽执行器 `claude`（客户 DeepSeek Anthropic 兼容端点，
+> 本文件描述 brain-worker 的主力执行器 `claude`（容量 2；客户 DeepSeek Anthropic 兼容端点，
 > 精确模型 `deepseek-flash`）。实现以 `scripts/claude_direct.py`、`scripts/deepseek_offpeak.py`
 > 与 `scripts/dispatch_pool.py` 为准，本文件为口径说明；二者不一致时以代码为准并回修文档。
 > **离线回归只证协议/绑定/时段门/容量语义；真实调用与端到端验收由根脑（root）在本机完成，
 > worker 不调 API。官方 Node CLI 2.1.76 真实 Read/Write 已成功（独立事实，见 §9），
 > native 2.1.220/296 连接失败单列，不与 Node 事实混写。**
 
-## 1. 容量池：AUTO 可选的第 11–12 主力槽（BW-CLAUDE-CAPACITY2 由 1 扩为 2，原 10 槽一项未减）
+## 1. 容量池：AUTO 可选主力槽 `claude`（容量 2；BW-CLAUDE-CAPACITY2 由 1 扩为 2，原 10 槽一项未减）
 
 - runtime `claude`，池 `claude:deepseek-flash`，`CLAUDE_CAPACITY = 2`（BW-CLAUDE-CAPACITY2 由 1 增至 2），
   `MAIN_FORCE_CAPACITY[CLAUDE_POOL_KEY] = 2`。
 - **已登记入主力体系**：`claude:deepseek-flash` 在 `MAIN_FORCE_POOLS`/`MAIN_FORCE_KEYS`/
-  `MAIN_FORCE_CAPACITY` 内，`DOMESTIC_TOTAL_CAPACITY = 6 + 4 + 2 = 12`（**原 10 槽一项未减**）；
+  `MAIN_FORCE_CAPACITY` 内，`DOMESTIC_TOTAL_CAPACITY = 13`（含 `codebuddy:deepseek-v4.1-flash`
+  精确模型 1 槽，由 `MAIN_FORCE+OVERFLOW` 求和自动得出；**原 10 槽一项未减**）；
   `_domestic_active` 统计所有非 Luna 在途 attempt，**claude 在途计入国内总额**。
 - **独立组 claude**：committed 由 attempts 真实提交历史
   `_count_committed_claude` 统计，**绝不污染** committed_zcode/committed_qoder；
-  BW-MAIN-PRIORITY-20261011-S1 当前口径：claude 优先级层=1——排三 Qoder Max（层=0）之后、
-  `zcode:GLM-5.3`（层=2）之前，Max 全不可用时 claude 允许窗且有空位即优先于 Z；旧
-  “平票排 Z2/Qoder 之后（`_grp_rank`）”的跨层 1:1 属历史、已被覆盖，历史 committed
-  计数照旧保留记账但不再参与跨层竞争。
+  当前口径（BW-CODEBUDDY-MAIN-S3 更新层序）：`codebuddy:deepseek-v4.1-flash`（层=0）>
+  三 Qoder Max（层=1）> claude（层=2）> `zcode:GLM-5.3`（层=3）；Max 全不可用时 claude
+  允许窗且有空位即优先于 Z；旧“平票排 Z2/Qoder 之后（`_grp_rank`）”的跨层 1:1 属历史、
+  已被覆盖，历史 committed 计数照旧保留记账但不再参与跨层竞争。
 - `AUTO` **可选** claude：AUTO 的 claude 入口请求**不绕过统一选择**，经同一权威 `_select_main_force`
   优先级排序（先过滤真实空位与时段门/限额，再按优先级层选择、同层内在途平衡）；显式 `executor='claude'` 保持
   精确组合、绝不跨到其它池或回退模型。
-- `_domestic_policy` claude 分支（S4 收口 + BW-CLAUDE-CAPACITY2）：`executor_conflict` → **总 12 守卫先于一切**
-  （迁移债务满 12 时 `full`，**绝不派第 13 个**）→ 时段门 `main_force_window_closed` →
+- `_domestic_policy` claude 分支（S4 收口 + BW-CLAUDE-CAPACITY2 + BW-CODEBUDDY-MAIN-S3）：`executor_conflict` → **总 13 守卫先于一切**
+  （迁移债务满 13 时 `full`，**绝不派第 14 个**）→ 时段门 `main_force_window_closed` →
   限额 `full` → 有空位 `claim` → 满 `full`。
 - 未配置（缺 local/example 配置或 executable）时**不得读作就绪**：`build_argv` 缺
   `executable` 直接 `ValueError`（零 Popen）。旧 runs/unknown 记录一律保留、不迁移、不清库。
@@ -123,15 +124,15 @@
 - `_counts_domestic_concurrency` 排除 `claude`（low=='claude' 不计入本快照并发闸的
   qoder/zcode 活进程计数；claude 的容量 2 由 `dispatch_pool` 原子池权威强制）。
   **注意与总额守卫区分**：claude 在途**仍计入** `dispatch_pool._domestic_active`
-  的国内总在途（总 12），二者不矛盾——前者是二级业务快照闸、后者是原子总额守卫。
+  的国内总在途（总 13，含 CodeBuddy 精确模型 1 槽），二者不矛盾——前者是二级业务快照闸、后者是原子总额守卫。
 
 ## 8. 离线回归
 
 - `tests/test_deepseek_offpeak.py`：09/12/14/18 边界、Sat/Sun 周末、节日覆盖峰值、
   未知年 2027 关峰放行非峰、时区折算、date 输入。
 - `tests/test_dispatch_pool_claude.py`：`CapacityAndRouting`（显式落第 11–12 槽、AUTO 经公平轮转
-  可选中 claude、总 12 语义）、`FairnessAndTotalGuard`（AUTO claude 请求不绕公平选择、
-  AUTO 峰值诚实关闭、**迁移债务满 12 时 claude 有空位也绝不派第 13**）、`WindowGate`
+  可选中 claude、总 13 语义）、`FairnessAndTotalGuard`（AUTO claude 请求不绕公平选择、
+  AUTO 峰值诚实关闭、**迁移债务满 13 时 claude 有空位也绝不派第 14**）、`WindowGate`
   （含跨峰 consume 只释放本 token）、`QuotaLimitMarker`
   （reserve→record→consume limited→release）、`WindowGateCaliber`。
 - `tests/test_claude_direct.py`：纯函数（argv 无 token / 无 bypass / 模型·权限模式·base_url

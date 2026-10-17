@@ -9,7 +9,9 @@ is_error 载体/零工具工程证据）、时段门拒派、跨高峰释放、l
 import json
 import sys
 import tempfile
+import time
 import unittest
+from contextlib import closing
 from datetime import datetime, timezone
 from pathlib import Path
 from unittest import mock
@@ -42,10 +44,11 @@ def _report_body(stage, workspace):
 
 class FakePopen:
     def __init__(self, stdout, stderr='', returncode=0, pid=4242, raise_comm=None,
-                 raise_init=False, sink=None):
+                 raise_init=False, sink=None, comm_delay=0.0):
         self._stdout, self._stderr = stdout, stderr
         self._rc, self.pid = returncode, pid
         self._raise_comm, self._raise_init = raise_comm, raise_init
+        self._comm_delay = comm_delay
         self.argv = self.env = None
         self.sink = sink
 
@@ -59,6 +62,9 @@ class FakePopen:
         return self
 
     def communicate(self, input=None):
+        if self._comm_delay:
+            # 极短等待仅确保真实时钟推进（毫秒级，不是长 sleep）；不改变生命周期语义。
+            time.sleep(self._comm_delay)
         if self._raise_comm:
             raise self._raise_comm
         self.returncode = self._rc
@@ -583,6 +589,63 @@ class LifecycleTests(unittest.TestCase):
         for f in Path(out['evidence']['report_md']).parent.glob('*'):
             if f.is_file():
                 self.assertNotIn(SECRET, f.read_text(encoding='utf-8'), f.name)
+
+    def test_injected_clock_keeps_offline_determinism(self):
+        # 显式注入 now：开始/结束/终态释放都用注入值，离线用例保持确定性。
+        fake = FakePopen(self.success_stream(), sink=self.sink)
+        out = self.run_with(fake, now=OFFPEAK, bind_child_pid=True)
+        self.assertTrue(out['sent'], out)
+        self.assertEqual(out['started_at_utc'], OFFPEAK.isoformat())
+        self.assertEqual(out['finished_at_utc'], OFFPEAK.isoformat())
+        req = json.loads(Path(out['evidence']['request_path']).read_text(encoding='utf-8'))
+        self.assertEqual(req['started_at_utc'], OFFPEAK.isoformat())
+        self.assertEqual(req['finished_at_utc'], OFFPEAK.isoformat())
+
+    def test_real_clock_start_and_finish_are_distinct(self):
+        # 默认（未注入 now）：开始取 Popen 前真实时点，结束取 communicate 返回后的新真实
+        # 时点；不再把派工开始的同一 now 写成结束。dp.utcnow 仅用于时段门，保持离线可控。
+        fake = FakePopen(self.success_stream(), sink=self.sink, comm_delay=0.02)
+        with mock.patch.object(dp, 'utcnow', return_value=OFFPEAK):
+            out = self.run_with(fake, now=None, bind_child_pid=True)
+        self.assertTrue(out['sent'], out)
+        self.assertTrue(out['passed'], out)
+        started = datetime.fromisoformat(out['started_at_utc'])
+        finished = datetime.fromisoformat(out['finished_at_utc'])
+        self.assertLessEqual(started, finished)
+        self.assertNotEqual(started, finished)  # 真实时钟推进
+        self.assertNotEqual(started, OFFPEAK)
+        self.assertNotEqual(finished, OFFPEAK)
+        req = json.loads(Path(out['evidence']['request_path']).read_text(encoding='utf-8'))
+        self.assertEqual(req['started_at_utc'], out['started_at_utc'])
+        self.assertEqual(req['finished_at_utc'], out['finished_at_utc'])
+        # 终态释放使用真实结束时钟，而不是开始时钟。
+        with closing(dp.connect(self.store)) as conn:
+            row = conn.execute('SELECT ended_at_utc FROM attempts WHERE token=?',
+                               (out['token'],)).fetchone()
+        self.assertEqual(datetime.fromisoformat(row['ended_at_utc']), finished)
+
+    def test_real_clock_unknown_keeps_placeholder(self):
+        # 默认真实时钟下 communicate 异常（真实退出未知）→ 保留 unknown 占位，绝不假释放。
+        fake = FakePopen('', raise_comm=RuntimeError('interrupted'), sink=self.sink)
+        with mock.patch.object(dp, 'utcnow', return_value=OFFPEAK):
+            out = self.run_with(fake, now=None, bind_child_pid=True)
+        self.assertTrue(out.get('launch_unknown'), out)
+        self.assertFalse(out['sent'])
+        self.assertEqual(
+            dp.status(self.store, now=OFFPEAK)['pools']['claude:deepseek-flash']['active'], 1)
+
+    def test_sent_contract_carries_current_identity(self):
+        # 实际发送的契约（落盘原件）携带本轮 runtime 与请求模型；不是旧提示词身份。
+        out = self.run_with(FakePopen(self.success_stream(), sink=self.sink))
+        contract = Path(out['evidence']['sent_contract_path']).read_text(encoding='utf-8')
+        self.assertIn('runtime=claude；请求模型=deepseek-flash', contract)
+        self.assertIn('不覆盖本轮身份', contract)
+        req = json.loads(Path(out['evidence']['request_path']).read_text(encoding='utf-8'))
+        self.assertEqual(req['executor_identity']['runtime'], 'claude')
+        self.assertEqual(req['executor_identity']['request_model'], 'deepseek-flash')
+        import hashlib
+        self.assertEqual(req['contract_sha256'],
+                         hashlib.sha256(contract.encode('utf-8')).hexdigest())
 
     def test_cli_non_pinned_model_rejected_zero_popen(self):
         # CLI --model 非 deepseek-flash → 明确拒绝（0 Popen），不因 cfg 而静默忽略。

@@ -59,25 +59,49 @@ _CONTRACT_LEAD = ('Final response must contain only the complete nine-section re
                   'Those markers must appear exactly once each; never quote them in the body. '
                   'No preface, epilogue, or code fences. Keep field names and values on the same line: '
                   '阶段编号与执行方式：{stage}；{mode}。 '
-                  '实际项目绝对路径：{workspace}。 Use the exact path without punctuation in its field.')
+                  '实际项目绝对路径：{workspace}。 Use the exact path without punctuation in its field.'
+                  '{identity}')
 
 
 def sha256_hex(data: bytes) -> str:
     return hashlib.sha256(data).hexdigest()
 
 
-def build_contract(stage: str, workspace: str, mode: str = 'direct') -> str:
+def _identity_clause(runtime, model) -> str:
+    """本轮执行者身份片段（可选，向后兼容）。
+
+    runtime 是入口真实运行时（如 qoder/qodercn/claude/zcode/codebuddy），model 是本轮
+    **请求**模型。二者来自入口实际参数，不由旧提示词/旧报告文本推断；请求模型也不冒充
+    已核验的后端/账号身份。旧身份不得覆盖本轮身份。"""
+    if runtime is None and model is None:
+        return ''
+    if not isinstance(runtime, str) or not runtime.strip():
+        raise ValueError('build_contract runtime must be a non-empty string when supplied')
+    if not isinstance(model, str) or not model.strip():
+        raise ValueError('build_contract model must be a non-empty string when supplied')
+    return (' 本轮执行者与本轮身份：runtime={runtime}；请求模型={model}。'
+            '该身份取自本轮入口 runtime 与请求参数，不是已核验的后端/账号身份；'
+            '旧提示词、旧报告或历史交接中的执行者/模型身份仅属历史，不覆盖本轮身份。'
+            ).format(runtime=runtime, model=model)
+
+
+def build_contract(stage: str, workspace: str, mode: str = 'direct',
+                   runtime=None, model=None) -> str:
     """构造完整契约文本：精确英文指令（含阶段/路径具体值）+ 九节骨架。
 
     以英文句子开头、阶段 token 与绝对路径都逐字出现在返回值里；调用方把返回值原样
     放入实际发送载荷（Qoder 走 --append-system-prompt argv 通道；CodeBuddy/ZCode
-    拼接到任务）。本函数是纯字符串构造，不读文件、不起子进程。"""
+    拼接到任务）。本函数是纯字符串构造，不读文件、不起子进程。
+
+    runtime/model 为向后兼容的可选参数：正式入口传入本轮真实 runtime 与请求模型，
+    契约里因此带有本轮身份；只传两个参数（旧调用）时输出与旧版逐字一致。"""
     if not stage or not str(stage).strip():
         raise ValueError('build_contract requires a non-empty stage')
     if not workspace or not str(workspace).strip():
         raise ValueError('build_contract requires a non-empty workspace path')
+    identity = _identity_clause(runtime, model)
     lead = _CONTRACT_LEAD.format(start=REPORT_START, end=REPORT_END, stage=stage,
-                                 mode=mode, workspace=workspace)
+                                 mode=mode, workspace=workspace, identity=identity)
     return (lead + '\nReproduce this nine-section contract verbatim as the report '
             'skeleton (fill every field on its line; write 无/未运行 for empty fields, '
             'never omit a section):\n' + NINE_SECTION_TEMPLATE)

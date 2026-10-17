@@ -1140,7 +1140,9 @@ def main():
             report_contract = None
             sent_prompt = prompt_text
         else:
-            report_contract = pc.build_contract(args.stage, str(work))
+            # 本轮身份来自入口真实 runtime（zcode）与请求模型，不读旧提示词推断身份。
+            report_contract = pc.build_contract(args.stage, str(work), runtime='zcode',
+                                                model=args.model)
             sent_prompt = pc.compose_task_payload(report_contract, prompt_text)
         sent_payload_bytes = sent_prompt.encode('utf-8')
         (out / 'sent-task-payload.bin').write_bytes(sent_payload_bytes)
@@ -1175,6 +1177,13 @@ def main():
                             chat_id=args.chat_id)
     argv = build_node_argv(cfg, runner, out / 'request.json')
     request['argv'] = argv
+    request['executor_identity'] = {
+        'runtime': 'zcode', 'request_model': args.model,
+        'provider_requested': args.provider, 'reasoning': args.reasoning,
+        'source': 'entry runtime + requested model; not a verified backend identity',
+        'older_identity_does_not_override': True,
+        'contract_sha256': (pc.sha256_hex(report_contract.encode('utf-8'))
+                            if report_contract is not None else None)}
     request['quota_gate'] = quota_gate
     # BW-ZCODE-MANUAL-QUOTA-20261008-S1：ZCode 额度由用户手动管理/重置，取消自动额度冷却。
     # 该标记如实声明本次 ZCode 派工不受自动额度冷却门禁（工作区单写入/通道单在途并发占位

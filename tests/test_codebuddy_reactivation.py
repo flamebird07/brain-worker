@@ -398,7 +398,19 @@ class TestLiveTransport(unittest.TestCase):
         # raw evidence retained on disk.
         outdir = self.base / 'out'
         self.assertEqual((outdir / 'stdout.jsonl').read_bytes(), stream)
-        self.assertTrue((outdir / 'sent-payload-stdin.bin').read_bytes())
+        payload = (outdir / 'sent-payload-stdin.bin').read_bytes()
+        self.assertTrue(payload)
+        text = payload.decode('utf-8')
+        self.assertIn(f'runtime=codebuddy；请求模型={CB_MODEL}', text)
+        self.assertIn('不覆盖本轮身份', text)
+        req = json.loads((outdir / 'request.json').read_text(encoding='utf-8'))
+        self.assertEqual(req['executor_identity']['runtime'], 'codebuddy')
+        self.assertEqual(req['executor_identity']['request_model'], CB_MODEL)
+        task_text = self._prompt_file().read_text(encoding='utf-8')
+        self.assertTrue(text.endswith('\n\n' + task_text), text)
+        sent_contract = text[:-len('\n\n' + task_text)]
+        self.assertEqual(req['contract_sha256'],
+                         pc.sha256_hex(sent_contract.encode('utf-8')))
         self.assertEqual((outdir / 'response.md').read_text(encoding='utf-8'),
                          self.report)
         # codebuddy slot released after confirmed exit.

@@ -867,7 +867,10 @@ def main():
     # the full task template. Never repair or trim the returned report. The contract
     # comes from the shared prompt-contract module so all three entries emit an
     # identical, verifiable nine-section payload before the call is made.
-    contract = pc.build_contract(args.stage, str(work))
+    # 本轮身份来自真实 runtime（国际 qoder / CN qodercn）与请求模型；不根据旧提示词
+    # 文本推断执行者，也不把请求名冒充已核验后端身份。
+    contract = pc.build_contract(args.stage, str(work), runtime=args.runtime,
+                                 model=args.model)
     argv[argv.index('-p'):argv.index('-p')] = ['--append-system-prompt', contract]
     # prompt_sha256 是原始提示词文件字节哈希（dispatch-plan 统一口径），不做换行归一。
     prompt_sha256 = hashlib.sha256(prompt_bytes).hexdigest()
@@ -1012,6 +1015,15 @@ def main():
                    'add_dirs': list(perms['add_dirs']),
                    'stage': args.stage, 'chat_id': args.chat_id,
                    'resume_session_id': args.session_id,
+                   'executor_identity': {
+                       'runtime': args.runtime,
+                       'request_model': args.model,
+                       'model_id': cn_model_id if is_cn else None,
+                       'source': 'entry runtime + requested model; not a verified '
+                                 'backend identity',
+                       'older_identity_does_not_override': True,
+                       'contract_sha256': hashlib.sha256(
+                           contract.encode('utf-8')).hexdigest()},
                    'entry_config': str(Path(args.cn_config if is_cn else args.config).resolve()),
                    'runtime': ({'cli': cfg['cli'], 'config_dir': cn_config_dir} if is_cn
                                else {'node': cfg['node'], 'qodercli': cfg['qodercli']}),

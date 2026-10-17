@@ -213,7 +213,9 @@ def run(cfg, *, workspace, prompt_file, out_dir, stage, task_id, model, tools_it
     claim = gate['token']
 
     # 载荷：九节契约前置 + 用户原文，整体进 stdin（完整，不裁剪）。
-    contract_text = pc.build_contract(stage, str(workspace))
+    # 本轮身份来自入口真实 runtime 与本轮请求模型（不读旧提示词推断）。
+    contract_text = pc.build_contract(stage, str(workspace), runtime=RUNTIME,
+                                      model=model)
     sent_payload = pc.compose_task_payload(contract_text, task_text).encode('utf-8')
 
     child_env = build_subprocess_env(environ)
@@ -374,6 +376,13 @@ def run(cfg, *, workspace, prompt_file, out_dir, stage, task_id, model, tools_it
              'disallowed_tools': list(perms['disallowed_tools']),
              'prompt_sha256': actual_prompt_sha, 'shell': False,
              'timeout_seconds': timeout_seconds,
+             'executor_identity': {
+                 'runtime': RUNTIME, 'request_model': model,
+                 'source': 'entry runtime + requested model; not a verified backend '
+                           'identity',
+                 'older_identity_does_not_override': True},
+             'contract_sha256': _sha(contract_text.encode('utf-8')),
+             'contract_sha256_caliber': 'utf-8 bytes of the contract prepended to stdin',
              'entry_config': {'node': cfg.get('node'), 'cli': cfg.get('cli')},
              'no_fallback_model': True},
             ensure_ascii=False, indent=2).encode('utf-8'))

@@ -268,9 +268,10 @@ Z2/Qoder 之后）属历史行为，已由 BW-MAIN-PRIORITY-20261011-S1 明确�
 
 ## 入口在 Popen 前的唯一容量门
 
-三个真实直连入口（Qoder/ZCode/CodeBuddy 精确模型）在**创建输出目录、Popen 之前**必须消费或
-校验一个容量 claim，**不能靠提示词或一个传入布尔跳过**（WorkBuddy 与 CodeBuddy 其它旧模型仍
-human-relay，仅提示词人工中继，不进池、不占名额）：
+各真实直连入口（国际 Qoder、Qoder CN、ZCode、Claude 与 `codebuddy:deepseek-v4.1-flash`
+精确模型）在**创建输出目录、Popen 之前**必须消费或校验一个容量 claim，**不能靠提示词或一个
+传入布尔跳过**（WorkBuddy 与 CodeBuddy 其它旧模型仍 human-relay，仅提示词人工中继，不进池、
+不占名额）：
 
 - `dp.consume_for_entry(store, task_id, runtime, model, workspace, prompt_sha256, ...)`：
   - 给了 `--dispatch-claim <token>` → 同一 `BEGIN IMMEDIATE` 事务内先精确校验（task/runtime/
@@ -482,11 +483,11 @@ BW-MAIN-PRIORITY-20261011-S1 的 Max > Claude > GLM 优先级对本入口同样�
   给出的本地区集合取交集，**绝不跨区**；地区外候选在 `candidate_filters` 如实显示
   `not_authorized`，**绝不把未选范围显示成 `eligible`**。
 - **AUTO 候选全集与 `not_authorized` 语义（BW-CANDIDATE-SCOPE-S1）**：AUTO 的
-  `allowed_candidates` 从真实用户原话/原 scope **保留完整已授权候选**（当前 7 候选＝三 Qoder
-  Max + claude + zcode + 两区 Flash）；时段/明确限额/容量/ZCode availability 等**动态不可用只写
+  `allowed_candidates` 从真实用户原话/原 scope **保留完整已授权候选**（当前 8 候选＝CodeBuddy
+  精确模型 + 三 Qoder Max + claude + zcode + 两区 Flash）；时段/明确限额/容量/ZCode availability 等**动态不可用只写
   `candidate_filters`**（`window_closed`/`explicitly_limited`/`capacity_full`/`zcode_unavailable`），
   **绝不改写 `allowed_candidates` 去绕过**。某 `runtime:model` 失败（含内置两 Max 落 `explicitly_limited`）
-  **不泛化成整个 executor**，CN 自定义 `qodercn:Qwen-3.8-Max` 仍**独立评估**、优先级仍最高。`not_authorized`
+  **不泛化成整个 executor**，CN 自定义 `qodercn:Qwen-3.8-Max` 仍**独立评估**、优先级仍属 Qoder Max 层（层=1，仅次于 CodeBuddy 精确模型）。`not_authorized`
   **只表示该池不在本轮输入里**，未核对真人原话**不得**说成“用户未授权/撤权”；运行错误不算撤权，授权缩窄
   必须有真实用户新指令或 executor 约束。诚实边界：入口**不能**凭主脑自写 `quote` 自动验证真人授权，也**不**
   新增机器级防伪门、`not_authorized` 字段改动或强制 AUTO 全集代码门（合法用户范围可更窄），靠 7 候选规范 +

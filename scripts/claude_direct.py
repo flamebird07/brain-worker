@@ -575,6 +575,9 @@ def run(cfg: dict, *, workspace: str, prompt_file: Path, out_dir: Path, stage: s
 
     离线测试注入 popen_factory（假 Popen）+ token_env 环境，不产生 OS 子进程、不联网、
     不调真实模型。"""
+    # 显式注入时钟（离线确定性）vs 默认真实时钟：派工/开始/结束各自取正确时点，
+    # 绝不再把派工开始的同一 now 同时写成真实结束时间。
+    clock_injected = now is not None
     now = now or dp.utcnow()
     model = cfg.get('model', MODEL)
 
@@ -594,7 +597,9 @@ def run(cfg: dict, *, workspace: str, prompt_file: Path, out_dir: Path, stage: s
             raise ValueError(f'prompt sha256 recheck failed: file hashes {actual_prompt_sha} '
                              f'but caller asserted {prompt_sha256!r}')
         task_text = prompt_bytes.decode('utf-8')
-        contract_text = pc.build_contract(stage, workspace, mode='direct')
+        # 本轮身份取自真实入口 runtime 与本轮请求模型（不读旧提示词推断身份）。
+        contract_text = pc.build_contract(stage, workspace, mode='direct',
+                                          runtime=RUNTIME, model=model)
         argv = build_argv(cfg, str(workspace), model, contract_text)
     except Exception as exc:  # noqa: BLE001
         return {'dispatch_failed': True, 'sent': False, 'dispatched': False,
@@ -646,25 +651,31 @@ def run(cfg: dict, *, workspace: str, prompt_file: Path, out_dir: Path, stage: s
     stdout_text = ''
     stderr_text = ''
     exit_code = None
+    started_at_utc = now
+    finished_at_utc = now
     try:
+        # 真实开始点：Popen 之前采集；显式注入时钟时用注入值保持离线确定性。
+        started_at_utc = now if clock_injected else datetime.now(timezone.utc)
         proc = popen_factory(argv, cwd=str(workspace), stdin=subprocess.PIPE,
                              stdout=subprocess.PIPE, stderr=subprocess.PIPE,
                              env=child_env, text=True)
         # Popen 成功返回真实句柄 → 立即 started=true；running 已带 wrapper(os.getpid())。
         started = True
-        dp.mark_running(dispatch_store, claim, wrapper_pid=os.getpid(), now=now)
+        dp.mark_running(dispatch_store, claim, wrapper_pid=os.getpid(),
+                        now=started_at_utc)
         if bind_child_pid:
             bound = None
             if getattr(proc, 'pid', None) is not None:
                 bound = dp.bind_child(dispatch_store, claim, int(proc.pid),
-                                      wrapper_pid=os.getpid(), now=now)
+                                      wrapper_pid=os.getpid(), now=started_at_utc)
             # bound 必须**明确为 true** 才算已核验：缺字段/false/None 一律未核验，绝不默认。
             child_verified = bool(isinstance(bound, dict) and bound.get('bound') is True)
             if not child_verified:
                 # 生产默认绑定未明确成功：绝不把任务写入子进程（不调用 communicate(input=...)）、
                 # 不杀进程、不假 start_failed/未知释放；保留活/未知占位供核查。
                 try:
-                    unknown_guard = dp.mark_unknown(dispatch_store, claim, now=now)
+                    unknown_guard = dp.mark_unknown(dispatch_store, claim,
+                                                    now=started_at_utc)
                 except Exception as uexc:  # noqa: BLE001
                     unknown_guard = {'marked': False, 'error': type(uexc).__name__}
                 return {'dispatch_failed': False, 'sent': False, 'dispatched': True,
@@ -673,6 +684,8 @@ def run(cfg: dict, *, workspace: str, prompt_file: Path, out_dir: Path, stage: s
                         'unknown_guard': unknown_guard, 'business_verified': False}
         stdout_text, stderr_text = proc.communicate(input=sent_payload)
         exit_code = getattr(proc, 'returncode', None)
+        # 真实结束点：communicate 返回后采集，绝不沿用派工开始的 now。
+        finished_at_utc = now if clock_injected else datetime.now(timezone.utc)
         child_done = True  # communicate 返回 → 子进程真实退出码已知（确知已退出）
     except BaseException as exc:  # noqa: BLE001 - 终态处理必须兜底
         if started:
@@ -722,7 +735,16 @@ def run(cfg: dict, *, workspace: str, prompt_file: Path, out_dir: Path, stage: s
                             report_text=report_text, binding={}, secret=secret,
                             task_sha=pc.sha256_hex(sent_payload.encode('utf-8')),
                             request={'argv': argv, 'cwd': str(workspace),
-                                     'runtime': RUNTIME, 'model': model},
+                                     'runtime': RUNTIME, 'model': model,
+                                     'started_at_utc': started_at_utc.isoformat(),
+                                     'finished_at_utc': finished_at_utc.isoformat(),
+                                     'executor_identity': {
+                                         'runtime': RUNTIME, 'request_model': model,
+                                         'source': 'entry runtime + requested model; not '
+                                                   'a verified backend identity',
+                                         'older_identity_does_not_override': True},
+                                     'contract_sha256': pc.sha256_hex(
+                                         contract_text.encode('utf-8'))},
                             process={'pid': getattr(proc, 'pid', None),
                                      'exit_code': exit_code, 'wrapper_pid': os.getpid()},
                             sent_task=task_text, sent_contract=contract_text,
@@ -754,7 +776,8 @@ def run(cfg: dict, *, workspace: str, prompt_file: Path, out_dir: Path, stage: s
                     rec = dp.record_main_force_limit(dispatch_store, POOL_KEY,
                                                      task_id=task_id, attempt_token=claim,
                                                      evidence_path=evid_path,
-                                                     evidence_sha256=evid_sha, now=now)
+                                                     evidence_sha256=evid_sha,
+                                                     now=finished_at_utc)
                     limit_recorded = bool(rec.get('recorded'))
                 except Exception as rec_exc:  # noqa: BLE001
                     limit_error = type(rec_exc).__name__
@@ -764,7 +787,7 @@ def run(cfg: dict, *, workspace: str, prompt_file: Path, out_dir: Path, stage: s
     success = bool(facts.get('execution_success') and binding.get('bound'))
     try:
         release = dp.finish(dispatch_store, claim, terminal='finished', success=success,
-                            now=now, prober=child_prober)
+                            now=finished_at_utc, prober=child_prober)
     except Exception as fexc:  # noqa: BLE001
         release = {'released': False, 'error': type(fexc).__name__}
     # passed 需要：执行证据成功 + 报告绑定 + 适用证据（最终 result 文件真实哈希）；
@@ -779,6 +802,8 @@ def run(cfg: dict, *, workspace: str, prompt_file: Path, out_dir: Path, stage: s
             'child_verified': child_verified, 'token': claim, 'exit_code': exit_code,
             'facts': facts, 'binding': binding, 'evidence': ev, 'launched': True,
             'limit_recorded': limit_recorded, 'limit_error': limit_error,
+            'started_at_utc': started_at_utc.isoformat(),
+            'finished_at_utc': finished_at_utc.isoformat(),
             'capacity_release': release, 'passed': passed, 'business_verified': False,
             'report_text_sha256': _sha(report_text.encode('utf-8'))}
 

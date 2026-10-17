@@ -127,6 +127,41 @@ class PromptContractPureTests(unittest.TestCase):
         for head in pc.SECTION_HEADERS:
             self.assertIn(head, contract)
 
+    def test_build_contract_two_arg_call_stays_backward_compatible(self):
+        # 旧两参调用不注入身份，输出不出现本轮身份句（既有调用方字节兼容）。
+        contract = pc.build_contract('BW-PC-OLD', '/isolated/example')
+        self.assertNotIn('本轮执行者与本轮身份', contract)
+        self.assertTrue(contract.startswith(
+            'Final response must contain only the complete nine-section report'))
+        self.assertIn('实际项目绝对路径：/isolated/example', contract)
+
+    def test_build_contract_identity_uses_supplied_runtime_and_request_model(self):
+        stage, ws = 'BW-PC-IDENTITY', 'C:\\work\\proj'
+        intl = pc.build_contract(stage, ws, runtime='qoder', model='Qwen3.8-Max')
+        self.assertIn('runtime=qoder；请求模型=Qwen3.8-Max', intl)
+        self.assertIn('不覆盖本轮身份', intl)
+        cn = pc.build_contract(stage, ws, runtime='qodercn', model='Qwen-3.8-Max')
+        self.assertIn('runtime=qodercn；请求模型=Qwen-3.8-Max', cn)
+        # 真实 runtime 区分国际/CN：同一模型名也不会互相顶替。
+        self.assertNotEqual(intl, cn)
+        self.assertNotEqual(hashlib.sha256(intl.encode('utf-8')).hexdigest(),
+                            hashlib.sha256(cn.encode('utf-8')).hexdigest())
+        with self.assertRaises(ValueError):
+            pc.build_contract(stage, ws, runtime='qoder')  # 缺 model 不静默补
+        with self.assertRaises(ValueError):
+            pc.build_contract(stage, ws, model='Qwen3.8-Max')  # 缺 runtime 不静默补
+
+    def test_old_prompt_identity_cannot_override_current_identity(self):
+        # 旧交接文本里的 ZCode/GLM 身份只作为任务原文出现在契约之后，契约中的本轮身份
+        # 保持不变；不得由旧文本反推或覆盖本轮执行者。
+        contract = pc.build_contract('BW-PC-OLD-ID', '/isolated/ww', runtime='qoder',
+                                     model='Qwen3.8-Max')
+        payload = pc.compose_task_payload(contract, '旧交接：执行者 ZCode；模型 GLM-5.3')
+        body = payload.split('\n\n', 1)[0]
+        self.assertIn('runtime=qoder；请求模型=Qwen3.8-Max', body)
+        self.assertNotIn('runtime=zcode', body)
+        self.assertTrue(payload.endswith('旧交接：执行者 ZCode；模型 GLM-5.3'))
+
     def test_compose_task_payload_preserves_task_verbatim(self):
         contract = 'C'
         task = '任务原文\r\nsecond'
@@ -296,6 +331,13 @@ class QoderSendEvidenceTests(_SubprocessBase):
         self.assertIn(self.stage, contract_tok)
         self.assertIn(str(self.ws), contract_tok)
         self.assertIn(pc.CLOSING_LINE, contract_tok)
+        # 实际发送契约携带本轮真实 runtime 与请求模型，而不是旧提示词里的身份。
+        self.assertIn(f'runtime=qoder；请求模型={self.model_qoder}', contract_tok)
+        self.assertEqual(request['executor_identity']['runtime'], 'qoder')
+        self.assertEqual(request['executor_identity']['request_model'],
+                         self.model_qoder)
+        self.assertEqual(request['executor_identity']['contract_sha256'],
+                         pp['contract_sha256'])
         # 报告绑定仍走原分析器，成功载荷 bound 为真。
         state = read_json(out / 'report-state.json')
         self.assertTrue(state['bound'])
@@ -464,6 +506,12 @@ class ZcodeSendEvidenceTests(_SubprocessBase):
                          recv['prompt'].encode('utf-8'))
         self.assertTrue(pp['readback_match'])
         self._assert_headers_in(recv['prompt'])
+        # ZCode 实际发送载荷同样携带本轮 runtime/请求模型身份。
+        self.assertIn('runtime=zcode；请求模型=GLM-5.3', recv['prompt'])
+        self.assertEqual(request['executor_identity']['runtime'], 'zcode')
+        self.assertEqual(request['executor_identity']['request_model'], 'GLM-5.3')
+        self.assertEqual(request['executor_identity']['contract_sha256'],
+                         pp['contract_sha256'])
         submit = [r for r in self._receipts(out) if r.get('event') == 'submit']
         self.assertEqual(len(submit), 1)
         self.assertEqual(submit[0]['prompt_sha256'], request['prompt_sha256'])

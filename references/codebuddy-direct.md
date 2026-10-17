@@ -9,7 +9,7 @@
 > 控制面 `execution_control.preflight` 同样只对精确模型放行，其余仍拒绝。旧模型/WorkBuddy
 > 的历史 `manual-relay` 语义与旧限流/冷却记录不删不改；旧额度冷却**不挡**这个新模型（本轮只
 > 试一次，失败换下一候选，下一新轮重新从最高优先开始）。本文其余内容保留为历史解析/诊断
-> 档案（原调用形状、事件流、额度冷却与错误分类口径），真实传输管线仍保留在**仅测试**的
+> 档案（原调用形状、事件流、额度冷却与错误分类口径），旧失败链的回放管线仍保留在**仅测试**的
 > `tests/offline_codebuddy_harness.py::replay_dispatch`，在隔离合成 stub 下回放旧失败链。
 
 ## 当前正式入口（codebuddy_live，精确模型）
@@ -58,7 +58,7 @@ python scripts/codebuddy_direct.py --workspace <项目绝对路径> --prompt-fil
 
 ## 统一契约与哈希口径
 
-- 当前直连入口（Qoder/ZCode）与 CodeBuddy 历史流水线调用前使用 `scripts/prompt_contract.py` 的完整九节契约，含精确标题、阶段/路径同一行、首末独占标记和结语。完整契约与任务拼接后经 stdin 发送。契约不能保证模型服从；原始响应照存，不合格仍保留 `bound=false`，不裁剪、不代写。
+- 当前直连入口（国际 Qoder、Qoder CN、ZCode、Claude 与 `codebuddy:deepseek-v4.1-flash` 精确模型）与 CodeBuddy 历史流水线调用前使用 `scripts/prompt_contract.py` 的完整九节契约，含精确标题、阶段/路径同一行、首末独占标记和结语。完整契约与任务拼接后经 stdin 发送。契约不能保证模型服从；原始响应照存，不合格仍保留 `bound=false`，不裁剪、不代写。
 - 新调用的 `prompt_sha256` 与 dispatch-plan 均绑定原提示词文件的原始字节；另外保存实际任务文本、契约和完整发送通道的字节与哈希。换行转换口径显式记录，不把 JSON 文件哈希当 SDK prompt 哈希；Qoder 两通道不冒称一个后端合成载荷。留证边界只到本地 CLI/SDK 提交，不证明服务端处理后的文本。
 - 不改提示词原文件或在途计划；旧调用记录沿用原入口版本的含义，升级后的新调用使用新计划。完整字段和留证位置见 [并行执行控制面](parallel-execution.md)。协议、报告绑定和独立业务验收分别报告，不能由本次传输回归推断真实业务恢复。
 

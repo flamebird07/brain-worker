@@ -642,6 +642,11 @@ class TaskToolRouteEntryTests(unittest.TestCase):
         self.assertIs(summary['protocol_success'], True)
         # present 是派工前 Python 决策；broker_ready/started 等执行载体回声不在离线断言范围。
         self.assertIs(summary['task_tool_authorization_present'], True)
+        # 实际发送载荷携带本轮 runtime 与请求模型身份（不读旧提示词推断）。
+        sent = (out / 'sent-task-payload.bin').read_text(encoding='utf-8')
+        self.assertIn('runtime=zcode；请求模型=GLM-5.3', sent)
+        self.assertEqual(req['executor_identity']['runtime'], 'zcode')
+        self.assertEqual(req['executor_identity']['request_model'], 'GLM-5.3')
         # 环境值绝不落进任何证据文件。
         for p in out.iterdir():
             if p.is_file():
