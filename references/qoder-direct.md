@@ -55,6 +55,44 @@ Popen 前额外拒绝裸/整工具通配 Edit/Write/NotebookEdit/Bash **allow** 
 
 遇到 Qoder 拒绝某动作时，执行 Agent 报告具体未执行的动作、被拒规则和证据，停止同类无效尝试；不重复询问已有授权，也不宣称修复成功——是否放行由主脑按隔离验证判断，不由执行 Agent 自报。扩展纪律（含认证失败分型、拒绝处置与隔离输出审查）见 [执行中断分类与接续](execution-interruption.md)。
 
+### 精确文件任务：scope -> helper -> plan -> actual
+
+Qoder 界面/任务 scope 里列出的文件只是**准备输入**，不自动等于 CLI 授权。客户只读取证确认
+（Qoder 国际 1.1.64，`dont_ask`）：任务 scope 有 17 个文件，但 `plan.grants.edits/bash=[]`，
+实际 `allowed_tools` 只有 Read/Glob/Grep/Edit/Write/Bash，2 次 Edit 被拒且同一目标未改。
+这只能证明“空 grants + 裸工具名”不能被当成已落实的文件清单，不能据此断言所有 bare 规则
+无效或官方 CLI 存在通用 bug。CN 已有精确规则路径经验；国际同版本隔离验证过
+`Edit(/工作区根相对文件)`，Write 按 Edit 型规则处理。
+
+主脑生成 Qoder 精确文件任务时固定走四步：
+
+1. 从任务书/已确认范围写 scope JSON：`edits` 是工作区根相对的具体文件，`bash` 是完整
+   原样命令，`read_dirs` 只放已授权只读目录。
+2. 运行 `python <技能目录>/scripts/qoder_permissions.py --scope <scope.json>`。helper 始终
+   可见 Read/Glob/Grep；有 edits 才可见 Edit+Write 且 allow 只生成 `Edit(/路径)`（不生成
+   `Write(路径)`、裸 Edit/Write）；有 bash 才可见 Bash 且原样生成 `Bash(命令)`。
+3. 用输出的 `visible_tools`/`allowed_tools`/`disallowed_tools`/`add_dirs`/`grants` 构造
+   计划与实际 argv（`--tools` 用 `visible_tools` 逗号连接，`--allowed-tools` 逐项用
+   `allowed_tools`，`--add-dir` 用 `add_dirs`）。
+4. 主脑先逐项核对已授权 scope 与 helper 输出，再据输出构造 plan 与实际 argv；
+   既有 `execution_control.preflight` 只比较 plan 与 actual 的权限集合，缺项或新增均拒绝。
+   它不读取原始 scope，不能替代前一步核对；预检通过后才 Popen。
+
+示例 scope（两个合成文件，仅示形）：
+
+```json
+{"edits": ["scripts\\模块\\我的 文件.py", "tests/test_x.py"],
+ "bash": ["python -m unittest tests.test_x"], "read_dirs": []}
+```
+
+输出 `allowed_tools` 为 `["Read","Glob","Grep","Edit(/scripts/模块/我的 文件.py)","Edit(/tests/test_x.py)","Bash(python -m unittest tests.test_x)"]`，`visible_tools` 为 `["Read","Glob","Grep","Edit","Write","Bash"]`，`grants.edits/bash` 非空。
+
+helper 只做字符串校验与组合：不启动进程、不执行命令、不派工、不写 DB/配置，也不修改计划
+或 scope。`bash` 逐字保留，不追加 `cd`/`echo`/通配符或自行包装；命令完整性由任务书/主脑
+核对，不把 `node --test` 等完整命令擅自判成不完整。Bash 规则中的括号按原样承载，本 helper
+不实现 shell 解析器。既有 legacy 裸规则行为保留，不声称所有版本都无效；现场真实拒绝仍停止
+受影响动作，不改 `dont_ask`、不绕过。
+
 认证失败的边界（BW-INTERRUPTION-20261015-S1）：真实终态文案如 "Custom model authentication failed. Please check if your API Key is correctly configured and valid."（exit 1）属**认证失败**，与上文“明确限额落标与识别”中 `401`/`invalid api key`/`unauthorized` 同类**绝不落限额标记**；只确认 auth failed、保留原文与 exit code，不断言密钥失效，本任务内不重复同 `runtime:model`/config 版本，处理与接续规则见 [执行中断分类与接续](execution-interruption.md)。
 
 ```text

@@ -69,6 +69,11 @@ Qoder/CodeBuddy 用它承载“看到哪些工具”，ZCode 只有这一层且�
 对齐口径；`allowed_tools`/`disallowed_tools` 是完整 allow/deny 规则原文集合。缺 Read 也要
 被拒（不能只比“新增”而漏“缺失”）。真实 `--tools` 为空却需要 Read 的错误配置一律拒。
 
+Qoder 精确文件任务应在核对当轮授权后，显式使用 `scripts/qoder_permissions.py` 生成
+参数；主脑核对 scope 与输出，既有预检核对 plan 与 actual。完整步骤与示例见
+[Qoder 精确文件任务](qoder-direct.md#精确文件任务scope---helper---plan---actual)。
+该工具不改变普通 `task_scope` 或 ZCode 能力，不代替真实 CLI 审批；实际拒绝仍原样保留。
+
 ZCode 的 `disallowed_tools` 应从**受信任本机入口** `build_tool_disallowlist(tools)` 派生（默认禁
 全目录、仅显式名单放行），并与预检 actual 集合精确相等核对；runner 提交时把活注册表里**未被显式
 放行**的项追加 deny，得到 `tool_disallowlist_effective`（= base deny ∪（`observed_tool_catalog` −
