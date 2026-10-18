@@ -67,6 +67,25 @@
   权限模式 ≠ `dontAsk`（任何其它模式，含 bypassPermissions）即 `ValueError`；
   模型 ≠ `deepseek-flash` 即 `ValueError`；`base_url` ≠
   `https://api.deepseek.com/anthropic` 即 `ValueError`——绝不静默改道或回退。
+- **显式任务需求 `required_tools`（BW-PERMISSION-CONFIG-S1/S2）**：
+  `run(..., required_tools=[...])` 与 CLI `--required-tools Read,Edit`（逗号分隔）是**唯一**
+  需求契约。主脑写任务必须传入 `--required-tools Read,Edit,Write`（按实际需要声明，不写
+  未用工具）；只读审查可只声明 Read 或省略。入口**绝不从自然语言猜写意图**，也绝不自动
+  加授权。核对在凭据读取/容量 consume/Popen 之前：工具必须（a）在 `--tools` 可见，
+  （b）被 `--allowedTools` 授权（`Edit(<path>)` 这类按任务路径限定的规则算正例），
+  （c）未被 `--disallowedTools` 拒绝；显式拒绝优先于允许。**规则只做结构校验**：恰好
+  一对括号、工具名非空；`Edit(/file.py))`、`Edit()`、`(/x)` 等畸形/空工具名形态绝不
+  算授权；无法解释的拒绝规则若指向显式需求工具，按 `invalid_rules` 保守拒绝，不静默
+  忽略后让宽 allow 通过。不解析括号内的路径/命令语义（不造 shell/glob 解析器）；合法
+  按文件/目录规则仍允许，合法的 Bash 命令参数括号只有在 Bash 本身被声明需求时才按
+  “无法解释”保守处理，不影响无关的 Read/Edit 需求。缺项返回
+  `required_tools_not_granted` 与具体工具名（不含秘密），零 Popen、零凭据读取、零容量
+  占位。声明成功后，标准化 `required_tools` 与最小 `permission_preflight` 结果写入
+  `request.json` 与 `run` 返回；旧调用 `None` 明确 `skipped=true`，不声称已检查业务意图。
+  该预检**只判断工具是否获授**，不是路径沙箱：存在任意 `Edit(<path>)` 不代表任务所有
+  目标路径均可写，路径外由 CLI 拒绝/现场验证。旧调用不传 `required_tools` 保持兼容，
+  但旧接口**不会**自动知道业务目标，编辑任务仍须主脑显式声明。该预检不是 OS 沙箱，
+  也不替代授权/验收。
 - `_PINNED_MODEL_ENVS` 把 default opus/sonnet/haiku/small-fast/subagent 全部钉成
   `deepseek-flash`，**没有任何模型回退**；`CLAUDE_CODE_SIMPLE` **绝不设置**，
   `build_subprocess_env` 对任何试图覆写被清除凭据 env（含 `CLAUDE_CODE_SIMPLE`）的配置项
@@ -91,8 +110,13 @@
 
 ## 6. 生命周期（`run`，S4 收口）
 
-- Popen **之前**完成全部预检（argv 构造、**prompt SHA 从文件真实回读**与传入值比对、
-  dispatch plan 精确预检、凭据解析）：任一失败 ⇒ **零 Popen、零占位泄漏**。
+- Popen **之前**完成全部预检（argv 构造、`required_tools` 显式需求核对、**prompt SHA
+  从文件真实回读**与传入值比对、dispatch plan 精确预检、凭据解析）：任一失败 ⇒
+  **零 Popen、零占位泄漏**；需求核对先于凭据读取与容量 consume。
+- **时间字段统一 UTC**：`started_at_utc`/`finished_at_utc` 落盘前统一转为同一时刻的
+  `+00:00` ISO 字符串。现场 `datetime.now(timezone.utc)` 本就正确；显式注入带 +08 等
+  偏移的 aware datetime 时也保存同一时刻的 UTC，保持离线注入可重复性与生命周期时段
+  含义。此规范化不追溯修改任何旧证据。
 - `consume_for_entry`（容量门 + 时段门 + 限额复检，executor=`claude`）→ `mark_running`
   （记真实 wrapper PID）→ `bind_child` 且 **`bound` 必须显式为 `true`** 才算子进程核验 →
   `communicate` → 解析 → 报告绑定。
@@ -109,6 +133,9 @@
   0 工具的工程任务绝不冒成功（`zero_tool_engineering`）。
 - **证据落盘**：请求（`request.json`）、进程（`process.json`）、发送任务
   （`sent-task.md`）、发送契约（`sent-contract.md`）、raw stdout/stderr 的**脱敏原件**均持久化；
+  `request.json` 与 `run` 返回同时含标准化 `required_tools` 与最小 `permission_preflight`
+  （`ok/skipped/required_tools/missing_*/denied/invalid_rules/reasons`，不含凭据），
+  便于核对“是否声明/是否跳过”，不把跳过写成已检查业务意图；
   最终改写后**刷新 `result_sha256`** 并重算 `evidence_sha256`；429 限额以**最终 SHA**
   先 `record_main_force_limit` 再释放本占位。
 - 报告绑定复用 `qoder_direct.analyze_report` + `finalize_binding`（正文九节 + 阶段 token +

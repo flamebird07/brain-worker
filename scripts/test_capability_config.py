@@ -34,6 +34,7 @@ def _clear_env():
     for name in ledger.ENV_KEYS.values():
         os.environ.pop(name, None)
     os.environ.pop("BRAIN_WORKER_PLATFORMS_CONFIG", None)
+    os.environ.pop(ledger.HERMES_CONFIG_ENV, None)
 
 
 class LoadConfigTests(unittest.TestCase):
@@ -114,6 +115,31 @@ class LoadConfigTests(unittest.TestCase):
         os.environ["BRAIN_WORKER_PLATFORMS_CONFIG"] = str(path)
         with self.assertRaisesRegex(RuntimeError, "不是合法 YAML"):
             ledger.load_config()
+
+    def test_invalid_yaml_formatted_traceback_does_not_leak_values(self):
+        # BW-PERMISSION-CONFIG-S2：不只 str(exc)，完整格式化异常链也不得回显原始 YAML 行。
+        import traceback
+        secret = "SYNTHETIC_SECRET_DO_NOT_LEAK"
+        path = Path(self.tmp) / "platforms-unclosed.yaml"
+        path.write_text(
+            "platforms:\n  feishu:\n    extra:\n      app_secret: [%s\n" % secret,
+            encoding="utf-8",
+        )
+        os.environ["BRAIN_WORKER_PLATFORMS_CONFIG"] = str(path)
+        try:
+            ledger.load_config()
+        except RuntimeError as exc:
+            formatted = traceback.format_exc()
+            message = str(exc)
+            cause = exc.__cause__
+            suppressed = exc.__suppress_context__
+        else:
+            self.fail("非法 YAML 应失败")
+        self.assertRegex(message, "不是合法 YAML")
+        self.assertNotIn(secret, message)
+        self.assertNotIn(secret, formatted)
+        self.assertIsNone(cause)
+        self.assertTrue(suppressed)
 
     def test_yaml_missing_pyyaml_fails(self):
         import builtins
@@ -316,6 +342,159 @@ class ExplicitYamlOptionalTests(unittest.TestCase):
         os.environ["BRAIN_WORKER_PLATFORMS_CONFIG"] = str(path)
         with self.assertRaisesRegex(RuntimeError, "根节点.*应为映射"):
             ledger.load_config()
+
+
+class HermesCredentialFallbackTests(unittest.TestCase):
+    """BW-PERMISSION-CONFIG S1：显式 Hermes 凭证 fallback（不自动发现、不取资源）。"""
+
+    def setUp(self):
+        _clear_env()
+        ledger._CONFIG = None
+        self.tmp = tempfile.mkdtemp(prefix="bw-hermes-")
+        self.addCleanup(_clear_env)
+        self.addCleanup(lambda: setattr(ledger, "_CONFIG", None))
+
+    def _write(self, extra, name="hermes.yaml"):
+        import yaml
+        path = Path(self.tmp) / name
+        path.write_text(
+            yaml.safe_dump({"platforms": {"feishu": {"extra": extra}}},
+                           allow_unicode=True, sort_keys=False),
+            encoding="utf-8",
+        )
+        return path
+
+    def _resources_env(self):
+        os.environ.update({
+            "FEISHU_APP_TOKEN": "tok_env", "FEISHU_SUMMARY_TABLE": "tbl_s_env",
+            "FEISHU_EVENTS_TABLE": "tbl_e_env",
+        })
+
+    def _pin_empty_platforms(self):
+        # 显式指定一个合成的空 extra 文件，避免默认用户目录被探测/读取。
+        path = self._write({}, name="platforms-empty.yaml")
+        os.environ["BRAIN_WORKER_PLATFORMS_CONFIG"] = str(path)
+        return path
+
+    def test_credentials_from_explicit_hermes_with_env_resources(self):
+        path = self._write({"app_id": "cli_hermes", "app_secret": "sec_hermes",
+                            "app_token": "tok_should_be_ignored",
+                            "summary_table": "tbl_should_be_ignored",
+                            "events_table": "tbl_should_be_ignored"})
+        self._resources_env()
+        self._pin_empty_platforms()
+        os.environ[ledger.HERMES_CONFIG_ENV] = str(path)
+        cfg = ledger.load_config()
+        self.assertEqual(cfg["app_id"], "cli_hermes")
+        self.assertEqual(cfg["app_secret"], "sec_hermes")
+        # 资源字段只来自环境变量，Hermes 中同名字段绝不覆盖。
+        self.assertEqual(cfg["app_token"], "tok_env")
+        self.assertEqual(cfg["summary_table"], "tbl_s_env")
+        self.assertEqual(cfg["events_table"], "tbl_e_env")
+
+    def test_env_credentials_beat_hermes(self):
+        path = self._write({"app_id": "cli_hermes", "app_secret": "sec_hermes"})
+        self._resources_env()
+        os.environ.update({"FEISHU_APP_ID": "cli_env",
+                           "FEISHU_APP_SECRET": "sec_env"})
+        os.environ[ledger.HERMES_CONFIG_ENV] = str(path)
+        cfg = ledger.load_config()
+        self.assertEqual(cfg["app_id"], "cli_env")
+        self.assertEqual(cfg["app_secret"], "sec_env")
+
+    def test_platforms_yaml_credentials_beat_hermes(self):
+        platforms = self._write({"app_id": "cli_platforms",
+                                 "app_secret": "sec_platforms",
+                                 "app_token": "tok_platforms",
+                                 "summary_table": "tbl_s_platforms",
+                                 "events_table": "tbl_e_platforms"},
+                                name="platforms.yaml")
+        hermes = self._write({"app_id": "cli_hermes", "app_secret": "sec_hermes"},
+                             name="hermes.yaml")
+        os.environ["BRAIN_WORKER_PLATFORMS_CONFIG"] = str(platforms)
+        os.environ[ledger.HERMES_CONFIG_ENV] = str(hermes)
+        cfg = ledger.load_config()
+        self.assertEqual(cfg["app_id"], "cli_platforms")
+        self.assertEqual(cfg["app_secret"], "sec_platforms")
+
+    def test_complete_env_never_reads_explicit_hermes(self):
+        self._resources_env()
+        os.environ.update({"FEISHU_APP_ID": "cli_env",
+                           "FEISHU_APP_SECRET": "sec_env"})
+        os.environ[ledger.HERMES_CONFIG_ENV] = str(Path(self.tmp) / "nonexistent.yaml")
+        # 凭证已齐全：即使显式 path 不存在也不读取、不报错。
+        with patch.object(ledger, "_hermes_credentials",
+                          side_effect=AssertionError("Hermes 不应被读取")):
+            cfg = ledger.load_config()
+        self.assertEqual(cfg["app_id"], "cli_env")
+
+    def test_no_hermes_env_means_no_discovery(self):
+        # 未显式设置时不探测任何路径：缺凭证直接报本机配置不完整。
+        self._resources_env()
+        self._pin_empty_platforms()
+        with patch.object(ledger, "_hermes_credentials",
+                          side_effect=AssertionError("不得自动发现 Hermes")):
+            with self.assertRaisesRegex(RuntimeError, "缺少必需飞书配置"):
+                ledger.load_config()
+
+    def test_missing_explicit_hermes_path_fails_without_secret(self):
+        self._resources_env()
+        self._pin_empty_platforms()
+        os.environ[ledger.HERMES_CONFIG_ENV] = str(Path(self.tmp) / "nope.yaml")
+        with self.assertRaisesRegex(RuntimeError, "无法读取显式 Hermes 配置文件"):
+            ledger.load_config()
+
+    def test_bad_hermes_schema_is_safe_and_does_not_leak_values(self):
+        secret = "sec_must_not_appear"
+        path = Path(self.tmp) / "bad-hermes.yaml"
+        path.write_text(
+            "platforms:\n  feishu:\n    extra:\n      - %s\n" % secret,
+            encoding="utf-8",
+        )
+        self._resources_env()
+        self._pin_empty_platforms()
+        os.environ[ledger.HERMES_CONFIG_ENV] = str(path)
+        with self.assertRaises(RuntimeError) as ctx:
+            ledger.load_config()
+        self.assertRegex(str(ctx.exception), "extra 应为映射")
+        self.assertNotIn(secret, str(ctx.exception))
+        self.assertNotIn("Authorization", str(ctx.exception))
+
+    def test_hermes_unclosed_yaml_not_in_formatted_exception_chain(self):
+        # 合成 Hermes YAML 的未闭合数组：完整 traceback 链也不得包含合成秘密。
+        import traceback
+        secret = "SYNTHETIC_SECRET_DO_NOT_LEAK"
+        path = Path(self.tmp) / "hermes-unclosed.yaml"
+        path.write_text(
+            "platforms:\n  feishu:\n    extra:\n      app_secret: [%s\n" % secret,
+            encoding="utf-8",
+        )
+        self._resources_env()
+        self._pin_empty_platforms()
+        os.environ[ledger.HERMES_CONFIG_ENV] = str(path)
+        try:
+            ledger.load_config()
+        except RuntimeError as exc:
+            formatted = traceback.format_exc()
+            message = str(exc)
+        else:
+            self.fail("非法 YAML 应失败")
+        self.assertRegex(message, "不是合法 YAML")
+        self.assertNotIn(secret, message)
+        self.assertNotIn(secret, formatted)
+        self.assertNotIn("Authorization", formatted)
+
+    def test_hermes_missing_credentials_is_local_config_error(self):
+        path = self._write({"app_id": "cli_only"})  # 缺 app_secret
+        self._resources_env()
+        self._pin_empty_platforms()
+        os.environ[ledger.HERMES_CONFIG_ENV] = str(path)
+        with self.assertRaises(RuntimeError) as ctx:
+            ledger.load_config()
+        message = str(ctx.exception)
+        self.assertIn("app_secret", message)
+        self.assertIn("本机配置不完整", message)
+        self.assertNotIn("cli_only", message)
 
 
 class RequestTargetTests(unittest.TestCase):

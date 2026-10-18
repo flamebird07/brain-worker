@@ -12,7 +12,7 @@ import tempfile
 import time
 import unittest
 from contextlib import closing
-from datetime import datetime, timezone
+from datetime import datetime, timedelta, timezone
 from pathlib import Path
 from unittest import mock
 
@@ -600,6 +600,22 @@ class LifecycleTests(unittest.TestCase):
         req = json.loads(Path(out['evidence']['request_path']).read_text(encoding='utf-8'))
         self.assertEqual(req['started_at_utc'], OFFPEAK.isoformat())
         self.assertEqual(req['finished_at_utc'], OFFPEAK.isoformat())
+
+    def test_injected_offset_clock_is_saved_as_same_instant_utc(self):
+        # 显式注入 +08 aware datetime：started_at_utc/finished_at_utc 存档必须是同一
+        # 时刻的 UTC（+00:00），不是原偏移字符串；不伪造修复现场旧证据。
+        beijing = datetime(2026, 10, 18, 13, 9, 48, tzinfo=timezone(timedelta(hours=8)))
+        expected = beijing.astimezone(timezone.utc).isoformat()
+        fake = FakePopen(self.success_stream(), sink=self.sink)
+        out = self.run_with(fake, now=beijing)
+        self.assertTrue(out['sent'], out)
+        self.assertEqual(out['started_at_utc'], expected)
+        self.assertEqual(out['finished_at_utc'], expected)
+        self.assertTrue(out['started_at_utc'].endswith('+00:00'), out['started_at_utc'])
+        self.assertEqual(datetime.fromisoformat(out['started_at_utc']), beijing)
+        req = json.loads(Path(out['evidence']['request_path']).read_text(encoding='utf-8'))
+        self.assertEqual(req['started_at_utc'], expected)
+        self.assertEqual(req['finished_at_utc'], expected)
 
     def test_real_clock_start_and_finish_are_distinct(self):
         # 默认（未注入 now）：开始取 Popen 前真实时点，结束取 communicate 返回后的新真实

@@ -6,8 +6,13 @@ The local lock serializes updates from separate conversations on this host.
 飞书资源与凭证全部由用户显式配置，不含任何内置应用/表标识或个人路径：
   - 凭证（应用身份）：app_id / app_secret，用于换取 tenant_access_token。
   - 多维表格标识：app_token（bitable app）；表标识：summary_table / events_table。
-  - 环境变量优先，其次 ~/.config/brain-worker/platforms.yaml 的 platforms.feishu.extra。
-  - 缺少任一必需配置时，在发起任何网络请求之前明确拒绝。
+  - 凭证与资源字段的环境变量优先，其次 ~/.config/brain-worker/platforms.yaml 的
+    platforms.feishu.extra。
+  - 凭证（仅 app_id/app_secret）可选地再回退到**显式指定**的一个 Hermes 配置文件
+    （BRAIN_WORKER_HERMES_CONFIG）的 platforms.feishu.extra；不自动探测任何路径。
+    app_token/summary_table/events_table 仍只来自环境变量或原 platforms 配置。
+  - 缺少任一必需配置时，在发起任何网络请求之前明确拒绝；这只是本机配置不完整，
+    不是 API 认证或飞书表权限结论。
   - 旧台账漂移检查默认关闭，仅当显式配置 legacy_ledger 路径时启用。
 """
 
@@ -47,25 +52,30 @@ ENV_KEYS = {
 REQUIRED_FIELDS = ("app_id", "app_secret", "app_token", "summary_table", "events_table")
 # YAML 配置文件位置；用 expanduser 解析，Windows/Linux 均按用户目录。
 CONFIG_FILE = "~/.config/brain-worker/platforms.yaml"
+# 可选的显式 Hermes 配置引用：只在 app_id/app_secret 仍缺失且用户显式设置时读取。
+HERMES_CONFIG_ENV = "BRAIN_WORKER_HERMES_CONFIG"
+HERMES_CREDENTIAL_FIELDS = ("app_id", "app_secret")
 
 
-def _mapping(value, what, path):
+def _mapping(value, what, path, label="飞书平台配置"):
     """YAML 节点类型校验：None 视为该层缺失（返回空映射），非映射类型给明确错误。"""
     if value is None:
         return {}
     if not isinstance(value, dict):
         raise RuntimeError(
-            "飞书平台配置的 %s 应为映射（键值结构），当前是其他类型：%s。请按 SKILL.md“飞书后端接入（可选）”修改。"
-            % (what, path)
+            "%s的 %s 应为映射（键值结构），当前是其他类型：%s。请按 SKILL.md“飞书后端接入（可选）”修改。"
+            % (label, what, path)
         )
     return value
 
 
-def _yaml_extra():
-    """读取 platforms.yaml 的 platforms.feishu.extra。
+def _read_extra_file(raw_path, *, label, missing_ok):
+    """读取一个显式 YAML 文件的 platforms.feishu.extra（仅结构，不复制秘密）。
 
-    仅在需要 YAML 回退时调用（见 load_config）；PyYAML 在此处按需加载，
-    纯环境变量方式不依赖 PyYAML。逐层校验节点类型，配置内容不回显。
+    missing_ok=True 仅用于原 platforms 配置的默认路径：该路径本就不存在时视为
+    没有 YAML。显式指定的文件（BRAIN_WORKER_PLATFORMS_CONFIG / HERMES_CONFIG_ENV）
+    缺失、不可读、非法 YAML 或结构错误一律明确报错，不静默忽略、不猜其他文件。
+    异常只携带路径/类型，绝不回显字段值或凭据。
     """
     try:
         import yaml
@@ -75,45 +85,72 @@ def _yaml_extra():
             "或改用环境变量（FEISHU_APP_ID / FEISHU_APP_SECRET / FEISHU_APP_TOKEN / "
             "FEISHU_SUMMARY_TABLE / FEISHU_EVENTS_TABLE）配置。"
         ) from exc
-    raw_path = os.environ.get("BRAIN_WORKER_PLATFORMS_CONFIG", CONFIG_FILE)
     path = Path(os.path.expanduser(raw_path))
     try:
         text = path.read_text(encoding="utf-8")
     except FileNotFoundError:
-        if "BRAIN_WORKER_PLATFORMS_CONFIG" not in os.environ:
-            # 默认配置路径本就不存在：视为没有 YAML，交由 load_config 报缺少必需字段。
+        if missing_ok:
             return {}
-        raise RuntimeError("无法读取飞书平台配置文件：%s" % path)
+        raise RuntimeError("无法读取%s：%s" % (label, path))
     except OSError as exc:
-        raise RuntimeError("无法读取飞书平台配置文件：%s" % path) from exc
+        raise RuntimeError("无法读取%s：%s" % (label, path)) from exc
     try:
         data = yaml.safe_load(text)
-    except Exception as exc:
-        raise RuntimeError("飞书平台配置文件不是合法 YAML：%s" % path) from exc
-    data = _mapping(data, "根节点", path)
-    platforms = _mapping(data.get("platforms"), "platforms", path)
-    feishu = _mapping(platforms.get("feishu"), "platforms.feishu", path)
+    except Exception:
+        # 安全抑制底层 YAML 解析异常链：其消息可能回显原始行（含字段值）。
+        # 只保留本机路径与“非法 YAML”事实，绝不把原行/字段值带入 str 或 traceback。
+        raise RuntimeError("%s不是合法 YAML：%s" % (label, path)) from None
+    data = _mapping(data, "根节点", path, label)
+    platforms = _mapping(data.get("platforms"), "platforms", path, label)
+    feishu = _mapping(platforms.get("feishu"), "platforms.feishu", path, label)
     extra = feishu.get("extra")
     if extra is None:
-        raise RuntimeError("飞书平台配置缺少 platforms.feishu.extra；请按 SKILL.md“飞书后端接入（可选）”填写。")
+        raise RuntimeError("%s缺少 platforms.feishu.extra；请按 SKILL.md“飞书后端接入（可选）”填写。" % label)
     if not isinstance(extra, dict):
         raise RuntimeError(
-            "飞书平台配置的 platforms.feishu.extra 应为映射（键值结构），当前是其他类型：%s。"
-            "请按 SKILL.md“飞书后端接入（可选）”修改。" % path
+            "%s的 platforms.feishu.extra 应为映射（键值结构），当前是其他类型：%s。"
+            "请按 SKILL.md“飞书后端接入（可选）”修改。" % (label, path)
         )
     return extra
 
 
-def load_config():
-    """解析飞书配置，返回 dict；每个字段环境变量优先，其次 YAML。
+def _yaml_extra():
+    """读取原 platforms.yaml 的 platforms.feishu.extra（默认路径缺失视为无 YAML）。"""
+    raw_path = os.environ.get("BRAIN_WORKER_PLATFORMS_CONFIG", CONFIG_FILE)
+    return _read_extra_file(
+        raw_path, label="飞书平台配置文件",
+        missing_ok="BRAIN_WORKER_PLATFORMS_CONFIG" not in os.environ)
 
-    读取 YAML 的条件（满足其一）：
+
+def _hermes_credentials():
+    """仅当显式设置 HERMES_CONFIG_ENV 且凭证仍缺失时，读取该一个文件的凭证字段。
+
+    只返回 app_id/app_secret；app_token/summary_table/events_table 绝不从这里取，
+    也不自动探测其它 Hermes/凭据池路径。文件缺失/结构错误明确报错。
+    """
+    raw_path = os.environ.get(HERMES_CONFIG_ENV)
+    if not raw_path:
+        raise RuntimeError("未显式设置 %s" % HERMES_CONFIG_ENV)
+    extra = _read_extra_file(raw_path, label="显式 Hermes 配置文件（%s）" % HERMES_CONFIG_ENV,
+                             missing_ok=False)
+    return {key: str(extra.get(key) or "").strip() for key in HERMES_CREDENTIAL_FIELDS}
+
+
+def load_config():
+    """解析飞书配置，返回 dict；环境变量 > 原 platforms YAML > 显式 Hermes（仅凭证）。
+
+    读取原 YAML 的条件（满足其一）：
       1. 任一必需字段未由环境变量提供（读默认 CONFIG_FILE 或显式指定文件）；
       2. 显式设置了 BRAIN_WORKER_PLATFORMS_CONFIG（此时即使必需字段已由环境变量
          提供，可选字段如 legacy_ledger 也从该文件回退；文件不可读/结构错误
          会明确报错，不静默忽略）。
-    五个必需环境变量齐全且未显式指定 YAML 时，不读取任何 YAML、不依赖 PyYAML。
-    缺少任一必需字段时立即抛错——在发起任何网络请求之前。
+    之后，**仅当** app_id/app_secret 仍缺失且显式设置了 BRAIN_WORKER_HERMES_CONFIG
+    时，读取该一个文件的 platforms.feishu.extra 作为凭证 fallback；资源字段
+    （app_token/summary_table/events_table）绝不从 Hermes 文件读取。没有显式设置
+    时不探测任何 Hermes/凭据池路径。
+    五个必需环境变量齐全且未显式指定任何文件时，不读取 YAML、不依赖 PyYAML。
+    缺少任一必需字段时立即抛错——在发起任何网络请求之前；该错误只表示本机配置
+    不完整，不是 API 认证/支付或飞书表权限结论。
     """
     env = {key: (os.environ.get(name) or "").strip() for key, name in ENV_KEYS.items()}
     explicit_yaml = "BRAIN_WORKER_PLATFORMS_CONFIG" in os.environ
@@ -124,13 +161,22 @@ def load_config():
     merged = {}
     for key in list(REQUIRED_FIELDS) + ["legacy_ledger"]:
         merged[key] = env[key] or str(extra.get(key) or "").strip()
+    # 凭证 fallback：只有仍缺 app_id/app_secret 且用户显式引用时才读那一个文件。
+    if HERMES_CONFIG_ENV in os.environ and any(
+            not merged[key] for key in HERMES_CREDENTIAL_FIELDS):
+        hermes = _hermes_credentials()
+        for key in HERMES_CREDENTIAL_FIELDS:
+            if not merged[key]:
+                merged[key] = hermes.get(key) or ""
     missing = [key for key in REQUIRED_FIELDS if not merged[key]]
     if missing:
         raise RuntimeError(
-            "缺少必需飞书配置：%s。请通过环境变量（%s）或 %s 配置。"
+            "缺少必需飞书配置：%s。请通过环境变量（%s）或 %s 配置；"
+            "可选凭证 fallback：显式设置 %s 指向 Hermes 配置文件。"
+            "这只是本机配置不完整，不代表账号无凭据或飞书表权限。"
             % ("、".join(missing),
                "、".join(ENV_KEYS[k] for k in missing),
-               CONFIG_FILE)
+               CONFIG_FILE, HERMES_CONFIG_ENV)
         )
     merged["legacy_ledger"] = merged["legacy_ledger"] or None
     return merged

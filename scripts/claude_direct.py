@@ -85,6 +85,17 @@ def _now() -> str:
     return datetime.now(timezone.utc).isoformat()
 
 
+def _iso_utc(dt) -> str:
+    """把时点序列化为**同一时刻**的 UTC ISO 字符串（存档字段 *_at_utc 的口径）。
+
+    aware datetime（含 +08 等偏移）先 astimezone(timezone.utc)；naive 按 UTC 解释
+    （与时段门对 naive 输入的口径一致）。正常现场 datetime.now(timezone.utc) 本就是
+    +00:00，此函数不改变其值；这里只保证显式注入带偏移的时钟时存档仍是 UTC。"""
+    if dt.tzinfo is None:
+        dt = dt.replace(tzinfo=timezone.utc)
+    return dt.astimezone(timezone.utc).isoformat()
+
+
 def _sha(b: bytes) -> str:
     import hashlib
     return hashlib.sha256(b).hexdigest()
@@ -193,6 +204,132 @@ def _validate_rule_list(value, field):
         if item != item.strip():
             raise ValueError(f'{field} entry has surrounding whitespace: {item!r}')
     return list(value)
+
+
+def normalize_required_tools(value):
+    """显式任务所需工具清单（唯一契约）：None 表示旧调用未声明；字符串按逗号分隔。
+
+    只接受**普通工具名**（如 Read/Edit/Write）；不接受路径/通配符/组合表达式作为
+    “需求”本身（路径限定属于 allowed_tools 规则，不属于需求）。空清单或空项直接
+    ValueError——显式声明却不能核对是配置错误，绝不静默当作“无需求”。"""
+    if value is None:
+        return None
+    if isinstance(value, str):
+        items = [x.strip() for x in value.split(',')]
+    elif isinstance(value, (list, tuple)):
+        items = [str(x).strip() for x in value]
+    else:
+        raise ValueError(f'required_tools must be a list of tool names or comma-separated '
+                         f'string, got {type(value).__name__}')
+    if not items or any(not x for x in items):
+        raise ValueError('required_tools must be a non-empty list of non-empty tool names')
+    result = []
+    for item in items:
+        if _rule_base_tool(item) != item:
+            raise ValueError(f'required_tools entry must be a plain tool name: {item!r}')
+        if item not in result:
+            result.append(item)
+    return result
+
+
+def _rule_base_tool(rule):
+    """把 allowed/disallowed 规则归为工具基名：`Read`、`Edit(<path>)` → Read/Edit。
+
+    只做**结构**校验，不解析括号内的路径/命令语义（不造 shell/glob 解析器）：
+      - 裸规则：首尾/内部无空白、无 `*?[]` 等未支持通配形态；
+      - 带参规则：恰好一对括号、工具名非空且无空白、括号内非空白；
+      - 多余的/不配对的括号（如 `Edit(/file.py))`）、空工具名（如 `(/x)`）返回 None。
+    调用方绝不把 None 当作“已授权”；对无法解释的拒绝规则按显式需求保守拒绝。"""
+    if not isinstance(rule, str) or not rule or rule != rule.strip():
+        return None
+    if '(' in rule or ')' in rule:
+        if rule.count('(') != 1 or rule.count(')') != 1:
+            return None
+        name, sep, rest = rule.partition('(')
+        if not sep or not rest.endswith(')'):
+            return None
+        if not name or name != name.strip() or any(ch.isspace() for ch in name):
+            return None
+        if not rest[:-1].strip():
+            return None
+        return name
+    if any(ch in rule for ch in '*?[]') or any(ch.isspace() for ch in rule):
+        return None
+    return rule
+
+
+def _rule_references_tool(rule, names):
+    """畸形规则是否明显指向某个显式需求工具（只取首个括号前的名字，不做语义解析）。
+
+    `Edit(/x))` / `Edit*` → Edit；`Editor` 不算 Edit；合法 Bash 命令参数里的括号
+    只有在 Bash 本身被显式声明为需求时才进入保守拒绝，不影响无关的 Read/Edit 需求。
+    """
+    if not isinstance(rule, str):
+        return None
+    head = rule.split('(', 1)[0].strip()
+    for name in names:
+        if head == name:
+            return name
+        if head.startswith(name) and len(head) > len(name):
+            nxt = head[len(name)]
+            if not (nxt.isalnum() or nxt in '_-'):
+                return name
+    return None
+
+
+def preflight_required_permissions(cfg: dict, required_tools=None) -> dict:
+    """启动前的**显式任务需求**核对（不是 OS 沙箱，也不猜业务意图）。
+
+    对照 cfg 的实际 `tools`（可见性）、`allowed_tools`（授权）、`disallowed_tools`
+    （拒绝）逐项核对 required_tools：
+      - 不可见（--tools 无该工具）→ 拒绝；
+      - 可见但 allowed 无该工具规则 → 拒绝（`Edit(<path>)` 这类按任务路径限定的
+        规则视为该工具的正例授权）；
+      - 显式 deny 该工具（裸名或带参规则）→ 拒绝，**拒绝优先于允许**；
+    复杂/不认识的规则形态不按“已授权”处理，保守拒绝。返回值只含工具/规则名称，
+    不含任何凭据、环境变量值或 token。未声明 required_tools（None）保持旧调用兼容。"""
+    required = normalize_required_tools(required_tools)
+    if required is None:
+        return {'ok': True, 'skipped': True, 'required_tools': None,
+                'missing_visible': [], 'missing_allowed': [], 'denied': [],
+                'invalid_rules': [], 'reasons': []}
+    tools = _validate_rule_list(cfg.get('tools'), 'tools')
+    allowed = _validate_rule_list(cfg.get('allowed_tools'), 'allowed_tools')
+    disallowed = _validate_rule_list(cfg.get('disallowed_tools'), 'disallowed_tools')
+    allowed_bases = {_rule_base_tool(r) for r in allowed}
+    denied_bases = {_rule_base_tool(r) for r in disallowed}
+    missing_visible, missing_allowed, denied = [], [], []
+    invalid_rules = []
+    reasons = []
+    for name in required:
+        if name in denied_bases:
+            denied.append(name)
+            reasons.append(f'required tool {name!r} is explicitly denied by --disallowedTools')
+        if name not in tools:
+            missing_visible.append(name)
+            reasons.append(f'required tool {name!r} is not visible in --tools')
+        if name not in allowed_bases:
+            missing_allowed.append(name)
+            reasons.append(f'required tool {name!r} is not granted by --allowedTools '
+                           f'(a path-limited rule {name}(<path>) is accepted)')
+    # 拒绝侧无法解释的复杂/畸形规则绝不静默忽略（否则宽 allow 会通过）：
+    # 只要该规则明显指向显式需求的工具，就保守拒绝，声明“无法判定是否被拒绝”。
+    for rule in disallowed:
+        if (_rule_base_tool(rule) is None
+                and _rule_references_tool(rule, required) is not None):
+            invalid_rules.append(rule)
+            reasons.append(f'--disallowedTools rule {rule!r} is malformed/unsupported '
+                           'for an explicitly required tool; refusing to infer permission')
+    return {'ok': not reasons, 'skipped': False, 'required_tools': required,
+            'missing_visible': missing_visible, 'missing_allowed': missing_allowed,
+            'denied': denied, 'invalid_rules': invalid_rules, 'reasons': reasons}
+
+
+def _preflight_evidence(result: dict) -> dict:
+    """最小预检回执（request.json / run 返回共用）：只含工具/规则名，不含凭据或环境值。"""
+    keys = ('ok', 'skipped', 'required_tools', 'missing_visible', 'missing_allowed',
+            'denied', 'invalid_rules', 'reasons')
+    return {key: result.get(key) for key in keys}
 
 
 def build_argv(cfg: dict, workspace: str, model: str, contract: str) -> list[str]:
@@ -734,10 +871,13 @@ def run(cfg: dict, *, workspace: str, prompt_file: Path, out_dir: Path, stage: s
         task_id: str, prompt_sha256: str, claim_token: str | None = None,
         is_engineering_task: bool = True, now=None, popen_factory=subprocess.Popen,
         environ=None, dispatch_store=None, child_prober=None, bind_child_pid=True,
-        plan=None, active_tasks=None) -> dict:
+        plan=None, active_tasks=None, required_tools=None) -> dict:
     """真实编排：outdir/预检/凭据前置 → 时段+容量门 → Popen → 解析 → 绑定 → 终态释放。
 
     - outdir 必须不存在（存在即 0 Popen 拒绝，绝不覆写旧证据）；
+    - required_tools（主脑显式声明的任务所需工具）对照真实 --tools/--allowedTools/
+      --disallowedTools 核对，在凭据读取/容量 consume 之前完成；缺项或显式拒绝 →
+      0 Popen、0 凭据读取、0 占位。未声明时保持旧调用兼容；
     - --dispatch-plan 精确预检（execution_control.preflight，复用真实 grants）在占位之前完成；
       预检/凭据/argv 任一失败 → 0 Popen、零占位泄漏；
     - communicate 拿到真实退出码即释放终态（即便随后解析/落盘失败也不再泄漏）；
@@ -778,6 +918,20 @@ def run(cfg: dict, *, workspace: str, prompt_file: Path, out_dir: Path, stage: s
                 'reasons': [f'argv/prompt precheck failed before any claim: {exc!r}']}
     sent_payload = pc.compose_task_payload(contract_text, task_text)
     prompt_sha256 = actual_prompt_sha
+
+    # (1b) 显式任务所需权限核对（仍然在凭据读取、容量 consume 与 Popen 之前）。
+    # 只核对主脑**明确声明**的 required_tools，绝不从自然语言猜写意图、不自动加授权。
+    try:
+        permission_preflight = preflight_required_permissions(cfg, required_tools)
+    except Exception as exc:  # noqa: BLE001
+        return {'dispatch_failed': True, 'sent': False, 'dispatched': False,
+                'reason': 'required_tools_invalid', 'error_class': type(exc).__name__,
+                'reasons': [f'required_tools declaration invalid: {exc!r}']}
+    if not permission_preflight.get('ok'):
+        return {'dispatch_failed': True, 'sent': False, 'dispatched': False,
+                'reason': 'required_tools_not_granted',
+                'permission_preflight': permission_preflight,
+                'reasons': permission_preflight.get('reasons') or []}
 
     # (2) --dispatch-plan 精确预检（占位之前，0 Popen）。
     if plan is not None:
@@ -908,8 +1062,11 @@ def run(cfg: dict, *, workspace: str, prompt_file: Path, out_dir: Path, stage: s
                             request={'argv': argv, 'cwd': str(workspace),
                                      'runtime': RUNTIME, 'model': model,
                                      'cli_version': summary.get('cli_version'),
-                                     'started_at_utc': started_at_utc.isoformat(),
-                                     'finished_at_utc': finished_at_utc.isoformat(),
+                                     'required_tools': permission_preflight.get('required_tools'),
+                                     'permission_preflight': _preflight_evidence(
+                                         permission_preflight),
+                                     'started_at_utc': _iso_utc(started_at_utc),
+                                     'finished_at_utc': _iso_utc(finished_at_utc),
                                      'executor_identity': {
                                          'runtime': RUNTIME, 'request_model': model,
                                          'source': 'entry runtime + requested model; not '
@@ -972,10 +1129,12 @@ def run(cfg: dict, *, workspace: str, prompt_file: Path, out_dir: Path, stage: s
                   and release_ok and not facts.get('downstream_error') and limit_ok)
     return {'sent': True, 'dispatched': True, 'started': started,
             'child_verified': child_verified, 'token': claim, 'exit_code': exit_code,
+            'required_tools': permission_preflight.get('required_tools'),
+            'permission_preflight': _preflight_evidence(permission_preflight),
             'facts': facts, 'binding': binding, 'evidence': ev, 'launched': True,
             'limit_recorded': limit_recorded, 'limit_error': limit_error,
-            'started_at_utc': started_at_utc.isoformat(),
-            'finished_at_utc': finished_at_utc.isoformat(),
+            'started_at_utc': _iso_utc(started_at_utc),
+            'finished_at_utc': _iso_utc(finished_at_utc),
             'capacity_release': release, 'passed': passed, 'business_verified': False,
             'report_text_sha256': _sha(report_text.encode('utf-8'))}
 
@@ -997,6 +1156,10 @@ def build_parser():
     ap.add_argument('--active-tasks', default=None,
                     help='JSON file with the active-tasks snapshot for the plan preflight')
     ap.add_argument('--not-engineering-task', action='store_true')
+    ap.add_argument('--required-tools', default=None,
+                    help='comma-separated tool names this task explicitly requires '
+                         '(e.g. "Read,Edit"); checked before credentials/capacity/Popen. '
+                         'Root must declare write needs explicitly; no inference from text')
     return ap
 
 
@@ -1009,6 +1172,13 @@ def main(argv=None) -> int:
                           'reason': 'cli_model_rejected',
                           'reasons': [f'--model must be {MODEL!r} on this entry, '
                                       f'got {args.model!r}; no model substitution']},
+                         ensure_ascii=False))
+        return 2
+    try:
+        required_tools = normalize_required_tools(args.required_tools)
+    except ValueError as exc:
+        print(json.dumps({'dispatch_failed': True, 'sent': False, 'dispatched': False,
+                          'reason': 'required_tools_invalid', 'reasons': [str(exc)]},
                          ensure_ascii=False))
         return 2
     cfg = load_entry_config(args.config or str(DEFAULT_CONFIG))
@@ -1024,7 +1194,8 @@ def main(argv=None) -> int:
               out_dir=Path(args.output_dir), stage=args.stage, task_id=args.task_id,
               prompt_sha256=_sha(prompt_bytes), claim_token=args.dispatch_claim,
               is_engineering_task=not args.not_engineering_task,
-              dispatch_store=args.dispatch_store, plan=plan, active_tasks=active_tasks)
+              dispatch_store=args.dispatch_store, plan=plan, active_tasks=active_tasks,
+              required_tools=required_tools)
     print(json.dumps(out, ensure_ascii=False))
     if not out.get('dispatched'):
         return 2  # not dispatched (precheck/credential/gate)
