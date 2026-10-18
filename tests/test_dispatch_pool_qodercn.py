@@ -134,15 +134,16 @@ class CapacityAndRotationTests(_Store):
 
     def test_auto_prefers_main_then_flash_then_full_at_thirteen(self):
         # 真实目标：主力优先 → 同级 Flash 兜底 → 13 满才物理满。
-        # BW-MAIN-PRIORITY-S1 新优先级：三 Qoder Max > claude > zcode；CodeBuddy 已在
-        # setUp 占住最高层，空池 AUTO 请求 zcode 会被改派到 qoder:Qwen3.8-Max。
+        # 新优先级：三 Qoder Max > claude > zcode；CodeBuddy 已在 setUp 占住最高层，
+        # 空池 AUTO 请求 zcode 会被改派到 Max 层；BW-CUSTOM-MAX-RESUME-20261018-S1 起
+        # Max 层内 CN 自定义先于两内置。
         first = dp.select_and_claim(self.store, task_id='p0', runtime='zcode',
                                     model='GLM-5.3', workspace=self.ws('p0'),
                                     prompt_sha256='p', executor='auto', now=T0,
                                     _preclaim=False)
         self.assertFalse(first['allowed'], first)
         self.assertTrue(first['routing_required'], first)
-        self.assertEqual(first['selected']['pool_key'], QMAX)
+        self.assertEqual(first['selected']['pool_key'], dp.CN_CUSTOM_MAX_POOL_KEY)
         self.assertEqual(self.active(ZCODE), 0)
         # 用明确 executor 约束补满其余十二槽（Z 2 + 两区内置 Max 各 1 + CN 自定义 Max 2
         # + claude 2 + 两区 Flash 各 2）+ setUp 的 CodeBuddy 1 → 总 13。
@@ -255,7 +256,7 @@ class CrossRuntimeClaimTests(_Store):
     def test_international_token_rejected_by_cn_entry(self):
         intl = dp.reserve(self.store, task_id='ic', runtime='qoder', model='Qwen3.8-Max',
                           workspace=self.ws('ic'), prompt_sha256='i' * 64,
-                          now=T0, _preclaim=False)
+                          now=T0, executor='qoder', _preclaim=False)
         out = dp.consume_for_entry(self.store, task_id='ic', runtime='qodercn',
                                    model='Qwen3.8-Max', workspace=self.ws('ic'),
                                    prompt_sha256='i' * 64, claim_token=intl['token'],
@@ -377,7 +378,8 @@ class ZcodeHoldSkipTests(_Store):
                                 _preclaim=False)
         self.assertFalse(r.get('allowed'), r)
         self.assertTrue(r.get('routing_required'), r)
-        self.assertEqual(r['selected']['pool_key'], QMAX, r)
+        # BW-CUSTOM-MAX-RESUME-20261018-S1：Max 层内 CN 自定义先于两内置。
+        self.assertEqual(r['selected']['pool_key'], dp.CN_CUSTOM_MAX_POOL_KEY, r)
         self.assertEqual(self.active(ZCODE), 0)
         # Z 仍合格：新政策下 _eligible_main_forces 不据历史 hold 剔除 Z。
         with contextlib.closing(dp.connect(self.store)) as conn:

@@ -16,7 +16,8 @@
 
 - 池与优先级：`capacity=1`，AUTO 最高层（高于全部 Qwen3.8-Max/Claude/ZCode），**不套** Max
   北京夜间窗或 Claude 离峰窗；显式 `executor='codebuddy'` 只认该精确组合，绝不跨模型回退。
-  总配置 13；CN 自定义 Max 2 槽仍按用户暂停令排除在可新派授权之外（当前授权可新派上限 11）。
+  总配置 13；BW-CUSTOM-MAX-RESUME-20261018-S1 已解除 CN 自定义 Max 暂停，授权可新派上限
+  恢复 13（自定义 2 槽、不新增槽；历史暂停期上限 11 属当时状态）。Max 层内自定义先于两内置。
 - 容量生命周期：`consume_for_entry(executor='codebuddy')` 认领 → `mark_running` → `bind_child`
   （必须 `bound=true`）→ 真实退出后 `finish`；启动前失败 `start_failed` 释放；已启动但终态
   无法确认 `mark_unknown` 保留占位。绝不误清别人的锁、不删真实锁、不新建冷却表/服务。

@@ -232,11 +232,12 @@ class CapacityAndKnownPoolTests(_PoolBase):
 
 class MainForceRotationTests(_PoolBase):
     def test_select_prefers_max_tier_then_claude_then_zcode(self):
-        # BW-MAIN-PRIORITY-S1 新主力优先级：三 Qoder Max > claude:deepseek-flash > zcode。
-        # 空池请求 zcode → AUTO 改派到最高层且有位的 qoder:Qwen3.8-Max（历史 committed 计数
+        # BW-MAIN-PRIORITY-S1 新主力优先级：三 Qoder Max > claude:deepseek-flash > zcode；
+        # BW-CUSTOM-MAX-RESUME-20261018-S1 起 Max 层内 CN 自定义 qodercn:Qwen-3.8-Max 先于
+        # 两内置。空池请求 zcode → AUTO 改派到最高层且有位的自定义 Max（历史 committed 计数
         # 仍照旧记账，但绝不再参与跨层排序，低层不能抢高层名额）。
         r1 = self.select('t1', 'zcode', 'GLM-5.3')
-        self.assertRouting(r1, 'qoder:Qwen3.8-Max')
+        self.assertRouting(r1, dp.CN_CUSTOM_MAX_POOL_KEY)
         self.assertFalse(r1.get('sent', True))
         # 占满三 Qoder Max 层（4 槽）后，请求 zcode → 落到下一层 claude:deepseek-flash。
         self.reserve_exec('m0', 'qoder', 'Qwen3.8-Max', 'qoder')
@@ -253,8 +254,11 @@ class MainForceRotationTests(_PoolBase):
         self.assertClaimed(r3, 'zcode:GLM-5.3')
 
     def test_select_prefers_requested_combo_on_tie(self):
+        # 自定义 CN Max 在 Max 层内先于两内置；先占满其 2 槽，使两内置均 0 在途平票。
+        self.reserve_exec('p0', 'qodercn', 'Qwen-3.8-Max', 'qodercn')
+        self.reserve_exec('p1', 'qodercn', 'Qwen-3.8-Max', 'qodercn')
         r = self.select('tie', 'qoder', 'Qwen3.8-Max')
-        # 平票时优先请求组合 → qoder 被选中而非轮换到 zcode。
+        # 两内置平票时优先请求组合 → qoder 被选中而非落到 CN 内置/zcode。
         self.assertClaimed(r, 'qoder:Qwen3.8-Max')
 
     def test_select_when_both_main_full_routes_to_overflow(self):
@@ -410,15 +414,16 @@ class ConsumeForEntryTests(_PoolBase):
         self.assertEqual(self._state(tok), 'reserved')
 
     def test_consume_without_token_routes(self):
-        # 无 token → 走 select_and_claim；BW-MAIN-PRIORITY-S1 新优先级下三 Qoder Max 为最高
-        # 层，空池请求 qoder:Qwen3.8-Max 即被 AUTO 选中并直接 claim（无需改派）。
-        r = dp.consume_for_entry(self.store, task_id='n', runtime='qoder',
-                                 model='Qwen3.8-Max', workspace=str(self._ws_for('n')),
+        # 无 token → 走 select_and_claim；BW-CUSTOM-MAX-RESUME-20261018-S1 起 Max 层内
+        # CN 自定义 qodercn:Qwen-3.8-Max 先于两内置，空池请求该组合即被 AUTO 选中并直接
+        # claim（无需改派）。
+        r = dp.consume_for_entry(self.store, task_id='n', runtime='qodercn',
+                                 model='Qwen-3.8-Max', workspace=str(self._ws_for('n')),
                                  prompt_sha256='p', wrapper_pid=4321, wrapper_created='w1',
                                  now=T0)
         self.assertTrue(r['allowed'], r)
         self.assertTrue(r['claimed'])
-        self.assertEqual(r['pool_key'], 'qoder:Qwen3.8-Max')
+        self.assertEqual(r['pool_key'], dp.CN_CUSTOM_MAX_POOL_KEY)
 
     def test_consume_without_token_can_route_wrong_combo(self):
         self.reserve('z0', 'zcode', 'GLM-5.3')

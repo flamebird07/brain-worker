@@ -207,7 +207,8 @@ class WindowAndLimitTests(_Base):
         self.reserve('b', 'zcode', 'GLM-5.3', executor='zcode')
         r = self.plan(self.auth('auto', 'T', 's2', LEGACY_MAINS + ALL_FLASH), now=T_NIGHT)
         self.assertEqual(r['candidate_filters'][dp.ZCODE_POOL_KEY], 'capacity_full')
-        self.assertEqual(r['selected']['pool_key'], 'qoder:Qwen3.8-Max', r)
+        # BW-CUSTOM-MAX-RESUME-20261018-S1：ZCode 满后落 Max 层，自定义 Max 现为该层首个。
+        self.assertEqual(r['selected']['pool_key'], dp.CN_CUSTOM_MAX_POOL_KEY, r)
 
 
 class NightAutoCustomMaxRegression(_Base):

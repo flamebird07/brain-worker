@@ -178,8 +178,8 @@ class CapacityAndRouting(_ClaudeBase):
 
     def test_auto_claude_entry_does_not_bypass_fair_selection(self):
         # BW-CLAUDE-DEEPSEEK-S4 反例：AUTO 的 claude 入口请求绝不绕过公平选择直接认领
-        # 自己那槽——先占住最高层 CodeBuddy（新最高层由独立回归验证），claude 请求按旧层序
-        # routing 到 qoder Max，绝不偷认领自己。
+        # 自己那槽——先占住最高层 CodeBuddy（新最高层由独立回归验证），claude 请求按层序
+        # routing 到 Max 层；BW-CUSTOM-MAX-RESUME-20261018-S1 起 Max 层内自定义优先。
         self.assertTrue(self._reserve('cb', 'codebuddy', 'deepseek-v4.1-flash',
                                       'codebuddy').get('allowed'))
         r = dp.select_and_claim(self.store, task_id='afc', runtime='claude',
@@ -188,7 +188,7 @@ class CapacityAndRouting(_ClaudeBase):
                                 now=OFFPEAK_NIGHT, executor='auto', _preclaim=False)
         self.assertFalse(r.get('allowed'), r)
         self.assertTrue(r.get('routing_required'), r)
-        self.assertEqual(r['selected']['pool_key'], 'qoder:Qwen3.8-Max', r)
+        self.assertEqual(r['selected']['pool_key'], dp.CN_CUSTOM_MAX_POOL_KEY, r)
 
     def test_auto_claude_entry_peak_is_honestly_closed(self):
         # AUTO 的 claude 入口高峰请求：如实 main_force_window_closed，绝不绕过时段门认领。

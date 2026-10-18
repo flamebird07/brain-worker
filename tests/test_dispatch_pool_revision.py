@@ -132,10 +132,9 @@ class TestUnifiedPolicy(TempStoreMixin, unittest.TestCase):
                          _preclaim=False)
         self.assertFalse(out['allowed'])
         self.assertTrue(out['routing_required'])
-        # 空库请求 Flash → 优先主力，绝不保留 Flash；committed/active 全平票时按 pool_key
-        # stable tie 选国际 Qwen3.8-Max（真实候选集合内主力在前）。
+        # 空库请求 Flash → 优先主力，绝不保留 Flash；Max 层内自定义 Max 现为最高优先。
         self.assertIn(out['selected']['pool_key'], dp.MAIN_FORCE_KEYS)
-        self.assertEqual(out['selected']['pool_key'], 'qoder:Qwen3.8-Max')
+        self.assertEqual(out['selected']['pool_key'], dp.CN_CUSTOM_MAX_POOL_KEY)
 
     def test_reserve_luna_rejected(self):
         out = dp.reserve(self.store, task_id='t', runtime='luna', model='native',
@@ -235,15 +234,16 @@ class TestConsume(TempStoreMixin, unittest.TestCase):
         self.assertEqual(self.row('attempts', 'token', tok)['state'], 'reserved')
 
     def test_auto_consume_records_wrapper_identity(self):
-        # 无 token 的 AUTO consume：BW-MAIN-PRIORITY-S1 下三 Qoder Max 为最高层，空池请求
-        # qoder:Qwen3.8-Max 被 AUTO 直接选中并 claim，同时记录 wrapper 真实身份。
-        out = dp.consume_for_entry(self.store, task_id='auto1', runtime='qoder',
-                                   model='Qwen3.8-Max', workspace='C:/w',
+        # 无 token 的 AUTO consume：BW-CUSTOM-MAX-RESUME-20261018-S1 起 Max 层内自定义
+        # qodercn:Qwen-3.8-Max 最高，空池请求该组合被 AUTO 直接选中并 claim，同时记录
+        # wrapper 真实身份。
+        out = dp.consume_for_entry(self.store, task_id='auto1', runtime='qodercn',
+                                   model='Qwen-3.8-Max', workspace='C:/w',
                                    prompt_sha256='b' * 64, stage='s', chat_id='c',
                                    wrapper_pid=777, wrapper_created='auto-created',
                                    now=T0)
         self.assertTrue(out['allowed'])
-        self.assertEqual(out['pool_key'], 'qoder:Qwen3.8-Max')
+        self.assertEqual(out['pool_key'], dp.CN_CUSTOM_MAX_POOL_KEY)
         row = self.row('attempts', 'token', out['token'])
         self.assertEqual(row['state'], 'running')
         self.assertEqual(row['wrapper_pid'], 777)
@@ -314,13 +314,13 @@ class TestFinish(TempStoreMixin, unittest.TestCase):
                           prober=_probe('dead', None))
         self.assertFalse(again['released'])
         self.assertTrue(again.get('idempotent'))
-        # 释放后可再 claim（新 attempt 不受旧 token 影响）。BW-MAIN-PRIORITY-S1：请求
-        # Qoder Max（最高优先层）AUTO 直接选中并 claim，先核验 reserve 真实返回再取 token。
-        out = dp.select_and_claim(self.store, task_id='nc2', runtime='qoder',
-                                  model='Qwen3.8-Max', workspace='C:/w',
+        # 释放后可再 claim（新 attempt 不受旧 token 影响）。BW-CUSTOM-MAX-RESUME-20261018-S1：
+        # CN 自定义 Max 为 Max 层内最高，AUTO 直接选中并 claim。
+        out = dp.select_and_claim(self.store, task_id='nc2', runtime='qodercn',
+                                  model='Qwen-3.8-Max', workspace='C:/w',
                                   prompt_sha256='c' * 64, now=T0, _preclaim=False)
         self.assertTrue(out['allowed'], out)
-        self.assertEqual(out['pool_key'], 'qoder:Qwen3.8-Max')
+        self.assertEqual(out['pool_key'], dp.CN_CUSTOM_MAX_POOL_KEY)
 
 
 class TestReconcile(TempStoreMixin, unittest.TestCase):
@@ -583,12 +583,12 @@ class TestMainForceRotationZ2(TempStoreMixin, unittest.TestCase):
 
     def test_z_request_routes_to_max_tier_and_committed_survives_restart(self):
         kw = dict(workspace='C:/w', prompt_sha256='a' * 64, now=T0, _preclaim=False)
-        # 空池 AUTO 请求 Z：新优先级下改派到最高层 qoder:Qwen3.8-Max（Z 池有空也不落 Z）。
+        # 空池 AUTO 请求 Z：改派到最高 Max 层，其中 CN 自定义 Max 现为最高优先。
         first = dp.select_and_claim(self.store, task_id='r1', runtime='zcode',
                                     model='GLM-5.3', **kw)
         self.assertFalse(first['allowed'], first)
         self.assertTrue(first['routing_required'], first)
-        self.assertEqual(first['selected']['pool_key'], 'qoder:Qwen3.8-Max')
+        self.assertEqual(first['selected']['pool_key'], dp.CN_CUSTOM_MAX_POOL_KEY)
         # 用显式 executor='zcode' 真实占一个 Z 名额（提交历史 bump committed_zcode）。
         zres = dp.reserve(self.store, task_id='rz', runtime='zcode', model='GLM-5.3',
                           workspace='C:/w/rz', prompt_sha256='z' * 64, executor='zcode',
@@ -603,7 +603,7 @@ class TestMainForceRotationZ2(TempStoreMixin, unittest.TestCase):
                                     workspace='C:/w', now=T0, _preclaim=False)
         self.assertFalse(again['allowed'])
         self.assertTrue(again['routing_required'])
-        self.assertEqual(again['selected']['pool_key'], 'qoder:Qwen3.8-Max')
+        self.assertEqual(again['selected']['pool_key'], dp.CN_CUSTOM_MAX_POOL_KEY)
         # “重启”（所有调用本就各自新连接；再显式读一次 status）后历史 committed 计数仍在：
         # 释放不回收 committed_zcode；AUTO 全程只改派未 claim Qoder，committed_qoder 保持 0。
         st = dp.status(self.store, now=T0)
@@ -619,7 +619,7 @@ class TestMainForceRotationZ2(TempStoreMixin, unittest.TestCase):
                                 model='GLM-5.3', prompt_sha256='b' * 64,
                                 workspace='C:/w/a2', now=T0, _preclaim=False)
         self.assertFalse(b['allowed'])
-        self.assertEqual(b['selected']['pool_key'], 'qoder:Qwen3.8-Max')
+        self.assertEqual(b['selected']['pool_key'], dp.CN_CUSTOM_MAX_POOL_KEY)
 
 
 class TestOverflowNotSubstitutedZ2(TempStoreMixin, unittest.TestCase):
@@ -849,11 +849,12 @@ class TestOwnerIdentityZ2(TempStoreMixin, unittest.TestCase):
         out = dp.finish(self.store, tok, terminal='start_failed', now=T0,
                         wrapper_pid=4321, wrapper_created='w-owned')
         self.assertTrue(out['released'])
-        # reserved 未消费的合法取消仍可释放。BW-MAIN-PRIORITY-S1：请求 Qoder Max（最高
-        # 优先层）AUTO 直接 claim；先核验 reserve 真实返回，绝不对 None 直接下标。
+        # reserved 未消费的合法取消仍可释放。BW-CUSTOM-MAX-RESUME-20261018-S1：Max 层内
+        # CN 自定义先于两内置，AUTO 请求 qoder:Qwen3.8-Max 会如实改派；本用例只验证预留
+        # 生命周期，故用显式 executor='qoder' 固定组合并核验 reserve 真实返回。
         rz = dp.reserve(self.store, task_id='rz', runtime='qoder', model='Qwen3.8-Max',
                         workspace='C:/w', prompt_sha256='b' * 64, now=T0,
-                        _preclaim=False)
+                        executor='qoder', _preclaim=False)
         self.assertTrue(rz['allowed'], rz)
         tok2 = self.row('attempts', 'task_id', 'rz')['token']
         self.assertIsNotNone(tok2)
@@ -887,7 +888,8 @@ class TestWorkspaceGuardZ4(TempStoreMixin, unittest.TestCase):
         self.assertTrue(dp.finish(self.store, first['token'], terminal='cancelled',
                                   now=T0)['released'])
         again = dp.reserve(self.store, task_id='wgb', runtime='qoder',
-                           model='Qwen3.8-Max', workspace='C:/wg/dir', **kw)
+                           model='Qwen3.8-Max', workspace='C:/wg/dir',
+                           executor='qoder', **kw)
         self.assertTrue(again['allowed'], again)
 
     def test_consume_same_token_allowed_other_task_same_dir_rejected(self):

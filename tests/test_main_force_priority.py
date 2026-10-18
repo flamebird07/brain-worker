@@ -200,16 +200,21 @@ class NightMaxPriorityTests(_Base):
 
 class SameTierBalanceTests(_Base):
     def test_same_tier_balances_by_real_inflight_first(self):
-        # 同层（Max 层）内保持现有在途平衡：在途少者优先，压过请求池偏好。
-        self.seed(CN_CUSTOM_MAX, 1)   # CN 自定义容量 2，仍有空位但在途 1
+        # BW-CUSTOM-MAX-RESUME-20261018-S1：自定义 Max 在 Max 层内先于两内置；先占满自定义
+        # 2 槽，再验证两内置之间仍按真实在途平衡——国际内置已满（1/1）则选 CN 内置（0/1）。
+        self.seed(CN_CUSTOM_MAX, 2)   # 自定义 2 槽满 → 落到两内置
+        self.seed(QMAX, 1)            # 国际内置容量 1 → 满
         target, _ = self.select(CN_CUSTOM_MAX, NIGHT)
-        self.assertEqual(target, QMAX)
+        self.assertEqual(target, CN_MAX)
 
     def test_same_tier_tie_prefers_requested_combo(self):
         target, _ = self.select(CN_CUSTOM_MAX, NIGHT)
         self.assertEqual(target, CN_CUSTOM_MAX)
 
     def test_same_tier_full_tie_uses_stable_pool_key_order(self):
+        # 自定义 Max 占满后，两内置全空且请求低层 ZCode：同子优先键内按 pool_key stable
+        # tie 仍选 qoder:Qwen3.8-Max（旧期望不变，只是先排除自定义子优先层）。
+        self.seed(CN_CUSTOM_MAX, 2)
         target, _ = self.select(ZCODE, NIGHT)
         self.assertEqual(target, QMAX)
 

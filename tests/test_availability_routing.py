@@ -335,10 +335,10 @@ class DispatchRoutingTests(_TmpBase):
                                   model='GLM-5.3', workspace=str(self._ws_for('t1')),
                                   prompt_sha256='p', stage='s1', chat_id='c1',
                                   executor='auto', quota_store=self.quota, now=T0)
-        # AUTO 按最高优先级层选：QMAX 空位优先于 Z（Z 不抢 Max）。
+        # AUTO 按最高优先级层选：Max 层最高，其中 CN 自定义先于两内置（Z 不抢 Max）。
         self.assertFalse(out['allowed'], out)
         self.assertTrue(out['routing_required'], out)
-        self.assertEqual(out['selected']['pool_key'], QMAX, out)
+        self.assertEqual(out['selected']['pool_key'], dp.CN_CUSTOM_MAX_POOL_KEY, out)
         self.assertEqual(self._active(ZCODE), 0)  # Z 本轮未被 AUTO 抢，等下一新轮/显式入口
 
     def test_explicit_qoder_not_one_on_one_rerouted_to_zcode(self):
@@ -367,7 +367,8 @@ class DispatchRoutingTests(_TmpBase):
                                       prompt_sha256='p', stage='s1',
                                       executor='auto', quota_store=self.quota, now=T0)
             self.assertTrue(out['routing_required'], out)
-            self.assertEqual(out['selected']['pool_key'], QMAX, out)
+            self.assertEqual(out['selected']['pool_key'],
+                             dp.CN_CUSTOM_MAX_POOL_KEY, out)
         # Z 未被 AUTO 抢，等下一轮/显式入口；候选资格仅通过 _eligible_main_forces 体现。
         self.assertEqual(self._active(ZCODE), 0)
 
@@ -1325,7 +1326,8 @@ class B4ComboExplicitTests(_TmpBase):
                                   executor='auto', quota_store=self.quota, now=T0)
         self.assertFalse(out['allowed'], out)
         self.assertTrue(out['routing_required'], out)
-        self.assertEqual(out['selected']['pool_key'], QMAX)  # committed_qoder(0)<zcode(3)
+        # BW-CUSTOM-MAX-RESUME-20261018-S1：Max 层内自定义 Max 现为最高，AUTO 选中它。
+        self.assertEqual(out['selected']['pool_key'], dp.CN_CUSTOM_MAX_POOL_KEY)
         self.assertEqual(self._active(ZCODE), 0)             # 零 ZCode 启动
 
 
@@ -1537,7 +1539,8 @@ class B5DefaultAvailabilityTests(_TmpBase):
                                       now=T0)
         self.assertFalse(out['allowed'], out)
         self.assertTrue(out.get('routing_required'), out)
-        self.assertEqual(out['selected']['pool_key'], QMAX, out)
+        self.assertEqual(out['selected']['pool_key'],
+                         dp.CN_CUSTOM_MAX_POOL_KEY, out)
         self.assertEqual(self._active(ZCODE), 0)
         # Z 依然合格：新政策下 _eligible_main_forces 不据历史 hold 剔除 Z。
         with contextlib.closing(dp.connect(self.dispatch)) as conn:

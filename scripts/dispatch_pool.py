@@ -172,9 +172,11 @@ except ImportError:  # isolated revision tree / standalone tests
 #     **不受内置 Max 时段门约束**，复用既有私有 model_ids 映射下发真实 ID）；
 #   兜底（同级两池共 4 槽）：qoder:Qwen3.8-Flash=2、qodercn:Qwen3.8-Flash=2；
 #   CN 独立补充池（qodercn:DeepSeek-Flash）仍在正常候选池移除（capacity=0，仅旧在途释放）。
-# 主力优先级（BW-MAIN-PRIORITY-20261011-S1，覆盖旧跨层 best-effort 1:1）：AUTO 只在**当前
-# 真实有空位**且合格的候选里，按主力优先级层排序——三 Qoder Max（两内置 Max + 自定义 Max）
-# 最高，其次 claude:deepseek-flash，最后 zcode:GLM-5.3；同层内以当前真实在途数少者优先，
+# 主力优先级（BW-MAIN-PRIORITY-20261011-S1，覆盖旧跨层 best-effort 1:1；BW-CUSTOM-MAX-
+# RESUME-20261018-S1 调整 Max 层内次序）：AUTO 只在**当前真实有空位**且合格的候选里，按主力
+# 优先级层排序——三 Qoder Max（两内置 Max + 自定义 Max）最高，其中自定义
+# qodercn:Qwen-3.8-Max 先于两个内置 Max，两内置之间同在途平衡；其次
+# claude:deepseek-flash，最后 zcode:GLM-5.3；同层内以当前真实在途数少者优先，
 # 平票才优先请求组合，再按 pool_key stable tie（`_select_main_force` 先按 capacity/active
 # 过滤再排序）。历史 committed 计数（rotation 两列 committed_zcode / committed_qoder 与
 # claude 提交历史）仍照旧记账并保留，但**不再参与跨层排序**，低层绝不能凭历史计数抢高层名额。
@@ -1086,9 +1088,13 @@ def _select_main_force(conn, requested_pk, now, eligible=None):
        Qoder Max（qoder:Qwen3.8-Max / qodercn:Qwen3.8-Max / qodercn:Qwen-3.8-Max）=1，
        claude:deepseek-flash=2（容量 2），zcode:GLM-5.3=3。历史 committed、请求池偏好与在途
        数**绝不能**让低层抢高层名额；最高层全部不合格或无空位才落到下一层；
-    4. 同层内保持现有在途平衡：当前真实在途数（`_count_active`）少者优先，平票才优先
-       请求的组合，再按 pool_key stable tie；rotation 历史 committed 计数照旧保留记账，
-       但不再参与跨层竞争；
+    3b. BW-CUSTOM-MAX-RESUME-20261018-S1：Max 层内增加自定义子优先键——CN 自定义
+       qodercn:Qwen-3.8-Max（0）先于两个内置 Max（1）；该子键位于真实在途数之前，故自定义
+       即使已有 1 在途、两内置 0 在途，仍先选自定义直到其 2 槽全满；两内置之间继续按在途
+       数平衡。CodeBuddy 仍高于所有 Max，claude/ZCode 层序不变；
+    4. 同层（同一子优先键）内保持现有在途平衡：当前真实在途数（`_count_active`）少者优先，
+       平票才优先请求的组合，再按 pool_key stable tie；rotation 历史 committed 计数照旧
+       保留记账，但不再参与跨层竞争；
     5. 全部主力都无可用槽才返回 main_force_full（由调用方走两地区 Flash 兜底）；
     6. 不新增记分/服务/额度，只用已有 attempts 表真实计数。
     返回 (target_pk, reason)。"""
@@ -1111,10 +1117,14 @@ def _select_main_force(conn, requested_pk, now, eligible=None):
     tier = {CODEBUDDY_POOL_KEY: 0,
             QMAX_POOL_KEY: 1, CN_MAX_POOL_KEY: 1, CN_CUSTOM_MAX_POOL_KEY: 1,
             CLAUDE_POOL_KEY: 2, ZCODE_POOL_KEY: 3}
+    # BW-CUSTOM-MAX-RESUME-20261018-S1：Max 层内自定义子优先（在途数/tie 之前）——
+    # qodercn:Qwen-3.8-Max 先于两个内置 Max，两内置之间仍按在途数平衡。保留原 tier 数值，
+    # 仅加一个子键，不新建优先级框架。
+    max_sub = {CN_CUSTOM_MAX_POOL_KEY: 0, QMAX_POOL_KEY: 1, CN_MAX_POOL_KEY: 1}
 
     def _key(item):
         pk, active = item
-        return (tier.get(pk, len(tier)), active,
+        return (tier.get(pk, len(tier)), max_sub.get(pk, 0), active,
                 0 if pk == requested_pk else 1, pk)
 
     avail.sort(key=_key)
