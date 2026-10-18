@@ -117,6 +117,29 @@
 - **退出码**：通过=0、未派发=2、失败=3；离线结果 `business_verified=false`
   （只证协议与绑定，不证真实业务）。
 
+### 6.1 传输故障（ECONNRESET 等）诊断口径
+
+- **只认真实 terminal result 错误载体**：`result_errors`/`errors`、`is_error=true` 的
+  result 文本、明确的 `errors_info`。绝不扫描成功报告/assistant 正文、成功 Read 回执或
+  任意 stdout/stderr 关键词；`ECONNRESET_HANDLER` 之类标识符不算独立网络码。
+- **字符串形态门**：仅当文本呈 CLI API/连接失败形态（如 `API Error: Unable to connect
+  to API (ECONNRESET)`）或开头就是独立网络错误码时才成立；终态业务测试报告里引用的
+  `ECONNRESET`（如 `FAILED ... expected ECONNRESET ...`）不算 CLI 传输失败。
+- **结构化载体只读白名单**：只取 `code` 与明确的 `message`/`error`/`detail`/`msg`
+  字符串（缺 message 用 code 本身），绝不序列化/复制整个 dict，headers/body/request
+  等字段不检查、不落诊断；同一事件原 error carrier 仍保留在 events 原件中。
+- facts 增加独立 `failure_kind='transport_error'` 与 `transport_error={code, source,
+  message, completed_tool_receipts, completed_tool_receipt_ids, session_id}`；
+  已完成工具数复用 `ok_receipt_ids`，因此能区分“零工具”和“2 个成功工具后网络失败”。
+  无网络码证据时不假造 transport，也不从消息猜 HTTP 状态、请求 ID、重试次数、后端或重置方。
+- 明确 **HTTP 401/402 认证/支付错误优先**：即便错误文本夹带 `ECONNRESET` 也不改判
+  transport；既有 429/权限/业务测试错误同样不被覆盖。已有终态释放与 `launch_unknown`
+  语义不变。失败后核对部分成果、原 session 与终态，按既有轮次授权换下一入口，不能
+  归因为额度或永久停用；不新增定时器，也不自动重放工程。
+- `CLAUDE_CODE_MAX_RETRIES=0` 由本地 CLI 读取支持，但**实际请求尝试次数**仍需动态
+  证据（CLI 版本、错误载体），不夸大。服务端根因未知；现场诊断尚未完成，由 root 后续
+  回读，离线诊断通过不等于现场网络已修复。
+
 ## 7. execution_control 接受 claude
 
 - `CAPABILITY['claude'] = {'fine_grained': True, 'read_dirs': True}`，可校验 claude plan /
@@ -152,7 +175,9 @@
 - **官方 Node CLI 2.1.76**：真实 Read/Write 调用**已成功**（前一轮跑到 `error_max_turns`，
   文件原件保留、无结构化报告——该事实单独记录，不等同于验收通过）。
 - **native 2.1.220 / 2.1.296**：连接失败，单列记录，不与 Node 成功事实混写、不据此改配置。
-- **Bash 工具**：尚未通过精确只读自动批准验收，因此**默认不开放**（entry 配置里
-  `tools`/`allowed_tools` 不含 Bash）；工程测试交授权执行器或主脑独立验收。
+- **Bash 工具**：默认配置不因此扩大。2026-10-18（UTC），root 按相同 Node 2.1.76、
+  模型、清代理与零重试设置完成两次正式隔离诊断：纯文本成功；Read→Edit→登记离线测试
+  →九节报告绑定成功（7 次工具调用，测试文件哈希不变）。其中额外两次只读 `ls -la`
+  如实单列，不作为精确命令沙箱或评分依据；成功往返不能定位历史 ECONNRESET 的重置方。
 - **费用**：**未知**——CLI 自报的 token/成本估算 ≠ 账单，绝不据此宣称额度或账务结论。
 - **真实一次新入口 Read/Write 验收由主脑（root）执行**；worker 不调 API、不读凭据。

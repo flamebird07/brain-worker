@@ -42,6 +42,7 @@
 import argparse
 import json
 import os
+import re
 import subprocess
 import sys
 from datetime import datetime, timezone
@@ -311,6 +312,7 @@ def summarize_stream(lines) -> dict:
     result_event = None
     session_id = None
     assistant_texts = []
+    cli_version = None
     for ev in events:
         if not isinstance(ev, dict):
             continue
@@ -320,6 +322,13 @@ def summarize_stream(lines) -> dict:
             session_id = ev.get('session_id') or session_id
         if ev.get('session_id'):
             session_id = ev.get('session_id')
+        # 安全元数据：只取 CLI 自己发送的 system/init 原始 version 字段，不另起进程猜测。
+        if et == 'system' and ev.get('subtype') == 'init':
+            for key in ('claude_code_version', 'version'):
+                v = ev.get(key)
+                if isinstance(v, str) and v.strip():
+                    cli_version = v.strip()
+                    break
         msg = ev.get('message') if isinstance(ev.get('message'), dict) else None
         content = (msg or {}).get('content')
         if isinstance(content, list):
@@ -382,7 +391,7 @@ def summarize_stream(lines) -> dict:
                                      or _looks_like_approval_denial(
                                          (result_event or {}).get('result')))
     return {'events': events, 'result_event': result_event, 'subtype': subtype,
-            'is_error': is_error, 'session_id': session_id,
+            'is_error': is_error, 'session_id': session_id, 'cli_version': cli_version,
             'tool_use': tool_use, 'tool_result': tool_result,
             'tool_use_count': len(tool_use), 'tool_result_count': len(tool_result),
             'matched_receipt_ids': matched_ids, 'ok_receipt_ids': ok_receipt_ids,
@@ -415,6 +424,155 @@ def _result_error_carrier(result_event: dict):
         if isinstance(result_text, str) and result_text.strip():
             errors = [result_text]
     return errors, info, is_error
+
+
+# 传输层故障只认这些**独立网络错误码**（小范围白名单，不做大型分类框架）。
+_TRANSPORT_ERROR_CODES = (
+    'ECONNRESET', 'ECONNREFUSED', 'ECONNABORTED', 'ETIMEDOUT', 'ENOTFOUND',
+    'EAI_AGAIN', 'ENETUNREACH', 'EHOSTUNREACH', 'EPIPE',
+)
+_TRANSPORT_CODE_RE = re.compile(
+    r'(?<![A-Za-z0-9_])(' + '|'.join(_TRANSPORT_ERROR_CODES) + r')(?![A-Za-z0-9_])',
+    re.IGNORECASE)
+# 字符串只有两种可信形态：CLI API/连接失败前缀，或开头就是独立网络错误码
+# （可带 Error:/TypeError:/connect 前缀）。终态业务测试报告里的引用词绝不据此推断传输。
+_CLI_API_ERROR_PREFIX_RE = re.compile(r'^\s*(?:api\s*error|apierror)\b', re.IGNORECASE)
+_CLI_UNABLE_CONNECT_RE = re.compile(r'^\s*unable\s+to\s+connect\s+to\s+api\b',
+                                   re.IGNORECASE)
+_LEADING_TRANSPORT_CODE_RE = re.compile(
+    r'^\s*(?:(?:error|typeerror|connection|connect)\s*[:\-]?\s*)?'
+    r'(' + '|'.join(_TRANSPORT_ERROR_CODES) + r')(?![A-Za-z0-9_])', re.IGNORECASE)
+# 明确 HTTP 401/402 认证/支付错误：错误载体该优先于夹带网络码的传输判断。
+_HTTP_AUTH_PAYMENT_STATUSES = (401, 402)
+_HTTP_AUTH_PAYMENT_LEADING_RE = re.compile(
+    r'^\s*(?:api\s*error\s*[:\-]?\s*)?(?:http\s*(?:status\s*)?[:\s]*)?(401|402)\b',
+    re.IGNORECASE)
+_AUTH_PAYMENT_CATEGORIES = ('auth', 'authentication', 'authorization',
+                            'payment', 'billing')
+_STRUCTURED_MESSAGE_KEYS = ('message', 'error', 'detail', 'msg')
+
+
+def _explicit_auth_or_payment(errors, errors_info, result_event: dict) -> bool:
+    """真实错误载体里是否有明确 HTTP 401/402（或 auth/payment 类别）。
+
+    只读白名单字段：结构化 status/status_code/statusCode 与 category，字符串开头独立
+    401/402；绝不序列化/读取 headers、body、request 等任意字段，也不从普通正文猜状态。
+    """
+    def _check(item):
+        if isinstance(item, dict):
+            for key in ('status', 'status_code', 'statusCode'):
+                v = item.get(key)
+                try:
+                    if int(v) in _HTTP_AUTH_PAYMENT_STATUSES:
+                        return True
+                except (TypeError, ValueError):
+                    continue
+            category = item.get('category')
+            if (isinstance(category, str)
+                    and category.strip().lower() in _AUTH_PAYMENT_CATEGORIES):
+                return True
+            return False
+        if isinstance(item, str):
+            return bool(_HTTP_AUTH_PAYMENT_LEADING_RE.match(item))
+        return False
+
+    for item in errors or []:
+        if _check(item):
+            return True
+    info_items = errors_info if isinstance(errors_info, list) else (
+        [errors_info] if errors_info else [])
+    if any(_check(item) for item in info_items):
+        return True
+    if result_event.get('is_error') and isinstance(result_event.get('result'), str):
+        return _check(result_event['result'])
+    return False
+
+
+def _structured_transport_hit(item: dict):
+    """结构化错误载体的传输码：只读白名单 `code` 与明确 message/error/detail/msg。
+
+    绝不 json.dumps/复制整个 dict（headers/body/request 等字段一律不碰）；缺 message
+    时用 code 本身，避免把 Authorization 等敏感内容带进 transport.message。
+    """
+    code = item.get('code')
+    if not isinstance(code, str):
+        return None
+    m = _TRANSPORT_CODE_RE.search(code.strip())
+    if not m:
+        return None
+    message = ''
+    for key in _STRUCTURED_MESSAGE_KEYS:
+        v = item.get(key)
+        if isinstance(v, str) and v.strip():
+            message = v.strip()
+            break
+    return m.group(1).upper(), (message or code.strip())
+
+
+def _string_transport_hit(text: str):
+    """字符串错误载体：必须呈 CLI API/连接失败形态或开头独立网络码。
+
+    仅凭终态业务测试报告（如 "FAILED ... expected ECONNRESET ..."）中的引用词不成立；
+    成功正文根本不会进入错误载体。
+    """
+    m = _TRANSPORT_CODE_RE.search(text)
+    if not m:
+        return None
+    shaped = (_CLI_API_ERROR_PREFIX_RE.match(text)
+              or _CLI_UNABLE_CONNECT_RE.match(text)
+              or _LEADING_TRANSPORT_CODE_RE.match(text))
+    if not shaped:
+        return None
+    return m.group(1).upper(), text.strip()
+
+
+def _transport_error(result_event: dict, errors, errors_info, ok_receipt_ids, session_id):
+    """从**真实 terminal result 错误载体**提取独立传输故障诊断。
+
+    只检查 result_errors/errors、`is_error=true` 的 result 文本与 errors_info；
+    绝不扫描成功 report/assistant 正文、Read 回执或任意 stdout/stderr。网络码必须是
+    独立 token（`ECONNRESET_HANDLER`、`xECONNRESET` 不算），不做 HTTP 状态、请求 ID、
+    重试次数、后端或重置方的猜测；证据不足返回 None，不假造 transport。结构化载体只读
+    `code` 与明确 message 字段，绝不序列化整个 dict。
+    """
+    def _match(item):
+        if isinstance(item, dict):
+            hit = _structured_transport_hit(item)
+        elif isinstance(item, str):
+            hit = _string_transport_hit(item)
+        else:
+            hit = None
+        if not hit:
+            return None
+        code, message = hit
+        if len(message) > 2000:
+            message = message[:2000] + '…[truncated]'
+        return code, message
+
+    candidates = []
+    for key in ('result_errors', 'errors'):
+        v = result_event.get(key)
+        if isinstance(v, list):
+            candidates.extend((key, item) for item in v)
+    if not candidates and result_event.get('is_error'):
+        result_text = result_event.get('result')
+        if isinstance(result_text, str) and result_text.strip():
+            candidates.append(('result', result_text))
+    info = errors_info
+    if isinstance(info, list):
+        candidates.extend(('errors_info', item) for item in info)
+    elif isinstance(info, (dict, str)) and info:
+        candidates.append(('errors_info', info))
+    for source, item in candidates:
+        hit = _match(item)
+        if hit:
+            code, message = hit
+            receipt_ids = list(ok_receipt_ids or [])
+            return {'code': code, 'source': source, 'message': message,
+                    'completed_tool_receipts': len(receipt_ids),
+                    'completed_tool_receipt_ids': receipt_ids,
+                    'session_id': session_id}
+    return None
 
 
 def classify_result(summary: dict, exit_code: int, stderr_text: str,
@@ -452,6 +610,15 @@ def classify_result(summary: dict, exit_code: int, stderr_text: str,
         protocol_success and not missing_receipts and not orphan_results
         and not conflict and not approval_denial
         and (not is_engineering_task or ok_receipts))
+    # 独立传输诊断：明确 quota/审批拒绝/HTTP 401·402 认证或支付错误优先，绝不被错误
+    # 文本夹带的网络码改判为 transport；仅在错误载体出现独立网络码时成立。
+    auth_or_payment = bool(
+        (errors or errors_info)
+        and _explicit_auth_or_payment(errors, errors_info, result_event))
+    transport_error = None
+    if not quota_429 and not approval_denial and not auth_or_payment:
+        transport_error = _transport_error(result_event, errors, errors_info,
+                                           ok_receipts, summary.get('session_id'))
     facts = {
         'exit_code': exit_code,
         'subtype': summary.get('subtype'),
@@ -470,6 +637,10 @@ def classify_result(summary: dict, exit_code: int, stderr_text: str,
         'duplicate_tool_results': len(duplicate_results),
         'permission_denials': len(denials_list),
         'approval_denials': int(approval_denial),
+        # 传输故障独立诊断（可回读）；无证据时为 None，绝不猜测网络/后端原因。
+        'failure_kind': 'transport_error' if transport_error else None,
+        'transport_error': transport_error,
+        'cli_version': summary.get('cli_version'),
         # 兼容旧字段名：工程任务必须有至少一条**成功**回执（不是仅 use_count>0）。
         'zero_tool_engineering': bool(zero_receipt_engineering),
         'stderr_present': bool(stderr_text),
@@ -736,6 +907,7 @@ def run(cfg: dict, *, workspace: str, prompt_file: Path, out_dir: Path, stage: s
                             task_sha=pc.sha256_hex(sent_payload.encode('utf-8')),
                             request={'argv': argv, 'cwd': str(workspace),
                                      'runtime': RUNTIME, 'model': model,
+                                     'cli_version': summary.get('cli_version'),
                                      'started_at_utc': started_at_utc.isoformat(),
                                      'finished_at_utc': finished_at_utc.isoformat(),
                                      'executor_identity': {
