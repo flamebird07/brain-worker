@@ -7,7 +7,8 @@
 - Max 全不可用时，Claude 允许窗且有空位优先于 Z；Claude 满/限额/峰值才 Z；
 - 同层内保持现有在途平衡与 tie 方式；rotation 历史计数照旧保留；
 - 全部主力无可用槽才 Flash；只允许 Z / 固定 Flash 时不强制 Max；CN 约束不跨区；
-- 13 总槽、unknown 在途、workspace 冲突、北京 22/08 边界与 DeepSeek 独立时间门不变；
+- 14 总槽（BW-WORKER-WIDGET-20261018-S3 起两 CodeBuddy 模型各独立 1 槽）、unknown 在途、
+  workspace 冲突、北京 22/08 边界与 DeepSeek 独立时间门不变；
 - stage_selection 复用单一权威 `_select_main_force`，同一新优先级。
 """
 import sys
@@ -305,8 +306,10 @@ class HighLevelDispatchTests(_Base):
         self.assertEqual(r2['reason'], 'workspace_in_flight')
 
     def test_total_capacity_and_slots(self):
-        self.assertEqual(dp.DOMESTIC_TOTAL_CAPACITY, 13)
+        # BW-WORKER-WIDGET-20261018-S3 当前权威总数 14：两 CodeBuddy 模型各独立 1 槽。
+        self.assertEqual(dp.DOMESTIC_TOTAL_CAPACITY, 14)
         self.assertEqual(dp.capacity_for(CODEBUDDY), 1)
+        self.assertEqual(dp.capacity_for('codebuddy:glm-5.3-flash'), 1)
         self.assertEqual(dp.capacity_for(ZCODE), 2)
         self.assertEqual(dp.capacity_for(QMAX), 1)
         self.assertEqual(dp.capacity_for(CN_MAX), 1)

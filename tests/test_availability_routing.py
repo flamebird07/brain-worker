@@ -67,15 +67,22 @@ class _TmpBase(unittest.TestCase):
         self.ws.mkdir()
         # 绝不使用真实/共享池：显式临时库，且断言不是默认路径。
         self.assertNotEqual(str(self.dispatch), str(dp.default_store_path()))
-        # BW-CODEBUDDY-MAIN-S3：本文件的历史层序/满池断言（Max > claude > Z、总 N 满）
-        # 都是在 CodeBuddy 恢复之前写的。这里先真实占住 CodeBuddy 唯一名额，使 AUTO 仍
-        # 按旧层序选择、`_fill_six` 补满其余 12 槽后总量正好 13；CodeBuddy 作为新最高层
-        # 由独立 tests/test_codebuddy_reactivation.py 验证，绝不放宽任何安全断言。
+        # BW-CODEBUDDY-MAIN-S3 + BW-WORKER-WIDGET-20261018-S3：本文件的历史层序/满池断言
+        # （Max > claude > Z、总 N 满）都是在 CodeBuddy 恢复之前写的。这里先真实占住
+        # CodeBuddy deepseek 与 GLM 各自的独立 1 槽（GLM 为额度条件池，夹具只作占位、
+        # 绝不进 AUTO 候选），使 AUTO 仍按旧层序选择、`_fill_six` 补满其余 12 槽后总量
+        # 正好 14；CodeBuddy 作为新最高层由独立 tests/test_codebuddy_reactivation.py
+        # 验证，绝不放宽任何安全断言。
         with contextlib.closing(dp.connect(self.dispatch)) as conn:
             conn.execute('INSERT INTO attempts(token, task_id, runtime, model, pool_key, '
                          "state, reserved_at_utc) VALUES(?,?,?,?,?,?,?)",
                          ('cb-fixture', 'cb-fixture-task', 'codebuddy',
                           'deepseek-v4.1-flash', dp.CODEBUDDY_POOL_KEY, 'reserved',
+                          dp._iso(T0)))
+            conn.execute('INSERT INTO attempts(token, task_id, runtime, model, pool_key, '
+                         "state, reserved_at_utc) VALUES(?,?,?,?,?,?,?)",
+                         ('cb-glm-fixture', 'cb-glm-fixture-task', 'codebuddy',
+                          'glm-5.3-flash', dp.CODEBUDDY_GLM_POOL_KEY, 'reserved',
                           dp._iso(T0)))
             conn.execute('PRAGMA journal_mode=DELETE')
 

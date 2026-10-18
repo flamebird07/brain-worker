@@ -60,14 +60,20 @@ class _Store(unittest.TestCase):
                       for k in ('BRAIN_WORKER_DISPATCH_STORE',
                                 'BRAIN_WORKER_QUOTA_STORE')}
         os.environ['BRAIN_WORKER_QUOTA_STORE'] = self.quota
-        # BW-CODEBUDDY-MAIN-S3：本文件的历史层序（Max > claude > Z）与“12 满”夹具写于
-        # CodeBuddy 恢复之前。先真实占住 CodeBuddy 唯一名额，使旧层序断言原样成立，
-        # 后续 12 槽补齐后总量正好 13；新最高层由独立回归验证。
+        # BW-CODEBUDDY-MAIN-S3 + BW-WORKER-WIDGET-20261018-S3：本文件的历史层序
+        # （Max > claude > Z）与“12 满”夹具写于 CodeBuddy 恢复之前。先真实占住 CodeBuddy
+        # deepseek 与 GLM 各自的独立 1 槽（GLM 为额度条件池，夹具只作占位，不经 AUTO 候选），
+        # 使旧层序断言原样成立，后续 12 槽补齐后总量正好 14；新最高层由独立回归验证。
         with contextlib.closing(dp.connect(self.store)) as conn:
             conn.execute('INSERT INTO attempts(token, task_id, runtime, model, pool_key, '
                          "state, reserved_at_utc) VALUES(?,?,?,?,?,?,?)",
                          ('cb-fixture', 'cb-fixture-task', 'codebuddy',
                           'deepseek-v4.1-flash', dp.CODEBUDDY_POOL_KEY, 'reserved',
+                          dp._iso(T0)))
+            conn.execute('INSERT INTO attempts(token, task_id, runtime, model, pool_key, '
+                         "state, reserved_at_utc) VALUES(?,?,?,?,?,?,?)",
+                         ('cb-glm-fixture', 'cb-glm-fixture-task', 'codebuddy',
+                          'glm-5.3-flash', dp.CODEBUDDY_GLM_POOL_KEY, 'reserved',
                           dp._iso(T0)))
             conn.execute('PRAGMA journal_mode=DELETE')
 
@@ -106,16 +112,18 @@ class _Store(unittest.TestCase):
 
 
 class CapacityAndRotationTests(_Store):
-    def test_cn_capacity_and_total_thirteen(self):
-        # BW-CODEBUDDY-MAIN-S3 真实布局：CN 内置 Max=1、CN 自定义 Max=2、CN Flash=2、claude=2、
-        # codebuddy=1；retired DeepSeek capacity=0。
+    def test_cn_capacity_and_total_fourteen(self):
+        # BW-CODEBUDDY-MAIN-S3 + BW-WORKER-WIDGET-20261018-S3 真实布局：CN 内置 Max=1、
+        # CN 自定义 Max=2、CN Flash=2、claude=2、codebuddy deepseek=1、codebuddy GLM=1
+        # （两 CodeBuddy 模型各自独立 1 槽）；retired DeepSeek capacity=0。
         self.assertEqual(dp.capacity_for(CN), 0)
         self.assertEqual(dp.capacity_for(CN_MAX), 1)
         self.assertEqual(dp.capacity_for('qodercn:Qwen-3.8-Max'), 2)
         self.assertEqual(dp.capacity_for(CN_FLASH), 2)
         self.assertEqual(dp.capacity_for('claude:deepseek-flash'), 2)
         self.assertEqual(dp.capacity_for('codebuddy:deepseek-v4.1-flash'), 1)
-        self.assertEqual(dp.DOMESTIC_TOTAL_CAPACITY, 13)
+        self.assertEqual(dp.capacity_for('codebuddy:glm-5.3-flash'), 1)
+        self.assertEqual(dp.DOMESTIC_TOTAL_CAPACITY, 14)
         # ZCode / 国际组合容量原样不变。
         self.assertEqual(dp.capacity_for(ZCODE), 2)
         self.assertEqual(dp.capacity_for(QMAX), 1)
@@ -132,8 +140,8 @@ class CapacityAndRotationTests(_Store):
         self.assertEqual(c['reason'], 'capacity_full')
         self.assertEqual(self.active(CN_FLASH), 2)
 
-    def test_auto_prefers_main_then_flash_then_full_at_thirteen(self):
-        # 真实目标：主力优先 → 同级 Flash 兜底 → 13 满才物理满。
+    def test_auto_prefers_main_then_flash_then_full_at_fourteen(self):
+        # 真实目标：主力优先 → 同级 Flash 兜底 → 14 满才物理满。
         # 新优先级：三 Qoder Max > claude > zcode；CodeBuddy 已在 setUp 占住最高层，
         # 空池 AUTO 请求 zcode 会被改派到 Max 层；BW-CUSTOM-MAX-RESUME-20261018-S1 起
         # Max 层内 CN 自定义先于两内置。
@@ -146,7 +154,7 @@ class CapacityAndRotationTests(_Store):
         self.assertEqual(first['selected']['pool_key'], dp.CN_CUSTOM_MAX_POOL_KEY)
         self.assertEqual(self.active(ZCODE), 0)
         # 用明确 executor 约束补满其余十二槽（Z 2 + 两区内置 Max 各 1 + CN 自定义 Max 2
-        # + claude 2 + 两区 Flash 各 2）+ setUp 的 CodeBuddy 1 → 总 13。
+        # + claude 2 + 两区 Flash 各 2）+ setUp 的 CodeBuddy deepseek 1 与 GLM 1 → 总 14。
         fill = [('z0', 'zcode', 'GLM-5.3', 'zcode'),
                 ('z1', 'zcode', 'GLM-5.3', 'zcode'),
                 ('q0', 'qoder', 'Qwen3.8-Max', 'qoder'),
@@ -165,10 +173,10 @@ class CapacityAndRotationTests(_Store):
                                     executor=ex, now=T0, _preclaim=False)
             self.assertTrue(r['allowed'], (tid, r))
         st = dp.status(self.store, now=T0)
-        self.assertEqual(st['domestic']['active'], 13)
+        self.assertEqual(st['domestic']['active'], 14)
         self.assertTrue(st['domestic']['full'])
         self.assertEqual(self.active(CN_FLASH), 2)
-        # 13 满：AUTO 请求主力 → 物理 capacity_full。
+        # 14 满：AUTO 请求主力 → 物理 capacity_full。
         full = dp.select_and_claim(self.store, task_id='all-full', runtime='zcode',
                                    model='GLM-5.3', workspace=self.ws('all-full'),
                                    prompt_sha256='p', executor='auto', now=T0,
@@ -222,9 +230,10 @@ class CrossRegionParallelTests(_Store):
         self.assertTrue(intl['allowed'], intl)
         self.assertTrue(cnr['allowed'], cnr)
         st = dp.status(self.store, now=T0)['domestic']
-        # setUp 的 CodeBuddy 真实 fixture 也计入国内在途：国际 Max 1 + CN 内置 Max 1 + CB 1 = 3。
-        self.assertEqual(st['active'], 3)
-        self.assertLess(st['active'], st['capacity'])  # 13 槽未满，二者共存
+        # setUp 的 CodeBuddy deepseek/GLM 真实 fixture 也计入国内在途：
+        # 国际 Max 1 + CN 内置 Max 1 + CB 1 + GLM 1 = 4。
+        self.assertEqual(st['active'], 4)
+        self.assertLess(st['active'], st['capacity'])  # 14 槽未满，二者共存
 
     def test_same_workspace_single_writer_across_runtimes(self):
         shared = self.ws('shared')
@@ -278,8 +287,8 @@ class TerminalReleaseTests(_Store):
     def test_cn_counts_toward_domestic_full_for_luna_threshold(self):
         # BW-CLAUDE-CAPACITY2：用明确 executor 约束逐次核验 allowed 占满八槽（Z2+两内置
         # Max+国际 Flash2+claude2），再补 CN 自定义 Max 2 + 两 CN Flash → 其余 12 满，加上
-        # setUp 真实占住的 CodeBuddy 1 → 总 13 满；Luna 阈值随总 13 更新（9/13 不算 full，
-        # 13/13 才满）。
+        # setUp 真实占住的 CodeBuddy deepseek 1 与 GLM 1 → 总 14 满；Luna 阈值随总 14 更新
+        # （10/14 不算 full，14/14 才满）。
         fill = [('f0', 'zcode', 'GLM-5.3', 'zcode'), ('f1', 'qoder', 'Qwen3.8-Max', 'qoder'),
                 ('f2', 'zcode', 'GLM-5.3', 'zcode'), ('f3', 'qodercn', 'Qwen3.8-Max', 'qodercn'),
                 ('f4', 'claude', 'deepseek-flash', 'claude'),
@@ -292,9 +301,9 @@ class TerminalReleaseTests(_Store):
                                     executor=ex, now=T0, _preclaim=False)
             self.assertTrue(r['allowed'], (tid, r))
         st = dp.status(self.store, now=T0)['domestic']
-        # 上面 8 个显式 claim + setUp 的 CodeBuddy 真实 fixture 1 = 9（9/13 不算满）。
-        self.assertEqual(st['active'], 9)
-        self.assertFalse(st['full'])  # 9/13 不算满
+        # 上面 8 个显式 claim + setUp 的 CodeBuddy/GLM 真实 fixture 2 = 10（10/14 不算满）。
+        self.assertEqual(st['active'], 10)
+        self.assertFalse(st['full'])  # 10/14 不算满
         # 补齐 CN 自定义 Max 2（now=T0 为北京 23:00、在主力时段内，正常 executor='qodercn' claim）。
         for tid in ('cu0', 'cu1'):
             r = dp.select_and_claim(self.store, task_id=tid, runtime='qodercn',
@@ -305,12 +314,13 @@ class TerminalReleaseTests(_Store):
         self.assertTrue(self.cn_flash('fc0')['allowed'])
         self.assertTrue(self.cn_flash('fc1')['allowed'])
         st = dp.status(self.store, now=T0)['domestic']
-        self.assertTrue(st['full'])  # 13/13 才满
+        self.assertTrue(st['full'])  # 14/14 才满
 
 
 class DomesticReclaimTests(_Store):
-    def test_reclaim_after_thirteen_full_prefers_cn_not_luna(self):
-        # 十三槽真实占满（setUp CodeBuddy 1 + 其余 12）后记录真实 ask；仅释放 1 个 CN Flash
+    def test_reclaim_after_fourteen_full_prefers_cn_not_luna(self):
+        # 十四槽真实占满（setUp CodeBuddy deepseek 1 + GLM 1 + 其余 12）后记录真实 ask；
+        # 仅释放 1 个 CN Flash
         # 名额 → 国内恢复空位 → claim_due 原子 domestic_reclaim 复用既有候选顺序选中该
         # CN Flash，绝不因未满而错误升级 Luna。
         fill = [('r0', 'zcode', 'GLM-5.3', 'zcode'),
@@ -333,7 +343,7 @@ class DomesticReclaimTests(_Store):
             self.assertTrue(r.get('allowed') and r.get('token'), (tid, r))
             toks[tid] = r['token']
         st = dp.status(self.store, now=T0)['domestic']
-        self.assertEqual(st['active'], 13)
+        self.assertEqual(st['active'], 14)
         self.assertTrue(st['full'])
         scope = {'task_id': 'ask-rc', 'stage': 's1', 'chat_id': 'c1',
                  'workspace': self.ws('ask-rc'), 'prompt_sha256': 'a' * 64}

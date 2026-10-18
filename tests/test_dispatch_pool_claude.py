@@ -1,11 +1,12 @@
 """BW-CLAUDE-DEEPSEEK-S3 / BW-CLAUDE-CAPACITY2 离线回归：claude:deepseek-flash AUTO 可选主力槽。
 
-覆盖：物理 DOMESTIC_TOTAL_CAPACITY=13（含 CodeBuddy 最高层 1 槽）；claude 在 MAIN_FORCE_KEYS 且容量 2（第 2 个请求可认领、
+覆盖：物理 DOMESTIC_TOTAL_CAPACITY=14（含 CodeBuddy 最高层 1 槽与 GLM 独立 1 槽，BW-WORKER-
+WIDGET-20261018-S3）；claude 在 MAIN_FORCE_KEYS 且容量 2（第 2 个请求可认领、
 第 3 个满且绝不回退别模型；完成释放后可再用；同 workspace 仍拒绝；reserved/running/unknown 均
 正确占位）；AUTO 在其它主力占满时可选中 claude（无需用户显式点名）；claude 在途计入国内总在途
 聚合、但绝不污染 committed_qoder；显式 executor='claude' 点名；时段门（工作日高峰拒 / 周末 /
-2026 假日 / 夜间放行）；跨高峰 reserve→consume 只释放本 token；明确限额落标/释放；总 13 守卫
-包含历史迁移占位且绝不派第 14 个。全部显式临时 sqlite store，绝不读写真实 ~/.brain-worker。
+2026 假日 / 夜间放行）；跨高峰 reserve→consume 只释放本 token；明确限额落标/释放；总 14 守卫
+包含历史迁移占位且绝不派第 15 个。全部显式临时 sqlite store，绝不读写真实 ~/.brain-worker。
 零网络/零模型。
 """
 import hashlib
@@ -81,8 +82,9 @@ class CapacityAndRouting(_ClaudeBase):
                          dp.MAIN_FORCE_CAPACITY[dp.CLAUDE_POOL_KEY])
         self.assertIn(CLAUDE, dp.MAIN_FORCE_KEYS)
 
-    def test_physical_domestic_total_is_thirteen(self):
-        self.assertEqual(dp.DOMESTIC_TOTAL_CAPACITY, 13)
+    def test_physical_domestic_total_is_fourteen(self):
+        # BW-WORKER-WIDGET-20261018-S3 当前权威总数：两 CodeBuddy 模型各独立 1 槽 → 14。
+        self.assertEqual(dp.DOMESTIC_TOTAL_CAPACITY, 14)
         self.assertEqual(dp.DOMESTIC_TOTAL_CAPACITY,
                          sum(dp.MAIN_FORCE_CAPACITY.values())
                          + sum(dp.OVERFLOW_CAPACITY.values()))
@@ -197,9 +199,10 @@ class CapacityAndRouting(_ClaudeBase):
         self.assertEqual(r['reason'], 'main_force_window_closed')
 
     def test_total_guard_blocks_claude_with_migration_debt(self):
-        # BW-CODEBUDDY-MAIN-S3：真实国内在途已达总 13（7 个非 claude 主力含 CodeBuddy +
-        # 4 个 Flash + 1 个 claude 在途 + 1 条 retired 池超额迁移在途），claude 自身按容量
-        # 看似仍空（1/2），但总守卫对 claude 同样生效，绝不派第 14 个。显式点名也如实拒绝。
+        # BW-CODEBUDDY-MAIN-S3 + BW-WORKER-WIDGET-20261018-S3：真实国内在途已达总 14
+        # （7 个非 claude 主力含 CodeBuddy deepseek + GLM 独立 1 槽在途 + 4 个 Flash +
+        # 1 个 claude 在途 + 1 条 retired 池超额迁移在途），claude 自身按容量
+        # 看似仍空（1/2），但总守卫对 claude 同样生效，绝不派第 15 个。显式点名也如实拒绝。
         self.occupy_non_claude_mains()
         for i in range(2):
             self.assertTrue(self._reserve(f'of{i}', 'qoder', 'Qwen3.8-Flash',
@@ -210,11 +213,16 @@ class CapacityAndRouting(_ClaudeBase):
         with closing(dp.connect(self.store)) as conn:
             conn.execute('INSERT INTO attempts(token, task_id, runtime, model, pool_key, '
                          "state, reserved_at_utc) VALUES(?,?,?,?,?,?,?)",
+                         ('glm-inflight', 'gi', 'codebuddy', 'glm-5.3-flash',
+                          'codebuddy:glm-5.3-flash', 'running',
+                          dp._iso(OFFPEAK_NIGHT)))
+            conn.execute('INSERT INTO attempts(token, task_id, runtime, model, pool_key, '
+                         "state, reserved_at_utc) VALUES(?,?,?,?,?,?,?)",
                          ('legacy-mig', 'lm', 'qodercn', 'DeepSeek-Flash',
                           'qodercn:DeepSeek-Flash', 'running',
                           dp._iso(OFFPEAK_NIGHT)))
         st = dp.status(self.store, now=OFFPEAK_NIGHT)
-        self.assertEqual(st['domestic']['active'], 13, st['domestic'])
+        self.assertEqual(st['domestic']['active'], 14, st['domestic'])
         self.assertEqual(st['pools'][CLAUDE]['active'], 1, st['pools'][CLAUDE])
         r = self.claim_claude('late', executor='claude')
         self.assertFalse(r.get('allowed'), r)

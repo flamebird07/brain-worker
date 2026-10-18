@@ -9,8 +9,10 @@
 - 层序：DeepSeek 本轮失败且 GLM 条件成立时，Max/Claude/ZCode 仍优先，GLM 在 Flash 前；
   授权集合缺 GLM 不扩权；新轮无证据不启用；GLM 失败后落 Flash；
 - `_select_main_force` 缺省 eligible=None 绝不自动纳入 GLM，显式 eligible 才参与排序；
-- 共享物理 1 槽：reserved/running/unknown 双向阻塞、finish 释放、并发仅一个赢家、
-  物理总 13 不双计、status 共享容量口径；
+- 独立名额（BW-WORKER-WIDGET-20261018-S3 用户最新明确，覆盖旧共享 1 槽口径）：
+  DeepSeek 与 GLM 各独立 1 槽、互不占位互斥；同模型第 2 个在途仍拒绝；并发同模型只有
+  一个赢家、两模型可同时各赢一个；finish 只释放自己的槽；物理总 14 不双计、status
+  按各自独立容量口径；
 - planner 与正式 reserve/consume 裁决一致；正式 GLM 缺 proof 在配置读取/outdir/claim/
   Popen 前拒绝；带 proof 的 CLI argv/model/pool/evidence 正确，不硬记 DeepSeek；
 - 其它旧 CodeBuddy 模型与 WorkBuddy 仍退休。
@@ -371,7 +373,7 @@ class TestFormalGateConsistency(_Base):
         self.assertFalse(consumed.get('allowed'), consumed)
         self.assertEqual(consumed['reason'], 'codebuddy_quota_condition_not_met')
         self.assertTrue(consumed.get('capacity_released'), consumed)
-        # 真正的条件消费成功（reserved → running），共享槽仍只有 1 个。
+        # 真正的条件消费成功（reserved → running），GLM 只占自己的独立 1 槽。
         claimed2 = dp.reserve(self.store, task_id='f3', runtime='codebuddy',
                               model=GLM_MODEL, workspace=self.ws('f3'),
                               prompt_sha256=SHA, stage='s', now=T_NIGHT,
@@ -385,24 +387,12 @@ class TestFormalGateConsistency(_Base):
             codebuddy_glm_allowed=True)
         self.assertTrue(consumed2.get('allowed'), consumed2)
         with closing(dp.connect(self.store)) as conn:
-            self.assertEqual(dp._shared_active(conn, CB), 1)
             self.assertEqual(dp._count_active(conn, GLM), 1)
             self.assertEqual(dp._count_active(conn, CB), 0)
 
 
-class TestSharedPhysicalSlot(_Base):
-    def test_both_directions_blocked_for_active_states(self):
-        for state in ('reserved', 'running', 'unknown'):
-            for occupancy in (CB, GLM):
-                self.setUp_store()
-                self.seed(occupancy, 1, state=state)
-                with closing(dp.connect(self.store)) as conn:
-                    other = GLM if occupancy == CB else CB
-                    self.assertFalse(dp._shared_has_capacity(conn, occupancy),
-                                     f'{state}/{occupancy}')
-                    self.assertFalse(dp._shared_has_capacity(conn, other),
-                                     f'{state}/{occupancy}->{other}')
-                    self.assertEqual(dp._shared_active(conn, CB), 1)
+class TestIndependentModelSlots(_Base):
+    """BW-WORKER-WIDGET-20261018-S3：两 CodeBuddy 模型各独立 1 槽、互不占位互斥。"""
 
     def setUp_store(self):
         """清空 attempts，保持每个状态用例独立。"""
@@ -410,28 +400,68 @@ class TestSharedPhysicalSlot(_Base):
             conn.execute('DELETE FROM attempts')
             conn.execute('PRAGMA journal_mode=DELETE')
 
-    def test_finish_releases_shared_slot_for_either_model(self):
+    def test_own_active_blocks_only_itself(self):
+        for state in ('reserved', 'running', 'unknown'):
+            for occupancy in (CB, GLM):
+                self.setUp_store()
+                self.seed(occupancy, 1, state=state)
+                with closing(dp.connect(self.store)) as conn:
+                    other = GLM if occupancy == CB else CB
+                    self.assertFalse(dp._has_own_capacity(conn, occupancy),
+                                     f'{state}/{occupancy}')
+                    self.assertTrue(dp._has_own_capacity(conn, other),
+                                    f'{state}/{occupancy} must not block {other}')
+                    self.assertEqual(dp._count_active(conn, occupancy), 1)
+                    self.assertEqual(dp._count_active(conn, other), 0)
+
+    def test_cross_model_active_does_not_block_reserve(self):
+        # GLM 在途不再挡 DeepSeek 自身名额；同模型第 2 个仍拒绝。
         claimed = dp.reserve(self.store, task_id='g', runtime='codebuddy',
                              model=GLM_MODEL, workspace=self.ws('g'),
                              prompt_sha256=SHA, stage='s', now=T_NIGHT,
                              executor='codebuddy', codebuddy_glm_allowed=True,
                              _preclaim=False)
         self.assertTrue(claimed.get('allowed'), claimed)
-        denied = dp.reserve(self.store, task_id='d', runtime='codebuddy',
-                            model=CB_MODEL, workspace=self.ws('d'),
-                            prompt_sha256=SHA, stage='s', now=T_NIGHT,
-                            executor='codebuddy', _preclaim=False)
-        self.assertFalse(denied.get('allowed'), denied)
-        rel = dp.finish(self.store, claimed['token'], terminal='cancelled',
-                        now=T_NIGHT, wrapper_pid=None)
-        self.assertTrue(rel.get('released') or rel.get('settled'), rel)
-        again = dp.reserve(self.store, task_id='c', runtime='codebuddy',
-                           model=CB_MODEL, workspace=self.ws('c'),
+        cb_ok = dp.reserve(self.store, task_id='d', runtime='codebuddy',
+                           model=CB_MODEL, workspace=self.ws('d'),
                            prompt_sha256=SHA, stage='s', now=T_NIGHT,
                            executor='codebuddy', _preclaim=False)
-        self.assertTrue(again.get('allowed'), again)
+        self.assertTrue(cb_ok.get('allowed'), cb_ok)
+        glm_again = dp.reserve(self.store, task_id='g2', runtime='codebuddy',
+                               model=GLM_MODEL, workspace=self.ws('g2'),
+                               prompt_sha256=SHA, stage='s', now=T_NIGHT,
+                               executor='codebuddy', codebuddy_glm_allowed=True,
+                               _preclaim=False)
+        self.assertFalse(glm_again.get('allowed'), glm_again)
+        self.assertEqual(glm_again['reason'], 'capacity_full', glm_again)
 
-    def test_concurrent_claim_has_exactly_one_winner(self):
+    def test_finish_releases_only_own_slot(self):
+        glm = dp.reserve(self.store, task_id='g', runtime='codebuddy',
+                         model=GLM_MODEL, workspace=self.ws('g'),
+                         prompt_sha256=SHA, stage='s', now=T_NIGHT,
+                         executor='codebuddy', codebuddy_glm_allowed=True,
+                         _preclaim=False)
+        self.assertTrue(glm.get('allowed'), glm)
+        cb = dp.reserve(self.store, task_id='d', runtime='codebuddy',
+                        model=CB_MODEL, workspace=self.ws('d'),
+                        prompt_sha256=SHA, stage='s', now=T_NIGHT,
+                        executor='codebuddy', _preclaim=False)
+        self.assertTrue(cb.get('allowed'), cb)
+        rel = dp.finish(self.store, glm['token'], terminal='cancelled',
+                        now=T_NIGHT, wrapper_pid=None)
+        self.assertTrue(rel.get('released') or rel.get('settled'), rel)
+        with closing(dp.connect(self.store)) as conn:
+            # GLM 结束只释放自己：DeepSeek 在途不受影响。
+            self.assertEqual(dp._count_active(conn, GLM), 0)
+            self.assertEqual(dp._count_active(conn, CB), 1)
+        glm_again = dp.reserve(self.store, task_id='g3', runtime='codebuddy',
+                               model=GLM_MODEL, workspace=self.ws('g3'),
+                               prompt_sha256=SHA, stage='s', now=T_NIGHT,
+                               executor='codebuddy', codebuddy_glm_allowed=True,
+                               _preclaim=False)
+        self.assertTrue(glm_again.get('allowed'), glm_again)
+
+    def test_concurrent_same_model_has_exactly_one_winner(self):
         def _claim(tid):
             return dp.reserve(self.store, task_id=tid, runtime='codebuddy',
                               model=GLM_MODEL, workspace=self.ws(tid),
@@ -447,13 +477,31 @@ class TestSharedPhysicalSlot(_Base):
         self.assertEqual(len(denied), 1, results)
         self.assertEqual(denied[0]['reason'], 'capacity_full', denied[0])
         with closing(dp.connect(self.store)) as conn:
-            self.assertEqual(dp._shared_active(conn, CB), 1)
+            self.assertEqual(dp._count_active(conn, GLM), 1)
 
-    def test_total_physical_capacity_13_and_status_no_double_count(self):
-        self.assertEqual(dp.DOMESTIC_TOTAL_CAPACITY, 13)
+    def test_concurrent_two_models_can_both_claim(self):
+        def _claim(args):
+            tid, model = args
+            return dp.reserve(self.store, task_id=tid, runtime='codebuddy',
+                              model=model, workspace=self.ws(tid),
+                              prompt_sha256=SHA, stage='s', now=T_NIGHT,
+                              executor='codebuddy', codebuddy_glm_allowed=True,
+                              _preclaim=False)
+
+        with ThreadPoolExecutor(max_workers=2) as pool:
+            results = list(pool.map(_claim, (('x-ds', CB_MODEL),
+                                             ('x-glm', GLM_MODEL))))
+        self.assertTrue(all(r.get('allowed') for r in results), results)
+        with closing(dp.connect(self.store)) as conn:
+            self.assertEqual(dp._count_active(conn, CB), 1)
+            self.assertEqual(dp._count_active(conn, GLM), 1)
+
+    def test_total_physical_capacity_14_and_status_independent_counts(self):
+        self.assertEqual(dp.DOMESTIC_TOTAL_CAPACITY, 14)
         self.assertEqual(dp.CAPACITY[GLM], 1)
-        self.assertNotIn(GLM, dp.MAIN_FORCE_CAPACITY)
+        self.assertEqual(dp.MAIN_FORCE_CAPACITY[GLM], 1)
         self.seed(CB, 1)
+        self.seed(GLM, 1)
         self.seed(ZCODE, 2)
         self.seed(QMAX, 1)
         self.seed(CN_MAX, 1)
@@ -462,22 +510,25 @@ class TestSharedPhysicalSlot(_Base):
         self.seed(QFLASH, 2)
         self.seed(CN_FLASH, 2)
         st = dp.status(self.store, now=T_NIGHT)
-        self.assertEqual(st['domestic']['active'], 13)
+        self.assertEqual(st['domestic']['capacity'], 14)
+        self.assertEqual(st['domestic']['active'], 14)
         self.assertEqual(st['pools'][CB]['active'], 1)
-        self.assertEqual(st['pools'][GLM]['active'], 0)  # 同一 attempt 不复制两次
-        self.assertEqual(st['pools'][GLM]['shared_active'], 1)
-        self.assertEqual(st['pools'][GLM]['free'], 0)
-        self.assertEqual(st['pools'][CB]['shared_active'], 1)
         self.assertEqual(st['pools'][CB]['free'], 0)
-        self.assertEqual(st['pools'][GLM]['shared_group'], [CB, GLM])
-        self.assertEqual(sum(p['active'] for p in st['pools'].values()), 13)
-        out = dp.reserve(self.store, task_id='full', runtime='codebuddy',
-                         model=GLM_MODEL, workspace=self.ws('full'),
-                         prompt_sha256=SHA, stage='s', now=T_NIGHT,
-                         executor='codebuddy', codebuddy_glm_allowed=True,
-                         _preclaim=False)
-        self.assertFalse(out.get('allowed'), out)
-        self.assertEqual(out['reason'], 'capacity_full', out)
+        self.assertEqual(st['pools'][GLM]['active'], 1)
+        self.assertEqual(st['pools'][GLM]['free'], 0)
+        self.assertNotIn('shared_active', st['pools'][GLM])
+        self.assertNotIn('shared_group', st['pools'][GLM])
+        self.assertNotIn('shared_capacity', st['pools'][CB])
+        self.assertEqual(sum(p['active'] for p in st['pools'].values()), 14)
+        for model in (GLM_MODEL, CB_MODEL):
+            out = dp.reserve(self.store, task_id=f'full-{model}',
+                             runtime='codebuddy',
+                             model=model, workspace=self.ws(f'full-{model}'),
+                             prompt_sha256=SHA, stage='s', now=T_NIGHT,
+                             executor='codebuddy', codebuddy_glm_allowed=True,
+                             _preclaim=False)
+            self.assertFalse(out.get('allowed'), out)
+            self.assertEqual(out['reason'], 'capacity_full', out)
 
 
 def _valid_report(stage, workspace):
@@ -555,7 +606,7 @@ class TestFormalLiveGlm(_Base):
         self.assertNotIn('argv', rec)  # 未 Popen
         self.assertFalse((self.base / 'run-nope').exists())
         with closing(dp.connect(self.store)) as conn:
-            self.assertEqual(dp._shared_active(conn, CB), 0)
+            self.assertEqual(dp._count_active(conn, CB), 0)
 
     def test_with_proof_uses_glm_model_argv_pool_and_evidence(self):
         evidence = self.evidence()
@@ -590,7 +641,7 @@ class TestFormalLiveGlm(_Base):
         self.assertIn(f'runtime=codebuddy；请求模型={GLM_MODEL}', payload)
         self.assertNotIn(CB_MODEL, payload)
         with closing(dp.connect(self.store)) as conn:
-            self.assertEqual(dp._shared_active(conn, CB), 0)
+            self.assertEqual(dp._count_active(conn, CB), 0)
 
     def test_old_codebuddy_and_workbuddy_remain_retired(self):
         def plan(runtime, model):

@@ -4,7 +4,7 @@ BW-CODEBUDDY-MAIN-S3 / BW-CODEBUDDY-GLM-FALLBACK-20261018：这是**唯一**允�
 CodeBuddy 精确模型执行正式 Popen 的生产入口，且只服务两个组合 ——
 `codebuddy` + `deepseek-v4.1-flash`（界面名 Deepseek-V4.1-Flash，最高优先主力）；
 `codebuddy` + `glm-5.3-flash`（界面名 GLM-5.3-Flash，**仅当轮明确 DeepSeek 限额证据成立**
-时的低层补位，与 deepseek 共用同一物理 CodeBuddy 1 槽）。其它 CodeBuddy 旧模型（含其它
+时的低层补位；与 deepseek 各有独立 1 槽，国内总容量 14）。其它 CodeBuddy 旧模型（含其它
 旧 GLM 组合）与 WorkBuddy 一律由 `codebuddy_direct.main()` 的 `manual_relay_only` 拒绝路径
 在**任何副作用之前**挡下，绝不进入本模块。GLM 还必须在读取用户私有配置、创建 outdir、
 容量认领或 Popen 之前，由 `codebuddy_fallback.verify_quota_evidence` 复验当轮 summary.json；

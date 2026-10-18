@@ -164,7 +164,7 @@ except ImportError:  # isolated revision tree / standalone tests
 # ------------------------------------------------------------------ 池定义
 # BW-POOL-SPLIT-20261010-S2 + BW-MAX-WINDOW-20261010-S2 用户 2026-10-10 最新分配：
 #   六池布局（BW-CLAUDE-CAPACITY2 起含 claude 2 槽；BW-CODEBUDDY-MAIN-S3 再加 CodeBuddy
-#   精确模型 1 槽）、当前调度总数 13：
+#   精确模型 1 槽；BW-WORKER-WIDGET-20261018-S3 起 CodeBuddy GLM 独立 1 槽）、当前调度总数 14：
 #   主力（四池共 6 槽，同属 best-effort 1:1 的两个组）：
 #     zcode:GLM-5.3=2（Z 组）、qoder:Qwen3.8-Max=1、qodercn:Qwen3.8-Max=1（国际/CN 内置
 #     Max，属 Qoder 组，仅北京时间 22:00 含至次日 08:00 不含作主力）、
@@ -183,14 +183,17 @@ except ImportError:  # isolated revision tree / standalone tests
 # 不新增记分系统，复用既有 rotation 列与 `_count_active` 即足够。
 # BW-CLAUDE-DEEPSEEK-S3：Claude Code / deepseek-flash 纳入主力候选与 AUTO 可派集合，成为
 # **独立第三公平组 claude**（与 Z2 组、Qoder 组并列）；BW-CLAUDE-CAPACITY2：容量由 1 增至 2。
-# BW-CODEBUDDY-MAIN-S3（用户 2026-10-17 最新授权）：独立 CodeBuddy CLI 的精确模型
-# **codebuddy:deepseek-v4.1-flash**（界面名 Deepseek-V4.1-Flash）恢复为**最高优先主力**（独立
-# 主力名额 1，优先级高于所有 Qwen3.8-Max），新 AUTO 层序为
-# **CodeBuddy > 三 Qoder Max > claude/deepseek-flash > ZCode > 两地区 Flash**。该模型
-# **不受任何时段门约束**（既不套 Claude 官方 API 离峰窗，也不套 Max 北京夜间窗）。其余池容量/
-# 优先级/时段不变：claude 仍 2。物理调度总数 DOMESTIC_TOTAL_CAPACITY 由 12 增至
-# 6(主力含 codebuddy 1 + claude 2) + ... = 13（=8+1 codebuddy +4=13；由 MAIN_FORCE+OVERFLOW
-# 求和自动得出）。WorkBuddy 仍 human-relay、CodeBuddy 其它旧模型（含旧 GLM）仍不恢复。
+# BW-CODEBUDDY-MAIN-S3（用户 2026-10-17 授权）：独立 CodeBuddy CLI 的精确模型
+# **codebuddy:deepseek-v4.1-flash**（界面名 Deepseek-V4.1-Flash）为**最高优先主力**（独立
+# 主力名额 1，优先级高于所有 Qwen3.8-Max）。该模型**不受任何时段门约束**（既不套 Claude
+# 官方 API 离峰窗，也不套 Max 北京夜间窗）。
+# BW-WORKER-WIDGET-20261018-S3（用户 2026-10-18 最新明确）：codebuddy:deepseek-v4.1-flash
+# 与 codebuddy:glm-5.3-flash **不共享名额，各自独立 1 槽**（旧「同一物理 1 槽」口径作废）。
+# 当前 AUTO 层序：CodeBuddy deepseek(0) > 三 Qoder Max(1) > claude(2) > ZCode(3) >
+# CodeBuddy GLM(4，仅当轮 DeepSeek 真实限额证据成立时进候选) > 两地区 Flash 兜底。
+# claude 仍 2 槽。物理调度总数 DOMESTIC_TOTAL_CAPACITY = 10(主力，含两个 CodeBuddy 各 1)
+# + 4(两地区 Flash) = 14（由 MAIN_FORCE+OVERFLOW 求和自动得出）。WorkBuddy 仍 human-relay、
+# CodeBuddy 其它旧模型（新旧 GLM 之外的组合）仍不恢复。
 MAIN_FORCE_POOLS = (('codebuddy', 'deepseek-v4.1-flash'),
                     ('zcode', 'GLM-5.3'),
                     ('qoder', 'Qwen3.8-Max'),
@@ -199,6 +202,7 @@ MAIN_FORCE_POOLS = (('codebuddy', 'deepseek-v4.1-flash'),
                     ('claude', 'deepseek-flash'),
                     ('codebuddy', 'glm-5.3-flash'))
 MAIN_FORCE_CAPACITY = {'codebuddy:deepseek-v4.1-flash': 1,
+                       'codebuddy:glm-5.3-flash': 1,
                        'zcode:GLM-5.3': 2,
                        'qoder:Qwen3.8-Max': 1,
                        'qodercn:Qwen3.8-Max': 1,
@@ -214,30 +218,30 @@ LUNA_RUNTIME = 'luna'
 LUNA_MODEL = 'native'
 LUNA_ASK_TIMEOUT_SECONDS = 300
 DOMESTIC_TOTAL_CAPACITY = (sum(MAIN_FORCE_CAPACITY.values())
-                           + sum(OVERFLOW_CAPACITY.values()))  # 9 (含 codebuddy 1) + 4 = 13
+                           + sum(OVERFLOW_CAPACITY.values()))  # 10 (两个 CodeBuddy 各 1) + 4 = 14
 
 # pool_key -> capacity（None 表示无上限，仅 Luna；0 表示已退出正常池但保留历史真实在途）。
 CAPACITY = {}
 CAPACITY.update(MAIN_FORCE_CAPACITY)
 CAPACITY.update(OVERFLOW_CAPACITY)
-# BW-CODEBUDDY-GLM-FALLBACK-20261018：CodeBuddy 的 GLM 补位是**同一物理 1 槽**的第二个
-# 逻辑 pool_key 别名——只在 CAPACITY 登记为 1 供选择/预览，**绝不加入 MAIN_FORCE_CAPACITY**，
-# 因此 DOMESTIC_TOTAL_CAPACITY 仍是 13（不双计成 14）；真实占用由 `_shared_active` 求和。
 for _rk in LEGACY_RETIRED_POOL_KEYS:
     CAPACITY[_rk] = 0
 CAPACITY['luna:native'] = None
 # BW-CLAUDE-DEEPSEEK-S3：claude:deepseek-flash 已并入 MAIN_FORCE_POOLS/CAPACITY（独立第三公平组
 # claude），故其容量已在上面 CAPACITY.update 中登记；BW-CLAUDE-CAPACITY2 起容量为 2。
-# 关键口径：
-#  - DOMESTIC_TOTAL_CAPACITY = 13（BW-CODEBUDDY-MAIN-S3），claude 与 codebuddy 在途都计入国内
-#    总在途（_domestic_active 只排除 Luna）；
-#  - _select_main_force 现按主力优先级层排序（BW-CODEBUDDY-MAIN-S3：codebuddy:deepseek-v4.1-flash
-#    最高 > 三 Qoder Max > claude:deepseek-flash > zcode:GLM-5.3）：committed 仍只作历史记账、
-#    不参与跨层排序，低层绝不凭历史计数抢高层名额；
+# 关键口径（BW-WORKER-WIDGET-20261018-S3 现行权威）：
+#  - DOMESTIC_TOTAL_CAPACITY = 14：两个 CodeBuddy 模型（deepseek-v4.1-flash / glm-5.3-flash）
+#    **各独立 1 槽、互不占位互斥**，claude 与两者在途都计入国内总在途（_domestic_active
+#    只排除 Luna）；
+#  - _select_main_force 按主力优先级层排序：codebuddy:deepseek-v4.1-flash 最高 > 三 Qoder
+#    Max > claude:deepseek-flash > zcode:GLM-5.3 > codebuddy:glm-5.3-flash（额度条件补位）。
+#    committed 仍只作历史记账、不参与跨层排序，低层绝不凭历史计数抢高层名额；
 #  - claude 受 deepseek_offpeak 的北京时间工作日高峰门约束（高峰不得新派）；
-#  - codebuddy:deepseek-v4.1-flash（独立 CodeBuddy CLI 精确模型）**不受任何时段门约束**：
-#    既不套 Claude 官方 API 离峰窗，也不套 Max 北京夜间窗；仅经自身 capacity=1 与总在途 13 守卫，
-#    无任何跨模型回退。CodeBuddy 其它旧模型（含旧 GLM）仍不恢复、不进候选池。
+#  - codebuddy:deepseek-v4.1-flash **不受任何时段门约束**：既不套 Claude 官方 API 离峰窗，
+#    也不套 Max 北京夜间窗；仅经自身 capacity=1 与总在途 14 守卫，无任何跨模型回退。
+#    codebuddy:glm-5.3-flash 同样无时段门，但仅在当轮 DeepSeek 真实明确限额证据复验通过
+#    （codebuddy_glm_allowed=True）时才进候选，仅经自身 capacity=1 守卫。
+#    CodeBuddy 其它旧模型仍不恢复、不进候选池。
 CLAUDE_RUNTIME = 'claude'
 CLAUDE_MODEL = 'deepseek-flash'
 CLAUDE_POOL_KEY = f'{CLAUDE_RUNTIME}:{CLAUDE_MODEL}'
@@ -252,14 +256,16 @@ CODEBUDDY_POOL_KEY = f'{CODEBUDDY_RUNTIME}:{CODEBUDDY_MODEL}'
 CODEBUDDY_CAPACITY = MAIN_FORCE_CAPACITY[CODEBUDDY_POOL_KEY]
 # BW-CODEBUDDY-GLM-FALLBACK-20261018 用户授权：CodeBuddy / GLM-5.3-Flash（精确 CLI ID
 # `codebuddy:glm-5.3-flash`）是**只在当轮 DeepSeek 真实明确限额后**启用的低层补位，优先级
-# 低于 ZCode、高于两地区 Qwen3.8-Flash；它与 deepseek-v4.1-flash **共用同一物理 CodeBuddy
-# 1 槽**（任一 reserved/running/unknown 都挡另一个），不新增并发、不改物理总 13。
+# 低于 ZCode、高于两地区 Qwen3.8-Flash。BW-WORKER-WIDGET-20261018-S3 用户最新明确：它与
+# deepseek-v4.1-flash **不共享名额，独立 1 槽**（已入 MAIN_FORCE_CAPACITY），不同工作区
+# 两模型可各有 1 个在途并发；各自第 2 个仍按自身容量拒绝；一个结束只释放自己的槽。
 CODEBUDDY_GLM_MODEL = 'glm-5.3-flash'
 CODEBUDDY_GLM_POOL_KEY = f'{CODEBUDDY_RUNTIME}:{CODEBUDDY_GLM_MODEL}'
-CODEBUDDY_SHARED_POOL_KEYS = (CODEBUDDY_POOL_KEY, CODEBUDDY_GLM_POOL_KEY)
-CODEBUDDY_SHARED_CAPACITY = CODEBUDDY_CAPACITY
-# 逻辑别名容量：仅供 capacity_for/候选预览；**不进入 MAIN_FORCE_CAPACITY/物理总和**。
-CAPACITY[CODEBUDDY_GLM_POOL_KEY] = CODEBUDDY_SHARED_CAPACITY
+CODEBUDDY_GLM_CAPACITY = MAIN_FORCE_CAPACITY[CODEBUDDY_GLM_POOL_KEY]
+# 已弃用（BW-WORKER-WIDGET-20261018-S3）：两个 CodeBuddy 模型改为各自独立 1 槽，不再存在
+# 跨模型共享物理槽。旧同名常量仅保留空元组供既有 import 兼容，任何代码/文案都不得再据此
+# 推导共享容量或跨模型占位互斥。
+CODEBUDDY_SHARED_POOL_KEYS: tuple = ()
 MAIN_FORCE_KEYS = tuple(f'{r}:{m}' for r, m in MAIN_FORCE_POOLS)
 OVERFLOW_KEYS = tuple(f'{r}:{m}' for r, m in OVERFLOW_POOLS)
 # 兼容既有引用名（CN_KEYS/CN_POOL_KEY 保留为空元组/空串，代码不再据此派工）；
@@ -666,30 +672,15 @@ def _count_active(conn, pk) -> int:
     return int(row['n']) if row else 0
 
 
-def _shared_active(conn, pk) -> int:
-    """CodeBuddy 两个逻辑 pool_key（deepseek-v4.1-flash / glm-5.3-flash）共用**同一物理
-    1 槽**：返回该物理组当前真实在途总数（reserved/running/unknown 求和）。非 CodeBuddy
-    池退化为自身 `_count_active`，语义完全不变。每个 attempt 只在自身 pool_key 下计一次，
-    本函数只做同一组内求和，绝不把同一 attempt 复制两次。"""
-    if pk in CODEBUDDY_SHARED_POOL_KEYS:
-        return sum(_count_active(conn, k) for k in CODEBUDDY_SHARED_POOL_KEYS)
-    return _count_active(conn, pk)
-
-
-def shared_group_for(pk):
-    """该 pool_key 所属的共享物理组（无共享则返回 (pk,)）。供 status/preview 明确展示
-    共享容量，不改变任何调度语义。"""
-    if pk in CODEBUDDY_SHARED_POOL_KEYS:
-        return CODEBUDDY_SHARED_POOL_KEYS
-    return (pk,)
-
-
-def _shared_has_capacity(conn, pk) -> bool:
-    """该池（或共享组）当前是否仍有真实空位；容量为 None（Luna）视为无上限。"""
+def _has_own_capacity(conn, pk) -> bool:
+    """该池按**自身独立容量**是否仍有真实空位；容量为 None（Luna）视为无上限。
+    BW-WORKER-WIDGET-20261018-S3：两个 CodeBuddy 模型各自独立 1 槽，此判断只数自身
+    pool_key 的 reserved/running/unknown，绝不做跨模型占位互斥（旧 `_shared_active` /
+    `_shared_has_capacity` / `shared_group_for` 共享组语义已随用户最新授权废弃移除）。"""
     cap = capacity_for(pk)
     if cap is None:
         return True
-    return _shared_active(conn, pk) < cap
+    return _count_active(conn, pk) < cap
 
 
 def _count_committed_claude(conn) -> int:
@@ -750,7 +741,7 @@ def _domestic_active(conn) -> int:
     """国内总在途保护计数（BW-POOL-SPLIT-20261010-S3 + BW-CLAUDE-DEEPSEEK-S3）：统计**所有
     非 Luna 的在途 attempt**，含 claude:deepseek-flash 以及仍在途的 retired DeepSeek 与超额
     旧 Max（迁移债务）。这样即便某个新池按各自容量看似有空位，只要真实总在途已达物理总容量
-    （现为 13：主力含 CodeBuddy 1 + claude 2 + 两地区 Flash 各 2），就不会派出超额的国内槽；减少容量不杀
+    （现为 14：主力含两个 CodeBuddy 各 1 + claude 2 + 两地区 Flash 各 2），就不会派出超额的国内槽；减少容量不杀
     老任务，老任务依真实终态自然释放后计数才下降。Luna（救援池、无上限）不计入国内总额。"""
     row = conn.execute(
         'SELECT COUNT(*) AS n FROM attempts WHERE pool_key != ? AND state IN (%s)'
@@ -830,21 +821,14 @@ def status(store_path=None, now=None) -> dict:
         pools = {}
         for pk, cap in CAPACITY.items():
             # active 始终是该 pool_key 自身的真实 attempt 数（同一 attempt 绝不复制两次）；
-            # CodeBuddy 组额外给出 shared_active（两逻辑 key 求和）与共享容量，free 按共享
-            # 槽计算，避免把同一物理 1 槽误读成 2 个可用名额。
+            # BW-WORKER-WIDGET-20261018-S3：两个 CodeBuddy 模型各自独立 1 槽，free 按自身
+            # 容量独立计算，不再输出任何 shared_group/shared_capacity/shared_active 字段。
             active = _count_active(conn, pk)
-            shared = pk in CODEBUDDY_SHARED_POOL_KEYS
-            effective_active = _shared_active(conn, pk) if shared else active
             pools[pk] = {'capacity': cap, 'active': active,
-                         'free': (None if cap is None
-                                  else max(0, cap - effective_active))}
-            if shared:
-                pools[pk]['shared_group'] = list(CODEBUDDY_SHARED_POOL_KEYS)
-                pools[pk]['shared_capacity'] = CODEBUDDY_SHARED_CAPACITY
-                pools[pk]['shared_active'] = effective_active
-            for pk in QUOTA_LIMITABLE_POOLS:
-                if pk in pools:
-                    pools[pk]['limited'] = _main_force_limit_active(conn, pk)
+                         'free': (None if cap is None else max(0, cap - active))}
+        for lpk in QUOTA_LIMITABLE_POOLS:
+            if lpk in pools:
+                pools[lpk]['limited'] = _main_force_limit_active(conn, lpk)
         rot = _rotation_row(conn)
         domestic_active = _domestic_active(conn)
         tickets = [dict(r) for r in conn.execute('SELECT * FROM luna_tickets').fetchall()]
@@ -1174,9 +1158,9 @@ def _select_main_force(conn, requested_pk, now, eligible=None):
         cap = capacity_for(pk)
         if cap is None:
             continue
-        # CodeBuddy 两个逻辑模型共用同一物理 1 槽：两个 key 任一有 reserved/running/
-        # unknown 都视为该组已占满，绝不因只看自己的 key 而派出第二个并发。
-        active = _shared_active(conn, pk)
+        # BW-WORKER-WIDGET-20261018-S3：所有池（含两个 CodeBuddy 模型）都按自身独立
+        # 容量与自身在途数判断空位，绝不做跨模型占位互斥。
+        active = _count_active(conn, pk)
         if active < cap:
             avail.append((pk, active))
     if not avail:
@@ -1258,15 +1242,15 @@ def _domestic_policy(conn, requested_pk, now, executor='auto', eligible=None,
       数选择；本池有空也不绕过层序；选中≠请求 → routing；主力都不可用/已满 → 两地区 Flash
       同级兜底；两 Flash 也满才 full。
     - 迁移债务总额守卫（BW-CLAUDE-DEEPSEEK-S4 起对全部国内池生效，含 claude/codebuddy）：
-      真实国内在途（含在途 retired DeepSeek 与超额旧 Max）已达总 13 时，即便某池按各自容量
-      看似有空也一律 full，绝不派第 14 个。"""
+      真实国内在途（含在途 retired DeepSeek 与超额旧 Max）已达总 14 时，即便某池按各自容量
+      看似有空也一律 full，绝不派第 15 个。"""
     if requested_pk == LUNA_KEY:
         return 'reject_luna', None
     if requested_pk in LEGACY_RETIRED_POOL_KEYS:
         return 'unknown_pool', None
     # BW-CLAUDE-DEEPSEEK-S4 + BW-CODEBUDDY-MAIN-S3：claude/codebuddy 已计入
-    # DOMESTIC_TOTAL_CAPACITY=13，总守卫必须同样约束：真实国内在途（含迁移债务/旧超额在途）
-    # 已满 13 时，即便该池按自身容量看似有空也绝不派第 14 个。显式点名 claude
+    # DOMESTIC_TOTAL_CAPACITY=14，总守卫必须同样约束：真实国内在途（含迁移债务/旧超额在途）
+    # 已满 14 时，即便该池按自身容量看似有空也绝不派第 15 个。显式点名 claude
     # （executor='claude' 或 None）保持
     # 精确组合：时段/限额/总守卫都过且有空位才 claim，否则如实拒绝，绝不回退国内模型；
     # AUTO 请求 claude（executor='auto'）绝不绕过三组公平选择——落入下方 auto 分支，与
@@ -1284,30 +1268,32 @@ def _domestic_policy(conn, requested_pk, now, executor='auto', eligible=None,
             if _max_window_blocks(CLAUDE_POOL_KEY, now):
                 return 'main_force_window_closed', None
             # BW-SIMPLE-PRIORITY-RETRY-S3：历史明确限额标记不再挡普通新一轮（真实尝试失败
-            # 才落诊断、CAS 结算不变）；claude 仍受总守卫与时段门约束，绝不误放第 13 个。
+            # 才落诊断、CAS 结算不变）；claude 仍受总守卫与时段门约束，绝不误放第 15 个。
             if _count_active(conn, CLAUDE_POOL_KEY) < capacity_for(CLAUDE_POOL_KEY):
                 return 'claim', CLAUDE_POOL_KEY
             return 'full', None
     # BW-CODEBUDDY-MAIN-S3：codebuddy:deepseek-v4.1-flash 是最高优先独立主力（capacity=1），
     # **不受任何时段门约束**（不套 Claude 离峰窗、不套 Max 夜间窗）。显式点名 CodeBuddy
-    # （executor='codebuddy' 或 None）保持精确组合：只在总守卫（13）与本池 capacity=1 有空时
-    # claim，否则如实拒绝，绝不跨模型回退到其它国内池/Flash；历史旧 GLM/WorkBuddy 冷却一律
-    # 不挡此新模型（本分支只认新 pool_key，不查任何冷却）。AUTO 请求 codebuddy（executor='auto'）
-    # 不直接认领，落到下方统一 auto 分支经 `_select_main_force` 公平选择（codebuddy 为最高层，
-    # 有空位即优先，绝不绕过层序）。
+    # （executor='codebuddy' 或 None）保持精确组合：只在总守卫（14）与本池自身 capacity=1
+    # 有空时 claim，否则如实拒绝，绝不跨模型回退到其它国内池/Flash；历史旧 GLM/WorkBuddy
+    # 冷却一律不挡此新模型（本分支只认新 pool_key，不查任何冷却）。BW-WORKER-WIDGET-
+    # 20261018-S3：GLM 在途**不再**挡本池（各自独立 1 槽）。AUTO 请求 codebuddy
+    # （executor='auto'）不直接认领，落到下方统一 auto 分支经 `_select_main_force` 公平选择
+    # （codebuddy 为最高层，有空位即优先，绝不绕过层序）。
     if requested_pk == CODEBUDDY_POOL_KEY:
         if executor not in ('auto', 'codebuddy', None):
             return 'executor_conflict', None
         if executor in ('codebuddy', None):
             if _domestic_active(conn) >= DOMESTIC_TOTAL_CAPACITY:
                 return 'full', None
-            if _shared_has_capacity(conn, CODEBUDDY_POOL_KEY):
+            if _has_own_capacity(conn, CODEBUDDY_POOL_KEY):
                 return 'claim', CODEBUDDY_POOL_KEY
             return 'full', None
-    # BW-CODEBUDDY-GLM-FALLBACK-20261018：GLM 是同一物理 CodeBuddy 1 槽的低层补位，必须
-    # 同时满足（1）调用方显式授权 codebuddy_glm_allowed=True（只能来自当轮真实明确限额证据
-    # 的复验）与（2）共享槽真实有空位；否则如实拒绝，绝不自动切换/重派、绝不消耗通用
-    # reserve 的容量来"证明"额度、绝不给 Max 夜间窗或 Claude 离峰窗待遇（无时段门）。
+    # BW-CODEBUDDY-GLM-FALLBACK-20261018 + BW-WORKER-WIDGET-20261018-S3：GLM 是额度条件
+    # 补位，**独立 1 槽**，必须同时满足（1）调用方显式授权 codebuddy_glm_allowed=True
+    # （只能来自当轮 DeepSeek 真实明确限额证据的复验）与（2）自身 capacity=1 真实有空位；
+    # 否则如实拒绝，绝不自动切换/重派、绝不消耗通用 reserve 的容量来"证明"额度、绝不给
+    # Max 夜间窗或 Claude 离峰窗待遇（无时段门）。DeepSeek 在途**不再**挡 GLM 自身名额。
     if requested_pk == CODEBUDDY_GLM_POOL_KEY:
         if executor not in ('auto', CODEBUDDY_RUNTIME, None):
             return 'executor_conflict', None
@@ -1316,13 +1302,13 @@ def _domestic_policy(conn, requested_pk, now, executor='auto', eligible=None,
         if executor != 'auto':
             if _domestic_active(conn) >= DOMESTIC_TOTAL_CAPACITY:
                 return 'full', None
-            if _shared_has_capacity(conn, CODEBUDDY_GLM_POOL_KEY):
+            if _has_own_capacity(conn, CODEBUDDY_GLM_POOL_KEY):
                 return 'claim', CODEBUDDY_GLM_POOL_KEY
             return 'full', None
         # executor='auto'：不直接认领，落入下方统一 auto 分支；更高优先主力全部
         # 受限/满/不合格后才轮到 tier=4 的 GLM。
     # 迁移债务总额守卫（BW-POOL-SPLIT-20261010-S3）：总在途已满 DOMESTIC_TOTAL_CAPACITY
-    # （现为 12）→ 任何新国内 claim 都不得放行（减少容量不杀老任务，老任务真实终态自然
+    # （现为 14）→ 任何新国内 claim 都不得放行（减少容量不杀老任务，老任务真实终态自然
     # 释放后计数才下降）。
     if _domestic_active(conn) >= DOMESTIC_TOTAL_CAPACITY:
         return 'full', None
@@ -1651,13 +1637,12 @@ def select_and_claim(store_path=None, *, task_id, runtime, model, workspace,
                                     'and never falls back to another model or an old CodeBuddy '
                                     'channel; wait for the real terminal release']
                 elif pk == CODEBUDDY_GLM_POOL_KEY:
-                    full_reasons = [f'{pk} (quota-conditional CodeBuddy / glm-5.3-flash) '
-                                    'shares the single physical CodeBuddy slot '
-                                    f'(capacity {CODEBUDDY_SHARED_CAPACITY}) with '
-                                    f'{CODEBUDDY_POOL_KEY}; either model\'s active attempt '
-                                    'occupies the group, so a second concurrent dispatch is '
-                                    'refused and never falls back to another model — wait '
-                                    'for the real terminal release']
+                    full_reasons = [f'{pk} (quota-conditional CodeBuddy / glm-5.3-flash) is '
+                                    f'at its own independent capacity of '
+                                    f'{CODEBUDDY_GLM_CAPACITY} (it does not share a slot '
+                                    f'with {CODEBUDDY_POOL_KEY}); a second concurrent '
+                                    'dispatch to this model is refused and never falls back '
+                                    'to another model — wait for the real terminal release']
                 else:
                     full_reasons = ['the sanctioned domestic candidate set for this combo is '
                                     'fully occupied; ask the user (external agent or Luna) and '
@@ -1789,12 +1774,11 @@ def reserve(store_path=None, *, task_id, runtime, model, workspace, prompt_sha25
                                    'concurrent dispatch is refused and never falls back to '
                                    'another model or an old CodeBuddy channel')
                 elif pk == CODEBUDDY_GLM_POOL_KEY:
-                    full_reason = (f'{pk} (quota-conditional CodeBuddy / glm-5.3-flash) '
-                                   'shares the single physical CodeBuddy slot '
-                                   f'(capacity {CODEBUDDY_SHARED_CAPACITY}) with '
-                                   f'{CODEBUDDY_POOL_KEY}; the shared slot is occupied, so '
-                                   'no second concurrent dispatch is reserved and no '
-                                   'automatic switch is performed')
+                    full_reason = (f'{pk} (quota-conditional CodeBuddy / glm-5.3-flash) is '
+                                   f'at its own independent capacity of '
+                                   f'{CODEBUDDY_GLM_CAPACITY} (it does not share a slot with '
+                                   f'{CODEBUDDY_POOL_KEY}); no second concurrent dispatch is '
+                                   'reserved and no automatic switch is performed')
                 else:
                     full_reason = f'{pk} and every other domestic pool is at capacity'
                 return _reject('capacity_full', task_id, pk,
@@ -2457,8 +2441,9 @@ def ask_record(store_path=None, *, task_id, scope=None, ask_message_id=None,
                     allowed_c = _scope_allowed_candidates(parsed_scope, zcode_blocked)
                     free_candidate = None
                     for k in allowed_c:
-                        # 共享 CodeBuddy 槽同样按组判断真实空位（GLM 默认不在候选内）。
-                        if capacity_for(k) is not None and _shared_has_capacity(conn, k):
+                        # 每个池（含两个 CodeBuddy 独立槽）都按自身容量判断真实空位
+                        # （GLM 默认不在候选内）。
+                        if capacity_for(k) is not None and _has_own_capacity(conn, k):
                             free_candidate = k
                             break
                     if free_candidate is not None:
@@ -2689,9 +2674,10 @@ def claim_due(store_path=None, *, task_id, now=None, scope=None,
                         and not _main_force_limit_active(conn, scope_combo) \
                         and not _max_window_blocks(scope_combo, now) \
                         and capacity_for(scope_combo) is not None \
-                        and _shared_has_capacity(conn, scope_combo):
+                        and _has_own_capacity(conn, scope_combo):
                     # 票据回收没有"当轮 DeepSeek 明确限额证据"的上文：GLM 永不通过这条
-                    # 路径被自动回收/启用，保持 pending；CodeBuddy deepseek 仍按共享槽判断。
+                    # 路径被自动回收/启用，保持 pending；CodeBuddy deepseek 按其自身
+                    # 独立 1 槽判断空位。
                     target = scope_combo
                 if target is None and allowed is None:
                     # 无显式 scope 的国内回收：主力已满后按同级两地区 Flash 兜底

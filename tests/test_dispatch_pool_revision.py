@@ -76,14 +76,21 @@ class TempStoreMixin:
         self.assertNotEqual(str(self.store), str(dp.default_store_path()))
         # 显式确保没有意外读到默认库/env 覆盖。
         self.saved_env = os.environ.pop('BRAIN_WORKER_DISPATCH_STORE', None)
-        # BW-CODEBUDDY-MAIN-S3：本文件的历史层序（Max > claude > Z）与“填满即满”夹具写于
-        # CodeBuddy 恢复之前。先真实占住 CodeBuddy 唯一名额，使旧层序断言原样成立，且
-        # fill_domestic 补 12 槽后总量正好 13（不靠虚拟同一路径、不放宽任何断言）。
+        # BW-CODEBUDDY-MAIN-S3 + BW-WORKER-WIDGET-20261018-S3：本文件的历史层序
+        # （Max > claude > Z）与“填满即满”夹具写于 CodeBuddy 恢复之前。先真实占住
+        # CodeBuddy deepseek 与 GLM 各自的独立 1 槽（GLM 为额度条件池，夹具只作占位），
+        # 使旧层序断言原样成立，且 fill_domestic 补 12 槽后总量正好 14（不靠虚拟同一路径、
+        # 不放宽任何断言）。
         with closing(dp.connect(self.store)) as conn:
             conn.execute('INSERT INTO attempts(token, task_id, runtime, model, pool_key, '
                          "state, reserved_at_utc) VALUES(?,?,?,?,?,?,?)",
                          ('cb-fixture', 'cb-fixture-task', 'codebuddy',
                           'deepseek-v4.1-flash', dp.CODEBUDDY_POOL_KEY, 'reserved',
+                          dp._iso(T0)))
+            conn.execute('INSERT INTO attempts(token, task_id, runtime, model, pool_key, '
+                         "state, reserved_at_utc) VALUES(?,?,?,?,?,?,?)",
+                         ('cb-glm-fixture', 'cb-glm-fixture-task', 'codebuddy',
+                          'glm-5.3-flash', dp.CODEBUDDY_GLM_POOL_KEY, 'reserved',
                           dp._iso(T0)))
             conn.execute('PRAGMA journal_mode=DELETE')
 

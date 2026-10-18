@@ -8,7 +8,8 @@
 - 全部 Max 满 → Claude；白天三 Max 全部剔除；
 - 显式指定内置 Max 的固定选择不被新优先级改写；
 - stage_selection 规划与正式原子入口 select_and_claim 同序；
-- 容量 13 不变、同 workspace 单写与 unknown 在途保护保留。
+- 当前权威总容量 14（BW-WORKER-WIDGET-20261018-S3 起两 CodeBuddy 模型各独立 1 槽）、
+  同 workspace 单写与 unknown 在途保护保留。
 """
 import sys
 import tempfile
@@ -175,11 +176,11 @@ class SameOrderAndGuardsTests(_Base):
         out = self.claim_auto('t1')
         self.assertEqual(out['selected']['pool_key'], CN_CUSTOM_MAX, out)
 
-    def test_capacity_13_unchanged(self):
-        self.assertEqual(dp.DOMESTIC_TOTAL_CAPACITY, 13)
+    def test_capacity_14_current_authority(self):
+        self.assertEqual(dp.DOMESTIC_TOTAL_CAPACITY, 14)
         self.assertEqual(dp.capacity_for(CN_CUSTOM_MAX), 2)
         self.assertEqual(sum(dp.MAIN_FORCE_CAPACITY.values())
-                         + sum(dp.OVERFLOW_CAPACITY.values()), 13)
+                         + sum(dp.OVERFLOW_CAPACITY.values()), 14)
 
     def test_workspace_single_write_guard_unchanged(self):
         shared = self.ws('shared')

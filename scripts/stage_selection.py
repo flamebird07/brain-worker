@@ -304,8 +304,9 @@ def _filter_candidates(conn, allowed, zcode_blocked, now, requirements=None,
         if dp._max_window_blocks(pk, now):
             filters[pk] = 'window_closed'
             continue
-        # CodeBuddy deepseek/GLM 共享同一物理 1 槽：任一在途都让组内两个逻辑 key 都满。
-        if not dp._shared_has_capacity(conn, pk):
+        # BW-WORKER-WIDGET-20261018-S3：两个 CodeBuddy 模型各自独立 1 槽，容量按自身
+        # pool_key 独立判断，绝不做跨模型占位互斥。
+        if not dp._has_own_capacity(conn, pk):
             filters[pk] = 'capacity_full'
             continue
         passed.append(pk)

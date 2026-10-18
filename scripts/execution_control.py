@@ -64,7 +64,8 @@ RETIRED_DIRECT_RUNTIMES = ('codebuddy', 'workbuddy')
 # 拒绝，旧回归用例对它们的覆盖不变。
 REACTIVATED_CODEBUDDY_MODEL = 'deepseek-v4.1-flash'
 # BW-CODEBUDDY-GLM-FALLBACK-20261018：同一控制面放行第二个**精确**模型 GLM-5.3-Flash。
-# 它只是额度条件成立时的低层补位，是否真的有当轮证据/共享槽空位由 stage_selection 与
+# 它只是额度条件成立时的低层补位（BW-WORKER-WIDGET-20261018-S3 起独立 1 槽、不与
+# deepseek 共享名额），是否真的有当轮证据/自身槽空位由 stage_selection 与
 # 正式 codebuddy_live 入口独立复验；控制面仅负责"这是被授权的精确组合、不是旧模型"。
 REACTIVATED_CODEBUDDY_MODELS = ('deepseek-v4.1-flash', 'glm-5.3-flash')
 
@@ -352,7 +353,7 @@ def preflight(plan, actual, *, active_tasks=None, max_concurrency=None) -> dict:
             # BW-CODEBUDDY-MAIN-S3 + BW-CODEBUDDY-GLM-FALLBACK-20261018：仅当
             # runtime=codebuddy 且 model 精确等于两个已恢复模型之一时放行；其它 CodeBuddy
             # 旧模型（含其它旧 GLM 组合）与 WorkBuddy 一律继续拒绝（旧 manual-relay 回归
-            # 不变）。GLM 的额度条件/共享槽由调度与正式入口另外强制，控制面放行不等于授权。
+            # 不变）。GLM 的额度条件/独立容量槽由调度与正式入口另外强制，控制面放行不等于授权。
             if rt.lower() == 'codebuddy' and isinstance(mdl, str) \
                     and mdl in REACTIVATED_CODEBUDDY_MODELS:
                 continue

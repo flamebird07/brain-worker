@@ -2,10 +2,11 @@
 
 全部使用临时 SQLite + 进程内合成 stub（tests/stub_codebuddy_live.py），零真实网络/账号/模型/
 子进程、零真实池。覆盖任务政策：
-- 共享池 codebuddy:deepseek-v4.1-flash=1，AUTO 最高优先（高于所有 Qwen3.8-Max）；本轮真实
+- 独立池 codebuddy:deepseek-v4.1-flash=1（BW-WORKER-WIDGET-20261018-S3 起与 GLM 各自
+  独立 1 槽），AUTO 最高优先（高于所有 Qwen3.8-Max）；本轮真实
   失败（round 候选剔除）后落 Max/其他合格；显式 executor/qodercn 不越权跨执行器改派；
-- 仅 1 个 CodeBuddy，第二个拒绝，终态释放后可复用；总 13 与迁移债务守卫、同 workspace/
-  unknown 不绕过；
+- 仅 1 个 CodeBuddy deepseek，第二个拒绝，终态释放后可复用；总 14 与迁移债务守卫、
+  同 workspace/unknown 不绕过；
 - codebuddy 无时段门（PEAK/GAP/DAY 仍可选，不套 Claude 离峰窗 / Max 夜间窗）；
 - WorkBuddy 与 CodeBuddy 旧模型（含旧 GLM）仍退休：execution_control 只为精确模型解禁；
 - 正式 codebuddy_live 传输用可移植 synthetic stub 验证成功读写回执/报告绑定、模型漂移拒绝、
@@ -165,10 +166,10 @@ class _PoolBase(unittest.TestCase):
 
 
 class TestCodebuddyPoolPriority(_PoolBase):
-    def test_shared_pool_has_one_codebuddy_slot(self):
+    def test_codebuddy_has_one_independent_slot(self):
         self.assertEqual(dp.capacity_for(CB), 1)
         self.assertIn(CB, dp.MAIN_FORCE_KEYS)
-        self.assertEqual(dp.DOMESTIC_TOTAL_CAPACITY, 13)
+        self.assertEqual(dp.DOMESTIC_TOTAL_CAPACITY, 14)
 
     def test_auto_prefers_codebuddy_over_all_max_when_free(self):
         out = self.reserve('t1', 'qoder', 'Qwen3.8-Max', 'auto')
@@ -215,9 +216,11 @@ class TestCodebuddyPoolPriority(_PoolBase):
             self.assertNotIn(CLAUDE, dp._eligible_main_forces(conn, False, PEAK))
             self.assertNotIn(QMAX, dp._eligible_main_forces(conn, False, DAY))
 
-    def test_total_guard_blocks_fourteenth(self):
-        # 真实填 13：codebuddy1 + zcode2 + qmax1 + cnmax1 + cnx2 + claude2 + qflash2 + cnflash2 = 13
+    def test_total_guard_blocks_fifteenth(self):
+        # 真实填 14：codebuddy1 + glm1 + zcode2 + qmax1 + cnmax1 + cnx2 + claude2
+        # + qflash2 + cnflash2 = 14
         self.seed(CB, 1, task_prefix='full')
+        self.seed('codebuddy:glm-5.3-flash', 1, task_prefix='full')
         self.seed(ZCODE, 2, task_prefix='full')
         self.seed(QMAX, 1, task_prefix='full')
         self.seed(CN_MAX, 1, task_prefix='full')
@@ -226,7 +229,7 @@ class TestCodebuddyPoolPriority(_PoolBase):
         self.seed(QFLASH, 2, task_prefix='full')
         self.seed(CN_FLASH, 2, task_prefix='full')
         with closing(dp.connect(self.store)) as conn:
-            self.assertEqual(dp._domestic_active(conn), 13)
+            self.assertEqual(dp._domestic_active(conn), 14)
         out = self.reserve('over', 'codebuddy', CB_MODEL, 'codebuddy')
         self.assertFalse(out.get('allowed'), out)
         self.assertTrue(out.get('domestic_full') or out['reason'] == 'capacity_full', out)

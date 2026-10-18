@@ -187,13 +187,16 @@ class _SpawnMixin(unittest.TestCase):
             return [dict(r) for r in conn.execute(sql, params).fetchall()]
 
     def _fill_six_via_api(self):
-        """真实 API 填满十三满基线（BW-CODEBUDDY-MAIN-S3：codebuddy×1 + zcode×2 + 两内置
-        Max 各 1 + CN 自定义 Max×2 + 两地区 Flash 各 2 + claude 2；T0=北京周四 23:00
-        claude offhours）。全部经显式 executor 逐一 claim 保证确定性（CN 池只能经
-        executor='qodercn'，claude 经 executor='claude'，codebuddy 经 executor='codebuddy'，
-        AUTO 轮换不保证落某特定主力），返回 13 个 token。"""
+        """真实 API 填满十四满基线（BW-CODEBUDDY-MAIN-S3 + BW-WORKER-WIDGET-20261018-S3：
+        codebuddy deepseek×1 + codebuddy GLM×1（各自独立 1 槽，GLM 需显式当轮额度条件
+        授权）+ zcode×2 + 两内置 Max 各 1 + CN 自定义 Max×2 + 两地区 Flash 各 2 +
+        claude 2；T0=北京周四 23:00 claude offhours）。全部经显式 executor 逐一 claim
+        保证确定性（CN 池只能经 executor='qodercn'，claude 经 executor='claude'，
+        codebuddy 两模型经 executor='codebuddy'，AUTO 轮换不保证落某特定主力），
+        返回 14 个 token。"""
         toks = []
         plan = [('codebuddy', 'deepseek-v4.1-flash', 'codebuddy'),
+                ('codebuddy', 'glm-5.3-flash', 'codebuddy'),
                 ('zcode', 'GLM-5.3', 'zcode'), ('zcode', 'GLM-5.3', 'zcode'),
                 ('qoder', 'Qwen3.8-Max', 'qoder'),
                 ('qodercn', 'Qwen3.8-Max', 'qodercn'),
@@ -210,7 +213,9 @@ class _SpawnMixin(unittest.TestCase):
                                       model=md, workspace=f'C:/mp/base-{i}',
                                       chat_id=f'bc{i}',
                                       stage=f'bs{i}', prompt_sha256=f'{i:x}' * 64,
-                                      executor=ex, now=T0, _preclaim=False)
+                                      executor=ex, now=T0,
+                                      codebuddy_glm_allowed=(md == 'glm-5.3-flash'),
+                                      _preclaim=False)
             self.assertTrue(out['allowed'], out)
             toks.append(out['token'])
         return toks

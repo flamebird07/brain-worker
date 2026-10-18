@@ -1,7 +1,7 @@
 # CodeBuddy Code CLI 本机直连（当前精确模型恢复 + 历史解析档案）
 
-> **当前状态（2026-10-18，BW-CODEBUDDY-GLM-FALLBACK-20261018）：恢复两个精确模型，二者
-> 共用同一物理 CodeBuddy 1 槽、物理总 13 不变。**
+> **当前状态（2026-10-18，BW-CODEBUDDY-GLM-FALLBACK-20261018 + BW-WORKER-WIDGET-20261018-S3）：
+> 恢复两个精确模型，二者不共享名额、各自独立物理 1 槽，物理总 14。**
 > - `codebuddy:deepseek-v4.1-flash`：最高优先主力，无时段门；
 > - `codebuddy:glm-5.3-flash`：仅当轮 DeepSeek 已真实失败且当轮 `summary.json` 带明确
 >   429/额度证据时的低层补位，层序在 ZCode 之后、两区 Qwen3.8-Flash 之前。
@@ -19,12 +19,14 @@
 
 ## 当前正式入口（codebuddy_live，两个精确模型）
 
-- 池与优先级：两个逻辑模型**共用同一物理 `capacity=1`**；`deepseek-v4.1-flash` 为 AUTO
-  最高层，`glm-5.3-flash` 为 ZCode 之后、两区 Flash 之前的条件补位。二者任一
-  `reserved`/`running`/`unknown` 都阻塞另一个，不新增并发。显式 `executor='codebuddy'`
+- 池与优先级：两个逻辑模型**各自独立物理 `capacity=1`、互不占位互斥**（BW-WORKER-WIDGET-
+  20261018-S3 用户 2026-10-18 最新明确；旧「共用同一物理 1 槽」口径作废、仅属历史）；
+  `deepseek-v4.1-flash` 为 AUTO 最高层，`glm-5.3-flash` 为 ZCode 之后、两区 Flash 之前的
+  条件补位。不同工作区两模型可并发各 1 在途；同模型第 2 个
+  `reserved`/`running`/`unknown` 仍拒绝；一个结束只释放自己的槽。显式 `executor='codebuddy'`
   只认这两个精确组合，绝不跨模型回退；GLM 缺当轮证据时返回
-  `codebuddy_quota_condition_not_met`。总配置 13；BW-CUSTOM-MAX-RESUME-20261018-S1 已解除
-  CN 自定义 Max 暂停，授权可新派上限恢复 13（自定义 2 槽、不新增槽；历史暂停期上限 11 属
+  `codebuddy_quota_condition_not_met`。总配置 14；BW-CUSTOM-MAX-RESUME-20261018-S1 已解除
+  CN 自定义 Max 暂停（自定义 2 槽；历史暂停期上限 11 属
   当时状态）。Max 层内自定义先于两内置。
 - 额度条件：GLM 只有在授权集合包含它、**本轮** DeepSeek 在 `round_failed_candidates` 中，
   且 `--codebuddy-quota-evidence` / authorization JSON 的 `codebuddy_quota_evidence` 指向
