@@ -17,13 +17,18 @@ BW-WORKER-WIDGET-20261018-S2 边界（必须遵守）：
 - Luna（`luna:native`）为可选外援行：无上限、不计入 14、不套本机 child PID 探针。
 - 界面不显示 token、argv、prompt、原始错误正文或任何秘密；`--once` 输出的 JSON
   同样只含脱敏后的状态字段。
+- 空闲自动关机（BW-WIDGET-IDLE-20261018-S2）：默认不勾选、不持久化；勾选后连续
+  30 分钟“有效空闲”才由 GUI 路径经 finalize 复核触发系统既有
+  `shutdown.exe /s /t 0`（不加 /f、不重启）；import/--once/未勾选/关闭绝不触发。
 """
 import argparse
 import json
 import queue
 import sqlite3
+import subprocess
 import sys
 import threading
+import time
 from datetime import datetime
 from pathlib import Path
 
@@ -191,6 +196,18 @@ def read_snapshot(store_path=None, *, now=None, pid_probe=None):
                 limits[r['pool_key']] = dict(r)
         except sqlite3.Error:
             limits = {}
+        # 空闲关机用的最小活动签名（同一只读事务内）：仅 rowid/计数/最近时间戳，
+        # 绝无 token/prompt/错误正文。两个刷新间隔内开始又结束的短调用会改变
+        # count/max_rowid/max_ended，计时器据此重置，不能只看 active==0。
+        act = conn.execute(
+            'SELECT MAX(rowid) AS max_rowid, COUNT(*) AS cnt, '
+            'MAX(reserved_at_utc) AS max_reserved, '
+            'MAX(started_at_utc) AS max_started, '
+            'MAX(ended_at_utc) AS max_ended FROM attempts').fetchone()
+        activity = {'max_rowid': act['max_rowid'] or 0, 'count': act['cnt'],
+                    'max_reserved': act['max_reserved'],
+                    'max_started': act['max_started'],
+                    'max_ended': act['max_ended']}
     except sqlite3.Error as exc:
         return _failure(path, now, 'read_failed', str(exc))
     finally:
@@ -258,7 +275,7 @@ def read_snapshot(store_path=None, *, now=None, pid_probe=None):
     return {'ok': True, 'store': str(path), 'now_utc': dp._iso(now),
             'domestic_total_capacity': dp.DOMESTIC_TOTAL_CAPACITY,
             'domestic_active': domestic_active, 'luna_active': luna_active,
-            'retired_active': retired_active, 'rows': rows}
+            'retired_active': retired_active, 'activity': activity, 'rows': rows}
 
 
 def snapshot_to_json_str(snap):
@@ -277,6 +294,192 @@ def format_duration(seconds):
     if m:
         return f'{m}分{s:02d}秒'
     return f'{s}秒'
+
+
+def _format_countdown(seconds):
+    seconds = max(0, int(seconds or 0))
+    m, s = divmod(seconds, 60)
+    return f'{m:02d}:{s:02d}'
+
+
+# ------------------------------------------------------------------ 空闲自动关机
+IDLE_SHUTDOWN_SECONDS = 1800
+_MAX_SNAPSHOT_AGE_SECONDS = 60.0
+_ACTIVITY_KEYS = ('max_rowid', 'count', 'max_reserved', 'max_started', 'max_ended')
+
+
+def _system_shutdown():
+    """真实关机动作：只允许 GUI 路径在用户勾选且连续 30 分钟有效空闲、finalize
+    复核通过后调用；使用系统既有 shutdown.exe /s /t 0——不加 /f、不重启、不执行
+    任何业务动作、不动别人安排的关机。测试一律注入 mock，绝不真跑。"""
+    subprocess.run(['shutdown.exe', '/s', '/t', '0'], check=True)
+
+
+class IdleShutdownController:
+    """纯控制器：monotonic 时钟、关机回调、UTC 当前时间均可注入，自身不碰 GUI/DB。
+
+    语义（BW-WIDGET-IDLE-20261018-S2）：
+    - 默认停用、不持久化；set_enabled(True) 从当刻开始计时，False 立即取消。
+    - 只有“有效空闲”计时：快照 ok、字段齐全、未过期、无任何在途（国内/Luna/
+      退休池的 reserved/running/unknown 都算在途，含 PID 身份待核），且活动签名
+      与上次观察一致；签名变化=两个刷新间隔内有过新调用（含开始又结束的短任务），
+      立即重新计满 30 分钟。
+    - 读取失败/过期/字段缺失 → 清零暂停；恢复后必须重新完整 30 分钟，绝不用旧
+      绿灯关机。计时用 monotonic，系统时钟跳变不会提前触发。
+    - 到期（due）不直接关机：调用方必须同步取得一份新只读快照交 finalize() 复核
+      （无在途且签名未变）才触发；成功后至多一次；失败置 failed 并自动停用
+      （解除勾选），绝不每个刷新周期重试。
+    """
+
+    def __init__(self, *, idle_seconds=IDLE_SHUTDOWN_SECONDS, clock=time.monotonic,
+                 shutdown=None, utcnow=None,
+                 max_snapshot_age=_MAX_SNAPSHOT_AGE_SECONDS):
+        self._idle = float(idle_seconds)
+        self._clock = clock
+        self._shutdown = shutdown if shutdown is not None else _system_shutdown
+        self._utcnow = utcnow or dp.utcnow
+        self._max_age = float(max_snapshot_age)
+        self.enabled = False
+        self.due = False
+        self.triggered = False
+        self.failed = False
+        self._armed_at = None
+        self._last_activity = None
+        self._pause_reason = None
+
+    # -- 用户勾选/取消
+    def set_enabled(self, on):
+        """勾选=从当刻重新开始计时；取消=立即取消计划。triggered 后绝不再武装
+        （成功至多一次）；failed 后重新勾选视为用户新一轮授权，清除失败标记。"""
+        self.enabled = bool(on) and not self.triggered
+        self.failed = False
+        self.due = False
+        self._armed_at = None
+        self._last_activity = None
+        self._pause_reason = None
+
+    # -- 快照分类
+    def _snapshot_stale(self, snap):
+        stamp = _parse_iso(snap.get('now_utc'))
+        if stamp is None:
+            return True
+        now = self._utcnow()
+        if stamp.tzinfo is None:
+            stamp = stamp.replace(tzinfo=now.tzinfo)
+        return abs((now - stamp).total_seconds()) > self._max_age
+
+    def _classify(self, snap):
+        if not isinstance(snap, dict) or not snap.get('ok'):
+            return 'read_failed', None
+        try:
+            counts = (int(snap['domestic_active']), int(snap['luna_active']),
+                      int(snap['retired_active']))
+        except (KeyError, TypeError, ValueError):
+            return 'fields_missing', None
+        activity = snap.get('activity')
+        if (not isinstance(activity, dict)
+                or any(k not in activity for k in _ACTIVITY_KEYS)):
+            return 'fields_missing', None
+        if self._snapshot_stale(snap):
+            return 'stale', activity
+        if any(c > 0 for c in counts):
+            return 'busy', activity
+        return 'idle', activity
+
+    # -- 每个刷新周期喂一份最新快照
+    def observe(self, snap):
+        if not self.enabled or self.triggered or self.failed:
+            return
+        self.due = False
+        verdict, activity = self._classify(snap)
+        if verdict != 'idle':
+            # 在途/读取失败/过期/字段缺失：清零暂停，绝不用旧绿灯继续倒计时。
+            self._armed_at = None
+            self._pause_reason = verdict
+            if verdict == 'busy':
+                self._last_activity = activity
+            else:
+                self._last_activity = None
+            return
+        self._pause_reason = None
+        if activity != self._last_activity:
+            # 首份有效快照或签名变化（含两刷新间隔内开始又结束的短调用）→ 重新计时。
+            self._last_activity = activity
+            self._armed_at = self._clock()
+            return
+        if self._armed_at is None:
+            self._armed_at = self._clock()
+        if self._clock() - self._armed_at >= self._idle:
+            self.due = True
+
+    def remaining(self):
+        """剩余秒数（int≥0）；未启用/已触发/已失败返回 None，暂停期间返回整段时长。"""
+        if not self.enabled or self.triggered or self.failed:
+            return None
+        if self._armed_at is None:
+            return int(self._idle)
+        return max(0, int(self._idle - (self._clock() - self._armed_at)))
+
+    # -- 到期后的最终复核 + 唯一触发点
+    def finalize(self, final_snap):
+        """触发前同步复核一份新只读快照：必须 ok、字段齐、未过期、无在途且活动
+        签名与到期时刻一致。返回 'shutdown'（指令已发出，至多一次）/
+        'failed'（系统动作失败，已停用且不重试）/ 'aborted'（复核未过，重新计时）。"""
+        if not self.enabled or not self.due or self.triggered or self.failed:
+            return 'aborted'
+        verdict, activity = self._classify(final_snap)
+        if verdict != 'idle' or activity != self._last_activity:
+            self.due = False
+            self._armed_at = None
+            self._pause_reason = verdict if verdict != 'idle' else 'signature_changed'
+            if activity is not None:
+                self._last_activity = activity
+            return 'aborted'
+        try:
+            self._shutdown()
+        except Exception as exc:
+            self.failed = True
+            self.enabled = False
+            self.due = False
+            self._armed_at = None
+            self._pause_reason = 'shutdown_failed'
+            self.error_text = f'自动关机执行失败（{type(exc).__name__}）· 已停用 · 不自动重试'
+            return 'failed'
+        self.triggered = True
+        self.enabled = False
+        self.due = False
+        return 'shutdown'
+
+    def status(self):
+        return {'enabled': self.enabled, 'due': self.due,
+                'triggered': self.triggered, 'failed': self.failed,
+                'remaining': self.remaining(), 'pause_reason': self._pause_reason}
+
+
+_IDLE_PAUSE_TEXT = {
+    'busy': '有任务在途 · 结束后重新计30分',
+    'read_failed': '读取失败 · 恢复后重新计30分',
+    'stale': '快照过期 · 重新计时',
+    'fields_missing': '快照字段缺失 · 重新计时',
+    'signature_changed': '检测到新调用 · 重新计30分',
+    'shutdown_failed': '',
+}
+
+
+def idle_status_text(st):
+    """勾选区的简短普通话状态文案（不含错误正文/秘密）。"""
+    if st.get('triggered'):
+        return '关机指令已发出'
+    if st.get('failed'):
+        return '自动关机执行失败 · 已停用 · 不自动重试'
+    if not st.get('enabled'):
+        return '未开启 · 勾选后连续空闲30分钟自动关机'
+    if st.get('due'):
+        return '已满30分钟 · 正在最终复核'
+    reason = st.get('pause_reason')
+    if reason:
+        return _IDLE_PAUSE_TEXT.get(reason, '暂停计时 · 恢复后重新计30分')
+    return f"空闲中 · 剩余 {_format_countdown(st.get('remaining'))} 关机"
 
 
 def detail_text(row):
@@ -455,6 +658,35 @@ def run_gui(store_path=None, interval=2.0):
                            anchor='w', justify='left')
     summary_lbl.pack(fill='x', padx=10, pady=(6, 2))
 
+    # --- 空闲自动关机（BW-WIDGET-IDLE-20261018-S2）：默认不勾选、不持久化，
+    # 关闭/重启浮窗即停用；收起仍计时，展开可取消。
+    idle_ctl = IdleShutdownController(shutdown=_system_shutdown)
+    shutdown_var = tk.BooleanVar(value=False)
+    idle_frame = tk.Frame(body, bg=_BG)
+    idle_frame.pack(fill='x', padx=10, pady=(0, 2))
+    idle_var = tk.StringVar(value='')
+    idle_lbl = tk.Label(idle_frame, textvariable=idle_var, bg=_BG, fg=_SUB, font=font,
+                        anchor='e')
+    idle_lbl.pack(side='right')
+    idle_chk = tk.Checkbutton(idle_frame, text='空闲30分钟自动关机', variable=shutdown_var,
+                              bg=_BG, fg=_SUB, font=font, selectcolor=_PANEL,
+                              activebackground=_BG, activeforeground=_FG,
+                              anchor='w', cursor='hand2')
+    idle_chk.pack(side='left')
+
+    def _on_idle_toggle():
+        idle_ctl.set_enabled(shutdown_var.get())
+        _refresh_idle_text()
+
+    idle_chk.configure(command=_on_idle_toggle)
+
+    def _refresh_idle_text():
+        st = idle_ctl.status()
+        idle_var.set(idle_status_text(st))
+        idle_lbl.configure(fg=_STATE_COLORS['read_failed'] if st['failed'] else _SUB)
+
+    _refresh_idle_text()
+
     rows_frame = tk.Frame(body, bg=_PANEL)
     rows_frame.pack(fill='x', padx=8, pady=4)
     row_widgets = {}
@@ -539,7 +771,23 @@ def run_gui(store_path=None, interval=2.0):
     btn_collapse.configure(command=_toggle_collapse)
     btn_pin.configure(command=_toggle_pin)
 
-    def _render(snap):
+    mini_base = {'full': '牛马 —', 'short': '牛马 —'}
+
+    def _refresh_mini():
+        # 收起条关机标记：有后缀时用短基文本，保证 230 宽内 展开/关闭 按钮不被挤裁。
+        st = idle_ctl.status()
+        if st['triggered']:
+            suffix = ' 关机已发'
+        elif st['failed']:
+            suffix = ' 关机失败'
+        elif st['enabled']:
+            suffix = f" 关机{_format_countdown(st['remaining'])}"
+        else:
+            suffix = ''
+        base = mini_base['short'] if suffix else mini_base['full']
+        mini_lbl.configure(text=base + suffix)
+
+    def _render_snapshot(snap):
         if not snap.get('ok'):
             code = snap.get('error_code', 'read_failed')
             summary_var.set(f'读取失败 · 待核（{code}） · 下轮自动重试')
@@ -547,7 +795,8 @@ def run_gui(store_path=None, interval=2.0):
             for w in row_widgets.values():
                 w['state'].configure(text='待核', fg=_STATE_COLORS['read_failed'])
                 w['occ'].configure(text='—', fg=_SUB)
-            mini_lbl.configure(text='牛马 读取失败·待核')
+            mini_base['full'] = '牛马 读取失败·待核'
+            mini_base['short'] = '牛马 待核'
             selected['rows'] = []
             detail_var.set('本地只读快照暂不可用（缺库/锁定/解析失败均如实待核，'
                            '绝不显示成空闲）。')
@@ -560,7 +809,7 @@ def run_gui(store_path=None, interval=2.0):
         summary_var.set(f"总占用 {active}/{total} · Luna {snap['luna_active']}"
                         f"{extra} · 更新 {stamp}")
         summary_lbl.configure(fg=_SUB if snap['ok'] else _STATE_COLORS['read_failed'])
-        mini_lbl.configure(text=f'牛马 {active}/{total}')
+        mini_base['full'] = mini_base['short'] = f'牛马 {active}/{total}'
         for row in snap['rows']:
             w = row_widgets[row['pool_key']]
             color = _STATE_COLORS[row['state']]
@@ -575,6 +824,17 @@ def run_gui(store_path=None, interval=2.0):
             w['occ'].configure(text=occ)
         if selected['pk']:
             _select(selected['pk'])
+
+    def _render(snap):
+        _render_snapshot(snap)
+        # 空闲计时只消费快照；真实关机动作仅在勾选到期且 finalize 同步复核
+        # 一份新只读快照（无在途、签名未变）通过后由此 GUI 路径发出。
+        idle_ctl.observe(snap)
+        if idle_ctl.due:
+            if idle_ctl.finalize(read_snapshot(store_path)) == 'failed':
+                shutdown_var.set(False)  # 显著失败并解除勾选，绝不逐轮重试
+        _refresh_idle_text()
+        _refresh_mini()
 
     q = poller._q
 

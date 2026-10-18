@@ -8,6 +8,10 @@ BW-WORKER-WIDGET-20261018-S3：两 CodeBuddy 模型各自独立 1 槽（总 14�
 状态绝不只信 DB running——死 PID/复用/探测未知/未绑定的 running 主行必须显著待核
 （待核优先，不被同池真 running 掩盖），只有匹配活 PID 才显示运行中；reserved 无子
 进程仍已预留；Luna 原生不套本机探针。
+BW-WIDGET-IDLE-20261018-S2：空闲自动关机——纯控制器注入 monotonic 时钟与 mock
+关机回调；真实 shutdown.exe 命令仅以 mock subprocess 验证参数，绝不真跑；覆盖默认
+关闭/1799-1800 边界/取消/在途与 Luna/退休占位/短调用漏采样/读取错误与陈旧快照/
+恢复重新 30 分/最终复核突然来任务/只触发一次/系统动作失败不循环。
 """
 import io
 import json
@@ -137,9 +141,10 @@ class TestModuleDiscipline(_WidgetBase):
             self._insert(conn, 'z1', dp.ZCODE_POOL_KEY, 'running',
                          started=T0 - timedelta(seconds=30))
         buf = io.StringIO()
-        with redirect_stdout(buf):
+        with mock.patch.object(wsw.subprocess, 'run') as m_run, redirect_stdout(buf):
             code = wsw.main(['--store', self.store, '--once'])
         self.assertEqual(code, 0)
+        m_run.assert_not_called()  # --once 绝不触发任何系统动作
         text = buf.getvalue()
         snap = json.loads(text)
         self.assertTrue(snap['ok'])
@@ -489,6 +494,327 @@ class TestGuiHelpers(_WidgetBase):
         self.assertEqual(wsw.format_duration(59), '59秒')
         self.assertEqual(wsw.format_duration(90), '1分30秒')
         self.assertEqual(wsw.format_duration(3720), '1时02分')
+
+
+# ---------------------------------------------------------------- 空闲自动关机
+class _FakeClock:
+    def __init__(self, start=100000.0):
+        self.t = start
+
+    def __call__(self):
+        return self.t
+
+    def advance(self, seconds):
+        self.t += float(seconds)
+
+
+def _activity(rowid=5, count=5, ended='2026-10-08T14:30:00+00:00'):
+    return {'max_rowid': rowid, 'count': count,
+            'max_reserved': '2026-10-08T14:00:00+00:00',
+            'max_started': '2026-10-08T14:01:00+00:00',
+            'max_ended': ended}
+
+
+def _snap(activity=None, now=None, **over):
+    s = {'ok': True, 'store': 'mem', 'now_utc': _iso(now or T0),
+         'domestic_active': 0, 'luna_active': 0, 'retired_active': 0,
+         'rows': [],
+         'activity': _activity() if activity is None else activity}
+    s.update(over)
+    return s
+
+
+class TestActivitySignature(_WidgetBase):
+
+    def test_signature_changes_on_short_task_between_polls(self):
+        with closing(self._conn()) as conn:
+            self._insert(conn, 'z1', dp.ZCODE_POOL_KEY, 'finished',
+                         reserved=T0 - timedelta(minutes=5),
+                         started=T0 - timedelta(minutes=4),
+                         ended=T0 - timedelta(minutes=3),
+                         terminal='finished', success=1)
+        snap1 = self._snap()
+        act1 = snap1['activity']
+        self.assertTrue(act1['max_rowid'] >= 1)
+        self.assertEqual(act1['count'], 1)
+        # 两个刷新间隔内开始又结束的短调用：active 仍为 0，但签名必须变化。
+        with closing(self._conn()) as conn:
+            self._insert(conn, 'z2', dp.ZCODE_POOL_KEY, 'finished',
+                         reserved=T0 - timedelta(seconds=90),
+                         started=T0 - timedelta(seconds=80),
+                         ended=T0 - timedelta(seconds=70),
+                         terminal='finished', success=1)
+        snap2 = self._snap()
+        self.assertEqual(snap2['domestic_active'], 0)
+        self.assertNotEqual(snap2['activity'], act1)
+        self.assertEqual(snap2['activity']['count'], 2)
+
+    def test_signature_has_no_secrets_and_failure_has_none(self):
+        with closing(self._conn()) as conn:
+            self._insert(conn, 'SECRET-TOKEN-XYZ', dp.ZCODE_POOL_KEY, 'running',
+                         started=T0)
+        snap = self._snap()
+        text = json.dumps(snap['activity'], ensure_ascii=False)
+        self.assertNotIn('SECRET-TOKEN-XYZ', text)
+        self.assertNotIn('token', text)
+        broken = self.base / 'broken.sqlite3'
+        broken.write_bytes(b'not a database at all' * 4)
+        fail = self._snap(store=str(broken))
+        self.assertFalse(fail['ok'])
+        self.assertNotIn('activity', fail)  # 失败快照绝不携带可当绿灯的签名
+
+
+class TestIdleShutdownController(unittest.TestCase):
+
+    def setUp(self):
+        self.clock = _FakeClock()
+        self.calls = []
+        self.ctl = self._ctl()
+
+    def _ctl(self, shutdown=None):
+        def _rec():
+            self.calls.append(self.clock())
+        return wsw.IdleShutdownController(
+            clock=self.clock, shutdown=_rec if shutdown is None else shutdown,
+            utcnow=lambda: T0)
+
+    def _arm(self, ctl=None):
+        ctl = ctl or self.ctl
+        ctl.set_enabled(True)
+        ctl.observe(_snap())
+        return ctl
+
+    def test_default_disabled_never_triggers(self):
+        self.assertFalse(self.ctl.enabled)
+        for _ in range(120):  # 远超 30 分钟的空闲快照
+            self.clock.advance(120)
+            self.ctl.observe(_snap())
+        self.assertFalse(self.ctl.due)
+        self.assertIsNone(self.ctl.remaining())
+        self.assertEqual(self.ctl.finalize(_snap()), 'aborted')
+        self.assertEqual(self.calls, [])
+        self.assertNotIn('tkinter', sys.modules)  # 未启动 GUI
+
+    def test_boundary_1799_no_trigger_1800_triggers_once(self):
+        self._arm()
+        self.assertEqual(self.ctl.remaining(), 1800)
+        self.clock.advance(1799)
+        self.ctl.observe(_snap())
+        self.assertFalse(self.ctl.due)
+        self.assertEqual(self.ctl.remaining(), 1)
+        self.clock.advance(1)
+        self.ctl.observe(_snap())
+        self.assertTrue(self.ctl.due)
+        self.assertEqual(self.ctl.remaining(), 0)
+        self.assertEqual(self.ctl.finalize(_snap()), 'shutdown')
+        self.assertEqual(len(self.calls), 1)  # 成功至多一次
+        self.assertTrue(self.ctl.triggered)
+        # 触发后即使重新勾选/继续喂空闲快照也绝不再触发。
+        self.ctl.set_enabled(True)
+        self.assertFalse(self.ctl.enabled)
+        self.clock.advance(7200)
+        self.ctl.observe(_snap())
+        self.assertEqual(self.ctl.finalize(_snap()), 'aborted')
+        self.assertEqual(len(self.calls), 1)
+
+    def test_uncheck_cancels_immediately(self):
+        self._arm()
+        self.clock.advance(1700)
+        self.ctl.observe(_snap())
+        self.ctl.set_enabled(False)
+        self.clock.advance(3600)
+        self.ctl.observe(_snap())
+        self.assertFalse(self.ctl.due)
+        self.assertEqual(self.ctl.finalize(_snap()), 'aborted')
+        self.assertEqual(self.calls, [])
+        self.assertIsNone(self.ctl.remaining())
+
+    def test_in_flight_luna_retired_all_block_and_restart_full_30min(self):
+        for busy in ({'domestic_active': 1},   # reserved/running/unknown 均计入在途
+                     {'luna_active': 1}, {'retired_active': 1}):
+            with self.subTest(busy=busy):
+                ctl = self._arm()
+                self.clock.advance(1500)
+                ctl.observe(_snap(**busy))
+                self.assertFalse(ctl.due)
+                self.assertEqual(ctl.status()['pause_reason'], 'busy')
+                self.clock.advance(100)
+                ctl.observe(_snap())  # 活任务结束 → 重新计满 30 分钟
+                self.clock.advance(1799)
+                ctl.observe(_snap())
+                self.assertFalse(ctl.due)
+                self.clock.advance(1)
+                ctl.observe(_snap())
+                self.assertTrue(ctl.due)
+
+    def test_short_task_missed_between_polls_resets_timer(self):
+        ctl = self._arm()
+        self.clock.advance(100)
+        # 短任务在两个刷新间隔内开始又结束：active==0 但活动签名已变 → 重置。
+        ctl.observe(_snap(activity=_activity(rowid=6, count=6,
+                                             ended='2026-10-08T14:40:00+00:00')))
+        self.assertFalse(ctl.due)
+        self.clock.advance(1700)  # 距勾选已 1800 秒，但距重置只有 1700
+        ctl.observe(_snap(activity=_activity(rowid=6, count=6,
+                                             ended='2026-10-08T14:40:00+00:00')))
+        self.assertFalse(ctl.due)
+        self.clock.advance(100)
+        ctl.observe(_snap(activity=_activity(rowid=6, count=6,
+                                             ended='2026-10-08T14:40:00+00:00')))
+        self.assertTrue(ctl.due)
+
+    def test_read_error_stale_and_missing_fields_reset_and_never_use_old_green(self):
+        ctl = self._arm()
+        self.clock.advance(1500)
+        ctl.observe({'ok': False, 'error_code': 'read_failed', 'rows': [],
+                     'domestic_active': None, 'luna_active': None})
+        self.assertFalse(ctl.due)
+        self.assertEqual(ctl.status()['pause_reason'], 'read_failed')
+        # 恢复后必须重新完整 30 分钟，绝不接着旧计时关机。
+        self.clock.advance(400)   # 距勾选已 1900 秒
+        ctl.observe(_snap())
+        self.assertFalse(ctl.due)
+        self.clock.advance(1799)
+        ctl.observe(_snap())
+        self.assertFalse(ctl.due)
+        self.clock.advance(1)
+        ctl.observe(_snap())
+        self.assertTrue(ctl.due)
+        # 陈旧快照（now_utc 远超允许时差）→ 暂停重新计时。
+        ctl2 = self._arm(self._ctl())
+        self.clock.advance(600)
+        ctl2.observe(_snap(now=T0 - timedelta(seconds=121)))
+        self.assertFalse(ctl2.due)
+        self.assertEqual(ctl2.status()['pause_reason'], 'stale')
+        # 字段缺失（无活动签名/无占用计数）→ 绝不当空闲。
+        ctl3 = self._arm(self._ctl())
+        no_act = _snap()
+        del no_act['activity']
+        ctl3.observe(no_act)
+        self.assertEqual(ctl3.status()['pause_reason'], 'fields_missing')
+        no_cnt = _snap()
+        del no_cnt['retired_active']
+        ctl3.observe(no_cnt)
+        self.assertFalse(ctl3.due)
+        self.assertEqual(self.calls, [])
+
+    def test_wall_clock_jump_does_not_trigger_early(self):
+        # 计时只认注入的 monotonic 时钟；系统时钟跳变（快照与 utcnow 同步前跳）
+        # 不得提前触发。
+        jumped = [T0]
+        ctl = wsw.IdleShutdownController(clock=self.clock,
+                                         shutdown=lambda: self.calls.append(1),
+                                         utcnow=lambda: jumped[0])
+        ctl.set_enabled(True)
+        ctl.observe(_snap(now=jumped[0]))
+        jumped[0] = T0 + timedelta(hours=6)  # 系统时钟前跳 6 小时
+        self.clock.advance(60)               # monotonic 只过了 60 秒
+        ctl.observe(_snap(now=jumped[0]))
+        self.assertFalse(ctl.due)
+        self.assertEqual(self.calls, [])
+
+    def test_finalize_recheck_sees_new_task_and_aborts(self):
+        ctl = self._arm()
+        self.clock.advance(1800)
+        ctl.observe(_snap())
+        self.assertTrue(ctl.due)
+        # 最后复核时突然来任务 → 放弃触发并重新计时。
+        self.assertEqual(ctl.finalize(_snap(domestic_active=1)), 'aborted')
+        self.assertEqual(self.calls, [])
+        self.assertFalse(ctl.due)
+        ctl.observe(_snap(domestic_active=1))
+        self.clock.advance(10)
+        ctl.observe(_snap())
+        self.clock.advance(1799)
+        ctl.observe(_snap())
+        self.assertFalse(ctl.due)
+        self.clock.advance(1)
+        ctl.observe(_snap())
+        self.assertTrue(ctl.due)
+        self.assertEqual(ctl.finalize(_snap()), 'shutdown')
+        self.assertEqual(len(self.calls), 1)
+
+    def test_finalize_recheck_signature_changed_aborts(self):
+        ctl = self._arm()
+        self.clock.advance(1800)
+        ctl.observe(_snap())
+        self.assertTrue(ctl.due)
+        changed = _snap(activity=_activity(rowid=9, count=9,
+                                           ended='2026-10-08T15:10:00+00:00'))
+        self.assertEqual(ctl.finalize(changed), 'aborted')
+        self.assertEqual(self.calls, [])
+        self.assertEqual(ctl.status()['pause_reason'], 'signature_changed')
+
+    def test_finalize_recheck_read_failure_aborts(self):
+        ctl = self._arm()
+        self.clock.advance(1800)
+        ctl.observe(_snap())
+        self.assertTrue(ctl.due)
+        self.assertEqual(ctl.finalize({'ok': False, 'error_code': 'read_failed'}),
+                         'aborted')
+        self.assertEqual(self.calls, [])
+        self.assertFalse(ctl.due)
+
+    def test_shutdown_failure_shows_and_disables_without_retry_loop(self):
+        attempts = []
+
+        def boom():
+            attempts.append(1)
+            raise OSError('shutdown refused')
+
+        ctl = wsw.IdleShutdownController(clock=self.clock, shutdown=boom,
+                                         utcnow=lambda: T0)
+        ctl.set_enabled(True)
+        ctl.observe(_snap())
+        self.clock.advance(1800)
+        ctl.observe(_snap())
+        self.assertTrue(ctl.due)
+        self.assertEqual(ctl.finalize(_snap()), 'failed')
+        self.assertTrue(ctl.failed)
+        self.assertFalse(ctl.enabled)  # 失败即解除勾选
+        st = ctl.status()
+        self.assertTrue(st['failed'])
+        self.assertIn('失败', wsw.idle_status_text(st))
+        # 之后每 2 秒继续喂空闲快照也绝不重试。
+        for _ in range(10):
+            self.clock.advance(2)
+            ctl.observe(_snap())
+            self.assertEqual(ctl.finalize(_snap()), 'aborted')
+        self.assertEqual(len(attempts), 1)
+        self.assertEqual(self.calls, [])
+
+    def test_status_text_states_are_short_and_no_secrets(self):
+        ctl = self._arm()
+        self.assertIn('剩余 30:00', wsw.idle_status_text(ctl.status()))
+        self.clock.advance(60)
+        ctl.observe(_snap())
+        self.assertIn('剩余 29:00', wsw.idle_status_text(ctl.status()))
+        for text in (wsw.idle_status_text({'enabled': False, 'triggered': False,
+                                           'failed': False, 'due': False,
+                                           'remaining': None,
+                                           'pause_reason': None}),
+                     wsw.idle_status_text({'enabled': False, 'triggered': True,
+                                           'failed': False, 'due': False,
+                                           'remaining': None,
+                                           'pause_reason': None})):
+            self.assertLessEqual(len(text), 24)
+            self.assertNotIn('token', text.lower())
+
+
+class TestRealShutdownCommandMocked(unittest.TestCase):
+
+    def test_system_shutdown_uses_existing_exe_without_force_or_reboot(self):
+        with mock.patch.object(wsw.subprocess, 'run') as m_run:
+            wsw._system_shutdown()
+        m_run.assert_called_once()
+        args, kwargs = m_run.call_args
+        cmd = args[0]
+        self.assertEqual(cmd, ['shutdown.exe', '/s', '/t', '0'])
+        self.assertNotIn('/f', cmd)   # 不强杀
+        self.assertNotIn('/r', cmd)   # 不重启
+        self.assertNotIn('/a', cmd)   # 不动别人安排的关机
+        self.assertFalse(kwargs.get('shell'))
+        self.assertTrue(kwargs.get('check'))
 
 
 if __name__ == '__main__':
