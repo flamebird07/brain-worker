@@ -32,6 +32,7 @@ if str(_SCRIPTS) not in sys.path:
 
 import dispatch_pool as dp  # noqa: E402
 import execution_control as ec  # noqa: E402
+import codebuddy_fallback as cbf  # noqa: E402
 
 SELECTION_MODES = ('auto', 'fixed', 'executor', 'temporary_fallback')
 EXECUTORS = ('auto', 'qoder', 'zcode', dp.CN_RUNTIME, 'claude', dp.CODEBUDDY_RUNTIME)
@@ -263,7 +264,8 @@ def _permission_incompatibility_details(filters, requirements):
 
 
 def _filter_candidates(conn, allowed, zcode_blocked, now, requirements=None,
-                       controlled_file_ok=False, round_failed=None):
+                       controlled_file_ok=False, round_failed=None,
+                       codebuddy_glm_allowed=False):
     """逐候选只读过滤，返回 (通过集合, {pk: 拒绝原因})。
     未授权/权限能力/本轮已试/时段/容量 分开记录。
     `permission_incompatible`（能力冲突）与 `not_authorized`（不在授权集合）分别为可辨
@@ -289,14 +291,21 @@ def _filter_candidates(conn, allowed, zcode_blocked, now, requirements=None,
         if _permission_incompatible(pk, requirements, controlled_file_ok):
             filters[pk] = 'permission_incompatible'
             continue
+        # BW-CODEBUDDY-GLM-FALLBACK-20261018：GLM 需要三条件同时成立——在授权集合内
+        # （外层已保证）、当轮 DeepSeek 真实失败（round_failed）、当轮 summary.json 证据
+        # 复验通过。任一不满足如实标 `codebuddy_quota_condition_not_met`，绝不静默启用，
+        # 也绝不因更高主力的普通授权/历史标记而放宽。
+        if pk == dp.CODEBUDDY_GLM_POOL_KEY and not codebuddy_glm_allowed:
+            filters[pk] = 'codebuddy_quota_condition_not_met'
+            continue
         if pk in failed_this_round:
             filters[pk] = 'already_tried_this_round'
             continue
         if dp._max_window_blocks(pk, now):
             filters[pk] = 'window_closed'
             continue
-        cap = dp.capacity_for(pk)
-        if cap is not None and dp._count_active(conn, pk) >= cap:
+        # CodeBuddy deepseek/GLM 共享同一物理 1 槽：任一在途都让组内两个逻辑 key 都满。
+        if not dp._shared_has_capacity(conn, pk):
             filters[pk] = 'capacity_full'
             continue
         passed.append(pk)
@@ -368,6 +377,9 @@ def plan_stage_selection(authorization, *, previous=None, store_path=None, quota
         'authorization_scope': auth.get('authorization_scope'),
         'allowed_candidates': list(auth.get('allowed_candidates') or []),
         'round_failed_candidates': [],
+        'codebuddy_quota_evidence': None,
+        'codebuddy_glm_allowed': False,
+        'codebuddy_glm_condition': None,
         'fallback_scope': auth.get('fallback_scope'),
         'reselection_due': False,
         'session_reuse_allowed': False,
@@ -435,6 +447,38 @@ def plan_stage_selection(authorization, *, previous=None, store_path=None, quota
     for pk in allowed:
         if not _allowed_candidate(pk):
             return _refuse('unauthorized_candidate', repr(pk))
+
+    # BW-CODEBUDDY-GLM-FALLBACK-20261018：GLM 三条件（授权集合包含 GLM + 当轮 DeepSeek
+    # 已真实失败 + 当轮 summary.json 明确 429/额度证据复验通过）。证据路径只从**本轮**
+    # authorization JSON 读取；缺省 None 即不授权，新轮不会继承旧轮路径/旧 persistent
+    # 标记/旧报告。证据畸形/失败只关闭 GLM，不影响其它主力的正常规划。
+    raw_evidence = auth.get('codebuddy_quota_evidence')
+    if raw_evidence is not None and not isinstance(raw_evidence, str):
+        # 不回显任意嵌套输入（可能夹带敏感内容），只报类型名。
+        return _refuse('invalid_codebuddy_quota_evidence',
+                       type(raw_evidence).__name__)
+    quota_evidence = cbf.verify_quota_evidence(raw_evidence)
+    glm_authorized = dp.CODEBUDDY_GLM_POOL_KEY in allowed
+    glm_deepseek_failed = dp.CODEBUDDY_POOL_KEY in round_failed
+    glm_allowed = bool(glm_authorized and glm_deepseek_failed
+                       and quota_evidence.get('ok'))
+    # 脱敏回执：只有路径/哈希/原因码/分类，不含任何原始错误文本或请求头。
+    receipt['codebuddy_quota_evidence'] = {
+        'provided': raw_evidence is not None,
+        'path': quota_evidence.get('path'),
+        'sha256': quota_evidence.get('sha256'),
+        'ok': bool(quota_evidence.get('ok')),
+        'reason': quota_evidence.get('reason'),
+        'failure_types': list(quota_evidence.get('failure_types') or []),
+        'source': 'current_round_summary_json',
+    }
+    receipt['codebuddy_glm_allowed'] = glm_allowed
+    receipt['codebuddy_glm_condition'] = {
+        'authorized': glm_authorized,
+        'deepseek_failed_this_round': glm_deepseek_failed,
+        'quota_evidence_ok': bool(quota_evidence.get('ok')),
+        'allowed': glm_allowed,
+    }
 
     # 有限字段直接校验（不做通用 schema 框架）
     if mode == 'executor' and auth.get('executor') not in EXECUTORS:
@@ -538,14 +582,19 @@ def plan_stage_selection(authorization, *, previous=None, store_path=None, quota
         # executor 限定用 dp._scope_allowed_candidates 给出的本地区集合交集，绝不跨区。
         if eff_mode == 'executor':
             local = set(dp._scope_allowed_candidates(
-                {'executor': eff_auth.get('executor')}, zcode_blocked))
+                {'executor': eff_auth.get('executor')}, zcode_blocked,
+                codebuddy_glm_allowed=glm_allowed))
             eff_allowed = [k for k in eff_allowed if k in local]
             if not eff_allowed:
                 return _refuse('no_eligible_candidate')
 
+        if isinstance(receipt.get('codebuddy_glm_condition'), dict):
+            receipt['codebuddy_glm_condition']['effective_authorized'] = bool(
+                dp.CODEBUDDY_GLM_POOL_KEY in set(eff_allowed))
         passed, filters = _filter_candidates(conn, eff_allowed, zcode_blocked, now,
                                              requirements, controlled_file_ok,
-                                             round_failed=round_failed)
+                                             round_failed=round_failed,
+                                             codebuddy_glm_allowed=glm_allowed)
         receipt['candidate_filters'] = _per_candidate_view(eff_allowed, filters)
         receipt['permission_incompatibility_details'] = _permission_incompatibility_details(
             receipt['candidate_filters'], requirements)

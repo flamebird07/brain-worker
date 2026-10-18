@@ -1,9 +1,14 @@
 """Production direct transport for the reactivated standalone CodeBuddy CLI.
 
-BW-CODEBUDDY-MAIN-S3：这是**唯一**允许对新 CodeBuddy 模型执行正式 Popen 的生产入口，且**只**
-服务一个精确组合 —— `codebuddy` 运行时 + `deepseek-v4.1-flash` 模型（界面名 Deepseek-V4.1-Flash）。
-其它 CodeBuddy 旧模型（含旧 GLM）与 WorkBuddy 一律由 `codebuddy_direct.main()` 的
-`manual_relay_only` 拒绝路径在**任何副作用之前**挡下，绝不进入本模块。
+BW-CODEBUDDY-MAIN-S3 / BW-CODEBUDDY-GLM-FALLBACK-20261018：这是**唯一**允许对
+CodeBuddy 精确模型执行正式 Popen 的生产入口，且只服务两个组合 ——
+`codebuddy` + `deepseek-v4.1-flash`（界面名 Deepseek-V4.1-Flash，最高优先主力）；
+`codebuddy` + `glm-5.3-flash`（界面名 GLM-5.3-Flash，**仅当轮明确 DeepSeek 限额证据成立**
+时的低层补位，与 deepseek 共用同一物理 CodeBuddy 1 槽）。其它 CodeBuddy 旧模型（含其它
+旧 GLM 组合）与 WorkBuddy 一律由 `codebuddy_direct.main()` 的 `manual_relay_only` 拒绝路径
+在**任何副作用之前**挡下，绝不进入本模块。GLM 还必须在读取用户私有配置、创建 outdir、
+容量认领或 Popen 之前，由 `codebuddy_fallback.verify_quota_evidence` 复验当轮 summary.json；
+缺证据/普通失败/认证/网络/权限/成功正文里的 429 字样一律拒绝，零副作用。
 
 设计边界（严格对齐任务政策，不新增服务/库/配置系统）：
 - 复用 `codebuddy_direct` 已保留的纯函数：`build_argv` / `parse_stream` /
@@ -58,10 +63,13 @@ import dispatch_pool as dp  # 共享原子容量池（同目录，标准库）
 import execution_control as ec  # 控制面预检（同目录）
 import prompt_contract as pc  # 三入口共享九节契约（同目录）
 import codebuddy_direct as cb  # 已保留的纯解析/argv/权限/失败事实函数（同目录）
+import codebuddy_fallback as cbf  # 当轮明确 429/额度证据只读复验（同目录）
 
 RUNTIME = 'codebuddy'
-MODEL = 'deepseek-v4.1-flash'  # 唯一被恢复的精确模型（界面名 Deepseek-V4.1-Flash）
-POOL_KEY = f'{RUNTIME}:{MODEL}'
+MODEL = 'deepseek-v4.1-flash'  # 默认/最高优先模型（界面名 Deepseek-V4.1-Flash）
+GLM_MODEL = 'glm-5.3-flash'    # 仅额度条件成立时的低层补位（界面名 GLM-5.3-Flash）
+MODELS = (MODEL, GLM_MODEL)
+POOL_KEY = dp.pool_key(RUNTIME, MODEL)  # 兼容默认；真实 pool_key 始终按 model 计算
 DEFAULT_CONFIG = cb.DEFAULT_CONFIG
 
 # 普通新派发**不设**默认/最长墙钟限制：只有调用方显式给出正数 timeout 才生效；
@@ -70,6 +78,20 @@ DEFAULT_CONFIG = cb.DEFAULT_CONFIG
 
 def _sha(data: bytes) -> str:
     return hashlib.sha256(data).hexdigest()
+
+
+def _evidence_summary(verified) -> dict:
+    """把证据复验结果压缩为脱敏回执（路径/哈希/原因码/分类）；绝不回显原始错误文本、
+    Cookie、请求头、密钥或令牌。"""
+    verified = verified if isinstance(verified, dict) else {}
+    return {'provided': bool(verified.get('path')),
+            'path': verified.get('path'),
+            'sha256': verified.get('sha256'),
+            'ok': bool(verified.get('ok')),
+            'reason': verified.get('reason'),
+            'failure_types': list(verified.get('failure_types') or []),
+            'source': 'current_round_summary_json',
+            'raw_error_text_included': False}
 
 
 def execution_evidence(parsed: dict) -> dict:
@@ -132,13 +154,15 @@ def run(cfg, *, workspace, prompt_file, out_dir, stage, task_id, model, tools_it
         allowed_tools=None, disallowed_tools=None, session_id=None, prompt_sha256=None,
         claim_token=None, now=None, popen_factory=subprocess.Popen, environ=None,
         dispatch_store=None, child_prober=None, bind_child_pid=True, plan=None,
-        active_tasks=None, timeout_seconds=None) -> dict:
+        active_tasks=None, timeout_seconds=None, codebuddy_quota_evidence=None) -> dict:
     """正式 CodeBuddy 传输：模型硬门 → outdir/argv/权限/预检 → 容量认领 → Popen（绑定子 PID
     + 创建）→ 解析/留证 → 真实终态释放/unknown 保留。任一前置失败零 Popen、零占位泄漏。
     `timeout_seconds=None`（缺省）表示不设墙钟限制；显式值必须为正数，否则在创建目录/认领
     之前诚实拒绝。"""
     clock_injected = now is not None
     now = now or dp.utcnow()
+    # 真实 pool_key 始终由本轮 runtime:model 计算，绝不硬编码为 deepseek。
+    pool_key = dp.pool_key(RUNTIME, model)
 
     # (0a) 显式超时只接受正数；<=0 诚实拒绝且零副作用（不建目录、不认领、不 Popen）。
     if timeout_seconds is not None and timeout_seconds <= 0:
@@ -148,14 +172,35 @@ def run(cfg, *, workspace, prompt_file, out_dir, stage, task_id, model, tools_it
                             f'explicitly supplied, got {timeout_seconds!r}; omit it for no '
                             'wall-clock limit (no silent default is applied)']}
 
-    # (0) 模型硬门：只服务精确恢复模型，其它一律在**任何副作用之前**拒绝（不建目录、不认领、
-    #     不 Popen）。生产正式 main 只为该精确 model 开放。
-    if model != MODEL:
+    # (0) 模型硬门：只服务两个精确模型，其它一律在**任何副作用之前**拒绝（不建目录、不认领、
+    #     不 Popen）。生产正式 main 只为这两个精确 model 开放。
+    if model not in MODELS:
         return {'dispatch_failed': True, 'sent': False, 'dispatched': False,
                 'manual_relay_only': True, 'reason': 'cli_model_rejected',
-                'reasons': [f'--model must be {MODEL!r} on this CodeBuddy live entry, got '
-                            f'{model!r}; no other CodeBuddy model / WorkBuddy / fallback is '
-                            'reactivated here (zero side effects before dispatch)']}
+                'reasons': [f'--model must be one of {MODELS!r} on this CodeBuddy live '
+                            f'entry, got {model!r}; no other CodeBuddy model / WorkBuddy / '
+                            'fallback is reactivated here (zero side effects before '
+                            'dispatch)']}
+
+    # (0b) GLM 额度条件：必须在 outdir/配置/认领/Popen 之前复验当轮 summary.json。claim token
+    #      不是证明；普通网络/认证/权限/容量失败、旧轮证据、成功正文含 429 字样均不通过。
+    #      DeepSeek（默认）调用完全不受该参数影响。
+    glm_allowed = False
+    quota_evidence = None
+    if model == GLM_MODEL:
+        quota_evidence = cbf.verify_quota_evidence(codebuddy_quota_evidence)
+        if not quota_evidence.get('ok'):
+            return {'dispatch_failed': True, 'sent': False, 'dispatched': False,
+                    'reason': 'codebuddy_quota_condition_not_met',
+                    'codebuddy_quota_evidence': _evidence_summary(quota_evidence),
+                    'reasons': ['CodeBuddy GLM-5.3-Flash is a quota-conditional low-tier '
+                                "backup: the current round's codebuddy:"
+                                'deepseek-v4.1-flash summary.json must show a terminal '
+                                'error failure envelope with explicit 429/quota evidence '
+                                f'(verification reason: {quota_evidence.get("reason")!r}); '
+                                'no config read, no outdir, no claim and no Popen are '
+                                'performed']}
+        glm_allowed = True
 
     # (1) outdir 必须不存在（存在即 0 Popen，绝不覆写旧证据）。
     if Path(out_dir).exists():
@@ -207,7 +252,8 @@ def run(cfg, *, workspace, prompt_file, out_dir, stage, task_id, model, tools_it
     gate = dp.consume_for_entry(
         dispatch_store, task_id=task_id, runtime=RUNTIME, model=model,
         workspace=str(workspace), prompt_sha256=actual_prompt_sha, stage=stage,
-        claim_token=claim_token, now=now, executor=RUNTIME)
+        claim_token=claim_token, now=now, executor=RUNTIME,
+        codebuddy_glm_allowed=glm_allowed)
     if not gate.get('allowed'):
         return {'dispatch_failed': True, 'sent': False, 'dispatched': False, 'gate': gate}
     claim = gate['token']
@@ -344,7 +390,10 @@ def run(cfg, *, workspace, prompt_file, out_dir, stage, task_id, model, tools_it
         (out / 'report-state.json').write_bytes(json.dumps(
             report_state, ensure_ascii=False, indent=2).encode('utf-8'))
         summary = {
-            'runtime': RUNTIME, 'model': model, 'pool_key': POOL_KEY,
+            'runtime': RUNTIME, 'model': model, 'pool_key': pool_key,
+            'codebuddy_glm_allowed': glm_allowed,
+            'codebuddy_quota_evidence': (_evidence_summary(quota_evidence)
+                                         if quota_evidence else None),
             'exit_code': exit_code, 'protocol_success': protocol_success,
             'report_bound': bool(report_state.get('bound', False)),
             'timed_out': timed_out, 'session_id': parsed['session_id'],
@@ -370,7 +419,10 @@ def run(cfg, *, workspace, prompt_file, out_dir, stage, task_id, model, tools_it
             {'started_at_utc': started_at_utc.isoformat(),
              'finished_at_utc': finished_at_utc.isoformat(),
              'workspace': str(workspace), 'argv': argv, 'cwd': str(workspace),
-             'runtime': RUNTIME, 'model': model, 'pool_key': POOL_KEY,
+             'runtime': RUNTIME, 'model': model, 'pool_key': pool_key,
+             'codebuddy_glm_allowed': glm_allowed,
+             'codebuddy_quota_evidence': (_evidence_summary(quota_evidence)
+                                          if quota_evidence else None),
              'task_id': task_id, 'stage': stage, 'tools_items': tools_items,
              'allowed_tools': list(perms['allowed_tools']),
              'disallowed_tools': list(perms['disallowed_tools']),
@@ -407,6 +459,9 @@ def run(cfg, *, workspace, prompt_file, out_dir, stage, task_id, model, tools_it
     passed = bool(success and not facts.get('downstream_error') and bind_ok and release_ok)
     return {'sent': True, 'dispatched': True, 'started': started,
             'child_verified': child_verified, 'token': claim, 'exit_code': exit_code,
+            'pool_key': pool_key, 'codebuddy_glm_allowed': glm_allowed,
+            'codebuddy_quota_evidence': (_evidence_summary(quota_evidence)
+                                         if quota_evidence else None),
             'protocol_success': bool(parsed.get('protocol_success') and ec_exit == 0),
             'report_bound': bool(binding.get('bound')), 'timed_out': timed_out,
             'evidence': ev_files, 'launched': True, 'capacity_release': release,
@@ -427,8 +482,17 @@ def build_parser():
     ap.add_argument('--stage', required=True)
     ap.add_argument('--task-id', required=True, dest='task_id')
     ap.add_argument('--model', default=MODEL,
-                    help=f'must be the exact reactivated model {MODEL}; no fallback, no '
-                         'other CodeBuddy model, never WorkBuddy.')
+                    help=f'must be one of the two exact reactivated models {MODELS}; no '
+                         'fallback, no other CodeBuddy model, never WorkBuddy. '
+                         f'{GLM_MODEL} additionally requires '
+                         '--codebuddy-quota-evidence.')
+    ap.add_argument('--codebuddy-quota-evidence', dest='codebuddy_quota_evidence',
+                    default=None,
+                    help='Absolute path to the CURRENT round summary.json with explicit '
+                         'terminal 429/quota evidence for codebuddy:deepseek-v4.1-flash. '
+                         'Only used for --model glm-5.3-flash; DeepSeek calls ignore it. '
+                         'Missing/invalid evidence refuses GLM before any config read, '
+                         'outdir, claim or Popen.')
     ap.add_argument('--config', default=str(DEFAULT_CONFIG),
                     help='entry config JSON with absolute node/cli (user-side; never '
                          'commit copies of credentials)')
@@ -461,11 +525,12 @@ def build_parser():
 
 def main(argv=None) -> int:
     args = build_parser().parse_args(argv)
-    if str(args.model) != MODEL:
+    if str(args.model) not in MODELS:
         print(json.dumps({'dispatch_failed': True, 'sent': False, 'dispatched': False,
                           'manual_relay_only': True, 'reason': 'cli_model_rejected',
-                          'reasons': [f'--model must be {MODEL!r} on this entry, got '
-                                      f'{args.model!r}; no model substitution, no WorkBuddy']},
+                          'reasons': [f'--model must be one of {MODELS!r} on this entry, '
+                                      f'got {args.model!r}; no model substitution, no '
+                                      'WorkBuddy']},
                          ensure_ascii=False))
         return 2
     if args.timeout_seconds is not None and args.timeout_seconds <= 0:
@@ -477,6 +542,20 @@ def main(argv=None) -> int:
                                       'wall-clock limit (no silent default is applied)']},
                          ensure_ascii=False))
         return 2
+    # GLM：在读取用户私有配置之前先复验当轮明确限额证据；不通过则零配置读取、零 outdir、
+    # 零认领、零 Popen。run() 内部还会在真正启动前再次复验（claim token 不是证明）。
+    if str(args.model) == GLM_MODEL:
+        early_evidence = cbf.verify_quota_evidence(args.codebuddy_quota_evidence)
+        if not early_evidence.get('ok'):
+            print(json.dumps({'dispatch_failed': True, 'sent': False, 'dispatched': False,
+                              'reason': 'codebuddy_quota_condition_not_met',
+                              'codebuddy_quota_evidence': _evidence_summary(early_evidence),
+                              'reasons': ['GLM-5.3-Flash requires current-round explicit '
+                                          'DeepSeek quota evidence; verification refused '
+                                          f'with reason {early_evidence.get("reason")!r} '
+                                          'before reading the private entry config']},
+                             ensure_ascii=False))
+            return 2
     cfg = cb.load_entry_config(args.config)
     tools_items = cb.parse_tools_arg(args.tools)
     plan = None
@@ -494,7 +573,8 @@ def main(argv=None) -> int:
               allowed_tools=args.allowed_tools, disallowed_tools=args.disallowed_tools,
               session_id=args.session_id, prompt_sha256=_sha(prompt_bytes),
               claim_token=args.dispatch_claim, dispatch_store=args.dispatch_store,
-              plan=plan, active_tasks=active_tasks, timeout_seconds=timeout_seconds)
+              plan=plan, active_tasks=active_tasks, timeout_seconds=timeout_seconds,
+              codebuddy_quota_evidence=args.codebuddy_quota_evidence)
     print(json.dumps(out, ensure_ascii=False))
     if not out.get('dispatched'):
         return 2

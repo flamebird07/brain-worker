@@ -1,0 +1,619 @@
+"""BW-CODEBUDDY-GLM-FALLBACK-20261018 离线回归：CodeBuddy GLM-5.3-Flash 低层补位。
+
+全部使用临时 SQLite / 合成的当轮 summary.json / 进程内 FakePopen，零真实网络、账号、
+子进程或真实额度文件。覆盖：
+- 当轮明确 429/额度证据复验（真实 envelope、CLI exit 0 但真实错误、取消码 4294967295、
+  成功正文 429、普通/网络/auth/权限失败均按既有分类）；
+- 回执脱敏：任意合成敏感标记不得经 `diagnostics.failure_types`、runtime/model/exit_code
+  形状回显，只保留既有白名单分类与已知身份/数字；
+- 层序：DeepSeek 本轮失败且 GLM 条件成立时，Max/Claude/ZCode 仍优先，GLM 在 Flash 前；
+  授权集合缺 GLM 不扩权；新轮无证据不启用；GLM 失败后落 Flash；
+- `_select_main_force` 缺省 eligible=None 绝不自动纳入 GLM，显式 eligible 才参与排序；
+- 共享物理 1 槽：reserved/running/unknown 双向阻塞、finish 释放、并发仅一个赢家、
+  物理总 13 不双计、status 共享容量口径；
+- planner 与正式 reserve/consume 裁决一致；正式 GLM 缺 proof 在配置读取/outdir/claim/
+  Popen 前拒绝；带 proof 的 CLI argv/model/pool/evidence 正确，不硬记 DeepSeek；
+- 其它旧 CodeBuddy 模型与 WorkBuddy 仍退休。
+"""
+import io
+import json
+import sys
+import tempfile
+import unittest
+from concurrent.futures import ThreadPoolExecutor
+from contextlib import closing, redirect_stdout
+from datetime import datetime, timezone
+from pathlib import Path
+from unittest import mock
+
+REPO = Path(__file__).resolve().parent.parent
+SCRIPTS = REPO / 'scripts'
+for p in (str(SCRIPTS), str(REPO / 'tests')):
+    if p not in sys.path:
+        sys.path.insert(0, p)
+
+import codebuddy_direct as cb  # noqa: E402
+import codebuddy_fallback as cbf  # noqa: E402
+import codebuddy_live as cl  # noqa: E402
+import dispatch_pool as dp  # noqa: E402
+import execution_control as ec  # noqa: E402
+import prompt_contract as pc  # noqa: E402
+import stage_selection as ss  # noqa: E402
+import stub_codebuddy_live as stub  # noqa: E402
+
+CB = 'codebuddy:deepseek-v4.1-flash'
+GLM = 'codebuddy:glm-5.3-flash'
+CB_MODEL = 'deepseek-v4.1-flash'
+GLM_MODEL = 'glm-5.3-flash'
+QMAX = 'qoder:Qwen3.8-Max'
+CN_MAX = 'qodercn:Qwen3.8-Max'
+CN_CUSTOM_MAX = 'qodercn:Qwen-3.8-Max'
+CLAUDE = 'claude:deepseek-flash'
+ZCODE = 'zcode:GLM-5.3'
+QFLASH = 'qoder:Qwen3.8-Flash'
+CN_FLASH = 'qodercn:Qwen3.8-Flash'
+MAXES = (QMAX, CN_MAX, CN_CUSTOM_MAX)
+HIGHER_THAN_GLM = (CB, QMAX, CN_MAX, CN_CUSTOM_MAX, CLAUDE, ZCODE)
+ALL_CANDIDATES = list(dp.MAIN_FORCE_KEYS) + list(dp.OVERFLOW_KEYS)
+SHA = 'p' + '0' * 63
+SECRET = 'SYNTHETIC_SECRET_SHOULD_NOT_BE_ECHOED'
+
+T_NIGHT = datetime(2026, 10, 8, 15, 0, 0, tzinfo=timezone.utc)  # 北京 23:00
+
+
+def _summary(*, runtime='codebuddy', model=CB_MODEL, protocol_success=False,
+             terminal_state='error', failure_envelope_valid=True,
+             failure_types=('quota_429',), errors=None, exit_code=0,
+             primary_failure='explicit 429 upstream'):
+    """构造当轮 summary.json 的**合成**形状；不读取任何真实额度文件。"""
+    if errors is None:
+        errors = [{'status': 429, 'message': '429 upstream rate limit'}]
+    return {
+        'runtime': runtime,
+        'model': model,
+        'protocol_success': protocol_success,
+        'terminal_state': terminal_state,
+        'failure_envelope_valid': failure_envelope_valid,
+        'exit_code': exit_code,
+        'diagnostics': {
+            'failure_types': list(failure_types),
+            'evidence': {
+                'primary_failure': primary_failure,
+                'errors': errors,
+                'errors_info': [],
+                'terminal_state': terminal_state,
+            },
+        },
+    }
+
+
+class _Base(unittest.TestCase):
+    def setUp(self):
+        self._tmp = tempfile.TemporaryDirectory(prefix='bw-cb-glm-')
+        self.base = Path(self._tmp.name)
+        self.store = str(self.base / 'dispatch.sqlite3')
+        self.assertNotEqual(self.store, str(dp.default_store_path()))
+        patches = [
+            mock.patch.object(dp, '_zcode_availability_blocked', lambda *a, **k: None),
+            mock.patch.object(dp, 'process_identity',
+                              return_value={'state': 'alive', 'created': 'c1'}),
+        ]
+        for p in patches:
+            p.start()
+            self.addCleanup(p.stop)
+        self.addCleanup(self._tmp.cleanup)
+        with closing(dp.connect(self.store)) as conn:
+            dp._rotation_row(conn)
+            conn.execute('PRAGMA journal_mode=DELETE')
+
+    def _normalize(self):
+        with closing(dp.connect(self.store)) as conn:
+            conn.execute('PRAGMA journal_mode=DELETE')
+
+    def ws(self, tid):
+        d = self.base / 'ws' / str(tid)
+        d.mkdir(parents=True, exist_ok=True)
+        return str(d)
+
+    def seed(self, pk, n=1, state='reserved', task_prefix=None):
+        runtime, model = pk.split(':', 1)
+        with closing(dp.connect(self.store)) as conn:
+            for i in range(n):
+                tid = f'{task_prefix or "seed"}-{pk.replace(":", "-")}-{i}'
+                conn.execute(
+                    'INSERT INTO attempts(token, task_id, runtime, model, pool_key, '
+                    'state, child_pid, reserved_at_utc, workspace) '
+                    'VALUES(?,?,?,?,?,?,?,?,?)',
+                    (f'seed-{tid}', tid, runtime, model, pk, state, None,
+                     dp._iso(T_NIGHT), str(self.base / tid)))
+            conn.execute('PRAGMA journal_mode=DELETE')
+
+    def evidence(self, name='summary.json', **kw):
+        path = self.base / name
+        path.write_text(json.dumps(_summary(**kw), ensure_ascii=False),
+                        encoding='utf-8')
+        return str(path)
+
+
+class TestQuotaEvidenceSanitized(_Base):
+    def test_cli_exit_zero_real_error_envelope_passes(self):
+        # CLI 常以 0 退出；是否明确限额只看错误结构，不要求 exit_code==429。
+        out = cbf.verify_quota_evidence(self.evidence(exit_code=0))
+        self.assertTrue(out['ok'], out)
+        self.assertEqual(out['reason'], 'explicit_quota_429')
+        self.assertEqual(out['runtime'], 'codebuddy')
+        self.assertEqual(out['model'], CB_MODEL)
+        self.assertEqual(out['exit_code'], 0)
+        self.assertEqual(out['failure_types'], ['quota_429'])
+
+    def test_arbitrary_failure_type_string_not_echoed(self):
+        path = self.evidence(failure_types=['quota_429', SECRET])
+        out = cbf.verify_quota_evidence(path)
+        self.assertTrue(out['ok'], out)  # 白名单内的明确 429 仍有效
+        self.assertNotIn(SECRET, json.dumps(out, ensure_ascii=False))
+        self.assertEqual(out['failure_types'], ['quota_429'])
+
+    def test_unknown_runtime_model_and_nested_exit_code_not_echoed(self):
+        payload = _summary(runtime={'leak': SECRET}, model=['x', SECRET],
+                           exit_code={'message': SECRET}, failure_types=[SECRET])
+        path = self.base / 'bad-shape.json'
+        path.write_text(json.dumps(payload), encoding='utf-8')
+        out = cbf.verify_quota_evidence(str(path))
+        self.assertFalse(out['ok'], out)
+        self.assertIsNone(out['runtime'])
+        self.assertIsNone(out['model'])
+        self.assertIsNone(out['exit_code'])
+        self.assertEqual(out['failure_types'], [])
+        self.assertNotIn(SECRET, json.dumps(out, ensure_ascii=False))
+
+    def test_raw_error_and_header_text_not_echoed(self):
+        errors = [{'status': 429, 'message': SECRET,
+                   'headers': {'Authorization': SECRET, 'Cookie': SECRET}}]
+        out = cbf.verify_quota_evidence(self.evidence(errors=errors))
+        self.assertTrue(out['ok'], out)
+        self.assertNotIn(SECRET, json.dumps(out, ensure_ascii=False))
+        self.assertFalse(out['raw_error_text_included'])
+
+    def test_cancel_exit_code_is_not_quota_proof(self):
+        out = cbf.verify_quota_evidence(
+            self.evidence(errors=[], exit_code=4294967295))
+        self.assertFalse(out['ok'], out)
+        self.assertEqual(out['reason'], 'evidence_429_structure_missing')
+        self.assertEqual(out['exit_code'], 4294967295)
+
+    def test_success_body_429_never_passes(self):
+        out = cbf.verify_quota_evidence(self.evidence(
+            protocol_success=True, terminal_state='success',
+            failure_envelope_valid=False, failure_types=[],
+            errors=[{'message': 'report body mentions 429 quota'}]))
+        self.assertFalse(out['ok'], out)
+        self.assertEqual(out['reason'], 'evidence_protocol_success')
+        self.assertNotIn('report body mentions', json.dumps(out, ensure_ascii=False))
+
+    def test_ordinary_network_auth_permission_failures_never_pass(self):
+        cases = {
+            'ordinary': (['model_execution_failure'],
+                         [{'status': 500, 'message': 'ordinary failure'}]),
+            'network': (['model_execution_failure'],
+                        [{'message': 'network connection reset'}]),
+            'auth': (['authentication_failure'],
+                     ['Custom model authentication failed. Please check API Key.']),
+            'permission': (['permission_rule_denied'],
+                           [{'message': 'permission denied by rule'}]),
+        }
+        for name, (types, errors) in cases.items():
+            out = cbf.verify_quota_evidence(
+                self.evidence(name=f'{name}.json', failure_types=types, errors=errors))
+            self.assertFalse(out['ok'], f'{name}: {out}')
+            self.assertNotEqual(out['reason'], 'explicit_quota_429')
+            self.assertNotIn('permission denied by rule',
+                             json.dumps(out, ensure_ascii=False))
+
+    def test_missing_or_unreadable_evidence_fails_closed(self):
+        self.assertFalse(cbf.verify_quota_evidence(None)['ok'])
+        self.assertFalse(cbf.verify_quota_evidence('')['ok'])
+        missing = cbf.verify_quota_evidence(str(self.base / 'no-such.json'))
+        self.assertEqual(missing['reason'], 'evidence_not_found')
+        self.assertFalse(missing['ok'])
+
+
+class TestSelectMainForceDefault(_Base):
+    def test_default_eligible_none_never_includes_glm(self):
+        # 直接把所有非 GLM 主力容量视为 0（GLM 自身仍有空位），缺省 eligible 仍不得选 GLM。
+        def _cap(pk):
+            return 1 if pk == GLM else 0
+
+        with mock.patch.object(dp, 'capacity_for', side_effect=_cap):
+            with closing(dp.connect(self.store)) as conn:
+                target, reason = dp._select_main_force(conn, GLM, T_NIGHT)
+        self.assertIsNone(target)
+        self.assertEqual(reason, 'main_force_full')
+
+    def test_explicit_eligible_containing_glm_sorts_it_last(self):
+        self.seed(ZCODE, 2)
+        self.seed(QMAX, 1)
+        self.seed(CN_MAX, 1)
+        self.seed(CN_CUSTOM_MAX, 2)
+        self.seed(CLAUDE, 2)
+        with closing(dp.connect(self.store)) as conn:
+            target, reason = dp._select_main_force(
+                conn, GLM, T_NIGHT, eligible={GLM})
+        self.assertEqual(target, GLM)
+        self.assertEqual(reason, 'main_force_selected')
+
+    def test_explicit_eligible_without_glm_never_returns_it(self):
+        with closing(dp.connect(self.store)) as conn:
+            target, _ = dp._select_main_force(
+                conn, GLM, T_NIGHT, eligible={CB})
+        self.assertEqual(target, CB)
+
+
+class TestPlannerGlmCondition(_Base):
+    def auth(self, allowed=None, **kw):
+        a = {'selection_mode': 'auto', 'quote': '用户真实原话',
+             'authorization_scope': {'task_id': 'T', 'stage': 's2'},
+             'allowed_candidates': list(allowed if allowed is not None
+                                        else ALL_CANDIDATES)}
+        a.update(kw)
+        return a
+
+    def plan(self, auth, **kw):
+        evidence = kw.pop('codebuddy_quota_evidence', None)
+        if evidence is not None:
+            auth = dict(auth, codebuddy_quota_evidence=evidence)
+        return ss.plan_stage_selection(
+            auth, store_path=self.store, task_id='T', stage='s2',
+            workspace=self.ws('T'), now=T_NIGHT, **kw)
+
+    def test_max_still_before_glm_when_evidence_valid(self):
+        receipt = self.plan(self.auth(),
+                            round_failed_candidates=[CB],
+                            codebuddy_quota_evidence=self.evidence())
+        self.assertTrue(receipt['codebuddy_glm_allowed'], receipt)
+        self.assertIn(receipt['selected']['pool_key'], MAXES, receipt)
+        self.assertNotEqual(receipt['selected']['pool_key'], GLM)
+
+    def test_glm_after_zcode_and_before_flash(self):
+        receipt = self.plan(self.auth(),
+                            round_failed_candidates=list(HIGHER_THAN_GLM),
+                            codebuddy_quota_evidence=self.evidence())
+        self.assertTrue(receipt['codebuddy_glm_allowed'], receipt)
+        self.assertEqual(receipt['selected']['pool_key'], GLM, receipt)
+        self.assertEqual(receipt['selected_reason'], 'main_force_selected')
+        for flash in (QFLASH, CN_FLASH):
+            self.assertEqual(receipt['candidate_filters'][flash], 'eligible')
+
+    def test_authorization_without_glm_not_expanded(self):
+        allowed = [k for k in ALL_CANDIDATES if k != GLM]
+        receipt = self.plan(self.auth(allowed),
+                            round_failed_candidates=list(HIGHER_THAN_GLM),
+                            codebuddy_quota_evidence=self.evidence())
+        self.assertNotIn(GLM, receipt['allowed_candidates'])
+        self.assertFalse(receipt['codebuddy_glm_allowed'], receipt)
+        self.assertFalse(receipt['codebuddy_glm_condition']['authorized'])
+        self.assertNotEqual(receipt['selected']['pool_key'], GLM)
+        self.assertEqual(receipt['selected_reason'], 'flash_fallback_selected')
+
+    def test_new_round_without_evidence_does_not_enable_glm(self):
+        receipt = self.plan(self.auth(),
+                            round_failed_candidates=list(HIGHER_THAN_GLM))
+        self.assertFalse(receipt['codebuddy_glm_allowed'], receipt)
+        self.assertEqual(receipt['candidate_filters'][GLM],
+                         'codebuddy_quota_condition_not_met')
+        self.assertEqual(receipt['selected_reason'], 'flash_fallback_selected')
+
+    def test_ordinary_failed_evidence_does_not_enable_glm(self):
+        receipt = self.plan(
+            self.auth(), round_failed_candidates=list(HIGHER_THAN_GLM),
+            codebuddy_quota_evidence=self.evidence(
+                name='ordinary.json', failure_types=['model_execution_failure'],
+                errors=[{'status': 500, 'message': 'ordinary failure'}]))
+        self.assertFalse(receipt['codebuddy_glm_allowed'], receipt)
+        self.assertEqual(receipt['candidate_filters'][GLM],
+                         'codebuddy_quota_condition_not_met')
+        self.assertEqual(receipt['selected_reason'], 'flash_fallback_selected')
+
+    def test_glm_failure_falls_to_flash(self):
+        receipt = self.plan(
+            self.auth(),
+            round_failed_candidates=list(HIGHER_THAN_GLM) + [GLM],
+            codebuddy_quota_evidence=self.evidence())
+        self.assertTrue(receipt['codebuddy_glm_allowed'], receipt)
+        self.assertEqual(receipt['candidate_filters'][GLM],
+                         'already_tried_this_round')
+        self.assertIn(receipt['selected']['pool_key'], (QFLASH, CN_FLASH))
+        self.assertEqual(receipt['selected_reason'], 'flash_fallback_selected')
+
+    def test_old_db_limit_mark_alone_does_not_enable_glm(self):
+        with closing(dp.connect(self.store)) as conn:
+            conn.execute('INSERT INTO main_force_limits(pool_key, limited) '
+                         'VALUES(?,1)', (GLM,))
+            conn.execute('PRAGMA journal_mode=DELETE')
+        receipt = self.plan(self.auth(),
+                            round_failed_candidates=list(HIGHER_THAN_GLM))
+        self.assertFalse(receipt['codebuddy_glm_allowed'], receipt)
+        self.assertEqual(receipt['candidate_filters'][GLM],
+                         'codebuddy_quota_condition_not_met')
+
+
+class TestFormalGateConsistency(_Base):
+    def test_planner_selection_matches_formal_claim_and_consume(self):
+        evidence = self.evidence()
+        receipt = ss.plan_stage_selection(
+            {'selection_mode': 'auto', 'quote': '用户真实原话',
+             'authorization_scope': {'task_id': 'T', 'stage': 's'},
+             'allowed_candidates': list(ALL_CANDIDATES),
+             'round_failed_candidates': list(HIGHER_THAN_GLM),
+             'codebuddy_quota_evidence': evidence},
+            store_path=self.store, task_id='T', stage='s',
+            workspace=self.ws('T'), now=T_NIGHT)
+        self.assertEqual(receipt['selected']['pool_key'], GLM, receipt)
+        # 正式 reserve：没有显式当轮条件布尔 → 与 planner 缺证据时一致拒绝。
+        denied = dp.reserve(self.store, task_id='f1', runtime='codebuddy',
+                            model=GLM_MODEL, workspace=self.ws('f1'),
+                            prompt_sha256=SHA, stage='s', now=T_NIGHT,
+                            executor='codebuddy', codebuddy_glm_allowed=False,
+                            _preclaim=False)
+        self.assertFalse(denied.get('allowed'), denied)
+        self.assertEqual(denied['reason'], 'codebuddy_quota_condition_not_met')
+        # 条件成立 → 正式入口允许认领；随后缺条件的消费不能借 claim token 启动。
+        claimed = dp.reserve(self.store, task_id='f2', runtime='codebuddy',
+                             model=GLM_MODEL, workspace=self.ws('f2'),
+                             prompt_sha256=SHA, stage='s', now=T_NIGHT,
+                             executor='codebuddy', codebuddy_glm_allowed=True,
+                             _preclaim=False)
+        self.assertTrue(claimed.get('allowed'), claimed)
+        consumed = dp.consume_for_entry(
+            self.store, task_id='f2', runtime='codebuddy', model=GLM_MODEL,
+            workspace=self.ws('f2'), prompt_sha256=SHA, stage='s',
+            claim_token=claimed['token'], now=T_NIGHT, executor='codebuddy',
+            codebuddy_glm_allowed=False)
+        self.assertFalse(consumed.get('allowed'), consumed)
+        self.assertEqual(consumed['reason'], 'codebuddy_quota_condition_not_met')
+        self.assertTrue(consumed.get('capacity_released'), consumed)
+        # 真正的条件消费成功（reserved → running），共享槽仍只有 1 个。
+        claimed2 = dp.reserve(self.store, task_id='f3', runtime='codebuddy',
+                              model=GLM_MODEL, workspace=self.ws('f3'),
+                              prompt_sha256=SHA, stage='s', now=T_NIGHT,
+                              executor='codebuddy', codebuddy_glm_allowed=True,
+                              _preclaim=False)
+        self.assertTrue(claimed2.get('allowed'), claimed2)
+        consumed2 = dp.consume_for_entry(
+            self.store, task_id='f3', runtime='codebuddy', model=GLM_MODEL,
+            workspace=self.ws('f3'), prompt_sha256=SHA, stage='s',
+            claim_token=claimed2['token'], now=T_NIGHT, executor='codebuddy',
+            codebuddy_glm_allowed=True)
+        self.assertTrue(consumed2.get('allowed'), consumed2)
+        with closing(dp.connect(self.store)) as conn:
+            self.assertEqual(dp._shared_active(conn, CB), 1)
+            self.assertEqual(dp._count_active(conn, GLM), 1)
+            self.assertEqual(dp._count_active(conn, CB), 0)
+
+
+class TestSharedPhysicalSlot(_Base):
+    def test_both_directions_blocked_for_active_states(self):
+        for state in ('reserved', 'running', 'unknown'):
+            for occupancy in (CB, GLM):
+                self.setUp_store()
+                self.seed(occupancy, 1, state=state)
+                with closing(dp.connect(self.store)) as conn:
+                    other = GLM if occupancy == CB else CB
+                    self.assertFalse(dp._shared_has_capacity(conn, occupancy),
+                                     f'{state}/{occupancy}')
+                    self.assertFalse(dp._shared_has_capacity(conn, other),
+                                     f'{state}/{occupancy}->{other}')
+                    self.assertEqual(dp._shared_active(conn, CB), 1)
+
+    def setUp_store(self):
+        """清空 attempts，保持每个状态用例独立。"""
+        with closing(dp.connect(self.store)) as conn:
+            conn.execute('DELETE FROM attempts')
+            conn.execute('PRAGMA journal_mode=DELETE')
+
+    def test_finish_releases_shared_slot_for_either_model(self):
+        claimed = dp.reserve(self.store, task_id='g', runtime='codebuddy',
+                             model=GLM_MODEL, workspace=self.ws('g'),
+                             prompt_sha256=SHA, stage='s', now=T_NIGHT,
+                             executor='codebuddy', codebuddy_glm_allowed=True,
+                             _preclaim=False)
+        self.assertTrue(claimed.get('allowed'), claimed)
+        denied = dp.reserve(self.store, task_id='d', runtime='codebuddy',
+                            model=CB_MODEL, workspace=self.ws('d'),
+                            prompt_sha256=SHA, stage='s', now=T_NIGHT,
+                            executor='codebuddy', _preclaim=False)
+        self.assertFalse(denied.get('allowed'), denied)
+        rel = dp.finish(self.store, claimed['token'], terminal='cancelled',
+                        now=T_NIGHT, wrapper_pid=None)
+        self.assertTrue(rel.get('released') or rel.get('settled'), rel)
+        again = dp.reserve(self.store, task_id='c', runtime='codebuddy',
+                           model=CB_MODEL, workspace=self.ws('c'),
+                           prompt_sha256=SHA, stage='s', now=T_NIGHT,
+                           executor='codebuddy', _preclaim=False)
+        self.assertTrue(again.get('allowed'), again)
+
+    def test_concurrent_claim_has_exactly_one_winner(self):
+        def _claim(tid):
+            return dp.reserve(self.store, task_id=tid, runtime='codebuddy',
+                              model=GLM_MODEL, workspace=self.ws(tid),
+                              prompt_sha256=SHA, stage='s', now=T_NIGHT,
+                              executor='codebuddy', codebuddy_glm_allowed=True,
+                              _preclaim=False)
+
+        with ThreadPoolExecutor(max_workers=2) as pool:
+            results = list(pool.map(_claim, ('race-a', 'race-b')))
+        allowed = [r for r in results if r.get('allowed')]
+        denied = [r for r in results if not r.get('allowed')]
+        self.assertEqual(len(allowed), 1, results)
+        self.assertEqual(len(denied), 1, results)
+        self.assertEqual(denied[0]['reason'], 'capacity_full', denied[0])
+        with closing(dp.connect(self.store)) as conn:
+            self.assertEqual(dp._shared_active(conn, CB), 1)
+
+    def test_total_physical_capacity_13_and_status_no_double_count(self):
+        self.assertEqual(dp.DOMESTIC_TOTAL_CAPACITY, 13)
+        self.assertEqual(dp.CAPACITY[GLM], 1)
+        self.assertNotIn(GLM, dp.MAIN_FORCE_CAPACITY)
+        self.seed(CB, 1)
+        self.seed(ZCODE, 2)
+        self.seed(QMAX, 1)
+        self.seed(CN_MAX, 1)
+        self.seed(CN_CUSTOM_MAX, 2)
+        self.seed(CLAUDE, 2)
+        self.seed(QFLASH, 2)
+        self.seed(CN_FLASH, 2)
+        st = dp.status(self.store, now=T_NIGHT)
+        self.assertEqual(st['domestic']['active'], 13)
+        self.assertEqual(st['pools'][CB]['active'], 1)
+        self.assertEqual(st['pools'][GLM]['active'], 0)  # 同一 attempt 不复制两次
+        self.assertEqual(st['pools'][GLM]['shared_active'], 1)
+        self.assertEqual(st['pools'][GLM]['free'], 0)
+        self.assertEqual(st['pools'][CB]['shared_active'], 1)
+        self.assertEqual(st['pools'][CB]['free'], 0)
+        self.assertEqual(st['pools'][GLM]['shared_group'], [CB, GLM])
+        self.assertEqual(sum(p['active'] for p in st['pools'].values()), 13)
+        out = dp.reserve(self.store, task_id='full', runtime='codebuddy',
+                         model=GLM_MODEL, workspace=self.ws('full'),
+                         prompt_sha256=SHA, stage='s', now=T_NIGHT,
+                         executor='codebuddy', codebuddy_glm_allowed=True,
+                         _preclaim=False)
+        self.assertFalse(out.get('allowed'), out)
+        self.assertEqual(out['reason'], 'capacity_full', out)
+
+
+def _valid_report(stage, workspace):
+    body = [pc.REPORT_START,
+            f'阶段编号与执行方式：{stage}；direct。',
+            f'实际项目绝对路径：{workspace}',
+            '汇报时间与执行环境：offline-synthetic']
+    for header in pc.SECTION_HEADERS:
+        body.extend(['', header, '- 合成小节内容'])
+    body.extend(['', pc.CLOSING_LINE, pc.REPORT_END])
+    return '\n'.join(body)
+
+
+def _stream(report_text, model):
+    init = {'type': 'system', 'subtype': 'init', 'session_id': 'S1',
+            'model': model, 'tools': ['Read'], 'mcp_servers': [],
+            'permissionMode': 'dontAsk'}
+    lines = [json.dumps(init, ensure_ascii=False)]
+    lines.append(json.dumps(
+        {'type': 'assistant', 'session_id': 'S1',
+         'message': {'model': model, 'usage': {'input_tokens': 1, 'output_tokens': 2},
+                     'content': [{'type': 'text', 'text': report_text}]}},
+        ensure_ascii=False))
+    lines.append(json.dumps(
+        {'type': 'result', 'subtype': 'success', 'is_error': False,
+         'session_id': 'S1', 'usage': {'input_tokens': 1, 'output_tokens': 2},
+         'modelUsage': {}, 'result': report_text, 'errors': []},
+        ensure_ascii=False))
+    return ('\n'.join(lines) + '\n').encode('utf-8')
+
+
+class TestFormalLiveGlm(_Base):
+    def setUp(self):
+        super().setUp()
+        self.work = self.base / 'live-ws'
+        self.work.mkdir(parents=True, exist_ok=True)
+        self.stage = 'BW-CB-GLM-LIVE'
+        self.report = _valid_report(self.stage, str(self.work))
+        self.cfg = {'node': 'node', 'cli': 'cli.js'}
+
+    def _prompt(self):
+        p = self.base / 'prompt.txt'
+        p.write_text('do a bounded read-only probe', encoding='utf-8')
+        return p
+
+    def test_missing_proof_refuses_before_config_outdir_claim_popen(self):
+        argv = ['--workspace', str(self.work),
+                '--prompt-file', str(self.base / 'missing-prompt.txt'),
+                '--output-dir', str(self.base / 'never-created'),
+                '--stage', self.stage, '--task-id', 't', '--model', GLM_MODEL,
+                '--config', str(self.base / 'no-such-config.json')]
+        buf = io.StringIO()
+        with redirect_stdout(buf):
+            code = cl.main(argv)
+        self.assertEqual(code, 2)
+        out = json.loads(buf.getvalue())
+        self.assertEqual(out['reason'], 'codebuddy_quota_condition_not_met')
+        self.assertFalse(out['dispatched'])
+        self.assertFalse((self.base / 'never-created').exists())
+        with closing(dp.connect(self.store)) as conn:
+            self.assertEqual(dp._count_active(conn, GLM), 0)
+            self.assertEqual(dp._count_active(conn, CB), 0)
+
+    def test_run_missing_proof_zero_side_effects(self):
+        rec = {}
+        factory = stub.make_popen_factory(stdout=b'', record=rec)
+        out = cl.run(self.cfg, workspace=str(self.work),
+                     prompt_file=self._prompt(), out_dir=self.base / 'run-nope',
+                     stage=self.stage, task_id='r', model=GLM_MODEL,
+                     tools_items=['Read'], prompt_sha256=SHA,
+                     dispatch_store=self.store, popen_factory=factory,
+                     codebuddy_quota_evidence=None, now=T_NIGHT)
+        self.assertTrue(out.get('dispatch_failed'), out)
+        self.assertEqual(out['reason'], 'codebuddy_quota_condition_not_met')
+        self.assertNotIn('argv', rec)  # 未 Popen
+        self.assertFalse((self.base / 'run-nope').exists())
+        with closing(dp.connect(self.store)) as conn:
+            self.assertEqual(dp._shared_active(conn, CB), 0)
+
+    def test_with_proof_uses_glm_model_argv_pool_and_evidence(self):
+        evidence = self.evidence()
+        rec = {}
+        stream = _stream(self.report, GLM_MODEL)
+        factory = stub.make_popen_factory(stdout=stream, returncode=0, record=rec)
+        out = cl.run(self.cfg, workspace=str(self.work),
+                     prompt_file=self._prompt(), out_dir=self.base / 'glm-out',
+                     stage=self.stage, task_id='ok', model=GLM_MODEL,
+                     tools_items=['Read'], prompt_sha256=cl._sha(
+                         (self.base / 'prompt.txt').read_bytes()),
+                     dispatch_store=self.store, popen_factory=factory,
+                     child_prober=lambda pid: {'state': 'dead', 'created': None},
+                     codebuddy_quota_evidence=evidence, now=T_NIGHT)
+        self.assertTrue(out.get('dispatched'), out)
+        self.assertTrue(out.get('passed'), out)
+        self.assertEqual(out['pool_key'], GLM)
+        self.assertTrue(out['codebuddy_glm_allowed'])
+        self.assertTrue(out['codebuddy_quota_evidence']['ok'])
+        self.assertEqual(out['codebuddy_quota_evidence']['source'],
+                         'current_round_summary_json')
+        argv = rec['argv']
+        self.assertEqual(argv[argv.index('--model') + 1], GLM_MODEL)
+        self.assertNotIn(CB_MODEL, argv)
+        req = json.loads((self.base / 'glm-out' / 'request.json').read_text(
+            encoding='utf-8'))
+        self.assertEqual(req['model'], GLM_MODEL)
+        self.assertEqual(req['pool_key'], GLM)
+        self.assertEqual(req['executor_identity']['request_model'], GLM_MODEL)
+        payload = (self.base / 'glm-out' / 'sent-payload-stdin.bin').read_text(
+            encoding='utf-8')
+        self.assertIn(f'runtime=codebuddy；请求模型={GLM_MODEL}', payload)
+        self.assertNotIn(CB_MODEL, payload)
+        with closing(dp.connect(self.store)) as conn:
+            self.assertEqual(dp._shared_active(conn, CB), 0)
+
+    def test_old_codebuddy_and_workbuddy_remain_retired(self):
+        def plan(runtime, model):
+            return {'task_id': 'T', 'stage': 's', 'runtime': runtime, 'model': model,
+                    'workspace': '/tmp/x', 'cwd': '/tmp/x', 'prompt_sha256': SHA,
+                    'grants': {'edits': [], 'bash': [], 'read_dirs': []},
+                    'max_concurrency': 1, 'active_tasks': []}
+
+        def actual(runtime, model):
+            return {'task_id': 'T', 'stage': 's', 'runtime': runtime, 'model': model,
+                    'workspace': '/tmp/x', 'cwd': '/tmp/x', 'prompt_sha256': SHA,
+                    'shell': False, 'argv': ['node', 'cli.js'],
+                    'grants': {'edits': [], 'bash': [], 'read_dirs': [],
+                               'tool_visibility': [], 'allowed_tools': [],
+                               'disallowed_tools': [], 'visible_tools': []}}
+
+        for runtime, model in (('codebuddy', 'glm-4'),
+                               ('codebuddy', 'glm-5.3'),
+                               ('workbuddy', 'anything')):
+            pf = ec.preflight(plan(runtime, model), actual(runtime, model))
+            self.assertTrue(pf.get('manual_relay_only'), (runtime, model, pf))
+            self.assertFalse(pf['ok'])
+
+
+if __name__ == '__main__':
+    unittest.main()

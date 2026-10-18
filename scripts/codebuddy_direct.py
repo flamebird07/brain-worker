@@ -986,22 +986,26 @@ def build_parser():
 def main():
     """生产 CLI 公开入口（CodeBuddy 正式 main）。
 
-    BW-CODEBUDDY-MAIN-S3：仅独立 CodeBuddy CLI 的**精确模型 deepseek-v4.1-flash**
-    （界面名 Deepseek-V4.1-Flash）被恢复为正式主力——它把本次直接调用移交生产传输入口
-    `codebuddy_live.main()`（consume_for_entry 容量认领 + 绑定自身子 PID + 真实终态释放，
-    shell=False、stdin 完整契约、cwd 隔离、MCP 空、hooks 禁用、无自动登录/升级/子代理/
-    回退模型）。**其它任何 CodeBuddy 旧模型（含旧 GLM）与 WorkBuddy 一律保持既有
-    manual_relay_only 拒绝**：在读取配置/提示词、创建输出目录、进入额度门禁或 Popen 之前
-    无条件拒绝，返回 sent=false/manual_relay_only 的 JSON 与非成功退出码，零副作用。模型判定
-    只读 argv（parse_known_args），不读配置/凭据，也不提供任何重新启用旧模型的参数。
+    BW-CODEBUDDY-MAIN-S3 / BW-CODEBUDDY-GLM-FALLBACK-20261018：只有独立 CodeBuddy CLI 的
+    两个**精确**模型被恢复并移交生产传输入口 `codebuddy_live.main()`：
+    - `deepseek-v4.1-flash`（界面名 Deepseek-V4.1-Flash）：最高优先主力；
+    - `glm-5.3-flash`（界面名 GLM-5.3-Flash）：**仅当轮明确 DeepSeek 限额证据成立**时
+      启用的低层补位，与 deepseek 共用同一物理 CodeBuddy 1 槽。
+    两者都经 consume_for_entry 容量认领 + 绑定自身子 PID + 真实终态释放，shell=False、
+    stdin 完整契约、cwd 隔离、MCP 空、hooks 禁用、无自动登录/升级/子代理/回退模型；GLM 的
+    额度证据/共享槽/层序在 codebuddy_live 与 dispatch_pool 内继续强制。**其它任何 CodeBuddy
+    旧模型（包括其它旧 GLM 组合）与 WorkBuddy 一律保持既有 manual_relay_only 拒绝**：在
+    读取配置/提示词、创建输出目录、进入额度门禁或 Popen 之前无条件拒绝，返回
+    sent=false/manual_relay_only 的 JSON 与非成功退出码，零副作用。模型判定只读 argv
+    （parse_known_args），不读配置/凭据。
 
     本模块仍**不 import subprocess**、不携带可执行传输；真实传输只在 `codebuddy_live` 内，
-    且只认这一精确模型。历史诊断/纯解析函数（parse_stream/build_argv/权限契约/失败留证）
+    且只认这两个精确模型。历史诊断/纯解析函数（parse_stream/build_argv/权限契约/失败留证）
     继续留在本模块供离线单测与 codebuddy_live 复用。"""
     probe = argparse.ArgumentParser(add_help=False)
     probe.add_argument('--model', default=None)
     probe_args, _unknown = probe.parse_known_args()
-    if probe_args.model == 'deepseek-v4.1-flash':
+    if probe_args.model in ('deepseek-v4.1-flash', 'glm-5.3-flash'):
         # 精确恢复模型：移交正式生产传输入口（其它约束在 codebuddy_live 内继续强制）。
         import codebuddy_live  # 惰性导入，避免与本模块的相互依赖
         return codebuddy_live.main()
@@ -1012,11 +1016,12 @@ def main():
         'sent': False,
         'dispatch_refused': True,
         'reason': 'CodeBuddy/WorkBuddy direct dispatch retired for every model except the '
-                  'reactivated exact deepseek-v4.1-flash: emit a complete copy-paste prompt '
-                  'and hand it to an external agent by hand. No new direct CodeBuddy call '
-                  'for any other model (old GLM included) or WorkBuddy is submitted from '
-                  'the Skill/CLI/control plane. Prompt generation is NOT recorded as a '
-                  'dispatch.',
+                  'two reactivated exact models (deepseek-v4.1-flash; glm-5.3-flash only '
+                  'with current-round explicit DeepSeek quota evidence): emit a complete '
+                  'copy-paste prompt and hand it to an external agent by hand. No new '
+                  'direct CodeBuddy call for any other model (other old GLM combinations '
+                  'included) or WorkBuddy is submitted from the Skill/CLI/control plane. '
+                  'Prompt generation is NOT recorded as a dispatch.',
         'exit_code': 2}, ensure_ascii=False))
     return 2
 

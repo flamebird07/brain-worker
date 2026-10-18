@@ -1,20 +1,20 @@
 ---
 name: brain-worker
-description: 主脑+执行 Agent 分工，覆盖阅读/开发/批量修改/测试/迁移/审计；已授权支持国际 Qoder、CN Qoder、ZCode 直连、Claude/deepseek-flash 2 槽、CodeBuddy 精确模型 deepseek-v4.1-flash 1 槽与可选 Luna 原生子 Agent；WorkBuddy 与 CodeBuddy 其它旧模型仍 human-relay only。国内配置真实容量：CodeBuddy=1、ZCode=2、国际内置 Max=1、CN 内置 Max=1、CN 自定义 `qodercn:Qwen-3.8-Max`=2、两区 Flash 各 2、`claude:deepseek-flash`=2（合计 13；2026-10-18 已解除暂停，授权可新派上限 13）；主力优先级：CodeBuddy 精确模型最高，其次 CN 自定义 Max 先于两内置 Max（两内置同级按真实在途数平衡），随后 claude，最后 ZCode；三 Qoder Max 仅北京 22:00（含）至 08:00（不含），CodeBuddy 不套任何时段门；两 Flash 同级兜底。BW-SIMPLE-PRIORITY-RETRY-S4：每轮从最高优先级真实尝试，本轮失败换下一，新轮重来；历史 ZCode availability/main_force_limit 仅作诊断，不挡普通新一轮、无需 recovery probe；不查余额、不假 healthy、不清旧 hold、绝不假装成功；时段/容量/权限/同 workspace 单写/unknown 在途/审批拒绝照常不绕过。
+description: 主脑+执行 Agent 分工，覆盖阅读/开发/批量修改/测试/迁移/审计；已授权支持国际 Qoder、CN Qoder、ZCode 直连、Claude/deepseek-flash 2 槽、CodeBuddy 精确模型 `deepseek-v4.1-flash` 与条件补位 `glm-5.3-flash`（两个逻辑模型共用同一物理 1 槽，物理总 13 不变）以及可选 Luna 原生子 Agent；WorkBuddy 与 CodeBuddy 其它旧模型仍 human-relay only。国内配置真实容量：CodeBuddy=1（两模型共享）、ZCode=2、国际内置 Max=1、CN 内置 Max=1、CN 自定义 `qodercn:Qwen-3.8-Max`=2、两区 Flash 各 2、`claude:deepseek-flash`=2（合计 13；2026-10-18 已解除暂停，授权可新派上限 13）；完整序列：`deepseek-v4.1-flash` ＞ CN 自定义 Max ＞ 两内置 Max（同级按真实在途数平衡）＞ claude ＞ ZCode ＞ `glm-5.3-flash`（仅当轮 DeepSeek 明确限额证据成立）＞ 两区 Flash（同级兜底）。三 Qoder Max 仅北京 22:00（含）至 08:00（不含）；CodeBuddy 主模型不套任何时段门，GLM 也不因该补位获得任何时段门；授权集合可含精确 GLM，但缺当轮证据时仍排除。BW-SIMPLE-PRIORITY-RETRY-S4：每轮从最高优先级真实尝试，本轮失败换下一，新轮重来；历史 ZCode availability/main_force_limit 仅作诊断，不挡普通新一轮、无需 recovery probe；不查余额、不假 healthy、不清旧 hold、绝不假装成功；时段/容量/权限/同 workspace 单写/unknown 在途/审批拒绝照常不绕过。
 ---
 
-CN 自定义 Max 恢复声明（BW-CUSTOM-MAX-RESUME-20261018-S1）：用户已于 2026-10-18 明确解除暂停，`qodercn:Qwen-3.8-Max`（Qoder CN自定义、带连字符）精确组合恢复正式授权，主脑新阶段授权集合恢复精确 `qodercn:Qwen-3.8-Max`，配置总 13 槽全部可新派（授权上限恢复 13，不新增槽；自定义仍 2 槽）。历史事实保留：2026-10-15 至恢复前该组合曾按 BW-CUSTOM-MAX-PAUSE-20261015 暂停新派工，当时按授权可新派上限为 11；该暂停只是授权候选软排除，不存在需要清理的真实 DB 暂停锁，本次不清真实池/历史限额/在途。恢复不等于认证或额度现场已验证：不查询余额、不探测模型、不把既有在途强杀或抢占。AUTO 层序为 CodeBuddy 精确模型 > CN 自定义 Max > 两内置 Max（同级按真实在途数平衡）> claude > ZCode > 两区 Flash；三 Max 仍受北京时间 22:00（含）至 08:00（不含）时段门。内置`qodercn:Qwen3.8-Max`、国际Max、两区Flash、CodeBuddy精确模型及其他既有规则不变。
+CN 自定义 Max 恢复声明（BW-CUSTOM-MAX-RESUME-20261018-S1）：用户已于 2026-10-18 明确解除暂停，`qodercn:Qwen-3.8-Max`（Qoder CN自定义、带连字符）精确组合恢复正式授权，主脑新阶段授权集合恢复精确 `qodercn:Qwen-3.8-Max`，配置总 13 槽全部可新派（授权上限恢复 13，不新增槽；自定义仍 2 槽）。历史事实保留：2026-10-15 至恢复前该组合曾按 BW-CUSTOM-MAX-PAUSE-20261015 暂停新派工，当时按授权可新派上限为 11；该暂停只是授权候选软排除，不存在需要清理的真实 DB 暂停锁，本次不清真实池/历史限额/在途。恢复不等于认证或额度现场已验证：不查询余额、不探测模型、不把既有在途强杀或抢占。AUTO 层序为 CodeBuddy `deepseek-v4.1-flash` > CN 自定义 Max > 两内置 Max（同级按真实在途数平衡）> claude > ZCode > CodeBuddy `glm-5.3-flash`（仅当轮 DeepSeek 明确限额且当轮 summary.json 证据复验通过）> 两区 Flash；GLM 与 deepseek 共用同一物理 1 槽、物理总 13 不变。三 Max 仍受北京时间 22:00（含）至 08:00（不含）时段门。内置`qodercn:Qwen3.8-Max`、国际Max、两区Flash、CodeBuddy 两模型及其他既有规则不变。
 
 每轮按优先级重试（BW-SIMPLE-PRIORITY-RETRY-S3，覆盖下方「主力明确限额自动跳过 Z」与「Z 限额时 AUTO 自动跳过 Z」的旧叙述）：用户决定「反复试不是问题，每轮从最高优先级起、不做复杂设计」。每个新调度轮都从时段/容量/权限/授权与明确停用仍合格的**最高优先级**候选起真实尝试；同一 `runtime:model` 本轮最多试一次，真实调用失败才在本轮换下一个，下一新轮重新从最高优先级起。历史 ZCode availability（旧 `hard_hold`/退避/未来时间）与三 Qoder Max/Claude 的 `main_force_limits` **不再挡普通新一轮**：`dispatch_pool` 的 AUTO 候选集合不再据此剔除（`_eligible_main_forces`/`_domestic_policy` 只保留时段/容量/总守卫/工作区/unknown/权限门），历史标记仅作诊断——真实尝试失败才落库、成功仍 epoch/attempt CAS 结算，不假装 healthy、不清旧 hold、不伪造成功；普通入口**无需** recovery probe。显式 `executor='zcode'` 权威原子门与 `purpose='probe'` 生命周期保持原样兼容。本轮失败列表由**主脑当前轮**在 `stage_selection` 的 authorization JSON 里以 `round_failed_candidates` 维护（内存入参，命中者标 `already_tried_this_round`），仅过滤本轮、绝不落新库/表/定时器/自动监控、不扩大 `allowed_candidates` 授权集合、下一新轮不传即空重来；当轮所有已授权候选都试过则诚实无候选、不再派，绝不偷偷复用已试组合或换模型。时段/容量/明确 model 约束/同 workspace 单写/unknown 在途/硬审批拒绝**照常**，绝不通过重试或改派绕过；CN 自定义 `qodercn:Qwen-3.8-Max` 自 2026-10-18 起已按用户明确授权恢复候选（授权范围外时仍照常不派）。示例：主脑本轮把已真实失败的池追加进当轮 JSON，下一轮以空列表重新从最高优先级起（不存在后台自动重派引擎）。
 
 
 # 主脑与苦力 Agent
 
-执行器范围（2026-10-08 用户决定；2026-10-11 增补 claude；2026-10-17 BW-CODEBUDDY-MAIN-S3 仅恢复 CodeBuddy 精确模型）：WorkBuddy 与 CodeBuddy 其它旧模型仍 human-relay only，不再从当前 Skill/CLI/控制面提交新的直接派发调用；选择它们时只生成完整可复制提示词，由客户人工交给外部 Agent，生成提示词不记成已派发。**唯一恢复的 CodeBuddy 组合是 `codebuddy:deepseek-v4.1-flash`（1 槽、最高优先、无时段门）**，经 `scripts/codebuddy_live.py` 正式传输。当前直连派发保留国际 Qoder、Qoder CN、ZCode、Claude Code CLI/deepseek-flash 与该 CodeBuddy 精确模型，默认按国内配置真实容量（CodeBuddy=1、ZCode=2、国际内置 Max=1、CN 内置 Max=1、CN 自定义主力 `qodercn:Qwen-3.8-Max`=2、两区 Flash 各 2、`claude:deepseek-flash`=2，合计 13；2026-10-18 已解除暂停、授权可新派上限 13；其余槽一项未减）做主力优先级排序（CodeBuddy > CN 自定义 Max > 两内置 Max 同级平衡 > `claude:deepseek-flash` > `zcode:GLM-5.3`，BW-CODEBUDDY-MAIN-S3 覆盖旧层序、BW-CUSTOM-MAX-RESUME-20261018-S1 调整 Max 层内次序）、明确 executor+model 组合授权优先；三个 Qoder Max（国际内置、CN 内置与 CN 自定义 `qodercn:Qwen-3.8-Max`）一律仅北京 22:00（含）至次日 08:00（不含）作主力、CN 自定义主力已与两内置 Max 同套时段门；claude 为独立组主力、AUTO 可选（优先级层=2：排 CodeBuddy 与三 Qoder Max 之后、ZCode 之前），受北京时间工作日高峰离线日历门（`deepseek_offpeak`）；CodeBuddy 精确模型不套 Max 夜间窗或 Claude 离峰窗；两 Flash 同级，AUTO 在合格可用主力均不可用或已满时从两区 Flash 选，明确 executor 或 model 的约束保持。不再启动 WorkBuddy 的认证或测试。历史能力、原错误与模型信息与测试证据保留，仅作离线证据回放/档案，不作为重新启用授权。
+执行器范围（2026-10-08 用户决定；2026-10-11 增补 claude；2026-10-17 BW-CODEBUDDY-MAIN-S3 仅恢复 CodeBuddy 精确模型）：WorkBuddy 与 CodeBuddy 其它旧模型仍 human-relay only，不再从当前 Skill/CLI/控制面提交新的直接派发调用；选择它们时只生成完整可复制提示词，由客户人工交给外部 Agent，生成提示词不记成已派发。**当前恢复的 CodeBuddy 精确组合有两个**：`codebuddy:deepseek-v4.1-flash`（1 槽、最高优先、无时段门）与 `codebuddy:glm-5.3-flash`（仅当轮 DeepSeek 明确限额且当轮证据复验通过的低层补位，ZCode 之后、两 Flash 之前）；两者**共用同一物理 1 槽**，均经 `scripts/codebuddy_live.py` 正式传输。授权集合包含 GLM 但未带当轮 quota 条件时仍排除，绝不自动启用。当前直连派发保留国际 Qoder、Qoder CN、ZCode、Claude Code CLI/deepseek-flash 与该 CodeBuddy 精确模型，默认按国内配置真实容量（CodeBuddy=1、ZCode=2、国际内置 Max=1、CN 内置 Max=1、CN 自定义主力 `qodercn:Qwen-3.8-Max`=2、两区 Flash 各 2、`claude:deepseek-flash`=2，合计 13；2026-10-18 已解除暂停、授权可新派上限 13；其余槽一项未减）做主力优先级排序（CodeBuddy `deepseek-v4.1-flash` > CN 自定义 Max > 两内置 Max 同级平衡 > `claude:deepseek-flash` > `zcode:GLM-5.3` > 条件补位 `codebuddy:glm-5.3-flash` > 两区 Flash；GLM 与 deepseek 共用 1 槽、物理总 13 不变；BW-CODEBUDDY-MAIN-S3 覆盖旧层序、BW-CUSTOM-MAX-RESUME-20261018-S1 调整 Max 层内次序、BW-CODEBUDDY-GLM-FALLBACK-20261018 增加条件 GLM 层）、明确 executor+model 组合授权优先；三个 Qoder Max（国际内置、CN 内置与 CN 自定义 `qodercn:Qwen-3.8-Max`）一律仅北京 22:00（含）至次日 08:00（不含）作主力、CN 自定义主力已与两内置 Max 同套时段门；claude 为独立组主力、AUTO 可选（优先级层=2：排 CodeBuddy 与三 Qoder Max 之后、ZCode 之前），受北京时间工作日高峰离线日历门（`deepseek_offpeak`）；CodeBuddy 精确模型不套 Max 夜间窗或 Claude 离峰窗；两 Flash 同级，AUTO 在合格可用主力均不可用或已满时从两区 Flash 选，明确 executor 或 model 的约束保持。不再启动 WorkBuddy 的认证或测试。历史能力、原错误与模型信息与测试证据保留，仅作离线证据回放/档案，不作为重新启用授权。
 
 ## GPT-6 Luna 原生子 Agent（可选）
 
-GPT-6 Luna（模型标识 `gpt-6-luna`）是可选执行端，通过所在宿主实际提供的原生子 Agent 工具调用。本机未另行指定时按国内配置真实容量（CodeBuddy=1、ZCode=2、国际内置 Max=1、CN 内置 Max=1、CN 自定义主力 `qodercn:Qwen-3.8-Max`=2、两区 Flash 各 2、`claude:deepseek-flash`=2，合计 13；2026-10-18 已解除暂停、授权可新派上限 13）做主力优先级排序（CodeBuddy > CN 自定义 Max > 两内置 Max 同级平衡 > `claude:deepseek-flash` > `zcode:GLM-5.3`，BW-CUSTOM-MAX-RESUME-20261018-S1）、明确 executor+model 授权组合优先；三个 Qoder Max（国际内置、CN 内置与 CN 自定义 `qodercn:Qwen-3.8-Max`）一律仅主力时段（北京时间 22:00 含至次日 08:00 不含）；CodeBuddy 精确模型无时段门；claude 属独立组、AUTO 可选，优先级层=2（排 CodeBuddy 与三 Qoder Max 之后、ZCode 之前），另受北京时间工作日高峰离线日历门（`deepseek_offpeak`）；两 Flash 同级，AUTO 在合格可用主力均不可用或已满时从两区 Flash 选，明确 executor 或 model 的约束保持；Qoder 沿用其既有入口配置。Luna 不自动接替任何在途任务，也不改变适用任务/在途任务已有的执行选择；非容量类 Luna 需明确授权、绝不凭超时自动接替；GPT/Luna 的工程实施须用户事先明确同意，不自动代做。
+GPT-6 Luna（模型标识 `gpt-6-luna`）是可选执行端，通过所在宿主实际提供的原生子 Agent 工具调用。本机未另行指定时按国内配置真实容量（CodeBuddy=1、ZCode=2、国际内置 Max=1、CN 内置 Max=1、CN 自定义主力 `qodercn:Qwen-3.8-Max`=2、两区 Flash 各 2、`claude:deepseek-flash`=2，合计 13；2026-10-18 已解除暂停、授权可新派上限 13）做主力优先级排序（CodeBuddy `deepseek-v4.1-flash` > CN 自定义 Max > 两内置 Max 同级平衡 > `claude:deepseek-flash` > `zcode:GLM-5.3` > 条件补位 `codebuddy:glm-5.3-flash` > 两区 Flash，BW-CUSTOM-MAX-RESUME-20261018-S1）、明确 executor+model 授权组合优先；三个 Qoder Max（国际内置、CN 内置与 CN 自定义 `qodercn:Qwen-3.8-Max`）一律仅主力时段（北京时间 22:00 含至次日 08:00 不含）；CodeBuddy 精确模型无时段门；claude 属独立组、AUTO 可选，优先级层=2（排 CodeBuddy 与三 Qoder Max 之后、ZCode 之前），另受北京时间工作日高峰离线日历门（`deepseek_offpeak`）；两 Flash 同级，AUTO 在合格可用主力均不可用或已满时从两区 Flash 选，明确 executor 或 model 的约束保持；Qoder 沿用其既有入口配置。Luna 不自动接替任何在途任务，也不改变适用任务/在途任务已有的执行选择；非容量类 Luna 需明确授权、绝不凭超时自动接替；GPT/Luna 的工程实施须用户事先明确同意，不自动代做。
 
 每次考虑调用 Luna 时，检查当前环境工具是否提供该模型、当前用户授权及审批要求，并遵循当次生效的 custom rule 与平台规则；需要审批时取得对应批准后才启动。能力登记、历史启动成功或工具存在都不是后续调用授权；不把动态规则、过去批准或某次测试参数固化为永久授权或默认参数。
 
@@ -32,7 +32,7 @@ Skill 使用与执行派发分别记录：`brain_worker=used/not-used`；外部�
 
 每次执行前及最终汇报明确记录：brain_worker=used/not-used、实际 SKILL.md 路径、已应用的步骤与证据；另记 external_dispatch=dispatched/not-dispatched 及原因。used 仅用于已实际读取并按 Skill 执行本次适用步骤；只写说明、理解理念或准备提示词不能冒称已使用或已派工。未读取或未应用时记 not-used，并主动提醒用户原因；已使用 Skill 做判断但未派工时，分开说明，不能掩盖执行状态。
 
-此偏好不扩大用户授权、不覆盖安全要求；实际派工仍须确认运行时、模型、工具授权、隔离工作区和报告回读条件。WorkBuddy 与 CodeBuddy 其它旧模型只生成可复制提示词人工转交；仅 `codebuddy:deepseek-v4.1-flash` 可经正式入口直连（无时段门、无回退）。历史 Flash-only 模型口径（GLM 5.3 Flash）仅适用于旧 CodeBuddy 直连档案，不作当前派发依据。
+此偏好不扩大用户授权、不覆盖安全要求；实际派工仍须确认运行时、模型、工具授权、隔离工作区和报告回读条件。WorkBuddy 与 CodeBuddy 其它旧模型只生成可复制提示词人工转交；`codebuddy:deepseek-v4.1-flash` 可经正式入口直连（无时段门、无回退）；`codebuddy:glm-5.3-flash` 仅在当轮 DeepSeek 明确限额且当轮 summary.json 证据复验通过时作为同一物理槽的低层补位，缺证据时即使出现在授权集合也排除。历史 Flash-only 模型口径（旧 GLM 5.3 Flash 直连形状）仅适用于历史档案，不作当前派发依据。
 
 已落实范围是本项目说明、对应 Obsidian 笔记、本机 brain-worker 安装版与仓库版的指导及 UI 默认提示。现有对话若缓存旧 Skill，需重新读取更新后的安装版；本规则不是已接通的 DOTS 全局自动路由，也不能保证未加载该 Skill 的其他入口自动执行。
 
@@ -44,15 +44,15 @@ Skill 使用与执行派发分别记录：`brain_worker=used/not-used`；外部�
 
 这是独立的新本地事件链，未迁移、导入、重算或覆盖历史远程评分；初始50分/步长1/样本0仅是本地初值。mode.json 明确 remote_score_synced=false、remote_write_performed=false、remote_history_imported=false。没有真实执行报告时只做status，不提前评价或计分；验收后以稳定event-id本地record，身份未证实不传--identity-confirmed，补证后本地resolve，写后回读。同阶段幂等，不因补修或重试新建加分样本。
 
-后续明确授权远程同步前，不运行 capability_ledger.py，不配置认证，不外发评分、报告或消息。派工与台账分开验证：台账就绪不是模型已调用或业务完成；执行端仍按 Qoder/ZCode/Claude 直连兜底，CodeBuddy 仅精确模型 `deepseek-v4.1-flash` 可直连，其它旧模型/WorkBuddy 仍生成提示词人工转交（不再直接派发）。
+后续明确授权远程同步前，不运行 capability_ledger.py，不配置认证，不外发评分、报告或消息。派工与台账分开验证：台账就绪不是模型已调用或业务完成；执行端仍按 Qoder/ZCode/Claude 直连兜底；CodeBuddy 精确模型 `deepseek-v4.1-flash` 可直连，`glm-5.3-flash` 仅凭当轮 DeepSeek 明确限额证据作为同一物理槽低层补位；其它旧模型/WorkBuddy 仍生成提示词人工转交（不再直接派发）。
 
 ## 当前本机跨项目调度约定（仅适用于用户当次指定的并行链路）
 
 目标仍是 GPT 主脑负责必要推导、规划与验收，国内执行器承担具体执行，以节省 GPT 额度。用户在本机并行推进的多条链路（例如某业务任务与 brain-worker/CodeBuddy 修复链路）经父线程互传已验证结果，业务不等待适配器修复；具体的任务标识与台账路径由用户当次指定，本仓库不固化任何单一任务、目录或授权。
 
-用户指定的业务任务顺序（2026-10-08 初版；2026-10-11 改为主力层序；2026-10-17 增补 CodeBuddy 精确模型）：小范围只读定位一类任务若选 WorkBuddy 或 CodeBuddy 旧模型，则生成完整可复制提示词由客户人工交外部 Agent，不再从入口直接派发；选 `codebuddy:deepseek-v4.1-flash` 时可走正式 live 入口（1 槽、最高优先、无时段门，失败本轮换下一候选）。按可用主力明确层序（CodeBuddy > CN 自定义 Max > 两内置 Max 同级平衡 > claude > ZCode）、明确 executor+model 授权组合优先作主路径，主力不可用时改用溢出 Flash 或已授权接续。ZCode/Qoder 的模型按各自档案与授权核对。切换先确认原调用终态，或明确停止并核对副作用；未知状态先查，不把“立即接续”变成同一目标的重复在途派发。成功与失败的原件保留。历史曾由独立 CodeBuddy CLI 用 GLM 5.3 Flash 先做定位、故障后 ZCode 接续，该旧模型直连步骤已停用、仅存档。
+用户指定的业务任务顺序（2026-10-08 初版；2026-10-11 改为主力层序；2026-10-17 增补 CodeBuddy 精确模型）：小范围只读定位一类任务若选 WorkBuddy 或 CodeBuddy 旧模型，则生成完整可复制提示词由客户人工交外部 Agent，不再从入口直接派发；选 `codebuddy:deepseek-v4.1-flash` 时可走正式 live 入口（最高优先、无时段门）；仅当本轮该模型真实失败且带当轮明确 429/额度证据时，才可把同一物理槽的 `codebuddy:glm-5.3-flash` 作为 ZCode 之后的低层补位。按可用主力明确层序（CodeBuddy deepseek > CN 自定义 Max > 两内置 Max 同级平衡 > claude > ZCode > 条件 GLM > 两区 Flash）、明确 executor+model 授权组合优先作主路径。ZCode/Qoder 的模型按各自档案与授权核对。切换先确认原调用终态，或明确停止并核对副作用；未知状态先查，不把“立即接续”变成同一目标的重复在途派发。成功与失败的原件保留。历史曾由独立 CodeBuddy CLI 用旧 GLM 5.3 Flash 先做定位、故障后 ZCode 接续；该历史形状仅存档。当前只有带当轮 DeepSeek 明确限额证据的 `glm-5.3-flash` 低层补位可直连。
 
-执行端角色（2026-10-07 用户补充，2026-10-08/10-11/10-17 更新；主力层序现为 CodeBuddy 精确模型 > CN 自定义 Max > 两内置 Max > claude > GLM，两内置同层在途平衡）：本机未另行指定执行者时按上述层序选择（用户付费套餐，用户反馈有额度且速度快，未独立核实账单或剩余额度）、明确 executor+model 授权组合优先，主力不可用时改用溢出 Flash 或已授权接续；Qoder 沿用其既有入口配置，不覆盖配置、不新增或替换模型，也不重复询问模型名称；用户反馈当前活动无消耗，尚未独立核实，不当作免费事实。明确用户选择与在途任务不替换：选择变更只应用于验收后的下一轮。GPT 主脑可做规划、推理、确定性输入准备和独立验收；GPT/Luna 工程实施须用户事先明确同意，不自动代做。外派被授权校验、自动审批或环境限制拦住时报告原拒绝，不改成 GPT 代做，也不换执行器或其他入口绕过；普通已终态执行失败是否兜底，按已授权顺序决定。WorkBuddy 与 CodeBuddy 旧模型不直接派发、只做提示词人工转交；`codebuddy:deepseek-v4.1-flash` 可直连，历史 Flash-only 模型口径仅适用于旧 CodeBuddy 直连档案，不强制其他执行端切换 Flash。
+执行端角色（2026-10-07 用户补充，2026-10-08/10-11/10-17 更新；主力层序现为 CodeBuddy 精确模型 > CN 自定义 Max > 两内置 Max > claude > GLM，两内置同层在途平衡）：本机未另行指定执行者时按上述层序选择（用户付费套餐，用户反馈有额度且速度快，未独立核实账单或剩余额度）、明确 executor+model 授权组合优先，主力不可用时改用溢出 Flash 或已授权接续；Qoder 沿用其既有入口配置，不覆盖配置、不新增或替换模型，也不重复询问模型名称；用户反馈当前活动无消耗，尚未独立核实，不当作免费事实。明确用户选择与在途任务不替换：选择变更只应用于验收后的下一轮。GPT 主脑可做规划、推理、确定性输入准备和独立验收；GPT/Luna 工程实施须用户事先明确同意，不自动代做。外派被授权校验、自动审批或环境限制拦住时报告原拒绝，不改成 GPT 代做，也不换执行器或其他入口绕过；普通已终态执行失败是否兜底，按已授权顺序决定。WorkBuddy 与 CodeBuddy 其它旧模型不直接派发、只做提示词人工转交；`codebuddy:deepseek-v4.1-flash` 可直连，`codebuddy:glm-5.3-flash` 仅当轮 DeepSeek 明确限额证据成立时补位。历史 Flash-only 模型口径仅适用于旧 CodeBuddy 直连档案，不强制其他执行端切换 Flash。
 
 牛马修复链路按错误证据是否到达分级处置，不预设“当前没有新报告”这一状态：若本阶段确有新的真实错误证据，据其定位适配器/Skill 缺口，在独立范围内准备、验收后经父线程反馈；若此刻尚无新的错误报告，则等待父线程转交，不凭历史 429 或猜测重跑测试，不重复调用适用任务，也不修改适用任务占用的文件、工作区或运行对象。修复仅针对报告所证实的适配器/Skill 缺口；双方成果互推，但不把一方未验收状态当作另一方成功基线。
 
@@ -151,7 +151,7 @@ Qoder/ZCode/CodeBuddy 精确模型入口在**建输出目录、Popen 之前**必
 
 ### 阶段重裁决与只读规划入口（2026-10-11，BW-STAGE-SELECTION-S1/S2）
 
-阶段切换时，**上一轮为临时 Flash 兜底（`temporary_fallback`）而选的模型绝不自动成为下一阶段约束**：`scripts/stage_selection.py` 是**只读规划入口**（不是新调度器/服务/DB 表），复用既有 `dispatch_pool` 权威方法，为受信任主脑在生成**精确**入口参数前一览候选。核心语义：① `authorization` 是主脑从用户**真实原话**派生的对象（`quote` + 至少含 `task_id`/`stage` 的 `authorization_scope` + 真实 `allowed_candidates`），无原话/空授权/scope 冲突一律拒；② `selection_mode`：`fixed` 按 `runtime+model` 原组合（即使 Flash 合法也不替换）、`executor` 只限本 runtime（该区可用主力优先、没主力才该区 Flash、**绝不跨区**）、`auto` 在授权集合内先主力再 Flash 并调用既有权威 `_select_main_force`（现为 CodeBuddy > CN 自定义 Max > 两内置 Max 同级 > Claude > GLM 优先级，见上文）、`temporary_fallback` 仅对 `fallback_scope == {task_id, stage}` 的同阶段有效；③ **新阶段到期必须用显式 `parent_authorization` 重新裁决**，绝不把 `previous selected` 当约束、绝不自猜扩权，缺父授权如实要求补范围，并记录 `fallback_scope`/`reselection_due`；④ 前轮 `reserved/running/unknown/executing/awaiting_acceptance` 或**未独立验收**时拒绝新选择（不抢占、不重派），只有真实终态 + 已验收才可新裁决；⑤ 只读核对本 task 在途 / 同 workspace 冲突 / 国内总 13 满，遇冲突**整项拒绝**；⑥ 输出最小 receipt（`selected` 或 `None`、逐候选过滤原因、`sent=false`、`preview_only=true`，无占位），**快照时间不等于实时能力**——最终正式入口仍原子复核。CLI 仅用 `--authorization-json/--permission-grants-json/--previous-json/--task-id/--stage/--workspace/--store/--quota-store`，输出 JSON，退出 0=选择成功 / 2=拒绝。离线回归 `tests/test_stage_selection.py`（临时 SQLite + mock Z availability，零真实模型/共享库/凭据），详见 [references/global-dispatch.md](references/global-dispatch.md) §“阶段重裁决只读规划入口”。本项**不是** AUTO 算法 bug 修复；不改任何既有容量/时段/锁/额度/Luna 规则。
+阶段切换时，**上一轮为临时 Flash 兜底（`temporary_fallback`）而选的模型绝不自动成为下一阶段约束**：`scripts/stage_selection.py` 是**只读规划入口**（不是新调度器/服务/DB 表），复用既有 `dispatch_pool` 权威方法，为受信任主脑在生成**精确**入口参数前一览候选。核心语义：① `authorization` 是主脑从用户**真实原话**派生的对象（`quote` + 至少含 `task_id`/`stage` 的 `authorization_scope` + 真实 `allowed_candidates`），无原话/空授权/scope 冲突一律拒；② `selection_mode`：`fixed` 按 `runtime+model` 原组合（即使 Flash 合法也不替换）、`executor` 只限本 runtime（该区可用主力优先、没主力才该区 Flash、**绝不跨区**）、`auto` 在授权集合内先主力再 Flash 并调用既有权威 `_select_main_force`（现为 CodeBuddy deepseek-v4.1-flash > CN 自定义 Max > 两内置 Max 同级 > Claude > ZCode > 条件CodeBuddy glm-5.3-flash > 两区Qwen3.8-Flash 优先级，见上文）、`temporary_fallback` 仅对 `fallback_scope == {task_id, stage}` 的同阶段有效；③ **新阶段到期必须用显式 `parent_authorization` 重新裁决**，绝不把 `previous selected` 当约束、绝不自猜扩权，缺父授权如实要求补范围，并记录 `fallback_scope`/`reselection_due`；④ 前轮 `reserved/running/unknown/executing/awaiting_acceptance` 或**未独立验收**时拒绝新选择（不抢占、不重派），只有真实终态 + 已验收才可新裁决；⑤ 只读核对本 task 在途 / 同 workspace 冲突 / 国内总 13 满，遇冲突**整项拒绝**；⑥ 输出最小 receipt（`selected` 或 `None`、逐候选过滤原因、`sent=false`、`preview_only=true`，无占位），**快照时间不等于实时能力**——最终正式入口仍原子复核。CLI 仅用 `--authorization-json/--permission-grants-json/--previous-json/--task-id/--stage/--workspace/--store/--quota-store`，输出 JSON，退出 0=选择成功 / 2=拒绝。离线回归 `tests/test_stage_selection.py`（临时 SQLite + mock Z availability，零真实模型/共享库/凭据），详见 [references/global-dispatch.md](references/global-dispatch.md) §“阶段重裁决只读规划入口”。本项**不是** AUTO 算法 bug 修复；不改任何既有容量/时段/锁/额度/Luna 规则。
 
 边界补修（BW-STAGE-SELECTION-S3）：① `temporary_fallback` 的 `fallback_scope` **必须显式含 `task_id` 且等于本 task**，缺 `task_id` 一律 `fallback_scope_mismatch` 拒绝，**不得凭 previous 或候选集合猜授权**；② `session_reuse_allowed` **仅当** `previous.task_id` 显式等于本 `task_id`、组合 `runtime+model` 相同、`previous` 为真实终态且已独立验收时才为真，**绝不跨 task 继承旧 session/ID**；普通 AUTO/fixed 合法新选择照常返回但 `session_reuse_allowed=false`，**CLI 会话连续不能替代本轮选择**；③ 只读 `_open_store_ro` 在 connect/PRAGMA/BEGIN 失败时**先 close 已建连接再抛 `Refused`**，不留连接泄漏、不改库。约定：“先用兜底 / 只看这一轮”**仅对当前阶段**成立；长期固定必须来自**真实用户原话与范围**；每个新阶段**先规划、再生成精确 params**，不得复制旧 model；临时 `allowed_candidates` 存**原 base 授权全集**（与所选 Flash 分开），同阶段按明确 `runtime+model` 选 Flash，旧 scope 原样留 s1，s2 须真实上一阶段终态 + 验收后按**显式 parent 授权交集**重新裁决；receipt 的本轮有效 `selection_mode/quote/scope` 与过期原临时记录（`source_*`/`fallback_scope`）**分开追溯**。
 
@@ -898,16 +898,29 @@ AGENT_CAPABILITY_RECORD_END
 
 ## CodeBuddy / WorkBuddy：精确模型恢复 + 其余人工转交
 
-**当前状态（2026-10-17，BW-CODEBUDDY-MAIN-S3）：仅 `codebuddy:deepseek-v4.1-flash`
-（界面名 Deepseek-V4.1-Flash）恢复为正式主力**——1 槽、最高优先、无时段门、计入国内总 13；
-正式传输在 `scripts/codebuddy_live.py`。WorkBuddy 与 CodeBuddy 其它旧模型（含旧 GLM）仍
-human-relay only：不再从当前 Skill/CLI/控制面提交直接派发，只产出完整可复制的阶段提示词，
-由客户人工交给外部 Agent；生成提示词不记成已派发/已验收，也不冒充 API 返回结果。
+**当前状态（2026-10-18，BW-CODEBUDDY-GLM-FALLBACK-20261018）：恢复两个精确模型，二者
+共用同一物理 CodeBuddy 1 槽、物理总 13 不变；正式传输均在 `scripts/codebuddy_live.py`。**
 
-- 精确模型入口：`codebuddy_direct.main()` 仅在 `--model deepseek-v4.1-flash` 时移交
-  `codebuddy_live.main()`；其余模型仍**在读配置/提示词、创建输出目录、进入额度门禁之前**
-  固定拒绝（`sent=false`、`manual_relay_only`、非成功退出码、零副作用）。控制面
-  `execution_control.preflight` 同样只放行该精确模型，其它 CodeBuddy/WorkBuddy 计划仍拒。
+- `codebuddy:deepseek-v4.1-flash`（界面名 Deepseek-V4.1-Flash）：最高优先主力，无时段门。
+- `codebuddy:glm-5.3-flash`（界面名 GLM-5.3-Flash）：**仅当轮 DeepSeek 已真实失败且当轮
+  `summary.json` 带明确 429/额度证据**时启用的低层补位；层序在 ZCode 之后、两区
+  Qwen3.8-Flash 之前。缺证据、普通失败、网络/auth/权限失败、取消、成功正文含 429 字样均
+  不启用；旧轮文件、旧 `main_force_limits` 标记、reserve/claim token 都不是证据。
+- 授权集合可以包含精确 GLM，但若未携带**本轮** quota 条件（`codebuddy_quota_evidence` 且
+  DeepSeek 在本轮 `round_failed_candidates` 中），仍按 `codebuddy_quota_condition_not_met`
+  排除，绝不自动扩权或自动切换。权限拒绝绝不触发换模型。
+- 两个模型共享同一物理 1 槽：任一 `reserved`/`running`/`unknown` 都挡另一个，不新增并发；
+  `DOMESTIC_TOTAL_CAPACITY` 仍为 13（GLM 逻辑别名不重复计入物理容量）。
+- WorkBuddy 与 CodeBuddy 其它旧模型（含其它旧 GLM 组合）仍 human-relay only：不再从当前
+  Skill/CLI/控制面提交直接派发，只产出完整可复制的阶段提示词，由客户人工交给外部 Agent；
+  生成提示词不记成已派发/已验收，也不冒充 API 返回结果。用户没有授权恢复其它模型。
+- 精确模型入口：`codebuddy_direct.main()` 仅在 `--model deepseek-v4.1-flash` 或
+  `--model glm-5.3-flash` 时移交 `codebuddy_live.main()`；其余模型仍在读配置/提示词、创建
+  输出目录、进入额度门禁或 Popen 之前固定拒绝（`sent=false`、`manual_relay_only`、非成功
+  退出码、零副作用）。控制面 `execution_control.preflight` 同样只放行这两个精确模型。
+- GLM 的正式入口在读取私有配置、创建 outdir、容量认领或 Popen **之前**复验
+  `--codebuddy-quota-evidence` 指向的当轮 DeepSeek `summary.json`；缺 proof 时零副作用拒绝。
+  DeepSeek 调用完全忽略该参数。
 - `codebuddy_live` 口径：`consume_for_entry(executor='codebuddy')` → `mark_running` →
   `bind_child`（`bound=true`）→ 真实退出 `finish`；启动前失败 `start_failed`，已启动终态未知
   `mark_unknown` 保占位；MCP 空、hooks 禁用、无 session resume、无 fallback/自动登录/升级/
@@ -920,7 +933,39 @@ human-relay only：不再从当前 Skill/CLI/控制面提交直接派发，只�
 - 旧模型/WorkBuddy 操作方式：用 `scripts/prompt_contract.py` 生成含完整九节契约 + 任务原文的
   可复制提示词，交给外部 Agent；执行 Agent 把 WORKER_REPORT 保存为 UTF-8 原始文件后按
   `human-relay` 流程回读验收（见上文 human-relay 一节）。
-- 当前直连派发保留国际 Qoder、Qoder CN、ZCode、Claude 与该 CodeBuddy 精确模型，均接入跨会话
+
+**当轮授权 JSON 片段示例**（每轮重建证据输入，不继承旧路径或旧 failed 列表）：
+
+```json
+{
+  "selection_mode": "auto",
+  "quote": "用户本轮原话",
+  "authorization_scope": {"task_id": "<task>", "stage": "<stage>"},
+  "allowed_candidates": [
+    "codebuddy:deepseek-v4.1-flash",
+    "codebuddy:glm-5.3-flash",
+    "zcode:GLM-5.3",
+    "qoder:Qwen3.8-Flash",
+    "qodercn:Qwen3.8-Flash"
+  ],
+  "round_failed_candidates": ["codebuddy:deepseek-v4.1-flash"],
+  "codebuddy_quota_evidence": "<本轮 DeepSeek summary.json 的绝对路径>"
+}
+```
+
+正式 GLM 入口示例（`--codebuddy-quota-evidence` 必须是**本轮**证据）：
+
+```text
+python scripts/codebuddy_live.py --model glm-5.3-flash \
+  --workspace <项目绝对路径> --prompt-file <UTF-8提示词绝对路径> \
+  --output-dir <不存在的新证据目录> --stage <阶段编号> --task-id <任务标识> \
+  --codebuddy-quota-evidence <本轮 DeepSeek summary.json 绝对路径>
+```
+
+未带当轮证据时，即使授权集合含 `codebuddy:glm-5.3-flash`，规划与正式入口都会拒绝。
+本档不宣称 GLM 通道已现场验证、免费、额度独立或调用必然成功；真实有界验证由主脑另行执行。
+
+- 当前直连派发保留国际 Qoder、Qoder CN、ZCode、Claude 与 CodeBuddy 两个精确模型，均接入跨会话
   共享并发容量池（见 [全局并发容量池与主力优先级](references/global-dispatch.md)）。旧额度冷却
   不挡新 CodeBuddy 模型：每轮只试一次，失败换下一，下一新轮重来；不查余额、不加冷却。
 
@@ -930,11 +975,12 @@ human-relay only：不再从当前 Skill/CLI/控制面提交直接派发，只�
 SHA-256，禁止真实 node、禁止任意 stub 目录里的真实 CLI、禁止生产默认用户配置），
 **不是**当前可执行的操作指引，也不宣称旧 API 已彻底无产出：
 
-- 历史调用形状：`python scripts/codebuddy_direct.py --workspace <绝对路径> --prompt-file <UTF-8
-  任务文件> --output-dir <不存在的新证据目录> --stage <非空阶段编号> --model <实际模型ID>
-  [--tools ...] [--allowed-tools RULE] [--disallowed-tools RULE] [--resume-session-id <会话>]`；
-  要求显式模型、无 auto/fallback，曾选 `glm-5.3-flash`。该旧模型调用仍被生产入口固定拒绝；
-  仅 `deepseek-v4.1-flash` 另行经 `codebuddy_live` 承接（见上），历史形状只存档。
+- **历史调用形状（仅存档，不是当前指引）**：`python scripts/codebuddy_direct.py --workspace
+  <绝对路径> --prompt-file <UTF-8 任务文件> --output-dir <不存在的新证据目录> --stage
+  <非空阶段编号> --model <实际模型ID> [--tools ...] [--allowed-tools RULE]
+  [--disallowed-tools RULE] [--resume-session-id <会话>]`；要求显式模型、无 auto/fallback。
+  历史上曾选用旧 GLM 形状；当前只有精确 `deepseek-v4.1-flash` 与带当轮明确限额证据的
+  `glm-5.3-flash` 经 `codebuddy_live` 承接（见上），其它旧模型/旧 GLM 组合仍被生产入口拒绝。
 - 历史传输细节：官方 `-p --output-format stream-json`，任务经 stdin、不经 shell 拼接；保持
   dontAsk、工具白名单、空 strict MCP、空 setting sources、关闭 hooks 与主 Agent cli；工具允许规则
   是 CLI 权限、非文件沙箱；命令按原样运行，不添加 cd/echo/复合命令绕过规则。

@@ -1,18 +1,22 @@
 # 并行执行控制面（BW-PARALLEL-UPGRADE）
 
-> **当前运行时口径（2026-10-17 更新，BW-USAGE-AUDIT-20261017-S3）：直连派发保留国际
-> Qoder、Qoder CN、ZCode、Claude 与 `codebuddy:deepseek-v4.1-flash` 精确模型。WorkBuddy 与
-> CodeBuddy 其它旧模型（含旧 GLM）仍 human-relay only。** `execution_control.preflight` 对
-> runtime 为 `workbuddy` 的计划及未命中精确模型的 `codebuddy` 计划明确拒绝（返回
+> **当前运行时口径（2026-10-18 更新，BW-CODEBUDDY-GLM-FALLBACK-20261018）：直连派发保留国际
+> Qoder、Qoder CN、ZCode、Claude 与 CodeBuddy 的两个精确模型——主模型
+> `deepseek-v4.1-flash`、条件低层兜底 `glm-5.3-flash`。两个逻辑键共享 CodeBuddy 原有的 1 个
+> 物理槽，不新增并发，国内物理总容量仍为 13。GLM 只有在当前轮已有真实 DeepSeek 限额失败
+> （结构化 429/额度证据）且上层显式判定 `codebuddy_glm_allowed` 时才是候选；授权候选集里
+> 出现 GLM 但缺少当前轮额度条件时仍被排除。WorkBuddy 与 CodeBuddy 其它旧模型（含旧 GLM
+> 历史条目）仍 human-relay only。** `execution_control.preflight` 对
+> runtime 为 `workbuddy` 的计划及未命中上述两个精确模型的 `codebuddy` 计划明确拒绝（返回
 > `sent=false`、`manual_relay_only`，不派发）；生产 `codebuddy_direct.main` 亦在读配置/建输出/
-> Popen 前固定拒绝非精确模型。下文能力表中的 `codebuddy` 行仅对精确模型有效；旧“三入口”
+> Popen 前固定拒绝其它模型。下文能力表中的 `codebuddy` 行仅对这两个精确模型有效；旧“三入口”
 > 派发示例与旧枚举保留为**历史/离线说明**。选择 WorkBuddy/旧 CodeBuddy 模型时只生成完整可
 > 复制提示词、由人工交外部 Agent，生成提示词不记成已派发。各直连入口的实际并行、重叠、
 > grants 精确比对与额度结算继续有效。
 
 本文件描述 brain-worker 新增的任务级控制面：`scripts/execution_control.py`（纯标准库，
 **无常驻调度服务**）与各直连执行入口（国际 Qoder、Qoder CN、ZCode、Claude、
-`codebuddy:deepseek-v4.1-flash` 精确模型）新增的可选 `--dispatch-plan`。控制面做的是**主脑快照
+CodeBuddy 两个精确模型 `deepseek-v4.1-flash`/条件 `glm-5.3-flash`）新增的可选 `--dispatch-plan`。控制面做的是**主脑快照
 预检**，不是原子跨进程锁：它比对“计划 JSON”与“实际入口选择/工具 grant/cwd/argv”，
 拒绝缺 grant 或扩大权限，并在 Popen 之前退出 2。真正的进程串行化仍靠主脑看板与人工
 纪律，不靠本模块抢锁；也不提供跨轮自动唤醒——并行推进依赖主脑在会话内主动派工、观察
@@ -125,7 +129,7 @@ catalog**。被派发前拒绝（`sent=false`/退出 2）不计模型轮次；�
 | qoder | 是（`--allowed-tools Edit(...)`/`Bash(...)`、`--add-dir`） | 是 |
 | qodercn | 是（同国际 Qoder 的规则表达；入口分支不同） | 是 |
 | claude | 是（逐文件 Edit(...)/原样 Bash(...)、`--add-dir`） | 是 |
-| codebuddy | 是（`--allowedTools` 规则；无外部只读目录参数；**仅 `deepseek-v4.1-flash` 放行**） | 否 |
+| codebuddy | 是（`--allowedTools` 规则；无外部只读目录参数；**仅 `deepseek-v4.1-flash` 与条件低层 `glm-5.3-flash` 放行**，两者共享 1 个物理槽） | 否 |
 | zcode | **否**（只有整工具开关） | 否 |
 
 ZCode 的工具名白名单**不能假称细粒度文件权限**。当计划要求 ZCode 表达不了的逐文件/逐命令
@@ -228,9 +232,9 @@ python scripts/execution_control.py preflight --plan <plan.json> --actual <actua
 ≠ 占用一个真实活进程并发槽**。真实活进程容量只看 `LIVE_PROCESS_STATES = executing / blocked`：
 `awaiting_acceptance` 表示子进程已退出、只等业务验收，仍保护原任务/原工作区，**但不占用真实进程
 并发槽**，从而允许为另一工作区分配新执行器。把 `awaiting_acceptance` 写成占真实进程槽是错误的。
-真实直连入口（国际 Qoder、Qoder CN、ZCode、Claude 与
-`codebuddy:deepseek-v4.1-flash` 精确模型；WorkBuddy 与 CodeBuddy 旧模型为 human-relay，仅
-提示词人工中继，不进池）接受可选 `--active-tasks <json>`（数组 `{task_id,state,...}`）或在
+真实直连入口（国际 Qoder、Qoder CN、ZCode、Claude 与 CodeBuddy 两个精确模型
+`deepseek-v4.1-flash`/条件 `glm-5.3-flash`，两者共享 1 个物理槽；WorkBuddy 与 CodeBuddy
+其它旧模型为 human-relay，仅提示词人工中继，不进池）接受可选 `--active-tasks <json>`（数组 `{task_id,state,...}`）或在
 plan 里带 `active_tasks`，都传给 `ec.preflight`；并行 plan 缺 `active_tasks` 会被
 `validate_plan` 拒绝，**缺失不当作“没有在途工作”**。
 
@@ -240,8 +244,9 @@ CodeBuddy（含精确模型，容量由独立原子池强制）、WorkBuddy、cl
 同样排除——旧的全局快照 max 绝不把 Luna/CodeBuddy/其它池当成统一容量闸（否则会出现 domestic=0、
 6 个 Luna executing 却误报“concurrency limit 6 exceeded”）。**旧“国内六名额”说明与该示例中的
 `6` 属历史/旧快照边界（早期 `max_concurrency` 演练值），不改变本快照算法**；真实共享国内容量上限
-另由 `dispatch_pool` 原子池权威强制（当前名义 13、CN 自定义 Max 2 槽暂停、授权可新派 11，见
-[global-dispatch](global-dispatch.md)），本快照闸只是业务二级保护。同 task/同 workspace/共享写/
+另由 `dispatch_pool` 原子池权威强制（当前国内物理总容量 13；CN 自定义 Max 等原有授权与时间窗
+不变，不存在“2 槽暂停/只能新派 11”的当前口径；CodeBuddy 的 GLM 逻辑别名与 deepseek 共享原有
+1 个物理槽，不是第 14 个槽，见 [global-dispatch](global-dispatch.md)），本快照闸只是业务二级保护。同 task/同 workspace/共享写/
 依赖的快照保护仍由 `HELD_STATES` 独立维持，不因容量分离而放宽。
 
 - 允许有价值的并行，不凑并发数量：并发上限服务于独立成果的真实节省；没有独立可验收

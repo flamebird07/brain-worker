@@ -196,7 +196,8 @@ MAIN_FORCE_POOLS = (('codebuddy', 'deepseek-v4.1-flash'),
                     ('qoder', 'Qwen3.8-Max'),
                     ('qodercn', 'Qwen3.8-Max'),
                     ('qodercn', 'Qwen-3.8-Max'),
-                    ('claude', 'deepseek-flash'))
+                    ('claude', 'deepseek-flash'),
+                    ('codebuddy', 'glm-5.3-flash'))
 MAIN_FORCE_CAPACITY = {'codebuddy:deepseek-v4.1-flash': 1,
                        'zcode:GLM-5.3': 2,
                        'qoder:Qwen3.8-Max': 1,
@@ -219,6 +220,9 @@ DOMESTIC_TOTAL_CAPACITY = (sum(MAIN_FORCE_CAPACITY.values())
 CAPACITY = {}
 CAPACITY.update(MAIN_FORCE_CAPACITY)
 CAPACITY.update(OVERFLOW_CAPACITY)
+# BW-CODEBUDDY-GLM-FALLBACK-20261018：CodeBuddy 的 GLM 补位是**同一物理 1 槽**的第二个
+# 逻辑 pool_key 别名——只在 CAPACITY 登记为 1 供选择/预览，**绝不加入 MAIN_FORCE_CAPACITY**，
+# 因此 DOMESTIC_TOTAL_CAPACITY 仍是 13（不双计成 14）；真实占用由 `_shared_active` 求和。
 for _rk in LEGACY_RETIRED_POOL_KEYS:
     CAPACITY[_rk] = 0
 CAPACITY['luna:native'] = None
@@ -246,6 +250,16 @@ CODEBUDDY_RUNTIME = 'codebuddy'
 CODEBUDDY_MODEL = 'deepseek-v4.1-flash'
 CODEBUDDY_POOL_KEY = f'{CODEBUDDY_RUNTIME}:{CODEBUDDY_MODEL}'
 CODEBUDDY_CAPACITY = MAIN_FORCE_CAPACITY[CODEBUDDY_POOL_KEY]
+# BW-CODEBUDDY-GLM-FALLBACK-20261018 用户授权：CodeBuddy / GLM-5.3-Flash（精确 CLI ID
+# `codebuddy:glm-5.3-flash`）是**只在当轮 DeepSeek 真实明确限额后**启用的低层补位，优先级
+# 低于 ZCode、高于两地区 Qwen3.8-Flash；它与 deepseek-v4.1-flash **共用同一物理 CodeBuddy
+# 1 槽**（任一 reserved/running/unknown 都挡另一个），不新增并发、不改物理总 13。
+CODEBUDDY_GLM_MODEL = 'glm-5.3-flash'
+CODEBUDDY_GLM_POOL_KEY = f'{CODEBUDDY_RUNTIME}:{CODEBUDDY_GLM_MODEL}'
+CODEBUDDY_SHARED_POOL_KEYS = (CODEBUDDY_POOL_KEY, CODEBUDDY_GLM_POOL_KEY)
+CODEBUDDY_SHARED_CAPACITY = CODEBUDDY_CAPACITY
+# 逻辑别名容量：仅供 capacity_for/候选预览；**不进入 MAIN_FORCE_CAPACITY/物理总和**。
+CAPACITY[CODEBUDDY_GLM_POOL_KEY] = CODEBUDDY_SHARED_CAPACITY
 MAIN_FORCE_KEYS = tuple(f'{r}:{m}' for r, m in MAIN_FORCE_POOLS)
 OVERFLOW_KEYS = tuple(f'{r}:{m}' for r, m in OVERFLOW_POOLS)
 # 兼容既有引用名（CN_KEYS/CN_POOL_KEY 保留为空元组/空串，代码不再据此派工）；
@@ -652,6 +666,32 @@ def _count_active(conn, pk) -> int:
     return int(row['n']) if row else 0
 
 
+def _shared_active(conn, pk) -> int:
+    """CodeBuddy 两个逻辑 pool_key（deepseek-v4.1-flash / glm-5.3-flash）共用**同一物理
+    1 槽**：返回该物理组当前真实在途总数（reserved/running/unknown 求和）。非 CodeBuddy
+    池退化为自身 `_count_active`，语义完全不变。每个 attempt 只在自身 pool_key 下计一次，
+    本函数只做同一组内求和，绝不把同一 attempt 复制两次。"""
+    if pk in CODEBUDDY_SHARED_POOL_KEYS:
+        return sum(_count_active(conn, k) for k in CODEBUDDY_SHARED_POOL_KEYS)
+    return _count_active(conn, pk)
+
+
+def shared_group_for(pk):
+    """该 pool_key 所属的共享物理组（无共享则返回 (pk,)）。供 status/preview 明确展示
+    共享容量，不改变任何调度语义。"""
+    if pk in CODEBUDDY_SHARED_POOL_KEYS:
+        return CODEBUDDY_SHARED_POOL_KEYS
+    return (pk,)
+
+
+def _shared_has_capacity(conn, pk) -> bool:
+    """该池（或共享组）当前是否仍有真实空位；容量为 None（Luna）视为无上限。"""
+    cap = capacity_for(pk)
+    if cap is None:
+        return True
+    return _shared_active(conn, pk) < cap
+
+
 def _count_committed_claude(conn) -> int:
     """claude 独立第三组的 committed 计数（BW-CLAUDE-DEEPSEEK-S3）：从**已有 attempts 表**的真实
     提交历史计算（`pool_key=claude:deepseek-flash` 且 `child_pid IS NOT NULL`，即真实启动过子进程
@@ -789,9 +829,19 @@ def status(store_path=None, now=None) -> dict:
     with closing(connect(store_path)) as conn:
         pools = {}
         for pk, cap in CAPACITY.items():
+            # active 始终是该 pool_key 自身的真实 attempt 数（同一 attempt 绝不复制两次）；
+            # CodeBuddy 组额外给出 shared_active（两逻辑 key 求和）与共享容量，free 按共享
+            # 槽计算，避免把同一物理 1 槽误读成 2 个可用名额。
             active = _count_active(conn, pk)
+            shared = pk in CODEBUDDY_SHARED_POOL_KEYS
+            effective_active = _shared_active(conn, pk) if shared else active
             pools[pk] = {'capacity': cap, 'active': active,
-                         'free': (None if cap is None else max(0, cap - active))}
+                         'free': (None if cap is None
+                                  else max(0, cap - effective_active))}
+            if shared:
+                pools[pk]['shared_group'] = list(CODEBUDDY_SHARED_POOL_KEYS)
+                pools[pk]['shared_capacity'] = CODEBUDDY_SHARED_CAPACITY
+                pools[pk]['shared_active'] = effective_active
             for pk in QUOTA_LIMITABLE_POOLS:
                 if pk in pools:
                     pools[pk]['limited'] = _main_force_limit_active(conn, pk)
@@ -986,7 +1036,7 @@ def _probe_allowed(quota_store, probe_ticket, now=None):
         return False
 
 
-def _eligible_main_forces(conn, zcode_blocked, now=None):
+def _eligible_main_forces(conn, zcode_blocked, now=None, codebuddy_glm_allowed=False):
     """可用主力集合（BW-POOL-SPLIT-20261010-S3 + BW-MAX-WINDOW-20261010-S1）：三主力明确
     限额都自动跳过、不查询余额；两个 Qoder 内置 Max 还受北京时间主力时段门约束。
     - ZCode:GLM-5.3 被持久 availability 阻断（hard_hold / bounded backoff /
@@ -1007,6 +1057,12 @@ def _eligible_main_forces(conn, zcode_blocked, now=None):
     调用点与显式 purpose=probe 生命周期；普通候选集不再据此剔除。"""
     eligible = set()
     for k in MAIN_FORCE_KEYS:
+        # BW-CODEBUDDY-GLM-FALLBACK-20261018：GLM 是**仅额度条件成立时**才可用的低层
+        # 补位；默认（无当轮 DeepSeek 明确限额证据）绝不进入候选，绝不因本轮其它主力
+        # 失败/满而自动启用。该布尔只能由 stage_selection/正式入口在复验当前轮
+        # summary.json 证据后显式传入；历史标记/旧报告/普通失败一律不算。
+        if k == CODEBUDDY_GLM_POOL_KEY and not codebuddy_glm_allowed:
+            continue
         if _max_window_blocks(k, now):
             continue
         eligible.add(k)
@@ -1043,7 +1099,7 @@ def _scope_combo_from_scope(scope):
     return None, False
 
 
-def _scope_allowed_candidates(scope, zcode_blocked):
+def _scope_allowed_candidates(scope, zcode_blocked, codebuddy_glm_allowed=False):
     """按票据 scope 的执行器/combo 硬约束给出该任务真正受信任的候选池（BW-POOL-SPLIT-
     20261010-S2）：优先顺序是**主力在前、两地区 Flash 同级兜底在后**，CN DeepSeek-Flash
     已退出正常候选池不再作为独立补充候选。scope 明确只要 ZCode 而 ZCode 当前不可用 →
@@ -1057,6 +1113,9 @@ def _scope_allowed_candidates(scope, zcode_blocked):
     if combo is not None:
         if combo == ZCODE_POOL_KEY and zcode_blocked:
             return []
+        # GLM 显式 combo 也不例外：没有当轮额度证据就绝不作为受信任候选。
+        if combo == CODEBUDDY_GLM_POOL_KEY and not codebuddy_glm_allowed:
+            return []
         return [combo]
     if executor == 'zcode':
         return [] if zcode_blocked else [ZCODE_POOL_KEY]
@@ -1068,11 +1127,15 @@ def _scope_allowed_candidates(scope, zcode_blocked):
         # 显式指定 claude 入口：只有独立 claude 池自身，绝不跨到其它国内槽或 Flash/回退模型。
         return [CLAUDE_POOL_KEY]
     if executor == CODEBUDDY_RUNTIME:
-        # 显式指定 CodeBuddy 入口：只有独立 codebuddy:deepseek-v4.1-flash 池自身，绝不跨到
-        # 其它国内槽、Flash 或任何回退模型；CodeBuddy 其它旧模型仍不在候选集合。
+        # 显式指定 CodeBuddy 入口：默认只有独立 codebuddy:deepseek-v4.1-flash 池自身，绝不
+        # 跨到其它国内槽、Flash 或任何回退模型。仅当调用方已复验当轮明确限额证据并显式
+        # 授权 GLM 时，才把同一物理槽的 GLM 逻辑 key 加入（更高层 deepseek 仍优先）。
+        if codebuddy_glm_allowed:
+            return [CODEBUDDY_POOL_KEY, CODEBUDDY_GLM_POOL_KEY]
         return [CODEBUDDY_POOL_KEY]
     mains = [k for k in MAIN_FORCE_KEYS
-             if not (k == ZCODE_POOL_KEY and zcode_blocked)]
+             if not (k == ZCODE_POOL_KEY and zcode_blocked)
+             and not (k == CODEBUDDY_GLM_POOL_KEY and not codebuddy_glm_allowed)]
     # 默认/auto 受信任候选：三主力在前、两地区 Flash 同级兜底在后；已 retired 的 CN
     # DeepSeek-Flash 不在候选集合中，任何 AUTO 派工绝不新落该池。
     return mains + list(OVERFLOW_KEYS)
@@ -1101,12 +1164,19 @@ def _select_main_force(conn, requested_pk, now, eligible=None):
     order = list(MAIN_FORCE_KEYS)
     if eligible is not None:
         order = [k for k in order if k in eligible]
+    else:
+        # BW-CODEBUDDY-GLM-FALLBACK-20261018：GLM 是额度条件补位，默认候选集**不含**它。
+        # 只有调用方显式传入的 eligible（已由上层复验当轮 DeepSeek 明确限额证据）包含 GLM
+        # 时才参与排序；缺省 eligible=None 绝不能凭「其它主力都满/不可用」自动启用 GLM。
+        order = [k for k in order if k != CODEBUDDY_GLM_POOL_KEY]
     avail = []
     for pk in order:
         cap = capacity_for(pk)
         if cap is None:
             continue
-        active = _count_active(conn, pk)
+        # CodeBuddy 两个逻辑模型共用同一物理 1 槽：两个 key 任一有 reserved/running/
+        # unknown 都视为该组已占满，绝不因只看自己的 key 而派出第二个并发。
+        active = _shared_active(conn, pk)
         if active < cap:
             avail.append((pk, active))
     if not avail:
@@ -1114,9 +1184,13 @@ def _select_main_force(conn, requested_pk, now, eligible=None):
     # BW-CODEBUDDY-MAIN-S3：最高优先层为 codebuddy:deepseek-v4.1-flash（无时段门），其后依序
     # 三 Qoder Max、claude:deepseek-flash、zcode:GLM-5.3（全天可用者垫底）。低层绝不凭历史
     # committed 抢高层名额；最高层不合格或无空位才落到下一层。
+    # BW-CODEBUDDY-GLM-FALLBACK-20261018 完整层序：CodeBuddy deepseek(0) > CN 自定义 Max
+    # 与两内置 Max(1) > Claude(2) > ZCode(3) > CodeBuddy GLM(4) > 两地区 Flash（主力之外）。
+    # GLM 只会在 eligible 已含它（当轮额度证据成立）时参与排序；否则根本不进 avail。
     tier = {CODEBUDDY_POOL_KEY: 0,
             QMAX_POOL_KEY: 1, CN_MAX_POOL_KEY: 1, CN_CUSTOM_MAX_POOL_KEY: 1,
-            CLAUDE_POOL_KEY: 2, ZCODE_POOL_KEY: 3}
+            CLAUDE_POOL_KEY: 2, ZCODE_POOL_KEY: 3,
+            CODEBUDDY_GLM_POOL_KEY: 4}
     # BW-CUSTOM-MAX-RESUME-20261018-S1：Max 层内自定义子优先（在途数/tie 之前）——
     # qodercn:Qwen-3.8-Max 先于两个内置 Max，两内置之间仍按在途数平衡。保留原 tier 数值，
     # 仅加一个子键，不新建优先级框架。
@@ -1155,7 +1229,8 @@ def _flash_fallback_or_full(conn, requested_pk):
 
 
 def _domestic_policy(conn, requested_pk, now, executor='auto', eligible=None,
-                     zcode_blocked=None, probe_allowed=False):
+                     zcode_blocked=None, probe_allowed=False,
+                     codebuddy_glm_allowed=False):
     """reserve 与 select-and-claim 共用的统一国内裁决（BW-POOL-SPLIT-20261010-S2）：
     返回 ('claim', pk) / ('routing', target_pk) / ('full', None) /
     ('zcode_unavailable', None) / ('executor_conflict', None) / ('reject_luna', None) /
@@ -1226,15 +1301,34 @@ def _domestic_policy(conn, requested_pk, now, executor='auto', eligible=None,
         if executor in ('codebuddy', None):
             if _domestic_active(conn) >= DOMESTIC_TOTAL_CAPACITY:
                 return 'full', None
-            if _count_active(conn, CODEBUDDY_POOL_KEY) < capacity_for(CODEBUDDY_POOL_KEY):
+            if _shared_has_capacity(conn, CODEBUDDY_POOL_KEY):
                 return 'claim', CODEBUDDY_POOL_KEY
             return 'full', None
+    # BW-CODEBUDDY-GLM-FALLBACK-20261018：GLM 是同一物理 CodeBuddy 1 槽的低层补位，必须
+    # 同时满足（1）调用方显式授权 codebuddy_glm_allowed=True（只能来自当轮真实明确限额证据
+    # 的复验）与（2）共享槽真实有空位；否则如实拒绝，绝不自动切换/重派、绝不消耗通用
+    # reserve 的容量来"证明"额度、绝不给 Max 夜间窗或 Claude 离峰窗待遇（无时段门）。
+    if requested_pk == CODEBUDDY_GLM_POOL_KEY:
+        if executor not in ('auto', CODEBUDDY_RUNTIME, None):
+            return 'executor_conflict', None
+        if not codebuddy_glm_allowed:
+            return 'codebuddy_quota_condition_not_met', None
+        if executor != 'auto':
+            if _domestic_active(conn) >= DOMESTIC_TOTAL_CAPACITY:
+                return 'full', None
+            if _shared_has_capacity(conn, CODEBUDDY_GLM_POOL_KEY):
+                return 'claim', CODEBUDDY_GLM_POOL_KEY
+            return 'full', None
+        # executor='auto'：不直接认领，落入下方统一 auto 分支；更高优先主力全部
+        # 受限/满/不合格后才轮到 tier=4 的 GLM。
     # 迁移债务总额守卫（BW-POOL-SPLIT-20261010-S3）：总在途已满 DOMESTIC_TOTAL_CAPACITY
     # （现为 12）→ 任何新国内 claim 都不得放行（减少容量不杀老任务，老任务真实终态自然
     # 释放后计数才下降）。
     if _domestic_active(conn) >= DOMESTIC_TOTAL_CAPACITY:
         return 'full', None
-    elig = eligible if eligible is not None else set(MAIN_FORCE_KEYS)
+    elig = set(eligible) if eligible is not None else set(MAIN_FORCE_KEYS)
+    if not codebuddy_glm_allowed:
+        elig.discard(CODEBUDDY_GLM_POOL_KEY)
 
     if executor == 'qoder':
         if requested_pk == QMAX_POOL_KEY:
@@ -1426,7 +1520,8 @@ def select_and_claim(store_path=None, *, task_id, runtime, model, workspace,
                      now=None, origin='select-and-claim',
                      wrapper_pid=None, wrapper_created=None,
                      executor='auto', quota_store=None, quota_routes=None,
-                     probe_ticket=None, _preclaim=True) -> dict:
+                     probe_ticket=None, codebuddy_glm_allowed=False,
+                     _preclaim=True) -> dict:
     """无显式 claim 时的原子路由选择（与 reserve 共用 _domestic_policy，语义集中）：
     - 请求 Luna → 拒绝（Luna 只经 claim-due 竞争裁决，绝不自动派生）；
     - 请求溢出 Flash：主力仍有空位 → routing_required 到该主力；主力与 Flash 均满但 CN
@@ -1473,12 +1568,14 @@ def select_and_claim(store_path=None, *, task_id, runtime, model, workspace,
                 return _workspace_busy_reject(task_id, pk, busy)
             zcode_blocked = _zcode_availability_blocked(quota_store, now=now,
                                                         routes_path=quota_routes)
-            eligible = _eligible_main_forces(conn, zcode_blocked, now)
+            eligible = _eligible_main_forces(conn, zcode_blocked, now,
+                                             codebuddy_glm_allowed=codebuddy_glm_allowed)
             probe_allowed = _probe_allowed(quota_store, probe_ticket, now=now)
             verdict, target = _domestic_policy(conn, pk, now, executor=executor,
                                                eligible=eligible,
                                                zcode_blocked=zcode_blocked,
-                                               probe_allowed=probe_allowed)
+                                               probe_allowed=probe_allowed,
+                                               codebuddy_glm_allowed=codebuddy_glm_allowed)
             domestic_full = _domestic_active(conn) >= DOMESTIC_TOTAL_CAPACITY
             if verdict == 'unknown_pool':
                 conn.execute('ROLLBACK')
@@ -1507,6 +1604,17 @@ def select_and_claim(store_path=None, *, task_id, runtime, model, workspace,
                 conn.execute('ROLLBACK')
                 return _reject('main_force_window_closed', task_id, pk,
                                [_window_closed_reason(pk)])
+            if verdict == 'codebuddy_quota_condition_not_met':
+                conn.execute('ROLLBACK')
+                return _reject('codebuddy_quota_condition_not_met', task_id, pk,
+                               ['CodeBuddy GLM-5.3-Flash is a quota-conditional low-tier '
+                                "backup: it may only be selected when the current round's "
+                                'codebuddy:deepseek-v4.1-flash attempt has valid explicit '
+                                'quota/429 evidence (summary.json envelope) and all '
+                                'applicable higher-priority main forces are unavailable; '
+                                'a generic reservation/claim token or an old persistent '
+                                'limit mark is never proof of that condition, so no '
+                                'automatic switch or re-dispatch is performed'])
             if verdict == 'reject_luna':
                 conn.execute('ROLLBACK')
                 return _reject('luna_requires_ticket', task_id, pk,
@@ -1542,6 +1650,14 @@ def select_and_claim(store_path=None, *, task_id, runtime, model, workspace,
                                     'concurrent dispatch to this independent pool is refused '
                                     'and never falls back to another model or an old CodeBuddy '
                                     'channel; wait for the real terminal release']
+                elif pk == CODEBUDDY_GLM_POOL_KEY:
+                    full_reasons = [f'{pk} (quota-conditional CodeBuddy / glm-5.3-flash) '
+                                    'shares the single physical CodeBuddy slot '
+                                    f'(capacity {CODEBUDDY_SHARED_CAPACITY}) with '
+                                    f'{CODEBUDDY_POOL_KEY}; either model\'s active attempt '
+                                    'occupies the group, so a second concurrent dispatch is '
+                                    'refused and never falls back to another model — wait '
+                                    'for the real terminal release']
                 else:
                     full_reasons = ['the sanctioned domestic candidate set for this combo is '
                                     'fully occupied; ask the user (external agent or Luna) and '
@@ -1574,7 +1690,8 @@ def select_and_claim(store_path=None, *, task_id, runtime, model, workspace,
 def reserve(store_path=None, *, task_id, runtime, model, workspace, prompt_sha256,
             stage=None, chat_id=None, token=None, now=None, origin='reserve',
             executor='auto', quota_store=None, quota_routes=None,
-            probe_ticket=None, _preclaim=True) -> dict:
+            probe_ticket=None, codebuddy_glm_allowed=False,
+            _preclaim=True) -> dict:
     """为确切 (runtime, model) 预留一个 claim。修订后与 select-and-claim 共用统一国内
     策略（_domestic_policy）：空库/主力有空时 reserve Flash 一律 routing_required 到
     主力（不保留任何绕过主力顺序的口子）；reserve Luna 一律拒绝（只能经 ask 票据 +
@@ -1611,12 +1728,14 @@ def reserve(store_path=None, *, task_id, runtime, model, workspace, prompt_sha25
                 return _workspace_busy_reject(task_id, pk, busy)
             zcode_blocked = _zcode_availability_blocked(quota_store, now=now,
                                                         routes_path=quota_routes)
-            eligible = _eligible_main_forces(conn, zcode_blocked, now)
+            eligible = _eligible_main_forces(conn, zcode_blocked, now,
+                                             codebuddy_glm_allowed=codebuddy_glm_allowed)
             probe_allowed = _probe_allowed(quota_store, probe_ticket, now=now)
             verdict, target = _domestic_policy(conn, pk, now, executor=executor,
                                                eligible=eligible,
                                                zcode_blocked=zcode_blocked,
-                                               probe_allowed=probe_allowed)
+                                               probe_allowed=probe_allowed,
+                                               codebuddy_glm_allowed=codebuddy_glm_allowed)
             if verdict == 'unknown_pool':
                 conn.execute('ROLLBACK')
                 return _reject('unknown_pool', task_id, pk,
@@ -1635,6 +1754,15 @@ def reserve(store_path=None, *, task_id, runtime, model, workspace, prompt_sha25
                 conn.execute('ROLLBACK')
                 return _reject('main_force_window_closed', task_id, pk,
                                [_window_closed_reason(pk)])
+            if verdict == 'codebuddy_quota_condition_not_met':
+                conn.execute('ROLLBACK')
+                return _reject('codebuddy_quota_condition_not_met', task_id, pk,
+                               ['reserve never pre-empts the quota condition: '
+                                'CodeBuddy GLM-5.3-Flash may only be reserved when the '
+                                "current round's DeepSeek attempt has valid explicit "
+                                'quota/429 evidence and higher-priority main forces are '
+                                'unavailable; a reservation is capacity-only and is never '
+                                'proof of authorization'])
             if verdict == 'reject_luna':
                 conn.execute('ROLLBACK')
                 return _reject('luna_requires_ticket', task_id, pk,
@@ -1660,6 +1788,13 @@ def reserve(store_path=None, *, task_id, runtime, model, workspace, prompt_sha25
                                    f'its capacity of {CODEBUDDY_CAPACITY} — a second '
                                    'concurrent dispatch is refused and never falls back to '
                                    'another model or an old CodeBuddy channel')
+                elif pk == CODEBUDDY_GLM_POOL_KEY:
+                    full_reason = (f'{pk} (quota-conditional CodeBuddy / glm-5.3-flash) '
+                                   'shares the single physical CodeBuddy slot '
+                                   f'(capacity {CODEBUDDY_SHARED_CAPACITY}) with '
+                                   f'{CODEBUDDY_POOL_KEY}; the shared slot is occupied, so '
+                                   'no second concurrent dispatch is reserved and no '
+                                   'automatic switch is performed')
                 else:
                     full_reason = f'{pk} and every other domestic pool is at capacity'
                 return _reject('capacity_full', task_id, pk,
@@ -1747,7 +1882,7 @@ def consume_for_entry(store_path=None, *, task_id, runtime, model, workspace,
                       prompt_sha256, stage=None, chat_id=None, claim_token=None,
                       wrapper_pid=None, wrapper_created=None, now=None,
                       executor='auto', quota_store=None, quota_routes=None,
-                      probe_ticket=None) -> dict:
+                      probe_ticket=None, codebuddy_glm_allowed=False) -> dict:
     """入口在 Popen 前的唯一容量门：
     - 给了 --dispatch-claim → 同一 `BEGIN IMMEDIATE` 事务内先精确校验（含 stage/chat）
       再 CAS reserved→running；重复/并发消费只有一个 allowed（一槽绝不双 Popen）；
@@ -1780,6 +1915,40 @@ def consume_for_entry(store_path=None, *, task_id, runtime, model, workspace,
                             'reason': 'claim_invalid', 'pool_key': pool_key(runtime, model),
                             'task_id': task_id, 'reasons': check['reasons'],
                             'drift': check['drift']}
+                # BW-CODEBUDDY-GLM-FALLBACK-20261018：claim token 只是容量/工作区占位，
+                # **不是**额度条件证明。入口若未在启动前重新复验当轮明确的 DeepSeek 限额
+                # 证据，就绝不能消费 GLM 的预留：reserved 的本任务占位在同一事务内释放为
+                # start_failed（只释放自己，绝不抢占/泄漏），running/unknown 旧状态原样
+                # 保留并拒绝重复启动；绝不自动切换模型或重派。
+                if row['pool_key'] == CODEBUDDY_GLM_POOL_KEY \
+                        and not codebuddy_glm_allowed:
+                    cur = conn.execute(
+                        "UPDATE attempts SET state='start_failed', "
+                        "terminal='start_failed', ended_at_utc=? WHERE token=? "
+                        "AND state='reserved'", (_iso(now), claim_token))
+                    released = cur.rowcount == 1
+                    if released:
+                        conn.execute('COMMIT')
+                    else:
+                        conn.execute('ROLLBACK')
+                    return {'allowed': False, 'sent': False, 'claimed': False,
+                            'token': None, 'routing_required': False,
+                            'reason': 'codebuddy_quota_condition_not_met',
+                            'pool_key': row['pool_key'], 'task_id': task_id,
+                            'capacity_released': released,
+                            'reasons': ['CodeBuddy GLM-5.3-Flash requires a fresh '
+                                        "verification of the current round's explicit "
+                                        'DeepSeek quota evidence at the formal entry; a '
+                                        'claim token is capacity-only and is never proof '
+                                        'of the switch condition — the start is refused '
+                                        'without any automatic model switch or re-dispatch'
+                                        + (' and this attempt\'s own reserved placeholder '
+                                           'was released to start_failed (real release, '
+                                           'no capacity leak)'
+                                           if released else
+                                           '; the attempt is no longer reserved, so its '
+                                           'original state and in-flight placeholder are '
+                                           'preserved (no false release)')]}
                 # BW-SIMPLE-PRIORITY-RETRY-S4 用户政策：消费已预留 token 前**不再**据历史
                 # ZCode availability 或主力明确限额（main_force_limits）把本 reserved 释放为
                 # start_failed 并拒绝启动——每轮从最高优先级真实尝试，真实失败才落诊断、成功
@@ -1865,7 +2034,8 @@ def consume_for_entry(store_path=None, *, task_id, runtime, model, workspace,
                             stage=stage, chat_id=chat_id, now=now, origin='entry-auto',
                             wrapper_pid=wrapper_pid, wrapper_created=wrapper_created,
                             executor=executor, quota_store=quota_store,
-                            quota_routes=quota_routes, probe_ticket=probe_ticket)
+                            quota_routes=quota_routes, probe_ticket=probe_ticket,
+                            codebuddy_glm_allowed=codebuddy_glm_allowed)
 
 
 def mark_running(store_path, token, *, wrapper_pid=None, wrapper_created=None, now=None):
@@ -2287,8 +2457,8 @@ def ask_record(store_path=None, *, task_id, scope=None, ask_message_id=None,
                     allowed_c = _scope_allowed_candidates(parsed_scope, zcode_blocked)
                     free_candidate = None
                     for k in allowed_c:
-                        cap = capacity_for(k)
-                        if cap is not None and _count_active(conn, k) < cap:
+                        # 共享 CodeBuddy 槽同样按组判断真实空位（GLM 默认不在候选内）。
+                        if capacity_for(k) is not None and _shared_has_capacity(conn, k):
                             free_candidate = k
                             break
                     if free_candidate is not None:
@@ -2515,10 +2685,13 @@ def claim_due(store_path=None, *, task_id, now=None, scope=None,
                             break
                 if target is None and scope_combo is not None \
                         and scope_combo in MAIN_FORCE_KEYS \
+                        and scope_combo != CODEBUDDY_GLM_POOL_KEY \
                         and not _main_force_limit_active(conn, scope_combo) \
                         and not _max_window_blocks(scope_combo, now) \
                         and capacity_for(scope_combo) is not None \
-                        and _count_active(conn, scope_combo) < capacity_for(scope_combo):
+                        and _shared_has_capacity(conn, scope_combo):
+                    # 票据回收没有"当轮 DeepSeek 明确限额证据"的上文：GLM 永不通过这条
+                    # 路径被自动回收/启用，保持 pending；CodeBuddy deepseek 仍按共享槽判断。
                     target = scope_combo
                 if target is None and allowed is None:
                     # 无显式 scope 的国内回收：主力已满后按同级两地区 Flash 兜底
