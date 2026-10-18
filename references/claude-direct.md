@@ -167,6 +167,37 @@
   证据（CLI 版本、错误载体），不夸大。服务端根因未知；现场诊断尚未完成，由 root 后续
   回读，离线诊断通过不等于现场网络已修复。
 
+### 6.2 传输阶段被动观测（默认关闭；只由宿主为子进程显式启用）
+
+- 模块 `scripts/claude_transport_trace.cjs`（纯 Node 内置模块 `diagnostics_channel`/
+  `fs`/`path`）**只订阅** Undici 官方诊断通道的 request 五事件
+  （`create`/`bodySent`/`headers`/`trailers`/`error`）与 client 四事件
+  （`beforeConnect`/`connected`/`connectError`/`sendHeaders`），通道前缀为 `undici:`。
+  不包装或改写 fetch/https、dispatcher、重试、socket；不读 request/response 的
+  headers、body、trailers 内容，也不读 URL 凭据/query/token。
+- **child-only 预加载**：仅由宿主在启动 Claude CLI **子进程**时显式设置
+  `NODE_OPTIONS=--require <仓库绝对路径>/scripts/claude_transport_trace.cjs` 与
+  `BRAIN_WORKER_CLAUDE_TRACE_FILE=<绝对路径>.jsonl`。**禁止**写入全局/用户级
+  `NODE_OPTIONS`、`~/.claude` 设置或任何默认配置；env 未设时模块零订阅、零写、
+  不产生任何日志。Windows 下预加载路径使用正斜杠并在路径含空格时加双引号，例如
+  `--require "C:/path with spaces/claude_transport_trace.cjs"`；反斜杠可能被 NODE_OPTIONS 解析吞掉，
+  此类预加载失败不是 API 通信故障。日志父目录由 root 预建，模块不建目录、不扫描路径；文件以独占方式
+  创建，已存在即停止采集，绝不覆盖既有证据。
+- 既有代理清理（`_CLEARED_CHILD_ENV` 清除 `HTTP(S)_PROXY`/`ALL_PROXY` 等）、
+  `CLAUDE_CODE_MAX_RETRIES=0`、`API_TIMEOUT_MS=60000`、
+  `CLAUDE_CODE_DISABLE_NONESSENTIAL_TRAFFIC=1` 全部保持原样：本观测不改代理、
+  重试、额度或调度。
+- 只记 `api.deepseek.com` HTTPS 443 且 path 属于 `/anthropic/v1/messages`、
+  `/anthropic/v1/messages/count_tokens`（忽略 query）的请求；字段限 UTC 时间、
+  相对耗时、固定事件名、本机匿名递增 request_id/socket_id、method 枚举、固定端点、
+  数字状态码、socket 实际使用次数与是否复用、白名单 error code/syscall 与有限层
+  cause。上限 1000 条 / 256 KiB，超出即停止；不轮转、不起后台任务、不写
+  stdout/stderr、不抛诊断异常中断 CLI。
+- **证据边界**：连接事件本身不是请求关联，只有 `client:sendHeaders` 同时给出
+  request 与 socket 时才建立关联；复用必须由同一 socket 的实际使用次数证明，不能按
+  “本轮第几次请求”推断。CLI 若走非 Undici transport 或未发这些事件，空日志**只说明
+  证据不足**，绝不据此推断链路健康。本观测只补诊断支持，不定位也不修复根因。
+
 ## 7. execution_control 接受 claude
 
 - `CAPABILITY['claude'] = {'fine_grained': True, 'read_dirs': True}`，可校验 claude plan /
@@ -190,6 +221,12 @@
   取 result 错误载体、正文普通 429 与取消 `4294967295` 不判限额、`parse_error` 不判协议成功、
   缺失回执/全部权限拒绝不判工程成功）、生命周期（FakePopen 真实 PID、绑定回读、脱敏、
   预检失败零 Popen、`launch_unknown` 保留）。
+- `tests/test_claude_transport_trace.py`（BW-CLAUDE-TRANSPORT-R2）：Node 不在 PATH 时
+  skip；用临时目录 + `diagnostics_channel` 合成 publish 验证 §6.2 的观测契约——未启用
+  零文件零订阅、独占创建、同 socket 两次请求标 `socket_uses`/`socket_reused`、连接错误
+  不绑 request、错误码白名单与 cause 层数、HTTP 状态只记数字、headers/body/query/
+  message/stack 与嵌套密钥标记不落盘、其他域/路径过滤、合法 JSON 行与真 UTC、既有文件
+  不覆盖、cap 停止不抛、callback 不改请求对象。**合成 publish 不是真实网络观察**。
 - 相关套件（fixture 已补第 11–12 claude 槽、安全断言未删未放宽）：`tests/test_dispatch_pool.py`、
   `test_dispatch_pool_revision.py`、`test_dispatch_pool_qodercn.py`、
   `test_dispatch_pool_multiprocess.py`、`test_availability_routing.py`、
