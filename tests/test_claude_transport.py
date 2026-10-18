@@ -262,6 +262,7 @@ class TransportLifecycleTests(unittest.TestCase):
 
     def cfg(self):
         return {'executable': str(self.base / 'claude.exe'), 'model': 'deepseek-flash',
+                'permission_mode': 'dontAsk',
                 'tools': ['Read'], 'allowed_tools': ['Read'], 'setting_sources': [],
                 'credential_source': {'mode': 'token_env', 'env': 'ANTHROPIC_API_KEY'}}
 

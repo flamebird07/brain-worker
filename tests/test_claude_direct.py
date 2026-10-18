@@ -1,7 +1,8 @@
 """BW-CLAUDE-DEEPSEEK-S3 离线回归：claude_direct 入口（零真实模型/零网络/零 DPAPI）。
 
 用注入的假 Popen + token_env 环境 + 显式临时 dispatch store 驱动整条生命周期，断言：
-argv 无 shell/无 token/无 bypass/无 --bare、--tools/--setting-sources 始终传、allowedTools 只出现
+argv 无 shell/无 token/无 --bare、显式 dontAsk fixture（默认 bypass 见
+test_claude_bypass_mode.py）、--tools/--setting-sources 始终传、allowedTools 只出现
 一次、env 钉死 deepseek-flash 且清除继承凭据/代理、outdir 必须不存在、结果分型（成功/429/
 is_error 载体/零工具工程证据）、时段门拒派、跨高峰释放、launch_unknown 保持、token 绝不进入任何
 证据文件。真实 Claude 调用与真实凭据由 root 本机执行，本文件只证明离线设计正确。
@@ -145,6 +146,7 @@ def _jsonl(events):
 class PureFunctionTests(unittest.TestCase):
     def cfg(self, **over):
         base = {'executable': 'C:/abs/claude.exe', 'model': 'deepseek-flash',
+                'permission_mode': 'dontAsk',
                 'tools': ['Read', 'Edit'], 'allowed_tools': ['Edit(/abs/x.py)'],
                 'max_turns': 8, 'setting_sources': [],
                 'credential_source': {'mode': 'token_env', 'env': 'ANTHROPIC_API_KEY'}}
@@ -175,9 +177,10 @@ class PureFunctionTests(unittest.TestCase):
         self.assertNotIn('yolo', joined)
         self.assertNotIn(SECRET, joined)
 
-    def test_argv_rejects_bypass_permission_mode(self):
+    def test_argv_rejects_unsupported_permission_mode(self):
+        # 显式 dontAsk 与默认 bypassPermissions 之外不扩大支持；未知模式仍拒绝。
         with self.assertRaises(ValueError):
-            cd.build_argv(self.cfg(permission_mode='bypassPermissions'), 'C:/ws',
+            cd.build_argv(self.cfg(permission_mode='acceptEdits'), 'C:/ws',
                           'deepseek-flash', '')
 
     def test_argv_launcher_args_node_cli(self):
@@ -497,6 +500,7 @@ class LifecycleTests(unittest.TestCase):
 
     def cfg(self):
         return {'executable': str(self.base / 'claude.exe'), 'model': 'deepseek-flash',
+                'permission_mode': 'dontAsk',
                 'tools': ['Read'], 'allowed_tools': ['Read'], 'setting_sources': [],
                 'credential_source': {'mode': 'token_env', 'env': 'ANTHROPIC_API_KEY'}}
 

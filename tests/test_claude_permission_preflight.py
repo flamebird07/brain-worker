@@ -27,7 +27,9 @@ SECRET = 'sk-PREFLIGHT-SECRET-DO-NOT-LEAK'
 
 
 def _cfg(**over):
+    # 旧严格 profile 用例显式选择 dontAsk；默认已改为 bypassPermissions。
     base = {'executable': 'C:/abs/claude.exe', 'model': 'deepseek-flash',
+            'permission_mode': 'dontAsk',
             'tools': ['Read'], 'allowed_tools': ['Read'], 'setting_sources': [],
             'credential_source': {'mode': 'token_env', 'env': 'ANTHROPIC_API_KEY'}}
     base.update(over)

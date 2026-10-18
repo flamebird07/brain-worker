@@ -7,6 +7,27 @@
 > worker 不调 API。官方 Node CLI 2.1.76 真实 Read/Write 已成功（独立事实，见 §9），
 > native 2.1.220/296 连接失败单列，不与 Node 事实混写。**
 
+## 0. 默认调用（最简单，直接 bypass）
+
+本机私有 `claude-entry.local.json` 保持 `permission_mode: "bypassPermissions"`、`tools`
+为 `Read/Glob/Grep/Edit/Write/Bash`（root 本机同步），即可直接派工；**不需要**
+`--required-tools`、`--write-file` 或逐文件登记命令：
+
+```bash
+python scripts/claude_direct.py \
+  --workspace "C:/absolute/workspace" \
+  --prompt-file "C:/absolute/task.md" \
+  --output-dir "C:/absolute/new-evidence-dir" \
+  --stage "BW-STAGE-ID" \
+  --task-id "task-id"
+```
+
+真实 argv 会带 `--permission-mode bypassPermissions` 与
+`--dangerously-skip-permissions`。回执如实记录 `permission_mode=bypassPermissions`、
+`enforcement=cli_bypass`、`exact_file_authorization=false`：精确文件授权预检没有执行，
+不能据此宣称存在精确文件保护。任务范围仍由提示词与独立验收界定，**不是沙箱**。
+`dontAsk` 仅在显式选择时保留旧的严格流程（见 §4）。
+
 ## 1. 容量池：AUTO 可选主力槽 `claude`（容量 2；BW-CLAUDE-CAPACITY2 由 1 扩为 2，原 10 槽一项未减）
 
 - runtime `claude`，池 `claude:deepseek-flash`，`CLAUDE_CAPACITY = 2`（BW-CLAUDE-CAPACITY2 由 1 增至 2），
@@ -58,8 +79,10 @@
 ## 4. CLI 构造（`scripts/claude_direct.py`，钉死不接受偏离）
 
 - `build_argv`：`-p --output-format stream-json --verbose --model deepseek-flash
-  --permission-mode dontAsk`，逐项 `--tools` / `--allowedTools` / `--disallowedTools` /
-  `--add-dir`（**绝不 bypass/yolo**）、`--setting-sources`、`--settings`（隔离环境，
+  --permission-mode bypassPermissions --dangerously-skip-permissions`（默认；真实启用
+  bypass 的是后者，`--allow-dangerously-skip-permissions` 不算已启用，入口不使用），
+  逐项 `--tools` / `--allowedTools` / `--disallowedTools` /
+  `--add-dir`、`--setting-sources`、`--settings`（隔离环境，
   **绝不覆盖 `~/.claude`**）、`--max-turns`；`--append-system-prompt` 附带
   `prompt_contract.build_contract` 完整九节契约。任务原文经 `stdin`（独立写线程写入
   并关闭；stdout 由独立 drain 线程**逐行记录原始行**并送入队列，主线程只消费队列判断
@@ -68,25 +91,28 @@
   `wait(timeout)`；reader 未到 EOF 时保留已收快照并标 `raw_stdout_partial`，terminate
   失败/进程仍活 → `exit_code=None`（unknown），不假释放。回执区分 `stop_requested`、
   `terminated_by_worker` 与原始流中实际观察到的 `observed_followup_tool_use`，不掩盖竞态。
-- **拒绝式钉死（S4）**：`--bare` 出现即 `ValueError`（官方 Node CLI 2.1.76 不支持该开关）；
-  权限模式 ≠ `dontAsk`（任何其它模式，含 bypassPermissions）即 `ValueError`；
-  模型 ≠ `deepseek-flash` 即 `ValueError`；`base_url` ≠
+- **拒绝式钉死（S4 保留）**：`--bare` 出现即 `ValueError`（官方 Node CLI 2.1.76
+  不支持该开关）；权限模式不属于 `bypassPermissions` / `dontAsk`（例如 `acceptEdits`）
+  即 `ValueError`；模型 ≠ `deepseek-flash` 即 `ValueError`；`base_url` ≠
   `https://api.deepseek.com/anthropic` 即 `ValueError`——绝不静默改道或回退。
-- **显式任务需求 `required_tools` + `write_files`（BW-CLAUDE-PATH-20261018-S2）**：
+- **默认 bypass 的权限口径（BW-CLAUDE-SIMPLE-20261018-S1）**：普通工程入口**不要求**
+  `required_tools`/`write_files`，**不执行**精确路径/逐文件授权预检；`--tools` 实参仍是
+  工具可见性来源（本机配置为 Read/Glob/Grep/Edit/Write/Bash），`--allowedTools` 默认
+  为空、不附逐文件规则。回执写入 `mode=bypassPermissions`、`enforcement=cli_bypass`、
+  `exact_file_authorization=false`，不得伪装精确文件保护有效。真实宿主的权限拒绝/系统
+  拒绝仍如实停止，不承诺 bypass 可绕过宿主系统。任务范围是提示词范围 + 独立验收，
+  不是沙箱。
+- **仅显式 `dontAsk` 保留旧严格需求（BW-CLAUDE-PATH-20261018-S2 原样）**：
   `run(..., required_tools=[...], write_files=[...])` 与 CLI
-  `--required-tools Read,Edit,Write`（逗号分隔）+ 可重复 `--write-file` 是**唯一**需求
-  契约。**工程任务不得遗漏 `required_tools`**：只读工程审查显式声明 `Read` 并使用
-  只读配置；**任何写操作必须同时显式声明 `Read`、所需的 `Edit`/`Write` 工具以及具体
-  `write_files`**（需新建/覆盖文件时声明 `Write`，修改已有文件声明 `Edit`），三者缺一
-  即拒绝，绝不把“未声明写工具”当作只读成功。非工程纯文本必须显式
-  `--not-engineering-task`，才保留 `skipped=true`；工程任务绝不以 `skipped` 继续。
-  但若 cfg 实际带可见且被允许的 `Edit`/`Write` 规则，该标志**不能绕过路径预检**：
-  未显式声明 `required_tools`/`write_files` 仍拒绝（只读/纯文本且 cfg 无写规则保持合法）。
-  入口**绝不从自然语言猜写意图**，也绝不自动加授权。核对在凭据读取/容量 consume/Popen
-  之前：只读工具必须（a）在 `--tools` 可见、（b）被 `--allowedTools` 授权、（c）未被
-  `--disallowedTools` 拒绝；显式拒绝优先于允许。缺少声明/缺 Read/缺写范围/范围外授权 →
-  零 Popen、零凭据读取、零容量占位（`required_tools_missing` /
-  `required_tools_missing_read` / `required_tools_not_granted`）。
+  `--required-tools Read,Edit,Write`（逗号分隔）+ 可重复 `--write-file` 是该模式下的
+  需求契约。工程任务必须声明 `required_tools`（至少 `Read`；写任务同时声明
+  `Edit`/`Write` 与具体 `write_files`），非工程纯文本显式 `--not-engineering-task` 才
+  保留 `skipped=true`。若 cfg 实际带可见且被允许的 `Edit`/`Write` 规则，该标志不能绕过
+  路径预检。核对在凭据读取/容量 consume/Popen 之前：只读工具必须（a）在 `--tools`
+  可见、（b）被 `--allowedTools` 授权、（c）未被 `--disallowedTools` 拒绝；显式拒绝
+  优先于允许。缺少声明/缺 Read/缺写范围/范围外授权 → 零 Popen、零凭据读取、零容量占位
+  （`required_tools_missing` / `required_tools_missing_read` /
+  `required_tools_not_granted`）。
 - **确定性精确写 profile（`scripts/claude_permissions.py`）**：由 workspace + 具体文件
   清单生成且只接受 `Edit(./规范正斜杠相对文件)` / `Write(./同文件)`。`C:/...`、`/...`、
   裸 `Edit`/`Write`、通配符、`..` 逃逸、盘符不一致、目录目标、范围外兄弟文件、
@@ -97,12 +123,14 @@
   符号链接时该平台不宣称已核验，绝不据此放宽）。真实 host 解析失败（如
   `PermissionError`）诚实拒绝，不做 best-effort 放行。大小写和反斜杠归一化在 Windows
   profile 上与平台一致，纯词法转换可在任一宿主离线测试。
-  该检查是**配置一致性检查，不是 OS 沙箱**；真实 Claude CLI 的精确授权仍须 root 用
-  正反例现场验证。
+  该检查只在**显式 dontAsk** 下执行，是**配置一致性检查，不是 OS 沙箱**；真实 Claude CLI
+  的精确授权仍须 root 用正反例现场验证。默认 bypass 不执行该检查，回执明确
+  `exact_file_authorization=false`。
 - 畸形规则（`Edit(/file.py))`、`Edit()`、`(/x)`、`Edit(...`）绝不按已授权处理；无法
   解释且指向显式需求工具的拒绝规则按 `invalid_rules` 保守拒绝。声明成功后，标准化
   `required_tools`/`write_files`、期望规则与最小 `permission_preflight` 结果写入
-  `request.json` 与 `run` 返回（不含凭据）。
+  `request.json` 与 `run` 返回（不含凭据）。默认 bypass 同时写入
+  `permission_mode`/`permission_enforcement`/`exact_file_authorization`。
 - `_PINNED_MODEL_ENVS` 把 default opus/sonnet/haiku/small-fast/subagent 全部钉成
   `deepseek-flash`，**没有任何模型回退**；`CLAUDE_CODE_SIMPLE` **绝不设置**，
   `build_subprocess_env` 对任何试图覆写被清除凭据 env（含 `CLAUDE_CODE_SIMPLE`）的配置项
@@ -127,11 +155,12 @@
 
 ## 6. 生命周期（`run`，S4 收口）
 
-- Popen **之前**完成全部预检（工程任务的 `required_tools`/`write_files` 显式需求与精确
-  写 profile 核对、argv 构造、**prompt SHA 从文件真实回读**与传入值比对、dispatch plan
-  精确预检、凭据解析）：任一失败 ⇒ **零 Popen、零占位泄漏**；需求核对先于凭据读取与
-  容量 consume。build_argv / plan / actual 使用同一份最终 cfg 规则，不悄悄替换旧
-  `C:/` 规则再声称预检正确。
+- Popen **之前**完成全部预检（argv 构造、**prompt SHA 从文件真实回读**与传入值比对、
+  dispatch plan 精确预检、凭据解析；显式 `dontAsk` 才另有 `required_tools`/`write_files`
+  与精确写 profile 核对）：任一失败 ⇒ **零 Popen、零占位泄漏**；dontAsk 的需求核对先于
+  凭据读取与容量 consume。默认 bypass 不跑精确写 profile，回执如实标
+  `exact_file_authorization=false`。build_argv / plan / actual 使用同一份最终 cfg 规则，
+  不悄悄替换旧 `C:/` 规则再声称预检正确。
 - **时间字段统一 UTC**：`started_at_utc`/`finished_at_utc` 落盘前统一转为同一时刻的
   `+00:00` ISO 字符串。现场 `datetime.now(timezone.utc)` 本就正确；显式注入带 +08 等
   偏移的 aware datetime 时也保存同一时刻的 UTC，保持离线注入可重复性与生命周期时段
@@ -152,10 +181,11 @@
   0 工具的工程任务绝不冒成功（`zero_tool_engineering`）。
 - **证据落盘**：请求（`request.json`）、进程（`process.json`）、发送任务
   （`sent-task.md`）、发送契约（`sent-contract.md`）、raw stdout/stderr 的**脱敏原件**均持久化；
-  `request.json` 与 `run` 返回同时含标准化 `required_tools`/`write_files`、期望
-  `Edit(./...)`/`Write(./...)` 规则与最小 `permission_preflight`
-  （`ok/skipped/required_tools/write_files/expected_write_rules/missing_*/denied/
-  invalid_rules/reasons`，不含凭据），便于核对“是否声明/是否跳过/范围是否精确”；
+  `request.json` 与 `run` 返回同时含权限模式与最小 `permission_preflight`
+  （`mode/enforcement/exact_file_authorization/skipped/tools/required_tools/write_files/
+  expected_write_rules/missing_*/denied/invalid_rules/reasons`，不含凭据）：bypass 下
+  `enforcement=cli_bypass`、`exact_file_authorization=false`，不伪装精确文件保护有效；
+  dontAsk 下保留旧标准化 `required_tools`/`write_files` 与精确范围核对；
   最终改写后**刷新 `result_sha256`** 并重算 `evidence_sha256`；429 限额以**最终 SHA**
   先 `record_main_force_limit` 再释放本占位。
 - 报告绑定复用 `qoder_direct.analyze_report` + `finalize_binding`（正文九节 + 阶段 token +
@@ -263,8 +293,14 @@
   AUTO 峰值诚实关闭、**迁移债务满 13 时 claude 有空位也绝不派第 14**）、`WindowGate`
   （含跨峰 consume 只释放本 token）、`QuotaLimitMarker`
   （reserve→record→consume limited→release）、`WindowGateCaliber`。
-- `tests/test_claude_direct.py`：纯函数（argv 无 token / 无 bypass / 模型·权限模式·base_url
-  钉死且偏离即拒、`--bare` 拒绝）、真实错误提取与回执配对（`is_error` + `subtype=success`
+- `tests/test_claude_bypass_mode.py`（BW-CLAUDE-SIMPLE-20261018-S1）：默认/显式
+  `--permission-mode bypassPermissions` 且真实 argv 含 `--dangerously-skip-permissions`、
+  不是 allow-only；默认工程无 required_tools/write_files 仍到达 FakePopen 且回执记录
+  `enforcement=cli_bypass`/`exact_file_authorization=false`；六项工具含 Bash 可见；
+  显式 `dontAsk` 仍要求 required_tools 且精确 profile 拒绝 `C:/` 规则；其他模型/
+  endpoint/未知模式拒绝；bypass 下零工具工程仍不 `execution_success`。
+- `tests/test_claude_direct.py`：纯函数（argv 无 token / 默认 bypass 标志 / 模型与
+  base_url 钉死且偏离即拒、非支持模式与 `--bare` 拒绝）、真实错误提取与回执配对（`is_error` + `subtype=success`
   取 result 错误载体、正文普通 429 与取消 `4294967295` 不判限额、`parse_error` 不判协议成功、
   缺失回执/全部权限拒绝不判工程成功）、生命周期（FakePopen 真实 PID、绑定回读、脱敏、
   预检失败零 Popen、`launch_unknown` 保留）。
@@ -278,8 +314,9 @@
   probe、原始证据保留、成功 Read 正文含拒绝词不误杀、普通工具错误不误杀、stderr 连续
   输出、拒绝后无 EOF 且 terminate 失败时有界返回 unknown（不阻塞下一行、不假释放，
   raw stdout/permission_stop/进程元数据落盘）、unknown 不假释放、传输失败不误判权限。
-- `tests/test_claude_permission_preflight.py`（S1/S2）：工程入口缺 `required_tools`/
-  缺 Read 零 Popen 零凭据零 claim、只读合法、精确写范围、CLI `--write-file` 契约。
+- `tests/test_claude_permission_preflight.py`（S1/S2）：**显式 dontAsk** 工程入口缺
+  `required_tools`/缺 Read 零 Popen 零凭据零 claim、只读合法、精确写范围、CLI
+  `--write-file` 契约（fixture 已显式设置 `permission_mode='dontAsk'`，旧断言未放宽）。
 - `tests/test_claude_transport_trace.py`（BW-CLAUDE-TRANSPORT-R2）：Node 不在 PATH 时
   skip；用临时目录 + `diagnostics_channel` 合成 publish 验证 §6.2 的观测契约——未启用
   零文件零订阅、独占创建、同 socket 两次请求标 `socket_uses`/`socket_reused`、连接错误
@@ -298,7 +335,9 @@
 - **官方 Node CLI 2.1.76**：真实 Read/Write 调用**已成功**（前一轮跑到 `error_max_turns`，
   文件原件保留、无结构化报告——该事实单独记录，不等同于验收通过）。
 - **native 2.1.220 / 2.1.296**：连接失败，单列记录，不与 Node 成功事实混写、不据此改配置。
-- **Bash 工具**：默认配置不因此扩大。2026-10-18（UTC），root 按相同 Node 2.1.76、
+- **Bash 工具**：BW-CLAUDE-SIMPLE-20261018-S1 起默认 bypass 配置显式开放
+  Read/Glob/Grep/Edit/Write/Bash 六项（由 root 同步本机私有配置），不再逐命令登记。
+  2026-10-18（UTC），root 按相同 Node 2.1.76、
   模型、清代理与零重试设置完成两次正式隔离诊断：纯文本成功；Read→Edit→登记离线测试
   →九节报告绑定成功（7 次工具调用，测试文件哈希不变）。其中额外两次只读 `ls -la`
   如实单列，不作为精确命令沙箱或评分依据；成功往返不能定位历史 ECONNRESET 的重置方。

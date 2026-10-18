@@ -6,7 +6,8 @@
   `https://api.deepseek.com/anthropic`；**不支持任何模型回退**：把 default opus/sonnet/haiku/
   small-fast/subagent 一并钉死 deepseek-flash。
 - CLI：官方 Node CLI 2.1.76（可执行 `node.exe` + `launcher_args=[<abs cli.js>]`），
-  `-p --output-format stream-json --verbose --permission-mode dontAsk`（**绝不 bypass**）；
+  `-p --output-format stream-json --verbose --permission-mode bypassPermissions`
+  （真实 argv 同时带 `--dangerously-skip-permissions`；显式 `dontAsk` 作为兼容模式保留）；
   **不支持 `--bare`**（2.1.76 无该开关）；`--tools`/`--setting-sources` **始终传**（空值也传）；
   `--allowedTools`/`--disallowedTools` **各只出现一次**，后跟全部规则（CLI 重复 flag 会覆盖）；
   `--strict-mcp-config` + 空 `--mcp-config`；`--disable-slash-commands`；stdin 传任务原文；
@@ -17,8 +18,10 @@
   文件，启动时经官方 pwsh/powershell 无日志解密。明文**只进子进程 env**（`ANTHROPIC_API_KEY`），
   绝不进 argv/request/异常/证据。**清除继承的 AUTH_TOKEN/OAuth/SIMPLE 与代理**，绝不把宿主
   已注入的旧凭据/代理带进子进程。
-- 生命周期：outdir 必须不存在（否则 0 Popen）；工程任务必须显式 required_tools（至少
-  Read；写任务加 Edit/Write + write_files），预检（精确 ./ 写 profile、argv 构造、
+- 生命周期：outdir 必须不存在（否则 0 Popen）；默认 bypassPermissions 的普通工程入口
+  不要求 required_tools/write_files，也不执行精确文件授权预检（回执如实记录
+  `enforcement=cli_bypass`、`exact_file_authorization=false`）；显式 dontAsk 才保留旧
+  严格 profile（至少 Read；写任务加 Edit/Write + write_files）。预检（argv 构造、
   **prompt SHA 从文件真实回读**比对、可选 --dispatch-plan 精确授权、凭据解析）在 dispatch
   占位之前完成（pre-check/cred 错误 → 0 Popen、零占位泄漏）；Popen 成功后立即
   started=true，`mark_running` 记真实 wrapper PID，`bind_child` 回核 **`bound` 必须显式为
@@ -37,7 +40,8 @@
   再释放本占位。离线结果 `business_verified=false`——只证协议与绑定，不证真实业务。
 - 真实世界事实（与本模块离线证明分开）：官方 Node CLI 2.1.76 真实 Read/Write **已成功**
   （前轮 `error_max_turns`、原件保留无报告，独立记录不等同验收）；native 2.1.220/296 连接失败
-  单列；Bash 未通过精确权限验收故默认不开放；费用未知（CLI 估算 ≠ 账单）；真实一次新入口
+  单列；BW-CLAUDE-SIMPLE-20261018-S1 起默认 bypass 六项工具含 Bash（root 同步本机
+  配置）；费用未知（CLI 估算 ≠ 账单）；真实一次新入口
   Read/Write 验收由主脑执行，本 worker 不调 API。
 
 本文件导入即无副作用；真实子进程仅在 main()/run() 中发生。离线测试用 injectable popen_factory。
@@ -67,7 +71,12 @@ RUNTIME = 'claude'
 MODEL = 'deepseek-flash'
 POOL_KEY = f'{RUNTIME}:{MODEL}'
 BASE_URL = 'https://api.deepseek.com/anthropic'
-PERMISSION_MODE = 'dontAsk'
+# 用户决定（BW-CLAUDE-SIMPLE-20261018-S1）：默认直接启用 CLI bypass，不再要求精确文件
+# 授权登记；dontAsk 仅作为显式选择的兼容模式保留（旧严格 profile 不删除）。
+PERMISSION_MODE = 'bypassPermissions'
+DONT_ASK_MODE = 'dontAsk'
+SUPPORTED_PERMISSION_MODES = (PERMISSION_MODE, DONT_ASK_MODE)
+BYPASS_PERMISSION_FLAG = '--dangerously-skip-permissions'
 # 默认钉死的全部模型别名，任何一项都不回退到 Claude/pro。
 _PINNED_MODEL_ENVS = ('ANTHROPIC_MODEL', 'ANTHROPIC_DEFAULT_OPUS_MODEL',
                       'ANTHROPIC_DEFAULT_SONNET_MODEL', 'ANTHROPIC_DEFAULT_HAIKU_MODEL',
@@ -417,24 +426,55 @@ def preflight_required_permissions(cfg: dict, required_tools=None, *, write_file
             'reasons': reasons}
 
 
+def _bypass_permission_preflight(cfg: dict, required_tools=None, write_files=None) -> dict:
+    """bypassPermissions 的如实回执：CLI 真正的权限执行交给 bypass 标志。
+
+    普通工程入口不要求 required_tools/write_files，也不执行精确路径/逐文件授权预检；
+    `exact_file_authorization=False` 明确表示未强制精确文件保护，绝不伪装成已有文件
+    边界。required_tools/write_files 若显式传入只做格式标准化并记录，不作为放行条件。
+    工具可见性（--tools 实参）仍写入回执。"""
+    required = normalize_required_tools(required_tools)
+    if write_files is None:
+        write_list = []
+    elif isinstance(write_files, (list, tuple)):
+        write_list = list(write_files)
+    else:
+        write_list = [write_files]
+    tools = _validate_rule_list(cfg.get('tools'), 'tools')
+    return {'ok': True, 'skipped': True, 'required_tools': required,
+            'write_files': write_list, 'expected_write_rules': [],
+            'missing_visible': [], 'missing_allowed': [], 'denied': [],
+            'invalid_rules': [], 'missing_write_rules': [],
+            'extra_write_rules': [], 'denied_write_tools': [],
+            'mode': PERMISSION_MODE, 'enforcement': 'cli_bypass',
+            'exact_file_authorization': False, 'tools': tools,
+            'reasons': ['bypassPermissions enabled by --dangerously-skip-permissions; '
+                        'exact file authorization preflight was not enforced']}
+
+
 def _preflight_evidence(result: dict) -> dict:
     """最小预检回执（request.json / run 返回共用）：只含工具/规则名，不含凭据或环境值。"""
     keys = ('ok', 'skipped', 'required_tools', 'write_files', 'expected_write_rules',
             'missing_visible', 'missing_allowed', 'denied', 'invalid_rules',
-            'missing_write_rules', 'extra_write_rules', 'denied_write_tools', 'reasons')
+            'missing_write_rules', 'extra_write_rules', 'denied_write_tools',
+            'mode', 'enforcement', 'exact_file_authorization', 'tools', 'reasons')
     return {key: result.get(key) for key in keys}
 
 
 def build_argv(cfg: dict, workspace: str, model: str, contract: str) -> list[str]:
-    """安全 argv（无 shell、无 token、无 bypass、无 --bare）。
+    """安全 argv（无 shell、无 token、无 --bare）。
 
-    - **钉死口径（BW-CLAUDE-DEEPSEEK-S4）**：permission_mode 只接受 dontAsk（其它任何模式
-      一律拒绝，不只 bypass）；model 必须是 deepseek-flash；base_url 必须是指定 DeepSeek
-      Anthropic 兼容入口——不同模型/权限模式/端点直接拒绝（0 argv 产出，绝不带病启动）；
+    - **默认口径（BW-CLAUDE-SIMPLE-20261018-S1）**：permission_mode 默认
+      bypassPermissions，真实 argv 带 `--dangerously-skip-permissions`（并保留一致的
+      `--permission-mode bypassPermissions`）；只有 `--allow-dangerously-skip-permissions`
+      不算启用。显式 `dontAsk` 作为兼容模式保留；其它模式不扩大支持，出现即拒绝。
+    - model 必须是 deepseek-flash；base_url 必须是指定 DeepSeek Anthropic 兼容入口——
+      不同模型/端点直接拒绝（0 argv 产出，绝不带病启动）；
     - `--bare` 官方 Node CLI 2.1.76 不支持，cfg 出现即拒绝；
     - `executable` 可为 node.exe，配 `launcher_args=[<abs cli.js>]`（官方 Node CLI 2.1.76）；
-    - `--tools` 与 `--setting-sources` **始终传**（即使空也传空值）；**默认无 Bash**
-      （tools 为空显式即不开放任何工具，绝不隐式注入 Bash）；
+    - `--tools` 与 `--setting-sources` **始终传**（即使空也传空值）；工具可见性完全由
+      cfg `tools` 决定（bypass 示例配置含 Read/Glob/Grep/Edit/Write/Bash），入口不隐式
+      注入工具，也不默认附逐文件 allowed 规则；
     - `--allowedTools` / `--disallowedTools` **各只出现一次**，后跟全部规则；
     - `--strict-mcp-config` + 空 `--mcp-config`（无 MCP）；`--disable-slash-commands`；
     - 空值也照传，保证授权面可被 execution_control 精确比对。token 只在 env，不进这里。"""
@@ -448,9 +488,9 @@ def build_argv(cfg: dict, workspace: str, model: str, contract: str) -> list[str
                                                       for x in launcher):
         raise ValueError('launcher_args must be a list of non-empty strings')
     mode = str(cfg.get('permission_mode', PERMISSION_MODE))
-    if mode != PERMISSION_MODE:
-        raise ValueError(f'permission_mode must be {PERMISSION_MODE!r}, got {mode!r}; '
-                         'bypassPermissions and every other mode are refused')
+    if mode not in SUPPORTED_PERMISSION_MODES:
+        raise ValueError(f'permission_mode must be one of {SUPPORTED_PERMISSION_MODES!r}, '
+                         f'got {mode!r}; other modes are not supported on this entry')
     if str(model) != MODEL:
         raise ValueError(f'model must be {MODEL!r} on this entry, got {model!r}; '
                          'no model substitution')
@@ -466,6 +506,10 @@ def build_argv(cfg: dict, workspace: str, model: str, contract: str) -> list[str
         '-p', '--output-format', 'stream-json', '--verbose',
         '--model', model,
         '--permission-mode', mode]
+    if mode == PERMISSION_MODE:
+        # CLI 真正启用 bypass 的是该标志；--allow-dangerously-skip-permissions 只是
+        # 允许后续启用，不等于已启用，入口绝不使用它冒充 bypass。
+        argv.append(BYPASS_PERMISSION_FLAG)
     # 始终传（空值也传）：工具可见性与设置来源，供精确授权比对。
     argv += ['--tools', ','.join(tools)]
     argv += ['--setting-sources', ','.join(setting_sources)]
@@ -1293,12 +1337,13 @@ def run(cfg: dict, *, workspace: str, prompt_file: Path, out_dir: Path, stage: s
     """真实编排：outdir/预检/凭据前置 → 时段+容量门 → Popen → 监控 → 绑定 → 终态释放。
 
     - outdir 必须不存在（存在即 0 Popen 拒绝，绝不覆写旧证据）；
-    - 工程任务必须显式声明 required_tools（至少 Read；写任务同时声明 Edit/Write 和
-      具体 write_files）。缺失/无 Read → 0 Popen、0 凭据读取、0 占位，绝不以
-      skipped=true 继续。非工程纯文本（is_engineering_task=False）保留 skipped；
-    - required_tools 对照真实 --tools/--allowedTools/--disallowedTools 核对；写工具走
-      确定性精确 ./ profile（claude_permissions），在凭据读取/容量 consume 之前完成；
-      缺项、范围外授权、裸 Edit/Write、通配、C:/ 规则或显式拒绝 → 0 Popen；
+    - 默认 bypassPermissions：普通工程入口不要求 required_tools/write_files，也不执行
+      精确文件授权预检；回执如实记录 `enforcement=cli_bypass` 与
+      `exact_file_authorization=false`（提示词范围 + 独立验收，不是沙箱）；
+    - 仅显式 dontAsk：工程任务必须声明 required_tools（至少 Read；写任务同时声明
+      Edit/Write 和具体 write_files），对照真实 --tools/--allowedTools/--disallowedTools
+      核对；写工具走确定性精确 ./ profile（claude_permissions），在凭据读取/容量 consume
+      之前完成；缺项、范围外授权、裸 Edit/Write、通配、C:/ 规则或显式拒绝 → 0 Popen；
     - --dispatch-plan 精确预检（execution_control.preflight，复用真实 grants）在占位之前完成；
       预检/凭据/argv 任一失败 → 0 Popen、零占位泄漏；
     - Popen 后 stdout 逐行实时监控：首次**真实结构化权限拒绝**立即 terminate 本 run 的
@@ -1314,6 +1359,8 @@ def run(cfg: dict, *, workspace: str, prompt_file: Path, out_dir: Path, stage: s
     clock_injected = now is not None
     now = now or dp.utcnow()
     model = cfg.get('model', MODEL)
+    mode = str(cfg.get('permission_mode', PERMISSION_MODE))
+    bypass = mode == PERMISSION_MODE
 
     # (0) outdir 必须不存在。
     if Path(out_dir).exists():
@@ -1322,8 +1369,8 @@ def run(cfg: dict, *, workspace: str, prompt_file: Path, out_dir: Path, stage: s
                 'reasons': [f'output dir {str(out_dir)!r} already exists; refusing to '
                             'overwrite prior evidence (choose a fresh dir)']}
 
-    # (0b) 工程入口不得以未声明/skipped=true 继续；纯文本非工程任务保留旧 skipped。
-    if is_engineering_task:
+    # (0b) 仅显式 dontAsk 的工程入口必须声明需求；默认 bypass 普通工程不要求。
+    if is_engineering_task and not bypass:
         if required_tools is None:
             return {'dispatch_failed': True, 'sent': False, 'dispatched': False,
                     'reason': 'required_tools_missing',
@@ -1360,21 +1407,35 @@ def run(cfg: dict, *, workspace: str, prompt_file: Path, out_dir: Path, stage: s
     sent_payload = pc.compose_task_payload(contract_text, task_text)
     prompt_sha256 = actual_prompt_sha
 
-    # (1b) 显式任务所需权限核对（仍然在凭据读取、容量 consume 与 Popen 之前）。
-    # 只核对主脑**明确声明**的 required_tools/write_files，绝不从自然语言猜写意图、
-    # 不自动加授权；写工具必须与显式文件清单精确一致。
-    try:
-        permission_preflight = preflight_required_permissions(
-            cfg, required_tools, write_files=write_files, workspace=str(workspace))
-    except Exception as exc:  # noqa: BLE001
-        return {'dispatch_failed': True, 'sent': False, 'dispatched': False,
-                'reason': 'required_tools_invalid', 'error_class': type(exc).__name__,
-                'reasons': [f'required_tools declaration invalid: {exc!r}']}
-    if not permission_preflight.get('ok'):
-        return {'dispatch_failed': True, 'sent': False, 'dispatched': False,
-                'reason': 'required_tools_not_granted',
-                'permission_preflight': permission_preflight,
-                'reasons': permission_preflight.get('reasons') or []}
+    # (1b) 权限核对（仍然在凭据读取、容量 consume 与 Popen 之前）。
+    # 默认 bypass：不要求 required_tools/write_files，不跑精确路径授权预检，回执如实
+    # 记录未强制精确文件保护。显式 dontAsk：保留旧严格 profile 与精确文件清单核对。
+    if bypass:
+        try:
+            permission_preflight = _bypass_permission_preflight(
+                cfg, required_tools, write_files)
+        except Exception as exc:  # noqa: BLE001
+            return {'dispatch_failed': True, 'sent': False, 'dispatched': False,
+                    'reason': 'required_tools_invalid', 'error_class': type(exc).__name__,
+                    'reasons': [f'required_tools declaration invalid: {exc!r}']}
+    else:
+        try:
+            permission_preflight = preflight_required_permissions(
+                cfg, required_tools, write_files=write_files, workspace=str(workspace))
+        except Exception as exc:  # noqa: BLE001
+            return {'dispatch_failed': True, 'sent': False, 'dispatched': False,
+                    'reason': 'required_tools_invalid', 'error_class': type(exc).__name__,
+                    'reasons': [f'required_tools declaration invalid: {exc!r}']}
+        permission_preflight = dict(
+            permission_preflight, mode=DONT_ASK_MODE, enforcement='dontask_exact_preflight',
+            exact_file_authorization=bool(permission_preflight.get('ok')
+                                          and not permission_preflight.get('skipped')),
+            tools=_validate_rule_list(cfg.get('tools'), 'tools'))
+        if not permission_preflight.get('ok'):
+            return {'dispatch_failed': True, 'sent': False, 'dispatched': False,
+                    'reason': 'required_tools_not_granted',
+                    'permission_preflight': permission_preflight,
+                    'reasons': permission_preflight.get('reasons') or []}
 
     # (2) --dispatch-plan 精确预检（占位之前，0 Popen）。
     if plan is not None:
@@ -1600,6 +1661,11 @@ def run(cfg: dict, *, workspace: str, prompt_file: Path, out_dir: Path, stage: s
                             request={'argv': argv, 'cwd': str(workspace),
                                      'runtime': RUNTIME, 'model': model,
                                      'cli_version': summary.get('cli_version'),
+                                     'permission_mode': mode,
+                                     'permission_enforcement': permission_preflight.get(
+                                         'enforcement'),
+                                     'exact_file_authorization': permission_preflight.get(
+                                         'exact_file_authorization'),
                                      'required_tools': permission_preflight.get('required_tools'),
                                      'write_files': permission_preflight.get('write_files'),
                                      'permission_preflight': _preflight_evidence(
@@ -1679,6 +1745,10 @@ def run(cfg: dict, *, workspace: str, prompt_file: Path, out_dir: Path, stage: s
                   and release_ok and not facts.get('downstream_error') and limit_ok)
     return {'sent': True, 'dispatched': True, 'started': started,
             'child_verified': child_verified, 'token': claim, 'exit_code': exit_code,
+            'permission_mode': mode,
+            'permission_enforcement': permission_preflight.get('enforcement'),
+            'exact_file_authorization': permission_preflight.get(
+                'exact_file_authorization'),
             'required_tools': permission_preflight.get('required_tools'),
             'write_files': permission_preflight.get('write_files'),
             'permission_preflight': _preflight_evidence(permission_preflight),
@@ -1710,13 +1780,13 @@ def build_parser():
                     help='JSON file with the active-tasks snapshot for the plan preflight')
     ap.add_argument('--not-engineering-task', action='store_true')
     ap.add_argument('--required-tools', default=None,
-                    help='comma-separated tool names this task explicitly requires '
-                         '(e.g. "Read,Edit"); engineering tasks must include Read and are '
-                         'checked before credentials/capacity/Popen. No inference from text')
+                    help='optional comma-separated tool names (e.g. "Read,Edit"). Only '
+                         'explicit dontAsk enforces/demands them; default bypassPermissions '
+                         'does not require this. No inference from text')
     ap.add_argument('--write-file', action='append', default=None, dest='write_files',
-                    help='explicit workspace-relative file the task may Edit/Write '
-                         '(repeatable). Config must contain exactly the derived '
-                         'Edit(./file)/Write(./file) rules; no globs/absolute rules')
+                    help='optional explicit workspace-relative edit target (repeatable). '
+                         'Only explicit dontAsk validates the exact Edit(./file)/Write(./file) '
+                         'profile; default bypassPermissions does not require registration')
     return ap
 
 

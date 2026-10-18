@@ -122,11 +122,11 @@ BW-CLAUDE-CAPACITY2 扩为 2 槽）。可派工槽位由 10 增至 **11**、再�
   绝不查余额；无证据不自动清标，恢复只由人工 `release_main_force_limit`。取消退出码
   （`4294967295`/`-1`）与 SIG **绝不判为 429**。
 - **入口与生命周期**：`scripts/claude_direct.py` 运行时 `claude`，`-p --output-format stream-json
-  --verbose`、`--permission-mode dontAsk`（任何其它权限模式被 `build_argv` 直接拒绝，
-  **绝不 bypass/yolo**）、逐项 `--tools`/`--allowedTools`（**默认不开 Bash**——未通过精确只读
-  自动批准验收故默认不开放）、stdin 传任务、`--append-system-prompt` 附完整九节契约、
-  `--max-turns`；**`--bare` 被拒**（官方 Node CLI 2.1.76 不支持）；模型/权限模式/base_url
-  与钉死值不同一律 `ValueError`。子进程 env 把 `ANTHROPIC_MODEL` 与 default
+  --verbose`、默认 `--permission-mode bypassPermissions --dangerously-skip-permissions`
+  （2026-10-18用户明确要求直接启用）；常用工具 Read/Glob/Grep/Edit/Write/Bash，无需逐文件或逐命令登记。
+  stdin 传任务、`--append-system-prompt` 附完整九节契约、`--max-turns`；显式 dontAsk 仅为可选兼容模式，
+  默认不强制 required_tools/write_files，也不宣称精确文件边界。**`--bare` 被拒**（官方 Node CLI
+  2.1.76 不支持）；模型/base_url 钉死值仍保持，其他权限模式不新增支持。子进程 env 把 `ANTHROPIC_MODEL` 与 default
   opus/sonnet/haiku/subagent 全部钉死 `deepseek-flash`（禁止回退 Claude/pro），
   `CLAUDE_CODE_SIMPLE` **绝不设置**。真实错误提取：`is_error=true` 时即使 `subtype=success`
   也从 result 字符串取真实 API 错误；`errors` 非空或 `parse_error` ⇒ 绝不
