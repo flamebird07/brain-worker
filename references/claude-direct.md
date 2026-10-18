@@ -26,7 +26,7 @@ python scripts/claude_direct.py \
 `--dangerously-skip-permissions`。回执如实记录 `permission_mode=bypassPermissions`、
 `enforcement=cli_bypass`、`exact_file_authorization=false`：精确文件授权预检没有执行，
 不能据此宣称存在精确文件保护。任务范围仍由提示词与独立验收界定，**不是沙箱**。
-`dontAsk` 仅在显式选择时保留旧的严格流程（见 §4）。
+`dontAsk` 仅在用户明确要求或确需严格边界并记录理由时显式选择（见 §4）；主脑不得从旧任务配置机械继承 dontAsk/逐文件清单，覆盖用户最新默认直接模式。新轮启动前核对实际配置与 argv，不能把静态 profile 通过当作 CLI 已可编辑。
 
 ## 1. 容量池：AUTO 可选主力槽 `claude`（容量 2；BW-CLAUDE-CAPACITY2 由 1 扩为 2，原 10 槽一项未减）
 
