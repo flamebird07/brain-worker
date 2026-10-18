@@ -16,9 +16,9 @@
     "Read",
     "Grep",
     "Glob",
-    "Edit(/absolute/path/to/file.py)"
+    "Edit(./path/to/file.py)"
   ],
-  "_allowed_note": "写授权使用 Edit(<具体文件>) 逐文件形式，而非宽泛 glob；allowedTools/disallowedTools 各只在 argv 出现一次，后跟全部规则。",
+  "_allowed_note": "写授权使用 Edit(./<workspace 内具体相对文件>) 逐文件形式，而非宽泛 glob 或绝对路径。工程入口还必须显式传入 required_tools=[Read,Edit] 与 write_files=[path/to/file.py]（相对 workspace，与上面的 Edit(./...) 一致）；缺任一项会在启动前被拒绝。新建/覆盖文件时改用 Write：required_tools=[Read,Write] + write_files=[path/to/new_file.py] + allowed Write(./path/to/new_file.py)。allowedTools/disallowedTools 各只在 argv 出现一次，后跟全部规则。",
   "disallowed_tools": [],
   "add_dirs": [],
   "max_turns": 40,

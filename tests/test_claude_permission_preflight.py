@@ -46,16 +46,68 @@ def _report_body(stage, workspace):
     return '\n'.join(lines)
 
 
+class _OutStream:
+    def __init__(self, text):
+        self._lines = text.splitlines(keepends=True)
+        self._index = 0
+        self.stopped = False
+
+    def readline(self):
+        if self.stopped or self._index >= len(self._lines):
+            return ''
+        line = self._lines[self._index]
+        self._index += 1
+        return line
+
+    def stop(self):
+        self.stopped = True
+
+    def close(self):
+        pass
+
+
+class _InStream:
+    def __init__(self):
+        self.data = []
+
+    def write(self, value):
+        self.data.append(value)
+        return len(value)
+
+    def flush(self):
+        pass
+
+    def close(self):
+        pass
+
+
 class FakePopen:
     def __init__(self, stdout, sink):
         self._stdout, self.sink = stdout, sink
         self.argv = self.env = None
+        self.returncode = None
+        self.terminated = False
+        self.stdin = self.stdout = self.stderr = None
 
     def __call__(self, argv, *, cwd=None, stdin=None, stdout=None, stderr=None,
                  env=None, text=None):
         self.argv, self.env = list(argv), env
         self.sink.append(self)
+        self.stdin = _InStream()
+        self.stdout = _OutStream(self._stdout)
+        self.stderr = _OutStream('')
         return self
+
+    def terminate(self):
+        self.terminated = True
+        self.stdout.stop()
+        self.stderr.stop()
+        self.returncode = -15
+
+    def wait(self, timeout=None):
+        if self.returncode is None:
+            self.returncode = 0
+        return self.returncode
 
     def communicate(self, input=None):
         self.returncode = 0
@@ -63,39 +115,57 @@ class FakePopen:
 
 
 class PurePreflightTests(unittest.TestCase):
-    def test_path_limited_edit_rule_is_a_positive(self):
+    WS = 'C:/ws'
+
+    def test_exact_edit_rule_with_matching_scope_is_a_positive(self):
         result = cd.preflight_required_permissions(
             _cfg(tools=['Read', 'Edit'],
-                 allowed_tools=['Read', 'Edit(/abs/workspace/out.txt)']),
-            ['Edit'])
+                 allowed_tools=['Read', 'Edit(./out.txt)']),
+            ['Read', 'Edit'], write_files=['out.txt'], workspace=self.WS)
         self.assertTrue(result['ok'], result)
+        self.assertEqual(result['write_files'], ['out.txt'])
+        self.assertEqual(result['expected_write_rules'], ['Edit(./out.txt)'])
+
+    def test_absolute_drive_rule_is_explicitly_rejected(self):
+        # 用户反例：Edit(C:/.../file.py) 不得被猜成匹配 ./file.py。
+        result = cd.preflight_required_permissions(
+            _cfg(tools=['Read', 'Edit'],
+                 allowed_tools=['Read', 'Edit(C:/ws/out.txt)']),
+            ['Read', 'Edit'], write_files=['out.txt'], workspace=self.WS)
+        self.assertFalse(result['ok'])
+        self.assertEqual(result['missing_write_rules'], ['Edit(./out.txt)'])
+        self.assertTrue(any('absolute rule' in r for r in result['reasons']), result)
 
     def test_visible_but_not_allowed_is_rejected(self):
         result = cd.preflight_required_permissions(
-            _cfg(tools=['Read', 'Edit'], allowed_tools=['Read']), ['Edit'])
+            _cfg(tools=['Read', 'Edit'], allowed_tools=['Read']),
+            ['Read', 'Edit'], write_files=['out.txt'], workspace=self.WS)
         self.assertFalse(result['ok'])
         self.assertEqual(result['missing_allowed'], ['Edit'])
         self.assertEqual(result['missing_visible'], [])
+        self.assertEqual(result['missing_write_rules'], ['Edit(./out.txt)'])
 
     def test_not_visible_is_rejected(self):
         result = cd.preflight_required_permissions(
-            _cfg(tools=['Read'], allowed_tools=['Read', 'Edit(/x)']), ['Edit'])
+            _cfg(tools=['Read'], allowed_tools=['Read', 'Edit(./x.txt)']),
+            ['Read', 'Edit'], write_files=['x.txt'], workspace=self.WS)
         self.assertFalse(result['ok'])
         self.assertEqual(result['missing_visible'], ['Edit'])
 
     def test_explicit_deny_beats_allow(self):
         result = cd.preflight_required_permissions(
             _cfg(tools=['Read', 'Edit'],
-                 allowed_tools=['Read', 'Edit(/x)'], disallowed_tools=['Edit']),
-            ['Edit'])
+                 allowed_tools=['Read', 'Edit(./x.txt)'], disallowed_tools=['Edit']),
+            ['Read', 'Edit'], write_files=['x.txt'], workspace=self.WS)
         self.assertFalse(result['ok'])
         self.assertEqual(result['denied'], ['Edit'])
         self.assertTrue(any('explicitly denied' in r for r in result['reasons']))
 
     def test_deny_with_path_rule_also_denies_base_tool(self):
         result = cd.preflight_required_permissions(
-            _cfg(tools=['Edit'], allowed_tools=['Edit'],
-                 disallowed_tools=['Edit(/x)']), ['Edit'])
+            _cfg(tools=['Edit'], allowed_tools=['Edit(./x.txt)'],
+                 disallowed_tools=['Edit(./x.txt)']),
+            ['Edit'], write_files=['x.txt'], workspace=self.WS)
         self.assertFalse(result['ok'])
         self.assertEqual(result['denied'], ['Edit'])
 
@@ -107,43 +177,49 @@ class PurePreflightTests(unittest.TestCase):
 
     def test_unsupported_complex_rule_is_not_treated_as_grant(self):
         result = cd.preflight_required_permissions(
-            _cfg(tools=['Edit'], allowed_tools=['Edit*']), ['Edit'])
+            _cfg(tools=['Read', 'Edit'], allowed_tools=['Read', 'Edit*']),
+            ['Read', 'Edit'], write_files=['x.txt'], workspace=self.WS)
         self.assertFalse(result['ok'])
         self.assertEqual(result['missing_allowed'], ['Edit'])
 
     # ---------------- BW-PERMISSION-CONFIG-S2：畸形规则精确负例 ----------------
 
     def test_extra_close_paren_allow_rule_is_not_a_grant(self):
-        malformed = 'Edit(/file.py))'
+        malformed = 'Edit(./file.py))'
         self.assertIsNone(cd._rule_base_tool(malformed))
         result = cd.preflight_required_permissions(
-            _cfg(tools=['Edit'], allowed_tools=[malformed]), ['Edit'])
+            _cfg(tools=['Read', 'Edit'], allowed_tools=['Read', malformed]),
+            ['Read', 'Edit'], write_files=['file.py'], workspace=self.WS)
         self.assertFalse(result['ok'])
-        self.assertEqual(result['missing_allowed'], ['Edit'])
+        self.assertEqual(result['missing_write_rules'], ['Edit(./file.py)'])
+        self.assertIn(malformed, result['invalid_rules'])
         self.assertEqual(result['denied'], [])
 
     def test_empty_tool_name_and_empty_arg_rules_are_not_grants(self):
         for malformed in ('(/file.py)', 'Edit()', 'Edit( )', 'Edit((/x))', 'Edit(/x'):
             self.assertIsNone(cd._rule_base_tool(malformed), malformed)
         result = cd.preflight_required_permissions(
-            _cfg(tools=['Edit'], allowed_tools=['(/file.py)']), ['Edit'])
+            _cfg(tools=['Read', 'Edit'], allowed_tools=['Read', '(/file.py)']),
+            ['Read', 'Edit'], write_files=['file.py'], workspace=self.WS)
         self.assertFalse(result['ok'])
         self.assertEqual(result['missing_allowed'], ['Edit'])
 
     def test_malformed_deny_rule_for_required_tool_is_not_ignored(self):
         # 无法解释的拒绝规则不得静默忽略后让宽 allow 通过：保守拒绝并出声。
-        malformed = 'Edit(/file.py))'
+        malformed = 'Edit(./file.py))'
         result = cd.preflight_required_permissions(
-            _cfg(tools=['Edit'], allowed_tools=['Edit'],
-                 disallowed_tools=[malformed]), ['Edit'])
+            _cfg(tools=['Read', 'Edit'], allowed_tools=['Read', 'Edit(./file.py)'],
+                 disallowed_tools=[malformed]),
+            ['Read', 'Edit'], write_files=['file.py'], workspace=self.WS)
         self.assertFalse(result['ok'])
         self.assertIn(malformed, result['invalid_rules'])
         self.assertTrue(any('malformed' in r for r in result['reasons']))
 
-    def test_legal_path_rule_remains_positive(self):
-        self.assertEqual(cd._rule_base_tool('Edit(/abs/out.txt)'), 'Edit')
+    def test_legal_exact_rule_remains_positive(self):
+        self.assertEqual(cd._rule_base_tool('Edit(./out.txt)'), 'Edit')
         result = cd.preflight_required_permissions(
-            _cfg(tools=['Edit'], allowed_tools=['Edit(/abs/out.txt)']), ['Edit'])
+            _cfg(tools=['Read', 'Edit'], allowed_tools=['Read', 'Edit(./out.txt)']),
+            ['Read', 'Edit'], write_files=['out.txt'], workspace=self.WS)
         self.assertTrue(result['ok'], result)
 
     def test_unrelated_legal_bash_parentheses_do_not_break_read(self):
@@ -164,6 +240,14 @@ class PurePreflightTests(unittest.TestCase):
         result = cd.preflight_required_permissions(_cfg(), None)
         self.assertTrue(result['ok'])
         self.assertTrue(result['skipped'])
+
+    def test_bare_edit_grant_is_rejected_for_precise_profile(self):
+        result = cd.preflight_required_permissions(
+            _cfg(tools=['Read', 'Edit'], allowed_tools=['Read', 'Edit']),
+            ['Read', 'Edit'], write_files=['out.txt'], workspace=self.WS)
+        self.assertFalse(result['ok'])
+        self.assertEqual(result['missing_write_rules'], ['Edit(./out.txt)'])
+        self.assertIn('Edit', result['invalid_rules'])
 
     def test_blank_declaration_is_an_error(self):
         with self.assertRaises(ValueError):
@@ -193,7 +277,8 @@ class LifecyclePreflightTests(unittest.TestCase):
         self.addCleanup(p.stop)
         self.addCleanup(self.tmp.cleanup)
 
-    def _run(self, fake, required_tools, *, cfg=None, environ=None):
+    def _run(self, fake, required_tools, *, cfg=None, environ=None, write_files=None,
+             is_eng=True):
         import hashlib
         return cd.run(
             cfg or _cfg(), workspace=str(self.ws), prompt_file=self.prompt,
@@ -202,7 +287,8 @@ class LifecyclePreflightTests(unittest.TestCase):
             now=OFFPEAK, popen_factory=fake,
             environ={'ANTHROPIC_API_KEY': SECRET} if environ is None else environ,
             dispatch_store=self.store, bind_child_pid=False,
-            required_tools=required_tools)
+            required_tools=required_tools, write_files=write_files,
+            is_engineering_task=is_eng)
 
     def _success_stream(self, tool='Read'):
         body = _report_body('BW-PERMISSION-CONFIG-S1', str(self.ws))
@@ -221,11 +307,13 @@ class LifecyclePreflightTests(unittest.TestCase):
         with mock.patch.object(cd, 'resolve_token',
                                side_effect=AssertionError('token must not be read')), \
              mock.patch.object(dp, 'consume_for_entry', claim):
-            out = self._run(fake, ['Edit'])
+            out = self._run(fake, ['Read', 'Edit'], write_files=['out.txt'])
         self.assertFalse(out['sent'])
         self.assertFalse(out['dispatched'])
         self.assertEqual(out['reason'], 'required_tools_not_granted')
         self.assertIn('Edit', out['permission_preflight']['missing_allowed'])
+        self.assertEqual(out['permission_preflight']['missing_write_rules'],
+                         ['Edit(./out.txt)'])
         self.assertEqual(self.sink, [])  # 零 Popen
         claim.assert_not_called()
         self.assertEqual(
@@ -235,11 +323,11 @@ class LifecyclePreflightTests(unittest.TestCase):
     def test_explicit_deny_zero_popen(self):
         fake = FakePopen(self._success_stream('Edit'), self.sink)
         cfg = _cfg(tools=['Read', 'Edit'],
-                   allowed_tools=['Read', 'Edit(/out/x.txt)'],
+                   allowed_tools=['Read', 'Edit(./out/x.txt)'],
                    disallowed_tools=['Edit'])
         with mock.patch.object(cd, 'resolve_token',
                                side_effect=AssertionError('token must not be read')):
-            out = self._run(fake, ['Edit'], cfg=cfg)
+            out = self._run(fake, ['Read', 'Edit'], cfg=cfg, write_files=['out/x.txt'])
         self.assertEqual(out['reason'], 'required_tools_not_granted')
         self.assertEqual(out['permission_preflight']['denied'], ['Edit'])
         self.assertEqual(self.sink, [])
@@ -251,39 +339,72 @@ class LifecyclePreflightTests(unittest.TestCase):
         self.assertEqual(len(self.sink), 1)
         self.assertNotIn(SECRET, ' '.join(fake.argv))
 
-    def test_path_limited_edit_requirement_reaches_popen(self):
+    def test_exact_edit_requirement_reaches_popen(self):
         fake = FakePopen(self._success_stream('Edit'), self.sink)
         cfg = _cfg(tools=['Read', 'Edit'],
-                   allowed_tools=['Read', 'Edit(/abs/workspace/out.txt)'])
-        out = self._run(fake, ['Edit'], cfg=cfg)
+                   allowed_tools=['Read', 'Edit(./out.txt)'])
+        out = self._run(fake, ['Read', 'Edit'], cfg=cfg, write_files=['out.txt'])
         self.assertTrue(out['sent'], out)
         self.assertEqual(len(self.sink), 1)
 
-    def test_undeclared_requirement_keeps_old_calls_working(self):
+    def test_undeclared_engineering_requirement_is_rejected(self):
         fake = FakePopen(self._success_stream('Read'), self.sink)
-        out = self._run(fake, None)
+        with mock.patch.object(cd, 'resolve_token',
+                               side_effect=AssertionError('token must not be read')):
+            out = self._run(fake, None)
+        self.assertEqual(out['reason'], 'required_tools_missing')
+        self.assertFalse(out['sent'])
+        self.assertEqual(self.sink, [])
+
+    def test_not_engineering_pure_text_keeps_skipped(self):
+        fake = FakePopen(self._success_stream('Read'), self.sink)
+        out = self._run(fake, None, is_eng=False)
         self.assertTrue(out['sent'], out)
+        self.assertTrue(out['permission_preflight']['skipped'])
         self.assertEqual(len(self.sink), 1)
+
+    def test_not_engineering_write_grant_without_declaration_zero_popen(self):
+        # cfg 实际带可见且被允许的 Edit 规则：--not-engineering-task 不能绕过路径预检。
+        fake = FakePopen(self._success_stream('Edit'), self.sink)
+        cfg = _cfg(tools=['Read', 'Edit'],
+                   allowed_tools=['Read', 'Edit(./out.txt)'])
+        with mock.patch.object(cd, 'resolve_token',
+                               side_effect=AssertionError('token must not be read')):
+            out = self._run(fake, None, cfg=cfg, is_eng=False)
+        self.assertFalse(out['sent'])
+        self.assertFalse(out['dispatched'])
+        self.assertEqual(out['reason'], 'required_tools_not_granted')
+        self.assertFalse(out['permission_preflight']['skipped'])
+        self.assertTrue(any('write' in reason
+                            for reason in out['permission_preflight']['reasons']))
+        self.assertEqual(self.sink, [])  # 零 Popen
+        self.assertEqual(
+            dp.status(self.store, now=OFFPEAK)['pools']['claude:deepseek-flash']['active'], 0)
 
     def test_malformed_allow_rule_zero_popen_zero_token(self):
         fake = FakePopen(self._success_stream('Edit'), self.sink)
-        cfg = _cfg(tools=['Edit'], allowed_tools=['Edit(/file.py))'])
+        cfg = _cfg(tools=['Read', 'Edit'],
+                   allowed_tools=['Read', 'Edit(./file.py))'])
         with mock.patch.object(cd, 'resolve_token',
                                side_effect=AssertionError('token must not be read')):
-            out = self._run(fake, ['Edit'], cfg=cfg)
+            out = self._run(fake, ['Read', 'Edit'], cfg=cfg, write_files=['file.py'])
         self.assertEqual(out['reason'], 'required_tools_not_granted')
-        self.assertEqual(out['permission_preflight']['missing_allowed'], ['Edit'])
+        self.assertEqual(out['permission_preflight']['missing_write_rules'],
+                         ['Edit(./file.py)'])
+        self.assertIn('Edit(./file.py))', out['permission_preflight']['invalid_rules'])
         self.assertEqual(self.sink, [])
 
     def test_malformed_deny_rule_zero_popen_zero_token(self):
         fake = FakePopen(self._success_stream('Edit'), self.sink)
-        cfg = _cfg(tools=['Edit'], allowed_tools=['Edit'],
-                   disallowed_tools=['Edit(/file.py))'])
+        cfg = _cfg(tools=['Read', 'Edit'],
+                   allowed_tools=['Read', 'Edit(./file.py)'],
+                   disallowed_tools=['Edit(./file.py))'])
         with mock.patch.object(cd, 'resolve_token',
                                side_effect=AssertionError('token must not be read')):
-            out = self._run(fake, ['Edit'], cfg=cfg)
+            out = self._run(fake, ['Read', 'Edit'], cfg=cfg, write_files=['file.py'])
         self.assertEqual(out['reason'], 'required_tools_not_granted')
-        self.assertIn('Edit(/file.py))', out['permission_preflight']['invalid_rules'])
+        self.assertEqual(out['permission_preflight']['denied'], ['Edit'])
+        self.assertIn('Edit(./file.py))', out['permission_preflight']['invalid_rules'])
         self.assertEqual(self.sink, [])
 
     # ---------------- BW-PERMISSION-CONFIG-S2：request/return 最小回执 ----------------
@@ -304,7 +425,7 @@ class LifecyclePreflightTests(unittest.TestCase):
 
     def test_undeclared_required_tools_is_explicitly_skipped_in_evidence(self):
         fake = FakePopen(self._success_stream('Read'), self.sink)
-        out = self._run(fake, None)
+        out = self._run(fake, None, is_eng=False)
         self.assertTrue(out['sent'], out)
         self.assertIsNone(out['required_tools'])
         self.assertTrue(out['permission_preflight']['skipped'])
@@ -347,9 +468,12 @@ class CliDeclarationTests(unittest.TestCase):
                 rc = cd.main(['--workspace', str(base), '--prompt-file', str(prompt),
                               '--output-dir', str(base / 'out'), '--stage', 'S1',
                               '--task-id', 't1', '--config', str(cfg),
-                              '--required-tools', 'Read,Edit'])
+                              '--required-tools', 'Read,Edit',
+                              '--write-file', 'scripts/a.py',
+                              '--write-file', 'scripts/b.py'])
         self.assertEqual(rc, 2)
         self.assertEqual(captured['required_tools'], ['Read', 'Edit'])
+        self.assertEqual(captured['write_files'], ['scripts/a.py', 'scripts/b.py'])
 
 
 if __name__ == '__main__':

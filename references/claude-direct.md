@@ -61,31 +61,48 @@
   --permission-mode dontAsk`，逐项 `--tools` / `--allowedTools` / `--disallowedTools` /
   `--add-dir`（**绝不 bypass/yolo**）、`--setting-sources`、`--settings`（隔离环境，
   **绝不覆盖 `~/.claude`**）、`--max-turns`；`--append-system-prompt` 附带
-  `prompt_contract.build_contract` 完整九节契约。任务原文经 `stdin`
-  （`proc.communicate(input=…)`），绝不拼进 argv。
+  `prompt_contract.build_contract` 完整九节契约。任务原文经 `stdin`（独立写线程写入
+  并关闭；stdout 由独立 drain 线程**逐行记录原始行**并送入队列，主线程只消费队列判断
+  首次拒绝，已收到的成功/错误原始行一律不裁剪；stderr 并发 drain，防管道死锁），绝不
+  拼进 argv。首次权限拒绝后主线程**不再阻塞等待下一行**，只做有界 drain 与有界
+  `wait(timeout)`；reader 未到 EOF 时保留已收快照并标 `raw_stdout_partial`，terminate
+  失败/进程仍活 → `exit_code=None`（unknown），不假释放。回执区分 `stop_requested`、
+  `terminated_by_worker` 与原始流中实际观察到的 `observed_followup_tool_use`，不掩盖竞态。
 - **拒绝式钉死（S4）**：`--bare` 出现即 `ValueError`（官方 Node CLI 2.1.76 不支持该开关）；
   权限模式 ≠ `dontAsk`（任何其它模式，含 bypassPermissions）即 `ValueError`；
   模型 ≠ `deepseek-flash` 即 `ValueError`；`base_url` ≠
   `https://api.deepseek.com/anthropic` 即 `ValueError`——绝不静默改道或回退。
-- **显式任务需求 `required_tools`（BW-PERMISSION-CONFIG-S1/S2）**：
-  `run(..., required_tools=[...])` 与 CLI `--required-tools Read,Edit`（逗号分隔）是**唯一**
-  需求契约。主脑写任务必须传入 `--required-tools Read,Edit,Write`（按实际需要声明，不写
-  未用工具）；只读审查可只声明 Read 或省略。入口**绝不从自然语言猜写意图**，也绝不自动
-  加授权。核对在凭据读取/容量 consume/Popen 之前：工具必须（a）在 `--tools` 可见，
-  （b）被 `--allowedTools` 授权（`Edit(<path>)` 这类按任务路径限定的规则算正例），
-  （c）未被 `--disallowedTools` 拒绝；显式拒绝优先于允许。**规则只做结构校验**：恰好
-  一对括号、工具名非空；`Edit(/file.py))`、`Edit()`、`(/x)` 等畸形/空工具名形态绝不
-  算授权；无法解释的拒绝规则若指向显式需求工具，按 `invalid_rules` 保守拒绝，不静默
-  忽略后让宽 allow 通过。不解析括号内的路径/命令语义（不造 shell/glob 解析器）；合法
-  按文件/目录规则仍允许，合法的 Bash 命令参数括号只有在 Bash 本身被声明需求时才按
-  “无法解释”保守处理，不影响无关的 Read/Edit 需求。缺项返回
-  `required_tools_not_granted` 与具体工具名（不含秘密），零 Popen、零凭据读取、零容量
-  占位。声明成功后，标准化 `required_tools` 与最小 `permission_preflight` 结果写入
-  `request.json` 与 `run` 返回；旧调用 `None` 明确 `skipped=true`，不声称已检查业务意图。
-  该预检**只判断工具是否获授**，不是路径沙箱：存在任意 `Edit(<path>)` 不代表任务所有
-  目标路径均可写，路径外由 CLI 拒绝/现场验证。旧调用不传 `required_tools` 保持兼容，
-  但旧接口**不会**自动知道业务目标，编辑任务仍须主脑显式声明。该预检不是 OS 沙箱，
-  也不替代授权/验收。
+- **显式任务需求 `required_tools` + `write_files`（BW-CLAUDE-PATH-20261018-S2）**：
+  `run(..., required_tools=[...], write_files=[...])` 与 CLI
+  `--required-tools Read,Edit,Write`（逗号分隔）+ 可重复 `--write-file` 是**唯一**需求
+  契约。**工程任务不得遗漏 `required_tools`**：只读工程审查显式声明 `Read` 并使用
+  只读配置；**任何写操作必须同时显式声明 `Read`、所需的 `Edit`/`Write` 工具以及具体
+  `write_files`**（需新建/覆盖文件时声明 `Write`，修改已有文件声明 `Edit`），三者缺一
+  即拒绝，绝不把“未声明写工具”当作只读成功。非工程纯文本必须显式
+  `--not-engineering-task`，才保留 `skipped=true`；工程任务绝不以 `skipped` 继续。
+  但若 cfg 实际带可见且被允许的 `Edit`/`Write` 规则，该标志**不能绕过路径预检**：
+  未显式声明 `required_tools`/`write_files` 仍拒绝（只读/纯文本且 cfg 无写规则保持合法）。
+  入口**绝不从自然语言猜写意图**，也绝不自动加授权。核对在凭据读取/容量 consume/Popen
+  之前：只读工具必须（a）在 `--tools` 可见、（b）被 `--allowedTools` 授权、（c）未被
+  `--disallowedTools` 拒绝；显式拒绝优先于允许。缺少声明/缺 Read/缺写范围/范围外授权 →
+  零 Popen、零凭据读取、零容量占位（`required_tools_missing` /
+  `required_tools_missing_read` / `required_tools_not_granted`）。
+- **确定性精确写 profile（`scripts/claude_permissions.py`）**：由 workspace + 具体文件
+  清单生成且只接受 `Edit(./规范正斜杠相对文件)` / `Write(./同文件)`。`C:/...`、`/...`、
+  裸 `Edit`/`Write`、通配符、`..` 逃逸、盘符不一致、目录目标、范围外兄弟文件、
+  写授权超出清单、未声明写工具却携带的 `Edit(...)`/`Write(...)` 一律明确拒绝，
+  **不猜匹配、不静默改写外来 cfg**。输入尾分隔符/重复分隔符明确拒绝（`newdir/` 不会被
+  剥成新文件）；Windows 歧义/非法段（冒号 ADS、保留设备名如 `NUL`、尾空格/点）拒绝。
+  现有文件和新文件都按最近存在祖先 `resolve` 核对（符号链接越界拒绝；平台不支持
+  符号链接时该平台不宣称已核验，绝不据此放宽）。真实 host 解析失败（如
+  `PermissionError`）诚实拒绝，不做 best-effort 放行。大小写和反斜杠归一化在 Windows
+  profile 上与平台一致，纯词法转换可在任一宿主离线测试。
+  该检查是**配置一致性检查，不是 OS 沙箱**；真实 Claude CLI 的精确授权仍须 root 用
+  正反例现场验证。
+- 畸形规则（`Edit(/file.py))`、`Edit()`、`(/x)`、`Edit(...`）绝不按已授权处理；无法
+  解释且指向显式需求工具的拒绝规则按 `invalid_rules` 保守拒绝。声明成功后，标准化
+  `required_tools`/`write_files`、期望规则与最小 `permission_preflight` 结果写入
+  `request.json` 与 `run` 返回（不含凭据）。
 - `_PINNED_MODEL_ENVS` 把 default opus/sonnet/haiku/small-fast/subagent 全部钉成
   `deepseek-flash`，**没有任何模型回退**；`CLAUDE_CODE_SIMPLE` **绝不设置**，
   `build_subprocess_env` 对任何试图覆写被清除凭据 env（含 `CLAUDE_CODE_SIMPLE`）的配置项
@@ -110,16 +127,18 @@
 
 ## 6. 生命周期（`run`，S4 收口）
 
-- Popen **之前**完成全部预检（argv 构造、`required_tools` 显式需求核对、**prompt SHA
-  从文件真实回读**与传入值比对、dispatch plan 精确预检、凭据解析）：任一失败 ⇒
-  **零 Popen、零占位泄漏**；需求核对先于凭据读取与容量 consume。
+- Popen **之前**完成全部预检（工程任务的 `required_tools`/`write_files` 显式需求与精确
+  写 profile 核对、argv 构造、**prompt SHA 从文件真实回读**与传入值比对、dispatch plan
+  精确预检、凭据解析）：任一失败 ⇒ **零 Popen、零占位泄漏**；需求核对先于凭据读取与
+  容量 consume。build_argv / plan / actual 使用同一份最终 cfg 规则，不悄悄替换旧
+  `C:/` 规则再声称预检正确。
 - **时间字段统一 UTC**：`started_at_utc`/`finished_at_utc` 落盘前统一转为同一时刻的
   `+00:00` ISO 字符串。现场 `datetime.now(timezone.utc)` 本就正确；显式注入带 +08 等
   偏移的 aware datetime 时也保存同一时刻的 UTC，保持离线注入可重复性与生命周期时段
   含义。此规范化不追溯修改任何旧证据。
 - `consume_for_entry`（容量门 + 时段门 + 限额复检，executor=`claude`）→ `mark_running`
   （记真实 wrapper PID）→ `bind_child` 且 **`bound` 必须显式为 `true`** 才算子进程核验 →
-  `communicate` → 解析 → 报告绑定。
+  stdout 实时逐行监控 + stdin/stderr 并发线程 → 解析 → 报告绑定。
 - 解析/分类/限额记录全在受保护流程内；**无条件**以真实退出做终态释放并**保留真实释放结果**
   （`capacity_release`，不再 except-pass 吞掉释放返回值）；已启动但真实退出未知 →
   `mark_unknown` 保留（`launch_unknown`），绝不假释放、绝不误判 429/cancel；
@@ -133,9 +152,10 @@
   0 工具的工程任务绝不冒成功（`zero_tool_engineering`）。
 - **证据落盘**：请求（`request.json`）、进程（`process.json`）、发送任务
   （`sent-task.md`）、发送契约（`sent-contract.md`）、raw stdout/stderr 的**脱敏原件**均持久化；
-  `request.json` 与 `run` 返回同时含标准化 `required_tools` 与最小 `permission_preflight`
-  （`ok/skipped/required_tools/missing_*/denied/invalid_rules/reasons`，不含凭据），
-  便于核对“是否声明/是否跳过”，不把跳过写成已检查业务意图；
+  `request.json` 与 `run` 返回同时含标准化 `required_tools`/`write_files`、期望
+  `Edit(./...)`/`Write(./...)` 规则与最小 `permission_preflight`
+  （`ok/skipped/required_tools/write_files/expected_write_rules/missing_*/denied/
+  invalid_rules/reasons`，不含凭据），便于核对“是否声明/是否跳过/范围是否精确”；
   最终改写后**刷新 `result_sha256`** 并重算 `evidence_sha256`；429 限额以**最终 SHA**
   先 `record_main_force_limit` 再释放本占位。
 - 报告绑定复用 `qoder_direct.analyze_report` + `finalize_binding`（正文九节 + 阶段 token +
@@ -198,6 +218,33 @@
   “本轮第几次请求”推断。CLI 若走非 Undici transport 或未发这些事件，空日志**只说明
   证据不足**，绝不据此推断链路健康。本观测只补诊断支持，不定位也不修复根因。
 
+### 6.3 首次真实权限拒绝立即停止（BW-CLAUDE-PATH-20261018-S2）
+
+- `_exchange_streaming` 在 stdin 独立线程写入原任务并关闭；stderr 独立线程持续 drain
+  （防管道死锁）；主线程逐行读取 stdout stream-json，**实时**识别结构化权限拒绝：
+  `permission_denials` 数组、`is_error` 的 `tool_result` 且文本开头是审批拒绝语、
+  result 错误载体里开头独立的拒绝文本。成功 Read 回执正文、assistant 文本、普通可恢复
+  工具错误**不参与**识别。
+- 首次命中后立即 `terminate()` **本 run 创建并绑定的 Popen 对象**（不扫描/不杀其它
+  进程），停止后续派工/写探测/自动重派；主线程**不再阻塞读下一行**。stdout 原始行由
+  reader 线程在锁内逐行记录（queue 只用于判断首次拒绝），主线程不重复 append、也不
+  裁剪已收到的行：拒绝前已发出的后续事件同样进入 raw（`observed_followup_tool_use`
+  如实标记竞态）；stderr 与触发 `tool_use_id`/原拒绝回执保留（脱敏后进入
+  `events.jsonl`/`raw-*`/`request.json`/facts）。回执区分 `stop_requested` 与
+  `terminated_by_worker`。
+- 停止后仍按真实退出路径处理：有界 `wait(timeout)` 已知退出码 → 正常终态释放
+  （`success=false`）；`wait` 失败/无退出码 → `mark_unknown` 保留占位
+  （`launch_unknown`），**绝不假释放**。此未知路径也把**当时已收**raw stdout/stderr、
+  `permission_stop` 与进程元数据写入本轮 outdir（`unknown-raw-stdout.txt` /
+  `unknown-raw-stderr.txt` / `unknown.json`，`exit_code=null`、
+  `raw_stdout_partial=true` 如实标快照、`success_binding_generated=false`），
+  不等待 EOF、不生成成功绑定或九节报告正文。
+- 传输失败（如 `API Error: Unable to connect to API (ECONNRESET)`）不是权限拒绝，不得
+  触发 stop；正常路径的 stdout/stderr 原件、时钟、secret 脱敏与 transport 分型保持不变。
+- 离线用可注入的假 Popen 覆盖立即 stop/已发出后续行原样保留/terminate 后可控 fake
+  不再发 probe/unknown/stderr 连续输出/误杀负例；
+  生产默认 `subprocess.Popen` 走实时监控，不是“结束后分类”。
+
 ## 7. execution_control 接受 claude
 
 - `CAPABILITY['claude'] = {'fine_grained': True, 'read_dirs': True}`，可校验 claude plan /
@@ -221,6 +268,18 @@
   取 result 错误载体、正文普通 429 与取消 `4294967295` 不判限额、`parse_error` 不判协议成功、
   缺失回执/全部权限拒绝不判工程成功）、生命周期（FakePopen 真实 PID、绑定回读、脱敏、
   预检失败零 Popen、`launch_unknown` 保留）。
+- `tests/test_claude_file_permissions.py`（S2）：`C:/` 规则明确拒绝、正确
+  `Edit(./file)`/`Write(./file)`、正反斜杠/大小写、新文件最近祖先、盘符不一致、
+  `..` 逃逸、通配、目录、范围外兄弟、写授权超出清单、未声明写工具的写规则、
+  写需求缺 Read、只读配置带写授权、尾分隔符、Windows 冒号 ADS/保留设备名/尾点空格、
+  host 解析失败诚实拒绝、符号链接越界（平台可用时）；POSIX 大小写负例使用纯词法
+  POSIX workspace（不依赖 Windows tempdir）。
+- `tests/test_claude_permission_stop.py`（S2）：首个结构化拒绝立即 terminate、零后续
+  probe、原始证据保留、成功 Read 正文含拒绝词不误杀、普通工具错误不误杀、stderr 连续
+  输出、拒绝后无 EOF 且 terminate 失败时有界返回 unknown（不阻塞下一行、不假释放，
+  raw stdout/permission_stop/进程元数据落盘）、unknown 不假释放、传输失败不误判权限。
+- `tests/test_claude_permission_preflight.py`（S1/S2）：工程入口缺 `required_tools`/
+  缺 Read 零 Popen 零凭据零 claim、只读合法、精确写范围、CLI `--write-file` 契约。
 - `tests/test_claude_transport_trace.py`（BW-CLAUDE-TRANSPORT-R2）：Node 不在 PATH 时
   skip；用临时目录 + `diagnostics_channel` 合成 publish 验证 §6.2 的观测契约——未启用
   零文件零订阅、独占创建、同 socket 两次请求标 `socket_uses`/`socket_reused`、连接错误

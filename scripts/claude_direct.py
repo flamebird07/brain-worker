@@ -17,13 +17,16 @@
   文件，启动时经官方 pwsh/powershell 无日志解密。明文**只进子进程 env**（`ANTHROPIC_API_KEY`），
   绝不进 argv/request/异常/证据。**清除继承的 AUTH_TOKEN/OAuth/SIMPLE 与代理**，绝不把宿主
   已注入的旧凭据/代理带进子进程。
-- 生命周期：outdir 必须不存在（否则 0 Popen）；预检（argv 构造、**prompt SHA 从文件真实回读**比对、
-  可选 --dispatch-plan 精确授权、凭据解析）在 dispatch 占位之前完成（pre-check/cred 错误 →
-  0 Popen、零占位泄漏）；Popen 成功后立即 started=true，`mark_running` 记真实 wrapper PID，
-  `bind_child` 回核 **`bound` 必须显式为 true**；解析/分类/限额记录全在受保护流程内，
-  communicate 拿到真实退出码后**无条件**做终态释放并**保留真实释放结果**（capacity_release，
-  不再 except-pass 吞掉返回值）；已启动但真实退出未知保留 launch_unknown 不假释放。
-  退出码：通过=0、未派发=2、失败=3。
+- 生命周期：outdir 必须不存在（否则 0 Popen）；工程任务必须显式 required_tools（至少
+  Read；写任务加 Edit/Write + write_files），预检（精确 ./ 写 profile、argv 构造、
+  **prompt SHA 从文件真实回读**比对、可选 --dispatch-plan 精确授权、凭据解析）在 dispatch
+  占位之前完成（pre-check/cred 错误 → 0 Popen、零占位泄漏）；Popen 成功后立即
+  started=true，`mark_running` 记真实 wrapper PID，`bind_child` 回核 **`bound` 必须显式为
+  true**；stdin 独立线程写入、stderr 并发 drain、stdout 逐行实时监控，首次真实结构化
+  权限拒绝立即 terminate 本 run 的 Popen（不扫描其它进程）并停止后续动作；解析/分类/
+  限额记录全在受保护流程内，真实退出码已知后**无条件**做终态释放并**保留真实释放结果**
+  （capacity_release，不再 except-pass 吞掉返回值）；已启动但真实退出未知保留
+  launch_unknown 不假释放。退出码：通过=0、未派发=2、失败=3。
 - 结果分型（S4 真实错误提取）：`is_error=true` 时即使 `subtype=success` 也把 result 字符串取入
   错误载体；`errors` 非空或 `parse_error` ⇒ 绝不 protocol_success；`tool_use.id`↔
   `tool_result.tool_use_id` 精确配对，**成功回执 ≥1** 才算工程成功（use_count>0 不够），
@@ -42,9 +45,11 @@
 import argparse
 import json
 import os
+import queue
 import re
 import subprocess
 import sys
+import threading
 from datetime import datetime, timezone
 from pathlib import Path
 
@@ -55,6 +60,7 @@ if str(_SCRIPTS_DIR) not in sys.path:
 import prompt_contract as pc            # noqa: E402
 import dispatch_pool as dp              # noqa: E402
 import execution_control as ec          # noqa: E402
+import claude_permissions as cp         # noqa: E402  精确 ./ 写授权 profile（非 OS 沙箱）
 import qoder_direct as qd               # noqa: E402  复用 analyze_report/finalize_binding
 
 RUNTIME = 'claude'
@@ -277,22 +283,78 @@ def _rule_references_tool(rule, names):
     return None
 
 
-def preflight_required_permissions(cfg: dict, required_tools=None) -> dict:
+def _cfg_write_grants(cfg):
+    """cfg 中**实际可见且带写规则**的工具（Edit/Write），仅用于未声明需求时的边界检查。
+
+    只做配置层事实判定：工具须在 `tools` 可见，且 `allowed_tools` 有其规则；畸形但
+    明显指向该写工具的规则也计入（保守）。不推断路径、不解析自然语言、不新增授权。
+    """
+    tools = _validate_rule_list(cfg.get('tools'), 'tools')
+    allowed = _validate_rule_list(cfg.get('allowed_tools'), 'allowed_tools')
+    grants = []
+    for name in ('Edit', 'Write'):
+        if name not in tools:
+            continue
+        for rule in allowed:
+            if _rule_base_tool(rule) == name or (
+                    _rule_base_tool(rule) is None
+                    and _rule_references_tool(rule, (name,)) == name):
+                grants.append(name)
+                break
+    return grants
+
+
+def preflight_required_permissions(cfg: dict, required_tools=None, *, write_files=None,
+                                   workspace=None) -> dict:
     """启动前的**显式任务需求**核对（不是 OS 沙箱，也不猜业务意图）。
 
     对照 cfg 的实际 `tools`（可见性）、`allowed_tools`（授权）、`disallowed_tools`
     （拒绝）逐项核对 required_tools：
       - 不可见（--tools 无该工具）→ 拒绝；
-      - 可见但 allowed 无该工具规则 → 拒绝（`Edit(<path>)` 这类按任务路径限定的
-        规则视为该工具的正例授权）；
-      - 显式 deny 该工具（裸名或带参规则）→ 拒绝，**拒绝优先于允许**；
-    复杂/不认识的规则形态不按“已授权”处理，保守拒绝。返回值只含工具/规则名称，
-    不含任何凭据、环境变量值或 token。未声明 required_tools（None）保持旧调用兼容。"""
+      - 只读工具可见但 allowed 无该工具规则 → 拒绝；
+      - 显式 deny 该工具（裸名或带参规则）→ 拒绝，**拒绝优先于允许**。
+    写工具（Edit/Write）走更严格的**确定性精确 profile**（`claude_permissions`）：
+    必须同时给出 workspace 与具体 write_files，cfg 只能包含由该清单推导出的
+    `Edit(./rel)` / `Write(./rel)`，不得有裸 Edit/Write、通配、`C:/` 绝对规则、
+    `..` 逃逸、盘符不一致或范围外兄弟文件；写授权也不得超出清单。该检查只是配置
+    一致性，不是 OS 沙箱；真实 CLI 权限仍由 root 正反验证。
+    复杂/不认识的拒绝规则不按“已授权”处理，保守拒绝。返回值只含工具/规则名称，
+    不含任何凭据、环境变量值或 token。required_tools=None 且无 write_files 时保持
+    纯文本旧调用兼容（skipped=true），但仅限 cfg 无实际写规则；cfg 可见且带 Edit/Write
+    规则却未声明需求时仍拒绝（--not-engineering-task 不能绕过路径预检）。工程入口由
+    run() 强制显式声明。"""
     required = normalize_required_tools(required_tools)
+    if write_files is None:
+        write_list = []
+    elif isinstance(write_files, (list, tuple)):
+        write_list = list(write_files)
+    else:
+        write_list = [write_files]
     if required is None:
-        return {'ok': True, 'skipped': True, 'required_tools': None,
+        if not write_list:
+            # 纯文本/只读 cfg 可不声明需求；但 cfg 本身带实际写规则时，绝不能靠
+            # --not-engineering-task 绕过路径预检：按配置事实拒绝，不做任何推断。
+            grants = _cfg_write_grants(cfg)
+            if grants:
+                return {'ok': False, 'skipped': False, 'required_tools': None,
+                        'write_files': [], 'expected_write_rules': [],
+                        'missing_visible': [], 'missing_allowed': [], 'denied': [],
+                        'invalid_rules': [], 'missing_write_rules': [],
+                        'extra_write_rules': [], 'denied_write_tools': [],
+                        'reasons': [f'cfg grants write tool(s) {grants!r} but the task '
+                                    'declares no explicit required_tools/write_files; '
+                                    'refusing to bypass the write path preflight']}
+            return {'ok': True, 'skipped': True, 'required_tools': None,
+                    'write_files': [], 'expected_write_rules': [],
+                    'missing_visible': [], 'missing_allowed': [], 'denied': [],
+                    'invalid_rules': [], 'missing_write_rules': [],
+                    'extra_write_rules': [], 'denied_write_tools': [], 'reasons': []}
+        return {'ok': False, 'skipped': False, 'required_tools': None,
+                'write_files': [], 'expected_write_rules': [],
                 'missing_visible': [], 'missing_allowed': [], 'denied': [],
-                'invalid_rules': [], 'reasons': []}
+                'invalid_rules': [], 'missing_write_rules': [],
+                'extra_write_rules': [], 'denied_write_tools': [],
+                'reasons': ['write_files require explicit required_tools (Edit/Write)']}
     tools = _validate_rule_list(cfg.get('tools'), 'tools')
     allowed = _validate_rule_list(cfg.get('allowed_tools'), 'allowed_tools')
     disallowed = _validate_rule_list(cfg.get('disallowed_tools'), 'disallowed_tools')
@@ -308,27 +370,58 @@ def preflight_required_permissions(cfg: dict, required_tools=None) -> dict:
         if name not in tools:
             missing_visible.append(name)
             reasons.append(f'required tool {name!r} is not visible in --tools')
-        if name not in allowed_bases:
+        if name not in ('Edit', 'Write') and name not in allowed_bases:
             missing_allowed.append(name)
-            reasons.append(f'required tool {name!r} is not granted by --allowedTools '
-                           f'(a path-limited rule {name}(<path>) is accepted)')
+            reasons.append(f'required tool {name!r} is not granted by --allowedTools')
+    # 写工具：确定性精确 ./ profile（workspace + 具体文件清单）。
+    if 'Edit' in required or 'Write' in required or write_list:
+        if workspace is None:
+            profile = {'ok': False, 'write_files': [], 'expected_write_rules': [],
+                       'missing_write_rules': [], 'extra_write_rules': [],
+                       'denied_write_tools': [], 'invalid_write_rules': [],
+                       'reasons': ['exact write profile requires an explicit workspace path']}
+        else:
+            profile = cp.validate_write_profile(cfg, required, write_list, workspace)
+    else:
+        profile = cp.validate_read_only_profile(cfg)
+    for reason in profile.get('reasons') or []:
+        if reason not in reasons:
+            reasons.append(reason)
+    for rule in profile.get('invalid_write_rules') or []:
+        if rule not in invalid_rules:
+            invalid_rules.append(rule)
+    for name in profile.get('denied_write_tools') or []:
+        if name not in denied:
+            denied.append(name)
+    if profile.get('missing_write_rules'):
+        for name in ('Edit', 'Write'):
+            if name in required and name not in missing_allowed:
+                missing_allowed.append(name)
     # 拒绝侧无法解释的复杂/畸形规则绝不静默忽略（否则宽 allow 会通过）：
     # 只要该规则明显指向显式需求的工具，就保守拒绝，声明“无法判定是否被拒绝”。
     for rule in disallowed:
         if (_rule_base_tool(rule) is None
                 and _rule_references_tool(rule, required) is not None):
-            invalid_rules.append(rule)
+            if rule not in invalid_rules:
+                invalid_rules.append(rule)
             reasons.append(f'--disallowedTools rule {rule!r} is malformed/unsupported '
                            'for an explicitly required tool; refusing to infer permission')
     return {'ok': not reasons, 'skipped': False, 'required_tools': required,
+            'write_files': profile.get('write_files') or [],
+            'expected_write_rules': profile.get('expected_write_rules') or [],
             'missing_visible': missing_visible, 'missing_allowed': missing_allowed,
-            'denied': denied, 'invalid_rules': invalid_rules, 'reasons': reasons}
+            'denied': denied, 'invalid_rules': invalid_rules,
+            'missing_write_rules': profile.get('missing_write_rules') or [],
+            'extra_write_rules': profile.get('extra_write_rules') or [],
+            'denied_write_tools': profile.get('denied_write_tools') or [],
+            'reasons': reasons}
 
 
 def _preflight_evidence(result: dict) -> dict:
     """最小预检回执（request.json / run 返回共用）：只含工具/规则名，不含凭据或环境值。"""
-    keys = ('ok', 'skipped', 'required_tools', 'missing_visible', 'missing_allowed',
-            'denied', 'invalid_rules', 'reasons')
+    keys = ('ok', 'skipped', 'required_tools', 'write_files', 'expected_write_rules',
+            'missing_visible', 'missing_allowed', 'denied', 'invalid_rules',
+            'missing_write_rules', 'extra_write_rules', 'denied_write_tools', 'reasons')
     return {key: result.get(key) for key in keys}
 
 
@@ -426,6 +519,293 @@ def _looks_like_approval_denial(text) -> bool:
         return False
     s = text.strip().lower()
     return any(s.startswith(p) for p in _APPROVAL_DENIAL_PREFIXES)
+
+
+def _permission_denial_from_event(ev):
+    """从**单个 stream-json 事件**提取真实结构化权限拒绝（首次拒绝即停的依据）。
+
+    只认：显式 `permission_denials` 数组、`is_error` 的 tool_result 错误回执且文本
+    **开头**是审批拒绝语、result 错误载体（errors/errors_info/is_error result）里开头
+    独立的审批拒绝。成功 Read 回执正文、assistant 文本、普通可恢复工具错误一律不参与。
+    返回 None 或 {tool_use_id, receipt, source}；不做变体猜测。
+    """
+    if not isinstance(ev, dict):
+        return None
+    denials = ev.get('permission_denials')
+    if isinstance(denials, list) and denials:
+        tid = None
+        for item in denials:
+            if isinstance(item, dict) and isinstance(item.get('tool_use_id'), str) \
+                    and item['tool_use_id']:
+                tid = item['tool_use_id']
+                break
+        return {'tool_use_id': tid, 'receipt': {'permission_denials': list(denials)},
+                'source': 'permission_denials'}
+    if ev.get('type') == 'result' and ev.get('is_error'):
+        errors, info, _ = _result_error_carrier(ev)
+        candidates = []
+        for item in errors:
+            if isinstance(item, str):
+                candidates.append(item)
+            elif isinstance(item, dict):
+                for key in _STRUCTURED_MESSAGE_KEYS:
+                    value = item.get(key)
+                    if isinstance(value, str):
+                        candidates.append(value)
+        info_items = info if isinstance(info, list) else ([info] if info else [])
+        for item in info_items:
+            if isinstance(item, str):
+                candidates.append(item)
+            elif isinstance(item, dict):
+                for key in _STRUCTURED_MESSAGE_KEYS:
+                    value = item.get(key)
+                    if isinstance(value, str):
+                        candidates.append(value)
+        if any(_looks_like_approval_denial(text) for text in candidates):
+            return {'tool_use_id': None,
+                    'receipt': {'errors': errors, 'errors_info': info},
+                    'source': 'result_error'}
+        result_text = ev.get('result')
+        if isinstance(result_text, str) and _looks_like_approval_denial(result_text):
+            return {'tool_use_id': None, 'receipt': {'result': result_text},
+                    'source': 'result'}
+        return None
+    msg = ev.get('message') if isinstance(ev.get('message'), dict) else None
+    content = (msg or {}).get('content')
+    if isinstance(content, list):
+        for block in content:
+            if not isinstance(block, dict) or block.get('type') != 'tool_result':
+                continue
+            if not (block.get('is_error') or block.get('error')):
+                continue
+            if _looks_like_approval_denial(_block_text(block)):
+                tid = block.get('tool_use_id')
+                return {'tool_use_id': tid if isinstance(tid, str) and tid else None,
+                        'receipt': block, 'source': 'tool_result'}
+    return None
+
+
+_STDOUT_POLL_SECONDS = 0.1
+_TERMINAL_WAIT_SECONDS = 10.0
+_DRAIN_JOIN_SECONDS = 5.0
+
+
+def _observed_followup_tool_use(lines) -> bool:
+    """原始流中是否在**首个拒绝行之后**实际观察到 tool_use 事件。
+
+    仅用于如实记录竞态：reader 可能已在 terminate 前收到已发出的后续事件；
+    绝不据此过滤/裁剪 raw，也绝不把它当作“停止后仍执行”的推断。
+    """
+    seen_denial = False
+    for line in lines:
+        try:
+            ev = json.loads(line)
+        except (json.JSONDecodeError, TypeError):
+            continue
+        if not seen_denial:
+            if _permission_denial_from_event(ev) is not None:
+                seen_denial = True
+            continue
+        msg = ev.get('message') if isinstance(ev.get('message'), dict) else None
+        content = (msg or {}).get('content')
+        if isinstance(content, list) and any(
+                isinstance(block, dict) and block.get('type') == 'tool_use'
+                for block in content):
+            return True
+    return False
+
+
+def _exchange_streaming(proc, payload, *, exit_timeout=None, drain_join_timeout=None):
+    """边写 stdin、边逐行监控 stdout 的交换；首次权限拒绝立即 terminate 本 run 的子进程。
+
+    - stdin 由独立线程写入并关闭；stderr 由独立线程持续 drain（防管道死锁）。
+    - stdout 由**独立 drain 线程**逐行送入 queue，并在记录锁下按原始顺序保存**每一行**；
+      主线程只消费队列判断首次拒绝，不再重复 append，也绝不裁剪已收到的后续原始行。
+      命中结构化拒绝后立即 terminate 并**跳出消费循环**，绝不再阻塞等待下一行（即使
+      terminate 失败、子进程仍活且 stdout 没有 EOF）。终止后做**有界** drain 等待：
+      reader 已到 EOF 则收全原始流；reader 仍阻塞则保留当时快照并标 `stdout_partial`。
+      随后只做**有界** `wait(timeout)`；仍未知则如实返回 exit_code=None，由 run() 保留
+      unknown，绝不假释放。
+    - 回执区分 `stop_requested`（首个拒绝已触发停止）、`terminate_called`（terminate
+      实际成功）与 `observed_followup_tool_use`（之后仍在原始流中实际观察到的 tool_use），
+      不掩盖“拒绝后输出在终止前已发出/已缓冲”的竞态。stderr drain 线程保留全部已收集
+      错误。线程仍阻塞时主线程**不 close** stdout，避免在阻塞读上触发死锁/异常；仅在
+      线程已退出后关闭。
+    - 只操作本 run 的 Popen 对象；不扫描/杀其它进程。未知退出绝不假定成功。
+    - 无管道属性的旧式测试替身回退到 communicate（生产默认 subprocess.Popen 始终走
+      实时监控路径）。
+    """
+    if exit_timeout is None:
+        exit_timeout = _TERMINAL_WAIT_SECONDS
+    if drain_join_timeout is None:
+        drain_join_timeout = _DRAIN_JOIN_SECONDS
+    stdout_stream = getattr(proc, 'stdout', None)
+    stdin_stream = getattr(proc, 'stdin', None)
+    stderr_stream = getattr(proc, 'stderr', None)
+    if (stdout_stream is None or stdin_stream is None
+            or not hasattr(stdout_stream, 'readline')):
+        out, err = proc.communicate(input=payload)
+        first = None
+        for line in (out or '').splitlines():
+            try:
+                ev = json.loads(line)
+            except (json.JSONDecodeError, TypeError):
+                continue
+            hit = _permission_denial_from_event(ev)
+            if hit:
+                first = hit
+                break
+        return {'stdout': out or '', 'stderr': err or '',
+                'exit_code': getattr(proc, 'returncode', None),
+                'first_denial': first, 'stop_requested': first is not None,
+                'terminate_called': False,
+                'observed_followup_tool_use': _observed_followup_tool_use(
+                    (out or '').splitlines()),
+                'stdout_partial': False,
+                'stdin_error': None, 'mode': 'communicate-fallback'}
+
+    raw_stdout, raw_stderr = [], []
+    raw_stdout_lock = threading.Lock()
+    first_denial = None
+    terminate_called = False
+    stdin_error = None
+    read_error = None
+    lines = queue.Queue()
+
+    def _write_stdin():
+        nonlocal stdin_error
+        try:
+            if payload:
+                stdin_stream.write(payload)
+            stdin_stream.flush()
+        except Exception as exc:  # noqa: BLE001 - 记录类型，不掩盖正常流
+            stdin_error = type(exc).__name__
+        finally:
+            try:
+                stdin_stream.close()
+            except Exception:  # noqa: BLE001
+                pass
+
+    def _read_stdout():
+        nonlocal read_error
+        try:
+            while True:
+                chunk = stdout_stream.readline()
+                if chunk in ('', b''):
+                    break
+                if isinstance(chunk, bytes):
+                    chunk = chunk.decode('utf-8', 'replace')
+                # 原始行由 reader 在锁内按到达顺序保存：queue 只用于首次拒绝判断，
+                # 主线程不得裁剪/丢弃任何已收到行（成功与错误原流都原样保留）。
+                with raw_stdout_lock:
+                    raw_stdout.append(chunk)
+                lines.put(chunk)
+        except Exception as exc:  # noqa: BLE001 - stdout 读失败保留原始诊断
+            read_error = type(exc).__name__
+            raw_stderr.append(f'\n[stdout-read-error: {read_error}]\n')
+        finally:
+            lines.put(None)
+
+    def _drain_stderr():
+        try:
+            while True:
+                if hasattr(stderr_stream, 'readline'):
+                    chunk = stderr_stream.readline()
+                else:
+                    chunk = stderr_stream.read(4096)
+                if chunk in ('', b''):
+                    break
+                raw_stderr.append(chunk.decode('utf-8', 'replace')
+                                  if isinstance(chunk, bytes) else chunk)
+        except Exception as exc:  # noqa: BLE001 - stderr 读失败只作诊断
+            raw_stderr.append(f'\n[stderr-read-error: {type(exc).__name__}]\n')
+
+    writer = threading.Thread(target=_write_stdin, daemon=True)
+    reader = threading.Thread(target=_read_stdout, daemon=True)
+    drainer = threading.Thread(target=_drain_stderr, daemon=True)
+    writer.start()
+    reader.start()
+    drainer.start()
+    try:
+        while True:
+            try:
+                chunk = lines.get(timeout=_STDOUT_POLL_SECONDS)
+            except queue.Empty:
+                # 拒绝后绝不等待下一行：即使 terminate 失败/没有 EOF，也立即转为有界终态确认。
+                if first_denial is not None:
+                    break
+                if getattr(proc, 'returncode', None) is not None:
+                    break  # 进程终态已知且输出暂停，交给下方有界 wait/回读
+                continue
+            if chunk is None:
+                break
+            if first_denial is not None:
+                break
+            try:
+                ev = json.loads(chunk)
+            except (json.JSONDecodeError, TypeError):
+                ev = None
+            hit = _permission_denial_from_event(ev)
+            if hit:
+                first_denial = hit
+                if hasattr(proc, 'terminate'):
+                    try:
+                        proc.terminate()
+                        terminate_called = True
+                    except Exception:  # noqa: BLE001
+                        terminate_called = False
+                break  # 不再阻塞读取下一行；后续只做有界终态确认
+    finally:
+        # 先做**有界**终态确认：真实退出后 reader 才能到 EOF 并收全原始流；
+        # terminate 失败/无 EOF 时也绝不无界等待。旧式替身不支持 timeout 则保持 unknown。
+        if (read_error is None and getattr(proc, 'returncode', None) is None
+                and hasattr(proc, 'wait')):
+            try:
+                proc.wait(timeout=exit_timeout)
+            except TypeError:
+                pass
+            except Exception:  # noqa: BLE001
+                pass
+        writer.join(timeout=drain_join_timeout)
+        drainer.join(timeout=drain_join_timeout)
+        reader.join(timeout=drain_join_timeout)
+        # 线程仍阻塞在 readline 时绝不能从主线程 close（会与阻塞读竞争/死锁）。
+        if not reader.is_alive():
+            try:
+                stdout_stream.close()
+            except Exception:  # noqa: BLE001
+                pass
+
+    # 停止后做**有界**的 drain 等待（上面的 join）。reader 已到 EOF 则快照即完整原始流；
+    # reader 仍阻塞（无 EOF/terminate 失败）时保留当时快照并标 partial，绝不等待 EOF。
+    with raw_stdout_lock:
+        stdout_lines = list(raw_stdout)
+    stdout_partial = bool(reader.is_alive() or read_error is not None)
+    observed_followup = _observed_followup_tool_use(stdout_lines)
+
+    exit_code = getattr(proc, 'returncode', None)
+    if read_error is not None:
+        # stdout 读取本身失败：已收集内容保留，但真实终态未知，绝不凭替身 returncode 假释放。
+        exit_code = None
+    return {'stdout': ''.join(stdout_lines), 'stderr': ''.join(raw_stderr),
+            'exit_code': exit_code, 'first_denial': first_denial,
+            'stop_requested': first_denial is not None,
+            'terminate_called': terminate_called,
+            'observed_followup_tool_use': observed_followup,
+            'stdout_partial': stdout_partial,
+            'stdin_error': stdin_error,
+            'read_error': read_error, 'mode': 'streaming'}
+
+
+def _mark_permission_stop(summary: dict, hit: dict) -> dict:
+    """把首次真实拒绝并入 summary，确保 classify 得到 approval_denial（不是成功正文）。"""
+    out = dict(summary)
+    ids = set(out.get('approval_denial_ids') or [])
+    tid = hit.get('tool_use_id') if isinstance(hit, dict) else None
+    ids.add(tid or 'permission-stop')
+    out['approval_denial_ids'] = sorted(ids)
+    out['permission_stop'] = hit
+    return out
 
 
 def summarize_stream(lines) -> dict:
@@ -850,6 +1230,44 @@ def write_evidence(out_dir: Path, *, events, facts: dict, report_text: str,
     return result
 
 
+def _write_unknown_evidence(out_dir, *, stage, task_id, process, raw_stdout,
+                            raw_stderr, permission_stop, secret,
+                            raw_stdout_partial=False) -> dict:
+    """真实退出未知时落盘**已收集的原件**并保留 unknown 占位。
+
+    绝不调用 write_evidence / finalize_binding：不生成 report.md、不生成成功绑定，
+    只写 raw stdout/stderr（精确 secret 脱敏）、permission_stop 原始回执与进程元数据。
+    任何落盘异常如实记录在返回值中，绝不因此假释放或改写 unknown 结论。"""
+    try:
+        out = Path(out_dir)
+        out.mkdir(parents=True, exist_ok=True)
+        stdout_path = out / 'unknown-raw-stdout.txt'
+        stderr_path = out / 'unknown-raw-stderr.txt'
+        stdout_path.write_bytes(
+            _redact(raw_stdout or '', secret).encode('utf-8'))
+        stderr_path.write_bytes(
+            _redact(raw_stderr or '', secret).encode('utf-8'))
+        payload = {'state': 'unknown', 'terminal': 'unknown',
+                   # 退出码未知时如实写 None：绝不伪造“已退出”或成功码。
+                   'exit_code': (process or {}).get('exit_code'),
+                   'success_binding_generated': False,
+                   'stage': stage, 'task_id': task_id,
+                   'process': process,
+                   'permission_stop': permission_stop,
+                   # reader 未到 EOF 时的已收快照必须明确标 partial，不冒充完整原始流。
+                   'raw_stdout_partial': bool(raw_stdout_partial),
+                   'raw_stdout_sha256': _sha(stdout_path.read_bytes()),
+                   'raw_stderr_sha256': _sha(stderr_path.read_bytes())}
+        unknown_path = out / 'unknown.json'
+        unknown_path.write_bytes(_redact(json.dumps(payload, ensure_ascii=False,
+                                                    indent=2), secret).encode('utf-8'))
+        return {'unknown_json': str(unknown_path),
+                'raw_stdout_path': str(stdout_path),
+                'raw_stderr_path': str(stderr_path)}
+    except Exception as exc:  # noqa: BLE001 - 证据落盘失败不改变 unknown 判断
+        return {'error': type(exc).__name__}
+
+
 # ------------------------------------------------------------------ 编排（Popen 生命周期）
 def _build_actual(cfg, *, task_id, stage, model, workspace, prompt_sha256, argv, task_text):
     """构造 execution_control 预检所需的 actual（与 plan 做双向精确集合比对）。"""
@@ -871,17 +1289,22 @@ def run(cfg: dict, *, workspace: str, prompt_file: Path, out_dir: Path, stage: s
         task_id: str, prompt_sha256: str, claim_token: str | None = None,
         is_engineering_task: bool = True, now=None, popen_factory=subprocess.Popen,
         environ=None, dispatch_store=None, child_prober=None, bind_child_pid=True,
-        plan=None, active_tasks=None, required_tools=None) -> dict:
-    """真实编排：outdir/预检/凭据前置 → 时段+容量门 → Popen → 解析 → 绑定 → 终态释放。
+        plan=None, active_tasks=None, required_tools=None, write_files=None) -> dict:
+    """真实编排：outdir/预检/凭据前置 → 时段+容量门 → Popen → 监控 → 绑定 → 终态释放。
 
     - outdir 必须不存在（存在即 0 Popen 拒绝，绝不覆写旧证据）；
-    - required_tools（主脑显式声明的任务所需工具）对照真实 --tools/--allowedTools/
-      --disallowedTools 核对，在凭据读取/容量 consume 之前完成；缺项或显式拒绝 →
-      0 Popen、0 凭据读取、0 占位。未声明时保持旧调用兼容；
+    - 工程任务必须显式声明 required_tools（至少 Read；写任务同时声明 Edit/Write 和
+      具体 write_files）。缺失/无 Read → 0 Popen、0 凭据读取、0 占位，绝不以
+      skipped=true 继续。非工程纯文本（is_engineering_task=False）保留 skipped；
+    - required_tools 对照真实 --tools/--allowedTools/--disallowedTools 核对；写工具走
+      确定性精确 ./ profile（claude_permissions），在凭据读取/容量 consume 之前完成；
+      缺项、范围外授权、裸 Edit/Write、通配、C:/ 规则或显式拒绝 → 0 Popen；
     - --dispatch-plan 精确预检（execution_control.preflight，复用真实 grants）在占位之前完成；
       预检/凭据/argv 任一失败 → 0 Popen、零占位泄漏；
-    - communicate 拿到真实退出码即释放终态（即便随后解析/落盘失败也不再泄漏）；
-    - 已启动但真实退出未知 → launch_unknown，绝不假释放；
+    - Popen 后 stdout 逐行实时监控：首次**真实结构化权限拒绝**立即 terminate 本 run 的
+      子进程并停止后续动作；stderr 并发 drain 防死锁；原始 stdout/stderr 保留；
+    - 真实退出已知即释放终态（即便随后解析/落盘失败也不再泄漏）；真实退出未知
+      （含 stop 后 wait 失败）→ launch_unknown，绝不假释放；
     - 明确限额 → 先 record_main_force_limit（带真实证据）再释放本占位。
 
     离线测试注入 popen_factory（假 Popen）+ token_env 环境，不产生 OS 子进程、不联网、
@@ -898,6 +1321,24 @@ def run(cfg: dict, *, workspace: str, prompt_file: Path, out_dir: Path, stage: s
                 'reason': 'output_dir_exists',
                 'reasons': [f'output dir {str(out_dir)!r} already exists; refusing to '
                             'overwrite prior evidence (choose a fresh dir)']}
+
+    # (0b) 工程入口不得以未声明/skipped=true 继续；纯文本非工程任务保留旧 skipped。
+    if is_engineering_task:
+        if required_tools is None:
+            return {'dispatch_failed': True, 'sent': False, 'dispatched': False,
+                    'reason': 'required_tools_missing',
+                    'reasons': ['engineering task requires explicit required_tools '
+                                '(at least Read; declare Edit/Write plus write_files '
+                                'when writing); refusing to infer permissions']}
+        try:
+            _declared = normalize_required_tools(required_tools)
+        except ValueError:
+            _declared = None  # 下方统一返回 required_tools_invalid
+        if _declared is not None and 'Read' not in _declared:
+            return {'dispatch_failed': True, 'sent': False, 'dispatched': False,
+                    'reason': 'required_tools_missing_read',
+                    'reasons': ['engineering task requires an explicit Read requirement '
+                                'in required_tools; no permission inference']}
 
     # (1) 构造 argv + 契约 + 任务（任一失败 → 0 Popen、零占位）。实际 prompt SHA 必须由
     # prompt 文件重算回核，绝不只信入参；入参（非空时）与文件哈希不符即拒。
@@ -920,9 +1361,11 @@ def run(cfg: dict, *, workspace: str, prompt_file: Path, out_dir: Path, stage: s
     prompt_sha256 = actual_prompt_sha
 
     # (1b) 显式任务所需权限核对（仍然在凭据读取、容量 consume 与 Popen 之前）。
-    # 只核对主脑**明确声明**的 required_tools，绝不从自然语言猜写意图、不自动加授权。
+    # 只核对主脑**明确声明**的 required_tools/write_files，绝不从自然语言猜写意图、
+    # 不自动加授权；写工具必须与显式文件清单精确一致。
     try:
-        permission_preflight = preflight_required_permissions(cfg, required_tools)
+        permission_preflight = preflight_required_permissions(
+            cfg, required_tools, write_files=write_files, workspace=str(workspace))
     except Exception as exc:  # noqa: BLE001
         return {'dispatch_failed': True, 'sent': False, 'dispatched': False,
                 'reason': 'required_tools_invalid', 'error_class': type(exc).__name__,
@@ -976,6 +1419,13 @@ def run(cfg: dict, *, workspace: str, prompt_file: Path, out_dir: Path, stage: s
     stdout_text = ''
     stderr_text = ''
     exit_code = None
+    permission_stop = None
+    stop_requested = False
+    terminate_called = False
+    observed_followup_tool_use = False
+    stdout_partial = False
+    exchange_mode = None
+    stdin_error = None
     started_at_utc = now
     finished_at_utc = now
     try:
@@ -1003,15 +1453,73 @@ def run(cfg: dict, *, workspace: str, prompt_file: Path, out_dir: Path, stage: s
                                                     now=started_at_utc)
                 except Exception as uexc:  # noqa: BLE001
                     unknown_guard = {'marked': False, 'error': type(uexc).__name__}
+                unknown_evidence = _write_unknown_evidence(
+                    out_dir, stage=stage, task_id=task_id,
+                    process={'pid': getattr(proc, 'pid', None),
+                             'wrapper_pid': os.getpid(), 'exit_code': None,
+                             'exchange_mode': None, 'terminated_by_worker': False,
+                             'stdin_error': None, 'child_verified': False,
+                             'bind_required': True, 'started': True,
+                             'started_at_utc': _iso_utc(started_at_utc),
+                             'finished_at_utc': _iso_utc(started_at_utc)},
+                    raw_stdout=stdout_text, raw_stderr=stderr_text,
+                    permission_stop=None, secret=secret)
                 return {'dispatch_failed': False, 'sent': False, 'dispatched': True,
                         'launch_unknown': True, 'started': True, 'token': claim,
                         'child_verified': False, 'bind_required': True,
-                        'unknown_guard': unknown_guard, 'business_verified': False}
-        stdout_text, stderr_text = proc.communicate(input=sent_payload)
-        exit_code = getattr(proc, 'returncode', None)
-        # 真实结束点：communicate 返回后采集，绝不沿用派工开始的 now。
+                        'unknown_guard': unknown_guard,
+                        'evidence': unknown_evidence,
+                        'business_verified': False}
+        exchange = _exchange_streaming(proc, sent_payload)
+        stdout_text = exchange.get('stdout') or ''
+        stderr_text = exchange.get('stderr') or ''
+        exit_code = exchange.get('exit_code')
+        first_denial = exchange.get('first_denial')
+        stop_requested = bool(exchange.get('stop_requested'))
+        terminate_called = bool(exchange.get('terminate_called'))
+        observed_followup_tool_use = bool(exchange.get('observed_followup_tool_use'))
+        stdout_partial = bool(exchange.get('stdout_partial'))
+        exchange_mode = exchange.get('mode')
+        stdin_error = exchange.get('stdin_error')
+        # 真实结束点：交换返回后采集，绝不沿用派工开始的 now。
         finished_at_utc = now if clock_injected else datetime.now(timezone.utc)
-        child_done = True  # communicate 返回 → 子进程真实退出码已知（确知已退出）
+        child_done = exit_code is not None  # 真实退出码已知（确知已退出）
+        if permission_stop is None and first_denial is not None:
+            permission_stop = first_denial
+        if not child_done:
+            # 已启动但真实退出未知（含 stop 后 wait 失败/terminate 失败）：保留 unknown，
+            # 不假释放；把已收集 raw stdout/stderr、permission_stop 与进程元数据落盘。
+            try:
+                unknown_guard = dp.mark_unknown(dispatch_store, claim, now=now)
+            except Exception as uexc:  # noqa: BLE001
+                unknown_guard = {'marked': False, 'error': type(uexc).__name__}
+            unknown_evidence = _write_unknown_evidence(
+                out_dir, stage=stage, task_id=task_id,
+                process={'pid': getattr(proc, 'pid', None),
+                         'wrapper_pid': os.getpid(), 'exit_code': exit_code,
+                         'exchange_mode': exchange_mode,
+                         'stop_requested': bool(stop_requested),
+                         'terminated_by_worker': bool(terminate_called),
+                         'observed_followup_tool_use': bool(observed_followup_tool_use),
+                         'raw_stdout_partial': bool(stdout_partial),
+                         'stdin_error': stdin_error, 'child_verified': child_verified,
+                         'bind_required': bool(bind_child_pid), 'started': True,
+                         'started_at_utc': _iso_utc(started_at_utc),
+                         'finished_at_utc': _iso_utc(finished_at_utc)},
+                raw_stdout=stdout_text, raw_stderr=stderr_text,
+                permission_stop=permission_stop, secret=secret,
+                raw_stdout_partial=stdout_partial)
+            return {'dispatch_failed': False, 'sent': False, 'dispatched': True,
+                    'launch_unknown': True, 'started': True, 'token': claim,
+                    'unknown_guard': unknown_guard, 'permission_stop': permission_stop,
+                    'stop_requested': bool(stop_requested),
+                    'terminated_by_worker': bool(terminate_called),
+                    'observed_followup_tool_use': bool(observed_followup_tool_use),
+                    'raw_stdout_partial': bool(stdout_partial),
+                    'stdout_sha256': _sha((stdout_text or '').encode('utf-8')),
+                    'stderr_sha256': _sha((stderr_text or '').encode('utf-8')),
+                    'evidence': unknown_evidence,
+                    'business_verified': False}
     except BaseException as exc:  # noqa: BLE001 - 终态处理必须兜底
         if started:
             # 已启动但真实退出未知（communicate/Popen 之后异常）→ 保留占位为 unknown，
@@ -1021,9 +1529,25 @@ def run(cfg: dict, *, workspace: str, prompt_file: Path, out_dir: Path, stage: s
                     unknown_guard = dp.mark_unknown(dispatch_store, claim, now=now)
                 except Exception as uexc:  # noqa: BLE001
                     unknown_guard = {'marked': False, 'error': type(uexc).__name__}
+                unknown_evidence = _write_unknown_evidence(
+                    out_dir, stage=stage, task_id=task_id,
+                    process={'pid': getattr(proc, 'pid', None),
+                             'wrapper_pid': os.getpid(), 'exit_code': None,
+                             'exchange_mode': exchange_mode,
+                             'terminated_by_worker': bool(terminate_called),
+                             'stdin_error': stdin_error,
+                             'child_verified': child_verified,
+                             'bind_required': bool(bind_child_pid), 'started': True,
+                             'started_at_utc': _iso_utc(started_at_utc),
+                             'finished_at_utc': _iso_utc(finished_at_utc),
+                             'error_class': type(exc).__name__},
+                    raw_stdout=stdout_text, raw_stderr=stderr_text,
+                    permission_stop=permission_stop, secret=secret)
                 return {'dispatch_failed': False, 'sent': False, 'dispatched': True,
                         'launch_unknown': True, 'started': True, 'token': claim,
                         'unknown_guard': unknown_guard,
+                        'permission_stop': permission_stop,
+                        'evidence': unknown_evidence,
                         'error_class': type(exc).__name__, 'business_verified': False}
             # 极小竞态：communicate 已返回但取 returncode 抛出 → 子进程确知已结束，
             # 走下面统一释放路径（不在此 return）。
@@ -1052,8 +1576,22 @@ def run(cfg: dict, *, workspace: str, prompt_file: Path, out_dir: Path, stage: s
     limit_error = None
     try:
         summary = summarize_stream((stdout_text or '').splitlines())
+        if permission_stop:
+            summary = _mark_permission_stop(summary, permission_stop)
         facts = classify_result(summary, ec_exit, stderr_text or '',
                                 is_engineering_task=is_engineering_task)
+        # 首次真实权限拒绝的停止事实单独保留（原始回执/触发 tool id/是否由本 run 终止）。
+        facts = dict(facts,
+                     permission_stop=bool(permission_stop),
+                     permission_stop_source=(permission_stop or {}).get('source'),
+                     permission_stop_tool_use_id=(permission_stop or {}).get('tool_use_id'),
+                     permission_stop_receipt=(permission_stop or {}).get('receipt'),
+                     permission_stop_requested=bool(stop_requested),
+                     terminated_by_worker=bool(terminate_called),
+                     observed_followup_tool_use=bool(observed_followup_tool_use),
+                     raw_stdout_partial=bool(stdout_partial),
+                     exchange_mode=exchange_mode,
+                     stdin_error=stdin_error)
         report_text = ((summary.get('result_event') or {}).get('result')
                        or summary.get('assistant_text') or '')
         ev = write_evidence(Path(out_dir), events=summary.get('events', []), facts=facts,
@@ -1063,8 +1601,15 @@ def run(cfg: dict, *, workspace: str, prompt_file: Path, out_dir: Path, stage: s
                                      'runtime': RUNTIME, 'model': model,
                                      'cli_version': summary.get('cli_version'),
                                      'required_tools': permission_preflight.get('required_tools'),
+                                     'write_files': permission_preflight.get('write_files'),
                                      'permission_preflight': _preflight_evidence(
                                          permission_preflight),
+                                     'permission_stop': permission_stop,
+                                     'stop_requested': bool(stop_requested),
+                                     'observed_followup_tool_use': bool(observed_followup_tool_use),
+                                     'exchange_mode': exchange_mode,
+                                     'terminated_by_worker': bool(terminate_called),
+                                     'raw_stdout_partial': bool(stdout_partial),
                                      'started_at_utc': _iso_utc(started_at_utc),
                                      'finished_at_utc': _iso_utc(finished_at_utc),
                                      'executor_identity': {
@@ -1075,7 +1620,12 @@ def run(cfg: dict, *, workspace: str, prompt_file: Path, out_dir: Path, stage: s
                                      'contract_sha256': pc.sha256_hex(
                                          contract_text.encode('utf-8'))},
                             process={'pid': getattr(proc, 'pid', None),
-                                     'exit_code': exit_code, 'wrapper_pid': os.getpid()},
+                                     'exit_code': exit_code, 'wrapper_pid': os.getpid(),
+                                     'stop_requested': bool(stop_requested),
+                                     'terminated_by_worker': bool(terminate_called),
+                                     'observed_followup_tool_use': bool(observed_followup_tool_use),
+                                     'raw_stdout_partial': bool(stdout_partial),
+                                     'exchange_mode': exchange_mode},
                             sent_task=task_text, sent_contract=contract_text,
                             raw_stdout=stdout_text, raw_stderr=stderr_text)
         body = qd.analyze_report(Path(ev['report_md']).read_text(encoding='utf-8'),
@@ -1130,7 +1680,10 @@ def run(cfg: dict, *, workspace: str, prompt_file: Path, out_dir: Path, stage: s
     return {'sent': True, 'dispatched': True, 'started': started,
             'child_verified': child_verified, 'token': claim, 'exit_code': exit_code,
             'required_tools': permission_preflight.get('required_tools'),
+            'write_files': permission_preflight.get('write_files'),
             'permission_preflight': _preflight_evidence(permission_preflight),
+            'permission_stop': permission_stop,
+            'stopped': bool(permission_stop),
             'facts': facts, 'binding': binding, 'evidence': ev, 'launched': True,
             'limit_recorded': limit_recorded, 'limit_error': limit_error,
             'started_at_utc': _iso_utc(started_at_utc),
@@ -1158,8 +1711,12 @@ def build_parser():
     ap.add_argument('--not-engineering-task', action='store_true')
     ap.add_argument('--required-tools', default=None,
                     help='comma-separated tool names this task explicitly requires '
-                         '(e.g. "Read,Edit"); checked before credentials/capacity/Popen. '
-                         'Root must declare write needs explicitly; no inference from text')
+                         '(e.g. "Read,Edit"); engineering tasks must include Read and are '
+                         'checked before credentials/capacity/Popen. No inference from text')
+    ap.add_argument('--write-file', action='append', default=None, dest='write_files',
+                    help='explicit workspace-relative file the task may Edit/Write '
+                         '(repeatable). Config must contain exactly the derived '
+                         'Edit(./file)/Write(./file) rules; no globs/absolute rules')
     return ap
 
 
@@ -1195,7 +1752,7 @@ def main(argv=None) -> int:
               prompt_sha256=_sha(prompt_bytes), claim_token=args.dispatch_claim,
               is_engineering_task=not args.not_engineering_task,
               dispatch_store=args.dispatch_store, plan=plan, active_tasks=active_tasks,
-              required_tools=required_tools)
+              required_tools=required_tools, write_files=args.write_files)
     print(json.dumps(out, ensure_ascii=False))
     if not out.get('dispatched'):
         return 2  # not dispatched (precheck/credential/gate)

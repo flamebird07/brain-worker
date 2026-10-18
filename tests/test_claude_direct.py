@@ -42,15 +42,66 @@ def _report_body(stage, workspace):
     return '\n'.join(lines)
 
 
+class _OutStream:
+    """Deterministic stdout/stderr line source for offline lifecycle tests."""
+
+    def __init__(self, text, owner):
+        self._lines = text.splitlines(keepends=True)
+        self._index = 0
+        self.owner = owner
+        self.stopped = False
+        self.closed = False
+
+    def readline(self):
+        if self.owner._comm_delay:
+            time.sleep(self.owner._comm_delay)
+            self.owner._comm_delay = 0.0
+        if self.owner._raise_comm:
+            raise self.owner._raise_comm
+        if self.stopped or self._index >= len(self._lines):
+            return ''
+        line = self._lines[self._index]
+        self._index += 1
+        return line
+
+    def stop(self):
+        self.stopped = True
+
+    def close(self):
+        self.closed = True
+
+
+class _InStream:
+    def __init__(self):
+        self.data = []
+        self.closed = False
+
+    def write(self, value):
+        if self.closed:
+            raise ValueError('stdin closed')
+        self.data.append(value)
+        return len(value)
+
+    def flush(self):
+        pass
+
+    def close(self):
+        self.closed = True
+
+
 class FakePopen:
     def __init__(self, stdout, stderr='', returncode=0, pid=4242, raise_comm=None,
-                 raise_init=False, sink=None, comm_delay=0.0):
+                 raise_init=False, sink=None, comm_delay=0.0, terminate_rc=-15):
         self._stdout, self._stderr = stdout, stderr
         self._rc, self.pid = returncode, pid
         self._raise_comm, self._raise_init = raise_comm, raise_init
         self._comm_delay = comm_delay
+        self._terminate_rc = terminate_rc
         self.argv = self.env = None
         self.sink = sink
+        self.returncode = None
+        self.terminated = False
+        self.stdin = self.stdout = self.stderr = None
 
     def __call__(self, argv, *, cwd=None, stdin=None, stdout=None, stderr=None,
                  env=None, text=None):
@@ -59,7 +110,23 @@ class FakePopen:
         self.argv, self.env = list(argv), env
         if self._raise_init:
             raise OSError('boom before handle')
+        self.stdin = _InStream()
+        self.stdout = _OutStream(self._stdout, self)
+        self.stderr = _OutStream(self._stderr, self)
         return self
+
+    def terminate(self):
+        self.terminated = True
+        if self.stdout is not None:
+            self.stdout.stop()
+        if self.stderr is not None:
+            self.stderr.stop()
+        self.returncode = self._terminate_rc
+
+    def wait(self, timeout=None):
+        if self.returncode is None:
+            self.returncode = self._rc
+        return self.returncode
 
     def communicate(self, input=None):
         if self._comm_delay:
@@ -446,13 +513,14 @@ class LifecycleTests(unittest.TestCase):
                       prompt_sha256=self.sha(), now=now, popen_factory=fake,
                       environ={'ANTHROPIC_API_KEY': SECRET}, dispatch_store=self.store,
                       child_prober=lambda pid: {'state': 'dead', 'created': 'c1'},
-                      is_engineering_task=is_eng, bind_child_pid=bind_child_pid)
+                      is_engineering_task=is_eng, bind_child_pid=bind_child_pid,
+                      required_tools=['Read'] if is_eng else None)
 
     def success_stream(self):
         body = _report_body('BW-CLAUDE-DEEPSEEK-S3', str(self.ws))
         return _jsonl([
             {'type': 'assistant', 'message': {'content': [
-                {'type': 'tool_use', 'name': 'Edit', 'id': 't1'}]}},
+                {'type': 'tool_use', 'name': 'Read', 'id': 't1'}]}},
             {'type': 'user', 'message': {'content': [{'type': 'tool_result', 'tool_use_id': 't1'}]}},
             {'type': 'result', 'subtype': 'success', 'is_error': False, 'session_id': 's1',
              'result': body}])
@@ -505,7 +573,7 @@ class LifecycleTests(unittest.TestCase):
 
     def test_format_failure_binding_false(self):
         stream = _jsonl([{'type': 'assistant', 'message': {'content': [
-            {'type': 'tool_use', 'name': 'Edit', 'id': 't1'}]}},
+            {'type': 'tool_use', 'name': 'Read', 'id': 't1'}]}},
             {'type': 'user', 'message': {'content': [{'type': 'tool_result', 'tool_use_id': 't1'}]}},
             {'type': 'result', 'subtype': 'success', 'is_error': False, 'session_id': 's1',
              'result': 'not a structured report'}])
@@ -539,7 +607,7 @@ class LifecycleTests(unittest.TestCase):
                      out_dir=self.out, stage='BW-CLAUDE-DEEPSEEK-S3', task_id='t1',
                      prompt_sha256=self.sha(), now=OFFPEAK, popen_factory=fake,
                      environ={'ANTHROPIC_API_KEY': SECRET}, dispatch_store=self.store,
-                     plan=plan)  # prompt_sha256 mismatch → reject before Popen
+                     required_tools=['Read'], plan=plan)  # plan grants mismatch → reject
         self.assertFalse(out['sent'])
         self.assertFalse(out['dispatched'])
         self.assertEqual(self.sink, [])
@@ -553,7 +621,7 @@ class LifecycleTests(unittest.TestCase):
                          popen_factory=FakePopen(self.success_stream(), sink=self.sink),
                          environ={'ANTHROPIC_API_KEY': SECRET}, dispatch_store=self.store,
                          child_prober=lambda pid: {'state': 'dead', 'created': 'c1'},
-                         bind_child_pid=True)
+                         required_tools=['Read'], bind_child_pid=True)
         self.assertFalse(out['sent'])
         self.assertTrue(out.get('launch_unknown'))
         self.assertFalse(out.get('passed', False))
@@ -574,7 +642,7 @@ class LifecycleTests(unittest.TestCase):
         body = _report_body('BW-CLAUDE-DEEPSEEK-S3', str(self.ws)) + f'\nnote: {SECRET}'
         stream = _jsonl([
             {'type': 'assistant', 'message': {'content': [
-                {'type': 'tool_use', 'name': 'Edit', 'id': 't1'}]}},
+                {'type': 'tool_use', 'name': 'Read', 'id': 't1'}]}},
             {'type': 'user', 'message': {'content': [{'type': 'tool_result', 'tool_use_id': 't1'}]}},
             {'type': 'result', 'subtype': 'success', 'is_error': False, 'session_id': 's1',
              'result': body}])

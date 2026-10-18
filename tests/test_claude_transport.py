@@ -276,7 +276,8 @@ class TransportLifecycleTests(unittest.TestCase):
                       popen_factory=FakePopen(stream),
                       environ={'ANTHROPIC_API_KEY': SECRET}, dispatch_store=self.store,
                       child_prober=lambda pid: {'state': 'dead', 'created': 'c1'},
-                      is_engineering_task=True, bind_child_pid=True)
+                      is_engineering_task=True, bind_child_pid=True,
+                      required_tools=['Read'])
 
     def _active(self):
         return dp.status(self.store, now=OFFPEAK)['pools']['claude:deepseek-flash']['active']
@@ -315,7 +316,7 @@ class TransportLifecycleTests(unittest.TestCase):
 
     def test_two_tool_receipts_then_transport_readback(self):
         carrier = 'API Error: Unable to connect to API (ECONNRESET)'
-        out = self.run_stream(_stream(carrier, tools=(('u1', 'Read'), ('u2', 'Edit'))))
+        out = self.run_stream(_stream(carrier, tools=(('u1', 'Read'), ('u2', 'Read'))))
         self.assertTrue(out['sent'], out)
         facts = out['facts']
         self.assertEqual(facts['ok_tool_receipts'], 2)
@@ -402,7 +403,8 @@ class TransportLifecycleTests(unittest.TestCase):
                      popen_factory=fake,
                      environ={'ANTHROPIC_API_KEY': SECRET}, dispatch_store=self.store,
                      child_prober=lambda pid: {'state': 'dead', 'created': 'c1'},
-                     is_engineering_task=True, bind_child_pid=False)
+                     is_engineering_task=True, bind_child_pid=False,
+                     required_tools=['Read'])
         self.assertTrue(out.get('launch_unknown'), out)
         self.assertFalse(out['sent'])
         self.assertEqual(self._active(), 1)
