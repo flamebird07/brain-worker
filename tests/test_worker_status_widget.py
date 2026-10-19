@@ -139,6 +139,17 @@ class TestModuleDiscipline(_WidgetBase):
         self.assertEqual(labels[dp.CN_MAX_POOL_KEY], 'Qoder CN／Qwen3.8-Max')
         self.assertEqual(labels[dp.CN_CUSTOM_MAX_POOL_KEY],
                          'Qoder CN／token plan／Qwen-3.8-Max')
+        # BW-HOVER-REPAIR-20261019-S7：CodeBuddy 使用国际账号，两个模型行可见名称
+        # 必须完整以「CodeBuddy 国际／」开头；旧的「CodeBuddy／...」可见标签不再出现。
+        # 仅改用户可见名称：pool key、runtime/model 名、两独立槽与优先级不变。
+        self.assertEqual(labels[dp.CODEBUDDY_POOL_KEY],
+                         'CodeBuddy 国际／DeepSeek-V4.1-Flash')
+        self.assertEqual(labels[dp.CODEBUDDY_GLM_POOL_KEY],
+                         'CodeBuddy 国际／GLM-5.3-Flash')
+        for pk, label, _lbl_note in wsw.ROW_DEFS:
+            if pk in (dp.CODEBUDDY_POOL_KEY, dp.CODEBUDDY_GLM_POOL_KEY):
+                self.assertTrue(label.startswith('CodeBuddy 国际／'), label)
+            self.assertFalse(label.startswith('CodeBuddy／'), label)
         for pk, _label, note in wsw.ROW_DEFS:
             self.assertNotIn('CN 内置', note)
             self.assertNotIn('CN 自定义', note)

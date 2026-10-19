@@ -79,6 +79,12 @@ sidecar、绝不 migrate、绝不回落成空表冒充空闲。
   `qodercn:Qwen3.8-Max`）与 `Qoder CN／token plan／Qwen-3.8-Max`（pool_key
   `qodercn:Qwen-3.8-Max`），**不再写「CN 内置/CN 自定义」**；精确 runtime/model
   pool_key 不变。主界面（精简/展开同宽）560，关键名称、组合状态徽标与占用数绝不截断。
+- CodeBuddy 使用国际账号（BW-HOVER-REPAIR-20261019-S7）：两个 CodeBuddy 模型行的
+  用户可见名称必须以 `CodeBuddy 国际／` 开头——`CodeBuddy 国际／DeepSeek-V4.1-Flash`
+  与 `CodeBuddy 国际／GLM-5.3-Flash`，旧的 `CodeBuddy／...` 可见标签不再出现。
+  **仅改用户可见名称**：内部 pool key（`codebuddy:deepseek-v4.1-flash`、
+  `codebuddy:glm-5.3-flash`）、runtime 名、模型名、两个独立 1 槽、优先级、限额状态、
+  30 分钟展示规则、调度与数据库均不变；其它执行器名称不变。
 - “上轮调用通过 / 未通过 / 待核”只读 attempts 的真实 `success` 字段：缺失=待核，
   `finished` 不一概当绿灯；这是**最近一次调用的记录**，不是永久健康状态，更不是
   业务验收。“上轮限额”：非 deepseek 池仍仅在主力限额标记绑定该池最新 attempt 时显示（保持既有规则）；
