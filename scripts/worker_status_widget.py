@@ -44,17 +44,17 @@ import stage_selection as ss  # noqa: E402
 # 另加可选 Luna 外援行；退休池（qodercn:DeepSeek-Flash、WorkBuddy 等）不显示成可派，
 # 但其真实在途仍计入总占用（见 retired_active）。
 ROW_DEFS = (
-    (dp.CODEBUDDY_POOL_KEY, 'CodeBuddy · DeepSeek-V4.1-Flash', '主力 · 最高优先 · 无时段门'),
+    (dp.CODEBUDDY_POOL_KEY, 'CodeBuddy／DeepSeek-V4.1-Flash', '主力 · 最高优先 · 无时段门'),
     (dp.CN_CUSTOM_MAX_POOL_KEY, 'Qoder CN／token plan／Qwen-3.8-Max', '主力 Max · 夜间窗'),
     (dp.CN_MAX_POOL_KEY, 'Qoder CN／Qwen3.8-Max', '主力 Max · 夜间窗'),
-    (dp.QMAX_POOL_KEY, 'Qoder 国际 · Qwen3.8-Max', '主力 Max · 国际内置 · 夜间窗'),
-    (dp.CLAUDE_POOL_KEY, 'Claude · deepseek-flash', '主力 · 空闲时段门'),
-    (dp.ZCODE_POOL_KEY, 'ZCode · GLM-5.3', '主力 · 全天'),
-    (dp.CODEBUDDY_GLM_POOL_KEY, 'CodeBuddy · GLM-5.3-Flash',
+    (dp.QMAX_POOL_KEY, 'Qoder 国际／Qwen3.8-Max', '主力 Max · 国际内置 · 夜间窗'),
+    (dp.CLAUDE_POOL_KEY, 'Claude Code／deepseek-flash', '主力 · 空闲时段门'),
+    (dp.ZCODE_POOL_KEY, 'ZCode／GLM-5.3', '主力 · 全天'),
+    (dp.CODEBUDDY_GLM_POOL_KEY, 'CodeBuddy／GLM-5.3-Flash',
      '条件补位 · 独立 1 槽 · 需当轮 DeepSeek 限额证据'),
-    (dp.QFLASH_POOL_KEY, 'Qoder 国际 · Qwen3.8-Flash', '兜底'),
-    (dp.CN_FLASH_POOL_KEY, 'Qoder CN · Qwen3.8-Flash', '兜底'),
-    (dp.LUNA_KEY, 'Luna · 原生外援', '可选 · 无上限 · 不计入国内总数'),
+    (dp.QFLASH_POOL_KEY, 'Qoder 国际／Qwen3.8-Flash', '兜底'),
+    (dp.CN_FLASH_POOL_KEY, 'Qoder CN／Qwen3.8-Flash', '兜底'),
+    (dp.LUNA_KEY, 'Luna／原生外援', '可选 · 无上限 · 不计入国内总数'),
 )
 
 STATE_LABELS = {'running': '运行中', 'unknown': '待核实', 'reserved': '已预留',
