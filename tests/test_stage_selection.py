@@ -108,6 +108,8 @@ class _Base(unittest.TestCase):
         a = {'selection_mode': mode, 'quote': kw.pop('quote', '用户真实原话'),
              'authorization_scope': kw.pop('scope', {'task_id': task, 'stage': stage}),
              'allowed_candidates': allowed}
+        if mode in ('fixed', 'executor'):
+            a['user_direct_selection'] = kw.pop('user_direct_selection', True)
         a.update(kw)
         return a
 
@@ -128,6 +130,41 @@ class _Base(unittest.TestCase):
 
 
 class AuthorizationTests(_Base):
+    def test_fixed_and_executor_require_explicit_user_choice(self):
+        self.build_store()
+        fixed = self.auth('fixed', 'T', 's2', [CN_FLASH], runtime='qodercn',
+                          model='Qwen3.8-Flash')
+        fixed.pop('user_direct_selection')
+        r = self.plan(fixed)
+        self.assertEqual(r['refused'], 'explicit_user_choice_required', r)
+        executor = self.auth('executor', 'T', 's2', ALL_MAINS + ALL_FLASH,
+                             executor='opencode', user_direct_selection=False)
+        r = self.plan(executor)
+        self.assertEqual(r['refused'], 'explicit_user_choice_required', r)
+
+    def test_auto_does_not_need_explicit_user_choice(self):
+        self.build_store()
+        r = self.plan(self.auth('auto', 'T', 's2', ALL_MAINS + ALL_FLASH))
+        self.assertIsNone(r['refused'], r)
+        self.assertFalse(r['user_direct_selection'])
+
+    def test_recent_limits_and_day_windows_select_opencode_before_flash(self):
+        self.build_store()
+        with closing(dp.connect(self.store)) as conn:
+            for pk in (dp.CODEBUDDY_POOL_KEY, dp.ZCODE_POOL_KEY):
+                conn.execute(
+                    'INSERT INTO main_force_limits(pool_key, limited, recorded_at_utc) '
+                    'VALUES(?,1,?)', (pk, dp._iso(T_DAY)))
+            conn.execute('PRAGMA journal_mode=DELETE')
+        r = self.plan(self.auth('auto', 'T', 's2', ALL_MAINS + ALL_FLASH), now=T_DAY)
+        self.assertIsNone(r['refused'], r)
+        self.assertEqual(r['candidate_filters'][dp.CODEBUDDY_POOL_KEY],
+                         'main_force_limited')
+        self.assertEqual(r['candidate_filters'][dp.ZCODE_POOL_KEY],
+                         'main_force_limited')
+        self.assertEqual(r['selected']['pool_key'], dp.OPENCODE_DEEPSEEK_POOL_KEY, r)
+        self.assertNotIn(r['selected']['pool_key'], dp.OVERFLOW_KEYS)
+
     def test_fixed_cn_flash_kept_even_with_free_main(self):
         self.build_store()
         auth = self.auth('fixed', 'T', 's2', [CN_FLASH], runtime='qodercn',

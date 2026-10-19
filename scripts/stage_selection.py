@@ -35,6 +35,7 @@ import execution_control as ec  # noqa: E402
 import codebuddy_fallback as cbf  # noqa: E402
 
 SELECTION_MODES = ('auto', 'fixed', 'executor', 'temporary_fallback')
+USER_DIRECT_SELECTION_FIELD = 'user_direct_selection'
 EXECUTORS = ('auto', 'qoder', 'zcode', dp.CN_RUNTIME, 'claude', dp.CODEBUDDY_RUNTIME,
              dp.OPENCODE_RUNTIME)
 TERMINAL_PREVIOUS_STATES = ('finished', 'start_failed', 'cancelled', 'reconciled_exit',
@@ -374,6 +375,7 @@ def plan_stage_selection(authorization, *, previous=None, store_path=None, quota
         'task_id': task_id, 'stage': stage, 'workspace': workspace,
         'observed_at_utc': dp._iso(now),
         'selection_mode': mode,
+        'user_direct_selection': auth.get(USER_DIRECT_SELECTION_FIELD) is True,
         'authorization_quote': auth.get('quote'),
         'authorization_scope': auth.get('authorization_scope'),
         'allowed_candidates': list(auth.get('allowed_candidates') or []),
@@ -441,6 +443,12 @@ def plan_stage_selection(authorization, *, previous=None, store_path=None, quota
     quote = auth.get('quote')
     if not isinstance(quote, str) or not quote.strip():
         return _refuse('no_source_quote')
+    # fixed/executor 会有意绕过 AUTO 优先级，只能来自用户当轮明确选择。普通新任务、
+    # “沿用上一轮”、会话复用或主脑方便均必须走 auto；严格要求 JSON true，不能把
+    # 其它 truthy 值当授权。temporary_fallback 继续由既有同 task/stage scope 约束。
+    if (mode in ('fixed', 'executor')
+            and auth.get(USER_DIRECT_SELECTION_FIELD) is not True):
+        return _refuse('explicit_user_choice_required')
 
     allowed = list(auth.get('allowed_candidates') or [])
     if not allowed:
@@ -571,12 +579,18 @@ def plan_stage_selection(authorization, *, previous=None, store_path=None, quota
             p_allowed = list(parent.get('allowed_candidates') or [])
             if not p_allowed:
                 return _refuse('parent_authorization_required')
+            if (parent.get('selection_mode') in ('fixed', 'executor')
+                    and parent.get(USER_DIRECT_SELECTION_FIELD) is not True):
+                return _refuse('parent_authorization_required',
+                               'explicit_user_choice_required')
             eff_allowed = [k for k in p_allowed if k in set(allowed)]  # 交集，不扩权
             if not eff_allowed:
                 return _refuse('parent_authorization_required', 'empty intersection with base')
             eff_mode, eff_auth = parent['selection_mode'], parent
             # 有效父授权体现在本轮 receipt；旧 temp 的 quote/scope/mode 另存追溯。
             receipt['selection_mode'] = eff_mode
+            receipt['user_direct_selection'] = (
+                parent.get(USER_DIRECT_SELECTION_FIELD) is True)
             receipt['authorization_quote'] = parent.get('quote')
             receipt['authorization_scope'] = parent.get('authorization_scope')
             receipt['allowed_candidates'] = list(eff_allowed)

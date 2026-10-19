@@ -375,10 +375,10 @@ class TestCodeBuddyIndependentOfWindow(_PoolBase):
         self.assertFalse(again.get('allowed'), again)
         self.assertEqual(again['reason'], 'capacity_full', again)
 
-    def test_window_pools_exclude_codebuddy(self):
-        self.assertNotIn(CB, dp.QUOTA_LIMIT_WINDOW_POOLS)
+    def test_window_pools_include_codebuddy_deepseek_only(self):
+        self.assertIn(CB, dp.QUOTA_LIMIT_WINDOW_POOLS)
         self.assertNotIn(GLM, dp.QUOTA_LIMIT_WINDOW_POOLS)
-        self.assertEqual(dp.QUOTA_LIMIT_WINDOW_POOLS, (ZC, CL))
+        self.assertEqual(dp.QUOTA_LIMIT_WINDOW_POOLS, (ZC, CL, CB))
         self.assertEqual(dp.QUOTA_LIMIT_WINDOW_SECONDS, 1800)
 
 

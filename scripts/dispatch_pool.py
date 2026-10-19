@@ -314,9 +314,10 @@ LUNA_KEY = f'{LUNA_RUNTIME}:{LUNA_MODEL}'
 # BW-LIMIT30-20261019-S3 用户最新明确：ZCode/GLM-5.3 与 Claude/deepseek-flash 的真实结构化
 # 429（Claude 另含真实 402 Insufficient Balance）落 main_force_limits 后，只在新派发的
 # **1800 秒只读窗口**内跳过；窗口到期按现有优先级重新可选。原错误原件不清除、不宣称额度
-# 恢复、不需要手动重置。Qoder Max 的既有标记语义不变（本窗口只作用于下列两个精确池）。
+# 恢复、不需要手动重置。Qoder Max 的既有标记语义不变。CodeBuddy DeepSeek 的真实
+# 限额也使用同一 1800 秒新派发窗口；CodeBuddy GLM 额度独立、不被连带。
 QUOTA_LIMIT_WINDOW_SECONDS = 1800
-QUOTA_LIMIT_WINDOW_POOLS = ('zcode:GLM-5.3', CLAUDE_POOL_KEY)
+QUOTA_LIMIT_WINDOW_POOLS = ('zcode:GLM-5.3', CLAUDE_POOL_KEY, CODEBUDDY_POOL_KEY)
 QUOTA_LIMITABLE_POOLS = (QMAX_POOL_KEY, CN_MAX_POOL_KEY, CN_CUSTOM_MAX_POOL_KEY,
                          CLAUDE_POOL_KEY, 'zcode:GLM-5.3')
 QUOTA_DISPLAY_ONLY_POOLS = (CODEBUDDY_POOL_KEY, CODEBUDDY_GLM_POOL_KEY)
@@ -803,7 +804,8 @@ def _limit_reference_utc(conn, row):
 
 
 def _quota_limit_window_active(conn, pk, now=None) -> bool:
-    """BW-LIMIT30-20261019-S3：仅 ZCode/GLM-5.3 与 Claude/deepseek-flash 两个精确池，
+    """BW-LIMIT30-20261019-S3/BW-PRIORITY-REPAIR-20261019：ZCode/GLM-5.3、
+    Claude/deepseek-flash 与 CodeBuddy/deepseek-v4.1-flash 三个精确池，
     从绑定真实失败的 ended_at_utc（回退 recorded_at_utc）起 0<=age<1800 秒内阻止新派发。
     恰好 1800 秒及更久返回 False（按现有优先级重新可选），但绝不删除原标记/证据、绝不
     宣称额度恢复。缺失/无时区/无法解析/未来时间不伪造有效窗口（不永久挡新轮）。每个
@@ -1349,6 +1351,10 @@ def _domestic_policy(conn, requested_pk, now, executor='auto', eligible=None,
         if executor not in ('auto', 'codebuddy', None):
             return 'executor_conflict', None
         if executor in ('codebuddy', None):
+            # CodeBuddy DeepSeek 的真实限额标记同时约束显式入口与 AUTO；仅在最近
+            # 1800 秒内停止新派发。GLM 使用独立 pool_key，不受此窗口连带影响。
+            if _quota_limit_window_active(conn, requested_pk, now):
+                return 'main_force_limited', None
             if _domestic_active(conn) >= DOMESTIC_TOTAL_CAPACITY:
                 return 'full', None
             if _has_own_capacity(conn, CODEBUDDY_POOL_KEY):

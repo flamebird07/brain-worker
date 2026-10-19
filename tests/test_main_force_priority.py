@@ -365,6 +365,7 @@ class StageSelectionPriorityTests(_Base):
     def test_stage_selection_fixed_flash_not_forced_to_max(self):
         auth = self.auth('fixed', 'T', 's2', [QFLASH], runtime='qoder',
                          model='Qwen3.8-Flash')
+        auth['user_direct_selection'] = True
         r = self.plan(auth)
         self.assertEqual(r['refused'], None, r)
         self.assertEqual(r['selected']['pool_key'], QFLASH)
@@ -372,6 +373,7 @@ class StageSelectionPriorityTests(_Base):
     def test_stage_selection_executor_cn_never_crosses_region(self):
         auth = self.auth('executor', 'T', 's2', ALL_MAINS + ALL_FLASH,
                          executor='qodercn')
+        auth['user_direct_selection'] = True
         r = self.plan(auth, now=GAP)   # GAP：CN 两 Max 窗外 → 只落 CN Flash
         self.assertEqual(r['refused'], None, r)
         self.assertEqual(r['selected_reason'], 'executor_region_flash', r)

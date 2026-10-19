@@ -1245,13 +1245,15 @@ class MainForceLimitTests(_PoolBase):
 
 
 class QuotaLimitWindowTests(_PoolBase):
-    """BW-LIMIT30-20261019-S3：zcode:GLM-5.3 与 claude:deepseek-flash 的真实失败
+    """BW-LIMIT30-20261019-S3/BW-PRIORITY-REPAIR-20261019：zcode:GLM-5.3、
+    claude:deepseek-flash 与 codebuddy:deepseek-v4.1-flash 的真实失败
     （ZCode 结构化 429 / Claude 402 余额不足或明确配额 429）落 main_force_limits 后，
     新派发在该池 1800 秒内跳过；恰好 1800 秒后按原优先级恢复可选，原错误证据不清、
     不声称额度恢复、无需手动重置。已运行 attempt 不受影响；其它池独立。"""
 
     ZC = 'zcode:GLM-5.3'
     CL = 'claude:deepseek-flash'
+    CB = 'codebuddy:deepseek-v4.1-flash'
 
     def _mark(self, pk, task, token):
         import hashlib as _h
@@ -1299,6 +1301,27 @@ class QuotaLimitWindowTests(_PoolBase):
         z = self._claim('cw4', 'zcode', 'GLM-5.3', T0 + timedelta(seconds=60))
         self.assertTrue(z.get('allowed'), z)
         self.assertEqual(z['pool_key'], self.ZC)
+
+    def test_codebuddy_deepseek_1799_refuses_1800_allows_glm_unaffected(self):
+        # _PoolBase 已放入唯一 CodeBuddy DeepSeek fixture；模拟它以限额失败终态释放槽位，
+        # 再验证后续新派发窗口，避免把容量占满与限额门混在一起。
+        tok = 'cb-fixture'
+        with closing(dp.connect(self.store)) as conn:
+            conn.execute("UPDATE attempts SET state='finished', ended_at_utc=? "
+                         'WHERE token=?', (dp._iso(T0), tok))
+        self._mark(self.CB, 'cb-fixture-task', tok)
+        r = self._claim('cbw2', 'codebuddy', 'deepseek-v4.1-flash',
+                        T0 + timedelta(seconds=1799))
+        self.assertFalse(r.get('allowed'), r)
+        self.assertEqual(r['reason'], 'main_force_limited', r)
+        glm = self._claim('cbwg', 'codebuddy', 'glm-5.3-flash',
+                          T0 + timedelta(seconds=60))
+        self.assertTrue(glm.get('allowed'), glm)
+        self.assertEqual(glm['pool_key'], dp.CODEBUDDY_GLM_POOL_KEY)
+        ok = self._claim('cbw3', 'codebuddy', 'deepseek-v4.1-flash',
+                         T0 + timedelta(seconds=1800))
+        self.assertTrue(ok.get('allowed'), ok)
+        self.assertEqual(ok['pool_key'], self.CB)
 
     def test_reserved_consume_refused_and_released_inside_window(self):
         tok = self.reserve_exec('zc', 'zcode', 'GLM-5.3', 'zcode')

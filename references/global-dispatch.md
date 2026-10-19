@@ -534,6 +534,10 @@ CodeBuddy deepseek > Max > Claude > ZCode > 两 OpenCode 免费模型（同层�
 
 ### 真实 `fixed` 与临时 `temporary_fallback` 的区别
 
+- 普通新任务使用 `auto`。`fixed` 与 `executor` 必须来自用户本轮直接点名，并在授权对象中
+  精确记录 `"user_direct_selection": true`；缺失或为 false 一律
+  `explicit_user_choice_required`。上一轮选中模型、旧 CLI session、临时兜底或调用脚本复制的
+  参数都不能生成这项声明。到期后的 `parent_authorization` 同样执行此检查。
 - **`fixed`**：授权明确要求某个 `runtime+model` 组合时，**即使是 Flash 也按原组合**，
   绝不因为是 Flash 就被主力替换；该组合被时段门/明确限额/容量挡下时**如实拒绝**
   （`fixed_candidate_unavailable`），绝不静默改道。
