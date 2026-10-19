@@ -31,6 +31,8 @@ _SCRIPTS = HERE.parent / 'scripts'
 if str(_SCRIPTS) not in sys.path:
     sys.path.insert(0, str(_SCRIPTS))
 import dispatch_pool as dp  # noqa: E402
+dp.LUNA_DISABLED = False
+dp.CAPACITY[dp.LUNA_KEY] = None
 try:
     import quota_control as qc  # noqa: E402 - 仅 Z-hold 子例需要
 except Exception:  # noqa: BLE001 - 隔离树无 quota_control 时跳过 Z-hold 子例

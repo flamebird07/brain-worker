@@ -25,6 +25,8 @@ sys.path.insert(0, str(SCRIPTS))
 sys.path.insert(0, str(TESTS))
 import quota_control as qc  # noqa: E402
 import dispatch_pool as dp  # noqa: E402
+dp.LUNA_DISABLED = False
+dp.CAPACITY[dp.LUNA_KEY] = None
 import zcode_direct as zd  # noqa: E402
 import prompt_contract as pc  # noqa: E402
 

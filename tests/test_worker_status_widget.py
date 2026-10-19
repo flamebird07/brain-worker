@@ -36,6 +36,13 @@ for p in (str(SCRIPTS), str(REPO / 'tests')):
 import dispatch_pool as dp  # noqa: E402
 import worker_status_widget as wsw  # noqa: E402
 
+# 历史浮窗用例显式开启旧 Luna 行；生产 ROW_DEFS 保持 11 行，禁用用例单独复核。
+dp.LUNA_DISABLED = False
+dp.CAPACITY[dp.LUNA_KEY] = None
+wsw.ROW_DEFS = wsw.ROW_DEFS + (
+    (dp.LUNA_KEY, 'Luna／原生外援', '历史测试兼容'),
+)
+
 # 北京 2026-10-08(周四) 23:00：三 Qoder Max 夜间窗开、claude 空闲时段放行。
 T0 = datetime(2026, 10, 8, 15, 0, 0, tzinfo=timezone.utc)
 # 北京 2026-10-08(周四) 10:00：Max 夜间窗关、claude 工作日高峰门关。
@@ -1578,6 +1585,22 @@ class TestRealTkLayoutHeight(unittest.TestCase):
         self.assertEqual(self.frames['rows'].winfo_manager(), '')
         self.assertEqual(self.frames['compact_idle'].winfo_manager(), 'pack')
         self.assertEqual(self.frames['empty'].winfo_manager(), 'pack')
+
+
+class LunaDisabledWidgetTests(unittest.TestCase):
+    def setUp(self):
+        self._rows = wsw.ROW_DEFS
+        self._disabled = dp.LUNA_DISABLED
+        wsw.ROW_DEFS = tuple(row for row in wsw.ROW_DEFS if row[0] != dp.LUNA_KEY)
+        dp.LUNA_DISABLED = True
+
+    def tearDown(self):
+        wsw.ROW_DEFS = self._rows
+        dp.LUNA_DISABLED = self._disabled
+
+    def test_luna_row_removed(self):
+        self.assertNotIn(dp.LUNA_KEY, [row[0] for row in wsw.ROW_DEFS])
+        self.assertEqual(len(wsw.ROW_DEFS), 11)
 
 
 if __name__ == '__main__':

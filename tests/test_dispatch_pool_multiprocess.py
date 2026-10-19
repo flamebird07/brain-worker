@@ -47,6 +47,8 @@ _SCRIPTS = Path(__file__).resolve().parent.parent / 'scripts'
 if str(_SCRIPTS) not in sys.path:
     sys.path.insert(0, str(_SCRIPTS))
 import dispatch_pool as dp  # noqa: E402
+dp.LUNA_DISABLED = False
+dp.CAPACITY[dp.LUNA_KEY] = None
 
 T0 = datetime(2026, 10, 8, 15, 0, 0, tzinfo=timezone.utc)  # 北京时间 23:00（主力时段内）
 JOIN_TIMEOUT = 60

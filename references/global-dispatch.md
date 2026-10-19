@@ -1,5 +1,13 @@
 # 全局并发容量池与 1:1 路由（global-dispatch）
 
+## Luna 强制禁用（2026-10-19）
+
+`luna:native` 已从 brain-worker 的可派池和浮窗删除。所有 Luna 新票据、领取、直接
+reserve/select、Agent ID 登记与原生结算入口均返回 `luna_disabled`；旧表和旧记录仅供审计。
+本轮失败列表只对本轮有效；进入新轮必须清空 `round_failed_candidates`、重新读取共享池并
+从最高优先级牛马裁决。容量满、候选耗尽或等待300秒都不得启动 Luna，宿主也不得直接
+`spawn_agent(model="gpt-6-luna")` 绕过登记。下文 Luna 章节均为历史设计说明，已被本节覆盖。
+
 CN 自定义 Max 恢复声明（BW-CUSTOM-MAX-RESUME-20261018-S1）：用户已于 2026-10-18 明确解除暂停，`qodercn:Qwen-3.8-Max`（Qoder CN自定义、带连字符）恢复正式授权候选；主脑新阶段授权集合恢复精确 `qodercn:Qwen-3.8-Max`。当前配置总 16 槽（BW-OPENCODE-20261019-S3：新增两个 OpenCode 免费精确模型 `opencode:deepseek-v4.1-flash-free` 与 `opencode:glm-5.3-flash-free` **各独立 1 槽**计入 `MAIN_FORCE_CAPACITY`/物理总和，无时段门、无 CodeBuddy 当轮额度前提；其前为 BW-WORKER-WIDGET-20261018-S3 总 14——用户 2026-10-18 最新明确：`codebuddy:deepseek-v4.1-flash` 与 `codebuddy:glm-5.3-flash` **不共享名额、各自独立 1 槽**，GLM 已计入 `MAIN_FORCE_CAPACITY`/物理总和；旧「同一物理 1 槽、总 13」口径作废，仅属历史），授权可新派上限 16，自定义仍 2 槽；既有在途/unknown 继续占位直至真实终态自然释放，不终止或抢占。历史事实：2026-10-15 至恢复前曾按 BW-CUSTOM-MAX-PAUSE-20261015 暂停该组合，当时授权可新派上限为 11；该暂停只是授权候选软排除，不存在需要清理的真实 DB 暂停锁，本次不清真实池/历史限额/在途。恢复不等于认证或额度现场已验证：不查询余额、不探测模型。内置`qodercn:Qwen3.8-Max`、国际Max、两区Flash、CodeBuddy精确模型及其他既有规则不变。
 
 每轮按优先级重试（BW-SIMPLE-PRIORITY-RETRY-S3，覆盖下方旧的「availability/限额先剔除」叙述）：每个新调度轮都从时段/容量/权限/授权与明确停用仍合格的**最高优先级**候选起真实尝试；同一 `runtime:model` 本轮最多一次，真实失败才在本轮换下一个，下一新轮重新从最高优先级起。`dispatch_pool` 的 AUTO 普通候选集合不再据历史 ZCode availability 或三 Qoder Max/Claude `main_force_limits` 剔除（`_eligible_main_forces`/`_domestic_policy` 只保留时段/容量/总守卫/工作区/unknown/权限门）；历史标记仅作诊断，真实尝试失败才落库、成功仍 epoch/attempt CAS，不假装 healthy、不清旧 hold、不伪造成功，普通入口无需 recovery probe。显式 `executor='zcode'` 权威原子门与 `purpose='probe'` 生命周期保持原样兼容。本轮失败列表由主脑经 `stage_selection` 的 authorization JSON（`round_failed_candidates`）维护，仅作本轮内存过滤、绝不落新库/定时器/自动监控，也不扩大 `allowed_candidates` 授权集合；当轮所有已授权候选都试过则诚实无候选、不再派。

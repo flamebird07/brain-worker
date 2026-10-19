@@ -31,6 +31,10 @@ for p in (str(SCRIPTS), str(REPO / 'tests')):
 
 import dispatch_pool as dp  # noqa: E402
 
+# 历史 Luna 状态机回归只在测试进程显式解锁，生产常量仍固定禁用；新禁用用例会单独恢复真值。
+dp.LUNA_DISABLED = False
+dp.CAPACITY[dp.LUNA_KEY] = None
+
 T0 = datetime(2026, 10, 8, 15, 0, 0, tzinfo=timezone.utc)  # 北京时间 23:00（主力时段内）
 
 
@@ -234,7 +238,7 @@ class CapacityAndKnownPoolTests(_PoolBase):
         r = dp.select_and_claim(self.store, task_id='l1', runtime='luna', model='native',
                                 workspace=str(self._ws_for('l1')), prompt_sha256='p',
                                 now=T0, _preclaim=False)
-        self.assertRejected(r, 'luna_requires_ticket')
+        self.assertRejected(r, 'luna_disabled')
         self.assertFalse(r.get('sent', True))
 
     def test_reserve_respects_pool_capacity(self):
@@ -1657,5 +1661,41 @@ class BeijingMainForceWindowTests(_PoolBase):
         self.assertEqual(dp.status(self.store, now=self.NOON)['pools'][self.QMAX]['active'], 0)
 
 
+class LunaDisabledTests(_PoolBase):
+    """BW-LUNA-DISABLED-20261019：所有新 Luna 路径机械拒绝且不落票据/attempt。"""
+
+    def setUp(self):
+        super().setUp()
+        self._old_disabled = dp.LUNA_DISABLED
+        self._old_cap = dp.CAPACITY.pop(dp.LUNA_KEY, None)
+        dp.LUNA_DISABLED = True
+
+    def tearDown(self):
+        dp.LUNA_DISABLED = self._old_disabled
+        dp.CAPACITY[dp.LUNA_KEY] = self._old_cap
+        super().tearDown()
+
+    def test_luna_removed_from_capacity_and_all_entry_points_refuse(self):
+        self.assertNotIn(dp.LUNA_KEY, dp.CAPACITY)
+        common = dict(task_id='L-disabled', runtime='luna', model='native',
+                      workspace=self._ws_for('L-disabled'), prompt_sha256='a' * 64, stage='s')
+        for out in (dp.reserve(self.store, **common, _preclaim=False),
+                    dp.select_and_claim(self.store, **common, _preclaim=False)):
+            self.assertFalse(out.get('allowed'), out)
+            self.assertEqual(out.get('reason'), 'luna_disabled', out)
+        ask = dp.ask_record(self.store, task_id='L-disabled', scope=self._scope('L-disabled'),
+                            ask_message_id='msg')
+        self.assertEqual(ask.get('reason'), 'luna_disabled', ask)
+        due = dp.claim_due(self.store, task_id='L-disabled', _preclaim=False)
+        self.assertEqual(due.get('reason'), 'luna_disabled', due)
+        self.assertEqual(dp.record_agent_id(self.store, task_id='L-disabled', agent_id='a')
+                         .get('reason'), 'luna_disabled')
+        self.assertEqual(dp.settle_native(self.store, task_id='L-disabled', token='t',
+                                          agent_id='a', terminal='finished')
+                         .get('reason'), 'luna_disabled')
+        st = dp.status(self.store)
+        self.assertNotIn(dp.LUNA_KEY, st['pools'])
+
 if __name__ == '__main__':
     unittest.main(verbosity=2)
+

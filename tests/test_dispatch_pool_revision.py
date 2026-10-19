@@ -60,6 +60,8 @@ _SCRIPTS = Path(__file__).resolve().parent.parent / 'scripts'
 if str(_SCRIPTS) not in sys.path:
     sys.path.insert(0, str(_SCRIPTS))
 import dispatch_pool as dp  # noqa: E402
+dp.LUNA_DISABLED = False
+dp.CAPACITY[dp.LUNA_KEY] = None
 
 T0 = datetime(2026, 10, 8, 15, 0, 0, tzinfo=timezone.utc)  # 北京时间 23:00（主力时段内）
 
@@ -152,14 +154,14 @@ class TestUnifiedPolicy(TempStoreMixin, unittest.TestCase):
                          workspace='C:/w', prompt_sha256='a' * 64, now=T0,
                          _preclaim=False)
         self.assertFalse(out['allowed'])
-        self.assertEqual(out['reason'], 'luna_requires_ticket')
+        self.assertEqual(out['reason'], 'luna_disabled')
 
     def test_select_and_claim_luna_rejected(self):
         out = dp.select_and_claim(self.store, task_id='t', runtime='luna', model='native',
                                   workspace='C:/w', prompt_sha256='a' * 64, now=T0,
                                   _preclaim=False)
         self.assertFalse(out['allowed'])
-        self.assertEqual(out['reason'], 'luna_requires_ticket')
+        self.assertEqual(out['reason'], 'luna_disabled')
 
     def test_fill_all_slots_then_one_more_rejected(self):
         # BW-CLAUDE-CAPACITY2 + BW-OPENCODE-20261019-S3：主力 + 两地区 Flash + 两 OpenCode

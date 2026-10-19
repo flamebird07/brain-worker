@@ -54,8 +54,9 @@ except Exception:  # noqa: BLE001 - 缺模块时 Claude 时段外退回纯「时
     offpeak = None
 
 # ------------------------------------------------------------------ 展示常量
-# 11 个可派组合按现有主力优先级显示（BW-OPENCODE-20261019 层序），
-# 另加可选 Luna 外援行；退休池（qodercn:DeepSeek-Flash、WorkBuddy 等）不显示成可派，
+# 11 个可派组合按现有主力优先级显示（BW-OPENCODE-20261019 层序）。
+# BW-LUNA-DISABLED-20261019：Luna 已从牛马删除，绝不显示可派行；旧记录只按退休历史审计。
+# 退休池（qodercn:DeepSeek-Flash、WorkBuddy 等）不显示成可派，
 # 但其真实在途仍计入总占用（见 retired_active）。
 ROW_DEFS = (
     (dp.CODEBUDDY_POOL_KEY, 'CodeBuddy 国际／DeepSeek-V4.1-Flash', '主力 · 最高优先 · 无时段门'),
@@ -72,7 +73,6 @@ ROW_DEFS = (
      '独立 1 槽 · 与 DeepSeek 额度独立 · 无证据前置门'),
     (dp.QFLASH_POOL_KEY, 'Qoder 国际／Qwen3.8-Flash', '兜底'),
     (dp.CN_FLASH_POOL_KEY, 'Qoder CN／Qwen3.8-Flash', '兜底'),
-    (dp.LUNA_KEY, 'Luna／原生外援', '可选 · 无上限 · 不计入国内总数'),
 )
 
 STATE_LABELS = {'running': '运行中', 'unknown': '待核实', 'reserved': '已预留',
@@ -395,14 +395,15 @@ def read_snapshot(store_path=None, *, now=None, pid_probe=None):
     for row in active:
         by_pool.setdefault(row['pool_key'], []).append(row)
     domestic_active = sum(len(v) for k, v in by_pool.items() if k != dp.LUNA_KEY)
-    luna_active = len(by_pool.get(dp.LUNA_KEY, []))
+    luna_active = (0 if dp.LUNA_DISABLED else len(by_pool.get(dp.LUNA_KEY, [])))
+    # 生产中已禁用且不再作为牛马状态展示；字段暂留给旧 UI 数据结构兼容。
     shown_keys = {pk for pk, _, _ in ROW_DEFS}
-    retired_active = sum(len(v) for k, v in by_pool.items()
-                         if k != dp.LUNA_KEY and k not in shown_keys)
+    retired_active = sum(len(v) for k, v in by_pool.items() if k not in shown_keys)
 
     def _annotated(row):
         pk = row['pool_key']
-        check = 'native' if pk == dp.LUNA_KEY else _pid_check(row, probe)
+        check = ('native' if pk == dp.LUNA_KEY and not dp.LUNA_DISABLED
+                 else _pid_check(row, probe))
         out = dict(row)
         out['_pid_check'] = check
         return _annotate(out, now)
@@ -412,7 +413,7 @@ def read_snapshot(store_path=None, *, now=None, pid_probe=None):
         own = by_pool.get(pk, [])
         # BW-WORKER-WIDGET-20261018-S3：两个 CodeBuddy 模型各自独立 1 槽，容量/占用
         # 只按自身 pool_key 计数，绝不合并、绝不跨模型互斥。
-        capacity = None if pk == dp.LUNA_KEY else dp.CAPACITY.get(pk, 0)
+        capacity = dp.CAPACITY.get(pk, 0)
         attempts = [_annotated(r) for r in own]
         # 主行状态 = 展示可信状态（PID 探针未确认的 running 降级待核），待核优先，
         # 绝不被同池另一个真 running 掩盖；DB 原始状态另行如实回显，占位计数不变。
@@ -1068,7 +1069,7 @@ def run_gui(store_path=None, interval=2.0):
     footer_lbl = tk.Label(shell, textvariable=footer_var, bg=_BG, fg=_DIM,
                           font=font_small, anchor='w')
 
-    # --- 12 行卡片（ROW_DEFS 顺序/名称原样，完整不截断；左色条+行卡层次）。
+    # --- 11 行卡片（ROW_DEFS 顺序/名称原样，完整不截断；左色条+行卡层次）。
     row_widgets = {}
     for pk, label, _note in ROW_DEFS:
         card = tk.Frame(rows_frame, bg=_CARD, highlightbackground=_BORDER,

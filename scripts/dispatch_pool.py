@@ -233,7 +233,8 @@ CAPACITY.update(MAIN_FORCE_CAPACITY)
 CAPACITY.update(OVERFLOW_CAPACITY)
 for _rk in LEGACY_RETIRED_POOL_KEYS:
     CAPACITY[_rk] = 0
-CAPACITY['luna:native'] = None
+# BW-LUNA-DISABLED-20261019：用户已明确从牛马中删除 Luna。历史表与常量只为读取旧证据，
+# 不再把 luna:native 登记为容量池、候选或浮窗行。
 # BW-CLAUDE-DEEPSEEK-S3：claude:deepseek-flash 已并入 MAIN_FORCE_POOLS/CAPACITY（独立第三公平组
 # claude），故其容量已在上面 CAPACITY.update 中登记；BW-CLAUDE-CAPACITY2 起容量为 2。
 # 关键口径（BW-OPENCODE-20261019 现行权威）：
@@ -305,6 +306,7 @@ QMAX_POOL_KEY = 'qoder:Qwen3.8-Max'
 QFLASH_POOL_KEY = 'qoder:Qwen3.8-Flash'
 DEEPSEEK_RETIRED_KEY = 'qodercn:DeepSeek-Flash'
 LUNA_KEY = f'{LUNA_RUNTIME}:{LUNA_MODEL}'
+LUNA_DISABLED = True
 # BW-POOL-SPLIT-20261010-S3 + BW-MAX-WINDOW-20261010-S2：可承载“明确限额”最小标记的主力池——
 # 两个 Qoder 内置 Max（qoder:Qwen3.8-Max / qodercn:Qwen3.8-Max）与 CN 自定义 Qoder Max
 # （qodercn:Qwen-3.8-Max）。ZCode 走既有 quota_control availability/hard_hold（本轮不改），
@@ -860,6 +862,8 @@ def _bump_rotation(conn, pk, now):
 
 
 def _luna_native_started(conn, task_id) -> bool:
+    if LUNA_DISABLED:
+        return False
     """同 task 的 Luna native 已启动（票据 claimed 或 launch_unknown）→ 不得再国内启动。"""
     row = conn.execute('SELECT state, launch_state FROM luna_tickets WHERE task_id=?',
                        (task_id,)).fetchone()
@@ -869,6 +873,8 @@ def _luna_native_started(conn, task_id) -> bool:
 
 
 def _ticket_answered_external(conn, task_id):
+    if LUNA_DISABLED:
+        return None
     """同 task 待援票据已被用户明确回复 external_agent/cancel → 不得再偷偷国内启动。"""
     row = conn.execute('SELECT state, reply_choice FROM luna_tickets WHERE task_id=?',
                        (task_id,)).fetchone()
@@ -1308,7 +1314,7 @@ def _domestic_policy(conn, requested_pk, now, executor='auto', eligible=None,
       真实国内在途（含在途 retired DeepSeek 与超额旧 Max）已达总 16 时，即便某池按各自容量
       看似有空也一律 full，绝不派第 17 个。"""
     if requested_pk == LUNA_KEY:
-        return 'reject_luna', None
+        return 'luna_disabled', None
     if requested_pk in LEGACY_RETIRED_POOL_KEYS:
         return 'unknown_pool', None
     # BW-CLAUDE-DEEPSEEK-S4 + BW-CODEBUDDY-MAIN-S3：claude/codebuddy 已计入
@@ -1607,6 +1613,10 @@ def select_and_claim(store_path=None, *, task_id, runtime, model, workspace,
     Popen 前即记录 wrapper 真实创建身份。"""
     now = now or utcnow()
     pk = pool_key(runtime, model)
+    if pk == LUNA_KEY:
+        return _reject('luna_disabled', task_id, pk,
+                       ['Luna has been removed from brain-worker and is disabled; '
+                        'start a new AUTO round over the authorized worker pool'])
     with closing(connect(store_path)) as conn:
         conn.execute('BEGIN IMMEDIATE')
         try:
@@ -1768,6 +1778,10 @@ def reserve(store_path=None, *, task_id, runtime, model, workspace, prompt_sha25
     claim-due）。主脑/测试据此拿到确定 token，交给对应入口 --dispatch-claim 精确消费。"""
     now = now or utcnow()
     pk = pool_key(runtime, model)
+    if pk == LUNA_KEY:
+        return _reject('luna_disabled', task_id, pk,
+                       ['Luna has been removed from brain-worker and is disabled; '
+                        'reserve must use an authorized non-Luna worker'])
     with closing(connect(store_path)) as conn:
         conn.execute('BEGIN IMMEDIATE')
         try:
@@ -2626,6 +2640,10 @@ def ask_record(store_path=None, *, task_id, scope=None, ask_message_id=None,
     reply luna，或原单 scope 携带合法任务级 luna_preauthorization 且候选客观耗尽后
     固定 300 秒无回复才放行（超时本身不得替代明确授权）。
     now 参数仅供确定性函数测试注入；宿主生产路径（CLI）始终使用真实 UTC。"""
+    if LUNA_DISABLED:
+        return {'recorded': False, 'task_id': task_id, 'reason': 'luna_disabled',
+                'reasons': ['Luna has been removed from brain-worker; no ask ticket '
+                            'or timeout fallback can be created']}
     now = now or utcnow()
     ok, parsed_scope, scope_reasons = _normalize_scope(scope)
     if degradation_reason is not None and degradation_reason not in ('quota', 'auth', 'capacity'):
@@ -2771,6 +2789,10 @@ def reply(store_path=None, *, task_id, choice, note=None, now=None) -> dict:
     """记录用户回复选择（幂等：首条回复生效，之后重复 callback 不覆盖、不重置任何
     计时）。一旦回复，claim-due 的超时自动裁决停止；reply luna 是明确的已授权接续
     路径（claim-due 可立即裁决 Luna）；external_agent/cancel 停止自动 Luna。"""
+    if LUNA_DISABLED:
+        return {'recorded': False, 'task_id': task_id, 'reason': 'luna_disabled',
+                'reasons': ['Luna has been removed from brain-worker; replies cannot '
+                            'reactivate the retired rescue path']}
     now = now or utcnow()
     if choice not in ('luna', 'external_agent', 'domestic', 'cancel'):
         raise ValueError("choice must be one of luna/external_agent/domestic/cancel")
@@ -2843,6 +2865,11 @@ def claim_due(store_path=None, *, task_id, now=None, scope=None,
       "只是满"）才落入 Luna 裁决——299 秒仍是 not_due，300 秒到期才 Luna 单赢家；纯 exact
       combo 本轮失败后同样不再被旧 pinned 分支永久挡死。缺预授权时回收与 pinned 语义完全
       照旧；用户 reply domestic/external/cancel、单写入者/活 writer 互斥、限额/时段门均不变。"""
+    if LUNA_DISABLED:
+        return {'claimed': False, 'sent': False, 'task_id': task_id,
+                'reason': 'luna_disabled',
+                'reasons': ['Luna has been removed from brain-worker; start a fresh '
+                            'AUTO worker-selection round instead of claiming Luna']}
     now = now or utcnow()
     with closing(connect(store_path)) as conn:
         conn.execute('BEGIN IMMEDIATE')
@@ -3285,6 +3312,9 @@ def claim_due(store_path=None, *, task_id, now=None, scope=None,
 def mark_launch_unknown(store_path=None, *, task_id, now=None) -> dict:
     """原生 Luna 调用非幂等窗口：工具已启动但在写出 agentID 前崩溃 → launch_unknown，
     待人工核验，绝不自动重复启动。只对已 claimed 票据生效，不改变 claimed 终态。"""
+    if LUNA_DISABLED:
+        return {'recorded': False, 'task_id': task_id, 'reason': 'luna_disabled',
+                'reasons': ['Luna lifecycle is disabled']}
     now = now or utcnow()
     with closing(connect(store_path)) as conn:
         conn.execute('BEGIN IMMEDIATE')
@@ -3308,6 +3338,9 @@ def mark_launch_unknown(store_path=None, *, task_id, now=None) -> dict:
 
 def record_agent_id(store_path=None, *, task_id, agent_id, now=None) -> dict:
     """记录宿主真实原生调用后的 agentID（真实回执；本模块绝不自己生成或冒称）。"""
+    if LUNA_DISABLED:
+        return {'recorded': False, 'task_id': task_id, 'reason': 'luna_disabled',
+                'reasons': ['Luna lifecycle is disabled']}
     now = now or utcnow()
     if not agent_id or not str(agent_id).strip():
         return {'recorded': False, 'task_id': task_id,
@@ -3433,6 +3466,11 @@ def settle_native(store_path=None, *, task_id, token, agent_id, terminal,
     票据置 settled/launch_state=native_terminal_recorded，原 task/workspace 随
     attempt 退出 ACTIVE 而释放（Luna 本不占国内 6 个名额，国内活进程不受影响）。
     重复同终态结算幂等且不影响新 attempt；不加 force、没有任何全放行布尔。"""
+    if LUNA_DISABLED:
+        return {'settled': False, 'released': False, 'task_id': task_id,
+                'reason': 'luna_disabled',
+                'reasons': ['Luna has been removed from brain-worker; native settlement '
+                            'cannot create or legitimize a new Luna dispatch']}
     now = now or utcnow()
     if terminal not in NATIVE_TERMINAL_STATES:
         raise ValueError(f'terminal must be one of {NATIVE_TERMINAL_STATES}; running/'
