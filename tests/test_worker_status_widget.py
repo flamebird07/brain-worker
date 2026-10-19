@@ -399,11 +399,12 @@ class TestLastResultAndLimits(_WidgetBase):
         self.assertFalse(self._row(self._snap(), dp.QMAX_POOL_KEY)['prev_limited'])
 
     def test_codebuddy_prev_limit_shows_main_state_when_idle_and_isolated(self):
-        """BW-WIDGET-QUOTA-20261019-S5：CodeBuddy 精确池上轮限额标记在**无在途**时主状态醒目
-        显示“上轮限额”（非空闲绿/非空闲灰），占用计数与空闲判定原语义不变；两 CodeBuddy 模型
-        独立落标——DeepSeek 限额不污染 GLM；有在途时在途状态优先、不被历史限额覆盖。"""
+        """BW-WIDGET-QUOTA30-20261019-S3：CodeBuddy 精确池 deepseek 真实限额在**无在途**时主状态
+        醒目显示“上轮限额”（非空闲绿/非空闲灰），半小时内有在途时在途状态优先但附带简短“限额”
+        组合提示、绝不遮盖真实运行/待核/预留；两 CodeBuddy 模型独立落标——DeepSeek 限额不污染
+        GLM；占用计数与空闲判定原语义不变。"""
         with closing(self._conn()) as conn:
-            # 只有 deepseek 池落标并绑定其最新 attempt。
+            # 只有 deepseek 池落标并绑定其失败 attempt（ended_at=T0）。
             conn.execute('INSERT INTO main_force_limits(pool_key, limited, task_id, '
                          'attempt_token, recorded_at_utc) VALUES(?,?,?,?,?)',
                          (dp.CODEBUDDY_POOL_KEY, 1, 'T-cb', 'cb-old', _iso(T0)))
@@ -418,7 +419,8 @@ class TestLastResultAndLimits(_WidgetBase):
         glm = self._row(snap, dp.CODEBUDDY_GLM_POOL_KEY)
         self.assertFalse(glm['prev_limited'])
         self.assertEqual(glm['main_state_label'], '空闲')
-        # 在途优先：deepseek 有真实 running 时主状态显示在途，绝不被历史限额遮盖。
+        # 在途优先：deepseek 有真实 running 时主状态显示在途 + 简短“限额”组合，
+        # 真实运行状态绝不丢、不挤掉名称/占用。
         with closing(self._conn()) as conn:
             self._insert(conn, 'cb-run', dp.CODEBUDDY_POOL_KEY, 'running',
                          started=T0, child_pid=4321,
@@ -427,15 +429,167 @@ class TestLastResultAndLimits(_WidgetBase):
                                                 'created': '2026-10-08T15:00:00+00:00'}}))
         cb2 = self._row(snap2, dp.CODEBUDDY_POOL_KEY)
         self.assertEqual(cb2['state'], 'running')
-        self.assertEqual(cb2['main_state_label'], '运行中')
-        # 后续新成功 attempt 顶掉旧标记 token → 不再显旧限额（标记持久但已不绑定最新）。
+        self.assertEqual(cb2['main_state_label'], '运行中·限额')
+        self.assertTrue(cb2['main_state_label'].startswith('运行中'))
+        # 后续新成功 attempt 顶掉旧标记 token → 半小时内真实限额提示仍保留，
+        # **不再用最新 attempt_token 相等把它提前隐藏**（保留 30 分钟）。
         with closing(self._conn()) as conn:
             conn.execute('UPDATE attempts SET state=?, terminal=?, success=?, ended_at_utc=? '
                          'WHERE token=?', ('finished', 'finished', 1, _iso(T0), 'cb-run'))
         snap3 = self._snap()
         cb3 = self._row(snap3, dp.CODEBUDDY_POOL_KEY)
-        self.assertFalse(cb3['prev_limited'])
-        self.assertNotEqual(cb3['main_state_label'], '上轮限额')
+        self.assertTrue(cb3['prev_limited'])
+        self.assertEqual(cb3['main_state_label'], '上轮限额')
+
+
+class TestQuota30Window(_WidgetBase):
+    """BW-WIDGET-QUOTA30-20261019-S3：仅精确 codebuddy:deepseek-v4.1-flash 池的真实限额
+    标记按绑定 attempt 的 ended_at_utc（终态未落盘回退标记 recorded_at_utc）起 0<=age<1800
+    显示；恰好 1800 及更久只撤下历史提示，不声称恢复。非该 DeepSeek 模型保持原 token 规则。
+    不用最新 attempt_token 相等让新预留/失败提前隐藏；重复限额重计时；缺失/无时区/未来时间
+    不伪造有效窗口；原始时间取自失败落盘时间，非 import 时刻。"""
+
+    def _mark(self, conn, *, ended, recorded=None, token='cb-old'):
+        conn.execute('INSERT INTO main_force_limits(pool_key, limited, task_id, '
+                     'attempt_token, recorded_at_utc) VALUES(?,?,?,?,?)',
+                     (dp.CODEBUDDY_POOL_KEY, 1, 'T-cb', token,
+                      _iso(recorded if recorded is not None else ended)))
+        self._insert(conn, token, dp.CODEBUDDY_POOL_KEY, 'finished',
+                     started=ended, ended=ended, terminal='finished', success=0)
+
+    def test_boundary_1799_shows_1800_hides(self):
+        with closing(self._conn()) as conn:
+            self._mark(conn, ended=T0)
+        # 原始失败时刻非 import 时间：以注入 now 相对 ended_at_utc 计算年龄。
+        self.assertTrue(self._row(
+            self._snap(now=T0 + timedelta(seconds=1799)),
+            dp.CODEBUDDY_POOL_KEY)['prev_limited'])
+        self.assertFalse(self._row(
+            self._snap(now=T0 + timedelta(seconds=1800)),
+            dp.CODEBUDDY_POOL_KEY)['prev_limited'])
+        self.assertFalse(self._row(
+            self._snap(now=T0 + timedelta(seconds=1801)),
+            dp.CODEBUDDY_POOL_KEY)['prev_limited'])
+
+    def test_new_reservation_or_failure_does_not_hide_early(self):
+        with closing(self._conn()) as conn:
+            self._mark(conn, ended=T0)
+        # 半小时内插入新预留/新失败（latest attempt token 变化）→ 真实限额绝不提前隐藏。
+        with closing(self._conn()) as conn:
+            self._insert(conn, 'cb-new', dp.CODEBUDDY_POOL_KEY, 'reserved',
+                         reserved=T0 + timedelta(seconds=10))
+        snap = self._snap(now=T0 + timedelta(seconds=60))
+        cb = self._row(snap, dp.CODEBUDDY_POOL_KEY)
+        self.assertTrue(cb['prev_limited'])
+        self.assertEqual(cb['main_state_label'], '已预留·限额')
+        # 新失败落终态但标记仍绑定旧 attempt（未更新）→ 旧真实限额窗口继续。
+        with closing(self._conn()) as conn:
+            conn.execute('UPDATE attempts SET state=?, terminal=?, success=? '
+                         'WHERE token=?', ('finished', 'finished', 0, 'cb-new'))
+        self.assertTrue(self._row(
+            self._snap(now=T0 + timedelta(seconds=60)),
+            dp.CODEBUDDY_POOL_KEY)['prev_limited'])
+
+    def test_repeat_limit_retimes_from_new_attempt(self):
+        # 再次实际限额：现有入口更新同一标记与新绑定 attempt（更晚 ended_at）→ 自然重新计时。
+        with closing(self._conn()) as conn:
+            self._mark(conn, ended=T0, token='cb-old')
+            self._insert(conn, 'cb-old2', dp.CODEBUDDY_POOL_KEY, 'finished',
+                         started=T0 + timedelta(seconds=1700),
+                         ended=T0 + timedelta(seconds=1700),
+                         terminal='finished', success=0)
+            conn.execute('UPDATE main_force_limits SET attempt_token=?, recorded_at_utc=? '
+                         'WHERE pool_key=?',
+                         ('cb-old2', _iso(T0 + timedelta(seconds=1700)),
+                          dp.CODEBUDDY_POOL_KEY))
+        # 距首次失败已 1799 秒本应过期，但距新绑定 attempt 仅 99 秒 → 仍显示（重计时）。
+        snap = self._snap(now=T0 + timedelta(seconds=1799))
+        self.assertTrue(self._row(snap, dp.CODEBUDDY_POOL_KEY)['prev_limited'])
+
+    def test_fallback_to_recorded_when_terminal_not_persisted(self):
+        with closing(self._conn()) as conn:
+            conn.execute('INSERT INTO main_force_limits(pool_key, limited, task_id, '
+                         'attempt_token, recorded_at_utc) VALUES(?,?,?,?,?)',
+                         (dp.CODEBUDDY_POOL_KEY, 1, 'T-cb', 'cb-x', _iso(T0)))
+            # 绑定 attempt 终态尚未落盘（ended_at_utc 为 NULL）。
+            self._insert(conn, 'cb-x', dp.CODEBUDDY_POOL_KEY, 'running', started=T0)
+        self.assertTrue(self._row(
+            self._snap(now=T0 + timedelta(seconds=1700)),
+            dp.CODEBUDDY_POOL_KEY)['prev_limited'])
+        self.assertFalse(self._row(
+            self._snap(now=T0 + timedelta(seconds=1800)),
+            dp.CODEBUDDY_POOL_KEY)['prev_limited'])
+
+    def test_bad_missing_or_future_time_never_fakes_window(self):
+        naive = T0.replace(tzinfo=None)
+        future = T0 + timedelta(seconds=100)
+        # (说明, 绑定 attempt 的 ended_at_utc 落盘值, 标记 recorded_at_utc 落盘值)
+        cases = (
+            ('naive', str(naive), str(naive)),        # 无时区
+            ('future', _iso(future), _iso(future)),   # 未来
+            ('missing', None, None),                  # 缺失
+            ('garbage', 'not-a-time', 'not-a-time'),  # 无法解析
+        )
+        for label, ended_val, rec_val in cases:
+            with self.subTest(kind=label):
+                with closing(self._conn()) as conn:
+                    conn.execute('DELETE FROM main_force_limits WHERE pool_key=?',
+                                 (dp.CODEBUDDY_POOL_KEY,))
+                    conn.execute('DELETE FROM attempts WHERE token=?', ('cb-bad',))
+                    conn.execute('INSERT INTO main_force_limits(pool_key, limited, '
+                                 'task_id, attempt_token, recorded_at_utc) VALUES(?,?,?,?,?)',
+                                 (dp.CODEBUDDY_POOL_KEY, 1, 'T-cb', 'cb-bad', rec_val))
+                    self._insert(conn, 'cb-bad', dp.CODEBUDDY_POOL_KEY, 'finished',
+                                 started=T0, ended=None, terminal='finished', success=0)
+                    if ended_val is not None:
+                        conn.execute('UPDATE attempts SET ended_at_utc=? WHERE token=?',
+                                     (ended_val, 'cb-bad'))
+                # 现在落在 T0：naive/未来/缺失/坏值都绝不伪造有效窗口。
+                self.assertFalse(self._row(
+                    self._snap(now=T0), dp.CODEBUDDY_POOL_KEY)['prev_limited'])
+
+    def test_other_model_keeps_original_token_rule(self):
+        # 非 deepseek 池（qoder 国际 Max）保持原有“绑定最新 attempt token”规则与既有期限。
+        with closing(self._conn()) as conn:
+            conn.execute('INSERT INTO main_force_limits(pool_key, limited, task_id, '
+                         'attempt_token, recorded_at_utc) VALUES(?,?,?,?,?)',
+                         (dp.QMAX_POOL_KEY, 1, 'T-q', 'q-old', _iso(T0)))
+            self._insert(conn, 'q-old', dp.QMAX_POOL_KEY, 'finished', started=T0,
+                         ended=T0, terminal='finished', success=0)
+        self.assertTrue(self._row(self._snap(now=T0 + timedelta(seconds=60)),
+                                  dp.QMAX_POOL_KEY)['prev_limited'])
+        # 更新的成功 attempt 顶掉 token → 原规则下立即隐藏（不受半小时窗口延长）。
+        with closing(self._conn()) as conn:
+            self._insert(conn, 'q-new', dp.QMAX_POOL_KEY, 'finished',
+                         started=T0 + timedelta(seconds=30),
+                         ended=T0 + timedelta(seconds=40),
+                         terminal='finished', success=1)
+        self.assertFalse(self._row(self._snap(now=T0 + timedelta(seconds=60)),
+                                   dp.QMAX_POOL_KEY)['prev_limited'])
+
+    def test_in_flight_and_limit_both_visible(self):
+        # 有在途（unknown 待核）时：真实待核状态与半小时限额同时可辨，不被限额遮盖。
+        with closing(self._conn()) as conn:
+            self._mark(conn, ended=T0)
+            self._insert(conn, 'cb-run', dp.CODEBUDDY_POOL_KEY, 'unknown',
+                         started=T0, child_pid=9, child_created='x')
+        snap = self._snap(now=T0 + timedelta(seconds=120),
+                          probe=_probe({}))
+        cb = self._row(snap, dp.CODEBUDDY_POOL_KEY)
+        self.assertEqual(cb['state'], 'unknown')
+        self.assertTrue(cb['prev_limited'])
+        self.assertTrue(cb['main_state_label'].startswith('待核实'))
+        self.assertIn('限额', cb['main_state_label'])
+        self.assertEqual(cb['active'], 1)  # 占位计数不因限额展示改变
+
+    def test_detail_text_declares_recent_record_not_balance(self):
+        with closing(self._conn()) as conn:
+            self._mark(conn, ended=T0)
+        row = self._row(self._snap(now=T0 + timedelta(seconds=30)),
+                        dp.CODEBUDDY_POOL_KEY)
+        text = wsw.detail_text(row)
+        self.assertIn('30', text)
+        self.assertIn('不代表实时余额', text)
 
 
 class TestFailureHonesty(_WidgetBase):
@@ -533,6 +687,34 @@ class TestGuiHelpers(_WidgetBase):
         self.assertEqual(wsw.format_duration(59), '59秒')
         self.assertEqual(wsw.format_duration(90), '1分30秒')
         self.assertEqual(wsw.format_duration(3720), '1时02分')
+
+    def test_detail_text_only_codebuddy_claims_thirty_minutes(self):
+        """BW-WIDGET-QUOTA30-20261019-S4：仅精确 codebuddy:deepseek 池详情说“近 30 分钟/超过
+        30 分钟撤下”；其它池保留“标记绑定最新 attempt、历史非实时额度”说明，绝不冒称 30 分钟。"""
+        # 非 deepseek 池（Qoder 国际 Max）按原有 token 规则落标且仍绑定最新 attempt → prev_limited。
+        with closing(self._conn()) as conn:
+            conn.execute('INSERT INTO main_force_limits(pool_key, limited, task_id, '
+                         'attempt_token, recorded_at_utc) VALUES(?,?,?,?,?)',
+                         (dp.QMAX_POOL_KEY, 1, 'T-q', 'q-old', _iso(T0)))
+            self._insert(conn, 'q-old', dp.QMAX_POOL_KEY, 'finished', started=T0,
+                         ended=T0, terminal='finished', success=0)
+        qrow = self._row(self._snap(), dp.QMAX_POOL_KEY)
+        self.assertTrue(qrow['prev_limited'])
+        qtext = wsw.detail_text(qrow)
+        self.assertIn('上轮限额', qtext)
+        self.assertNotIn('30 分钟', qtext)      # 其它池绝不冒称半小时窗口
+        self.assertNotIn('30分钟', qtext)
+        self.assertIn('最新 attempt', qtext)    # 保留原“绑定最新 attempt、历史非实时额度”语义
+        # 精确 deepseek 池仍保留 30 分钟说明。
+        with closing(self._conn()) as conn:
+            conn.execute('INSERT INTO main_force_limits(pool_key, limited, task_id, '
+                         'attempt_token, recorded_at_utc) VALUES(?,?,?,?,?)',
+                         (dp.CODEBUDDY_POOL_KEY, 1, 'T-cb', 'cb-old', _iso(T0)))
+            self._insert(conn, 'cb-old', dp.CODEBUDDY_POOL_KEY, 'finished',
+                         started=T0, ended=T0, terminal='finished', success=0)
+        ctext = wsw.detail_text(self._row(self._snap(now=T0 + timedelta(seconds=30)),
+                                          dp.CODEBUDDY_POOL_KEY))
+        self.assertIn('30 分钟', ctext)
 
 
 # ---------------------------------------------------------------- 空闲自动关机

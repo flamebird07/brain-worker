@@ -78,13 +78,54 @@ _STATE_PRIORITY = ('running', 'unknown', 'reserved')
 _DISPLAY_PRIORITY = ('unknown', 'running', 'reserved')
 # BW-WIDGET-QUOTA-20261019-S5：主行“上轮限额”展示标签（纯展示，绝不写回 DB/容量/idle 判定）。
 PREV_LIMIT_LABEL = '上轮限额'
+# BW-WIDGET-QUOTA30-20261019-S3：CodeBuddy／deepseek-v4.1-flash 精确池真实限额标记的展示
+# 期限——从绑定 attempt 的 ended_at_utc（终态未落盘回退标记 recorded_at_utc）起 0<=age<1800 秒
+# 显示；恰好 1800 秒及更久只撤下历史提示，绝不声称额度恢复。纯展示窗口，不改 DB/调度/重试/冷却。
+QUOTA_LIMIT_WINDOW_SECONDS = 1800
+
+
+def _within_recent_window(ref_text, now, window_seconds):
+    """半小时展示窗口判定：ref 必须为带时区、非未来的过去时间，且 0<=age<window。
+    缺失/无法解析/无时区/未来时间一律返回 False（不伪造有效窗口）；恰好 window 及更久 False。
+    只读时间戳，绝不用 import 时刻或 now 顶替原始失败时间。"""
+    ref = _parse_iso(ref_text)
+    if ref is None:
+        return False
+    if ref.tzinfo is None:
+        return False
+    age = (now - ref).total_seconds()
+    return 0 <= age < window_seconds
+
+
+def _quota_window_limited(lim, bound_ended, now, window_seconds=QUOTA_LIMIT_WINDOW_SECONDS):
+    """CodeBuddy deepseek 精确池专用：真实限额标记按绑定 attempt 的真实终止时间是否仍落在
+    半小时内展示，**不再用最新 attempt_token 相等**让新预留/新失败把半小时内真实限额提前隐藏。
+    重复限额由现有入口更新同一标记与其绑定 attempt（更晚的 ended_at_utc），自然重新计时。"""
+    if not lim or int(lim.get('limited') or 0) != 1:
+        return False
+    ref_text = bound_ended or lim.get('recorded_at_utc')
+    return _within_recent_window(ref_text, now, window_seconds)
+
+
+def _prev_limited_for(pk, lim, latest_any, bound_ended, now):
+    """按池选择限额展示规则：仅精确 dp.CODEBUDDY_POOL_KEY（deepseek-v4.1-flash）用半小时
+    真实窗口；其余池保持原有“标记仍绑定该池最新 attempt”的既有规则，不改动其它模型现有期限。"""
+    if pk == dp.CODEBUDDY_POOL_KEY:
+        return _quota_window_limited(lim, bound_ended, now)
+    return bool(
+        lim is not None and int(lim.get('limited') or 0) == 1
+        and latest_any.get(pk, {}).get('token') is not None
+        and latest_any[pk]['token'] == lim.get('attempt_token'))
 
 
 def _main_state_display(state, state_label, prev_limited):
-    """纯格式函数：无在途（state 不在 _STATE_PRIORITY）且仍绑定最新 attempt 的上轮限额标记
-    命中时，主状态醒目标为“上轮限额”；有任何在途（running/unknown/reserved）时在途状态优先，
-    绝不被历史限额覆盖。只返回展示标签，不改变 state/db_state/占用计数/空闲判定原语义。"""
-    if prev_limited and state not in _STATE_PRIORITY:
+    """纯格式函数：无在途（state 不在 _STATE_PRIORITY）且限额展示窗口命中时，主状态醒目标为
+    “上轮限额”；有任何在途（running/unknown/reserved）时在途状态优先、绝不被历史限额遮盖，
+    但仍以简短组合文字附带“限额”提示（不遮住真实待核/运行/预留状态，不挤掉占用数或名称）。
+    只返回展示标签，不改变 state/db_state/占用计数/空闲判定原语义。"""
+    if prev_limited:
+        if state in _STATE_PRIORITY:
+            return f'{state_label}·限额'
         return PREV_LIMIT_LABEL
     return state_label
 
@@ -202,11 +243,26 @@ def read_snapshot(store_path=None, *, now=None, pid_probe=None):
             'WHERE rowid=(SELECT MAX(rowid) FROM attempts b WHERE b.pool_key=a.pool_key)')}
         limits = {}
         try:
-            for r in conn.execute('SELECT pool_key, limited, attempt_token '
-                                  'FROM main_force_limits'):
+            for r in conn.execute('SELECT pool_key, limited, attempt_token, '
+                                  'recorded_at_utc FROM main_force_limits'):
                 limits[r['pool_key']] = dict(r)
         except sqlite3.Error:
             limits = {}
+        # BW-WIDGET-QUOTA30-20261019-S3：CodeBuddy deepseek 精确池的半小时展示窗口需要其
+        # 绑定 attempt 的真实 ended_at_utc（只读，绝不改写限额写入端或 attempt）。
+        bound_ended = {}
+        for pk_l, lim_l in limits.items():
+            if pk_l != dp.CODEBUDDY_POOL_KEY:
+                continue
+            if int(lim_l.get('limited') or 0) != 1 or not lim_l.get('attempt_token'):
+                continue
+            try:
+                br = conn.execute('SELECT ended_at_utc FROM attempts WHERE token=?',
+                                  (lim_l['attempt_token'],)).fetchone()
+            except sqlite3.Error:
+                br = None
+            if br is not None:
+                bound_ended[pk_l] = dict(br).get('ended_at_utc')
         # 空闲关机用的最小活动签名（同一只读事务内）：仅 rowid/计数/最近时间戳，
         # 绝无 token/prompt/错误正文。两个刷新间隔内开始又结束的短调用会改变
         # count/max_rowid/max_ended，计时器据此重置，不能只看 active==0。
@@ -269,10 +325,8 @@ def read_snapshot(store_path=None, *, now=None, pid_probe=None):
             # success 缺失/NULL = 未知；绝不把 finished 一概当绿灯。
             last_result = 'unknown'
         lim = limits.get(pk)
-        prev_limited = bool(
-            lim is not None and int(lim.get('limited') or 0) == 1
-            and latest_any.get(pk, {}).get('token') is not None
-            and latest_any[pk]['token'] == lim.get('attempt_token'))
+        prev_limited = _prev_limited_for(pk, lim, latest_any,
+                                          bound_ended.get(pk), now)
         rows.append({
             'pool_key': pk, 'label': label, 'note': note,
             'capacity': capacity, 'active': len(own),
@@ -519,8 +573,14 @@ def detail_text(row):
     lines.append(f"最近结果：{row['last_result_label']}"
                  + ('（success 缺失=未知，不当通过）' if row['last_result'] == 'unknown' else ''))
     if row['prev_limited']:
-        lines.append('上轮限额：仅上一轮绑定该池最新 attempt 的结构化 429/硬限额证据；'
-                     '不代表实时余额、不猜恢复时间、不新增冷却，也不阻止下一轮最高优先重试')
+        if row['pool_key'] == dp.CODEBUDDY_POOL_KEY:
+            lines.append('上轮限额：近 30 分钟内的真实限额/429 错误记录（按绑定 attempt 的真实终止时间计时），'
+                         '仅代表历史期限、不代表实时余额、不猜恢复时间、不新增冷却，也不阻止下一轮最高优先重试；'
+                         '超过 30 分钟仅撤下本提示，绝不声称额度已恢复')
+        else:
+            lines.append('上轮限额：该标记仍绑定此池最新 attempt 的历史限额记录，'
+                         '仅代表历史期限、不代表实时余额、不猜恢复时间、不新增冷却，也不阻止下一轮最高优先重试；'
+                         '最新 attempt 变化后即不再显示，非实时额度')
     return '\n'.join(lines)
 
 
@@ -714,7 +774,7 @@ def run_gui(store_path=None, interval=2.0):
         name.pack(side='left', padx=(4, 2))
         occ = tk.Label(rf, text='—', bg=_PANEL, fg=_SUB, font=font, anchor='e', width=7)
         occ.pack(side='right', padx=(2, 4))
-        st = tk.Label(rf, text='待核', bg=_PANEL, fg=_SUB, font=font_bold, anchor='e', width=6)
+        st = tk.Label(rf, text='待核', bg=_PANEL, fg=_SUB, font=font_bold, anchor='e', width=9)
         st.pack(side='right')
         row_widgets[pk] = {'frame': rf, 'name': name, 'state': st, 'occ': occ}
 
