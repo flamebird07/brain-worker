@@ -399,10 +399,11 @@ class TestLastResultAndLimits(_WidgetBase):
         self.assertFalse(self._row(self._snap(), dp.QMAX_POOL_KEY)['prev_limited'])
 
     def test_codebuddy_prev_limit_shows_main_state_when_idle_and_isolated(self):
-        """BW-WIDGET-QUOTA30-20261019-S3：CodeBuddy 精确池 deepseek 真实限额在**无在途**时主状态
-        醒目显示“上轮限额”（非空闲绿/非空闲灰），半小时内有在途时在途状态优先但附带简短“限额”
-        组合提示、绝不遮盖真实运行/待核/预留；两 CodeBuddy 模型独立落标——DeepSeek 限额不污染
-        GLM；占用计数与空闲判定原语义不变。"""
+        """BW-WIDGET-QUOTA30-20261019-S3 / BW-WIDGET-HOVER-20261019-S2：CodeBuddy 精确池
+        deepseek 真实限额在**无在途**时主状态醒目显示“上轮限额”（非空闲绿/非空闲灰）；
+        真实运行中则只显示“运行中”，行/徽标/详情/摘要都不再出现历史限额（用户明确纠正：
+        运行中就不该显示限额）。两 CodeBuddy 模型独立落标——DeepSeek 限额不污染 GLM；
+        占用计数与空闲判定原语义不变，prev_limited 原始证据保留。"""
         with closing(self._conn()) as conn:
             # 只有 deepseek 池落标并绑定其失败 attempt（ended_at=T0）。
             conn.execute('INSERT INTO main_force_limits(pool_key, limited, task_id, '
@@ -419,8 +420,8 @@ class TestLastResultAndLimits(_WidgetBase):
         glm = self._row(snap, dp.CODEBUDDY_GLM_POOL_KEY)
         self.assertFalse(glm['prev_limited'])
         self.assertEqual(glm['main_state_label'], '空闲')
-        # 在途优先：deepseek 有真实 running 时主状态显示在途 + 简短“限额”组合，
-        # 真实运行状态绝不丢、不挤掉名称/占用。
+        # 在途优先：deepseek 有真实 running 时主状态只显示“运行中”，历史限额不再出现
+        # （用户 2026-10-19 明确纠正：运行中就不该显示限额），原始 prev_limited 保留。
         with closing(self._conn()) as conn:
             self._insert(conn, 'cb-run', dp.CODEBUDDY_POOL_KEY, 'running',
                          started=T0, child_pid=4321,
@@ -429,8 +430,10 @@ class TestLastResultAndLimits(_WidgetBase):
                                                 'created': '2026-10-08T15:00:00+00:00'}}))
         cb2 = self._row(snap2, dp.CODEBUDDY_POOL_KEY)
         self.assertEqual(cb2['state'], 'running')
-        self.assertEqual(cb2['main_state_label'], '运行中·限额')
-        self.assertTrue(cb2['main_state_label'].startswith('运行中'))
+        self.assertEqual(cb2['main_state_label'], '运行中')
+        self.assertTrue(cb2['prev_limited'])  # 原始证据不变，只过滤展示
+        self.assertNotIn('limit', [k for k, _ in wsw.row_badges(cb2)])
+        self.assertNotIn('限额', wsw.detail_text(cb2))
         # 后续新成功 attempt 顶掉旧标记 token → 半小时内真实限额提示仍保留，
         # **不再用最新 attempt_token 相等把它提前隐藏**（保留 30 分钟）。
         with closing(self._conn()) as conn:
@@ -591,6 +594,56 @@ class TestQuota30Window(_WidgetBase):
         self.assertIn('30', text)
         self.assertIn('不代表实时余额', text)
 
+    def test_running_hides_limit_then_reappears_after_end_within_window(self):
+        """BW-WIDGET-HOVER-20261019-S2：真实 running attempt 在途时，主状态/徽标/详情/
+        摘要限额计数全部不显示历史限额；结束后未满 30 分钟重新如实展示；恰好 1800 秒
+        只撤下提示、绝不宣称额度恢复。prev_limited 原始证据与计时不变。"""
+        created = '2026-10-08T15:00:00+00:00'
+        with closing(self._conn()) as conn:
+            self._mark(conn, ended=T0)
+            self._insert(conn, 'cb-run', dp.CODEBUDDY_POOL_KEY, 'running',
+                         started=T0, child_pid=4321, child_created=created)
+            # 另一模型运行中：DeepSeek 的限额标记绝不串到 GLM 行。
+            self._insert(conn, 'glm-run', dp.CODEBUDDY_GLM_POOL_KEY, 'running',
+                         started=T0, child_pid=8765, child_created=created)
+        probe = _probe({4321: {'pid': 4321, 'state': 'alive', 'created': created},
+                        8765: {'pid': 8765, 'state': 'alive', 'created': created}})
+        snap = self._snap(now=T0 + timedelta(seconds=60), probe=probe)
+        cb = self._row(snap, dp.CODEBUDDY_POOL_KEY)
+        self.assertEqual(cb['state'], 'running')
+        self.assertTrue(cb['prev_limited'])          # 原始证据保留
+        self.assertEqual(cb['main_state_label'], '运行中')
+        self.assertEqual(wsw.compact_state_text(cb), '运行中')
+        self.assertNotIn(('limit', '限额'), wsw.row_badges(cb))
+        self.assertNotIn('限额', wsw.detail_text(cb))
+        self.assertEqual(wsw.view_summary(snap)['limited'], 0)
+        glm = self._row(snap, dp.CODEBUDDY_GLM_POOL_KEY)
+        self.assertFalse(glm['prev_limited'])
+        self.assertEqual(glm['main_state_label'], '运行中')
+        self.assertNotIn(('limit', '限额'), wsw.row_badges(glm))
+        # 只针对历史限额状态段断言：GLM 的静态模型说明（“需当轮 DeepSeek 限额证据”）不是限额状态。
+        self.assertNotIn('上轮限额：', wsw.detail_text(glm))
+        # 运行结束后（距失败 150 秒 < 1800）历史限额重新展示，不声称余额恢复。
+        with closing(self._conn()) as conn:
+            conn.execute('UPDATE attempts SET state=?, terminal=?, success=?, '
+                         'ended_at_utc=? WHERE token=?',
+                         ('finished', 'finished', 1,
+                          _iso(T0 + timedelta(seconds=120)), 'cb-run'))
+        snap2 = self._snap(now=T0 + timedelta(seconds=150))
+        cb2 = self._row(snap2, dp.CODEBUDDY_POOL_KEY)
+        self.assertEqual(cb2['state'], 'idle')
+        self.assertTrue(cb2['prev_limited'])
+        self.assertEqual(cb2['main_state_label'], '上轮限额')
+        self.assertIn(('limit', '限额'), wsw.row_badges(cb2))
+        self.assertIn('不代表实时余额', wsw.detail_text(cb2))
+        self.assertEqual(wsw.view_summary(snap2)['limited'], 1)
+        # 恰好 1800 秒：撤下历史提示，不宣称恢复。
+        snap3 = self._snap(now=T0 + timedelta(seconds=1800))
+        cb3 = self._row(snap3, dp.CODEBUDDY_POOL_KEY)
+        self.assertFalse(cb3['prev_limited'])
+        self.assertEqual(cb3['main_state_label'], '空闲')
+        self.assertNotIn(('limit', '限额'), wsw.row_badges(cb3))
+
 
 class TestFailureHonesty(_WidgetBase):
 
@@ -715,6 +768,151 @@ class TestGuiHelpers(_WidgetBase):
         ctext = wsw.detail_text(self._row(self._snap(now=T0 + timedelta(seconds=30)),
                                           dp.CODEBUDDY_POOL_KEY))
         self.assertIn('30 分钟', ctext)
+
+
+class TestCompactViewHelpers(unittest.TestCase):
+    """BW-WIDGET-HOVER-20261019-S1：精简/展开纯视图筛选与摘要。只认 attempt 的
+    display_state=running；混池待核优先但保留“含运行”；零运行/读失败不冒充空闲；
+    展开保留全部行；摘要不丢总占用/Luna/待核/限额。不启动 Tk。"""
+
+    @staticmethod
+    def _row(pk, state, display_states, *, active=1, capacity=1,
+             prev_limited=False, window_blocked=False):
+        return {
+            'pool_key': pk, 'label': pk, 'note': '',
+            'capacity': capacity, 'active': active, 'own_active': active,
+            'state': state, 'db_state': state,
+            'state_label': wsw.STATE_LABELS[state],
+            'window_blocked': window_blocked,
+            'main_state_label': wsw._main_state_display(
+                state, wsw.STATE_LABELS[state], prev_limited,
+                'running' in display_states),
+            'last_result': 'none', 'last_result_label': '暂无调用记录',
+            'prev_limited': prev_limited,
+            'attempts': [
+                {'task_id': f'T-{i}', 'stage': 'S1', 'state': d,
+                 'display_state': d,
+                 'display_state_label': wsw.STATE_LABELS.get(d, d),
+                 'reserved_at_utc': None, 'started_at_utc': None,
+                 'child_pid': None, 'pid_check': 'alive_matched',
+                 'elapsed_seconds': 1}
+                for i, d in enumerate(display_states)
+            ],
+        }
+
+    @staticmethod
+    def _snap(rows, **over):
+        snap = {'ok': True, 'domestic_total_capacity': 14, 'domestic_active': 3,
+                'luna_active': 1, 'retired_active': 0, 'rows': rows}
+        snap.update(over)
+        return snap
+
+    def test_compact_only_true_running_and_mixed_pending_keeps_pending_priority(self):
+        rows = [
+            self._row(dp.ZCODE_POOL_KEY, 'running', ['running']),
+            self._row(dp.CLAUDE_POOL_KEY, 'unknown', ['running', 'unknown']),
+            self._row(dp.QMAX_POOL_KEY, 'unknown', ['unknown']),
+            self._row(dp.CN_MAX_POOL_KEY, 'reserved', ['reserved']),
+            self._row(dp.CODEBUDDY_POOL_KEY, 'idle', [], active=0),
+        ]
+        snap = self._snap(rows)
+        compact = wsw.view_rows(snap, expanded=False)
+        self.assertEqual([r['pool_key'] for r in compact],
+                         [dp.ZCODE_POOL_KEY, dp.CLAUDE_POOL_KEY])
+        mixed = compact[1]
+        self.assertEqual(wsw.compact_state_text(mixed), '待核实')
+        self.assertEqual(wsw.state_color(mixed), wsw._STATE_COLORS['unknown'])
+        self.assertIn(('run', '含运行'), wsw.row_badges(mixed))
+        self.assertNotIn(dp.QMAX_POOL_KEY, [r['pool_key'] for r in compact])
+        self.assertNotIn(dp.CN_MAX_POOL_KEY, [r['pool_key'] for r in compact])
+        self.assertEqual([r['pool_key'] for r in wsw.view_rows(snap, expanded=True)],
+                         [r['pool_key'] for r in rows])
+
+    def test_db_running_without_matched_live_pid_is_not_compact_running(self):
+        row = self._row(dp.ZCODE_POOL_KEY, 'running', ['unknown'])
+        self.assertFalse(wsw.row_has_true_running(row))
+        self.assertEqual(wsw.view_rows(self._snap([row])), [])
+
+    def test_zero_running_and_read_failure_keep_risk_counts_without_fake_running(self):
+        rows = [
+            self._row(dp.QMAX_POOL_KEY, 'unknown', ['unknown']),
+            self._row(dp.CN_MAX_POOL_KEY, 'reserved', ['reserved']),
+            self._row(dp.CODEBUDDY_POOL_KEY, 'idle', [], active=0,
+                      prev_limited=True),
+        ]
+        snap = self._snap(rows, domestic_active=2, luna_active=1,
+                          retired_active=1)
+        self.assertEqual(wsw.view_rows(snap), [])
+        counts = wsw.view_summary(snap)
+        self.assertEqual((counts['total'], counts['capacity'], counts['luna'],
+                          counts['retired']), (2, 14, 1, 1))
+        self.assertEqual((counts['running'], counts['pending'],
+                          counts['reserved'], counts['limited']), (0, 1, 1, 1))
+        failed = {'ok': False, 'error_code': 'read_failed', 'rows': []}
+        self.assertEqual(wsw.view_rows(failed), [])
+        self.assertEqual(wsw.view_rows(failed, expanded=True), [])
+        self.assertFalse(wsw.view_summary(failed)['ok'])
+
+    def test_summary_counts_mixed_pool_as_running_and_pending(self):
+        rows = [
+            self._row(dp.CLAUDE_POOL_KEY, 'unknown', ['running', 'unknown']),
+            self._row(dp.ZCODE_POOL_KEY, 'running', ['running']),
+            self._row(dp.QMAX_POOL_KEY, 'idle', [], active=0, prev_limited=True),
+        ]
+        counts = wsw.view_summary(self._snap(rows, domestic_active=2,
+                                             luna_active=0))
+        self.assertEqual((counts['running'], counts['pending'],
+                          counts['limited']), (2, 1, 1))
+
+    def test_compact_state_text_quota_only_when_no_in_flight(self):
+        idle_lim = self._row(dp.CODEBUDDY_POOL_KEY, 'idle', [], active=0,
+                             prev_limited=True)
+        self.assertEqual(wsw.compact_state_text(idle_lim), wsw.PREV_LIMIT_LABEL)
+        self.assertEqual(wsw.state_color(idle_lim), wsw._QUOTA_LIMIT_COLOR)
+        run_lim = self._row(dp.ZCODE_POOL_KEY, 'running', ['running'],
+                            prev_limited=True)
+        self.assertEqual(run_lim['main_state_label'], '运行中')
+        self.assertEqual(wsw.compact_state_text(run_lim), '运行中')
+        self.assertNotIn(('limit', '限额'), wsw.row_badges(run_lim))
+        self.assertEqual(wsw.state_color(run_lim), wsw._STATE_COLORS['running'])
+        closed = self._row(dp.QMAX_POOL_KEY, 'window_closed', [], active=0,
+                           window_blocked=True)
+        self.assertEqual(wsw.compact_state_text(closed), '时段外')
+        self.assertNotIn(('window', '时段外'), wsw.row_badges(closed))
+
+    def test_running_suppresses_limit_but_mixed_pending_keeps_pending_priority(self):
+        """用户 2026-10-19 纠正：运行中不显示限额。真运行行与未知+真运行的混合池
+        都不出现限额徽标/组合文字/摘要计数；混合池仍是待核实（不冒充全绿）。"""
+        running = self._row(dp.ZCODE_POOL_KEY, 'running', ['running'],
+                            prev_limited=True)
+        mixed = self._row(dp.CLAUDE_POOL_KEY, 'unknown', ['running', 'unknown'],
+                          prev_limited=True)
+        idle = self._row(dp.CODEBUDDY_POOL_KEY, 'idle', [], active=0,
+                         prev_limited=True)
+        snap = self._snap([running, mixed, idle], domestic_active=2)
+        self.assertEqual(wsw.compact_state_text(mixed), '待核实')
+        self.assertEqual(mixed['main_state_label'], '待核实')
+        self.assertNotIn(('limit', '限额'), wsw.row_badges(mixed))
+        self.assertNotIn(('limit', '限额'), wsw.row_badges(running))
+        self.assertIn(('run', '含运行'), wsw.row_badges(mixed))
+        self.assertEqual(wsw.state_color(mixed), wsw._STATE_COLORS['unknown'])
+        self.assertFalse(wsw.row_shows_limit(running))
+        self.assertFalse(wsw.row_shows_limit(mixed))
+        self.assertTrue(wsw.row_shows_limit(idle))
+        # 摘要限额计数只算真正在展示限额的行（空闲的历史限额）。
+        self.assertEqual(wsw.view_summary(snap)['limited'], 1)
+        self.assertEqual(wsw.view_summary(snap)['running'], 2)
+        self.assertEqual(wsw.view_summary(snap)['pending'], 1)
+
+    def test_expanded_keeps_all_rows_even_with_zero_running(self):
+        rows = [
+            self._row(dp.QMAX_POOL_KEY, 'unknown', ['unknown']),
+            self._row(dp.CODEBUDDY_POOL_KEY, 'idle', [], active=0),
+        ]
+        snap = self._snap(rows)
+        self.assertEqual(wsw.view_rows(snap), [])
+        self.assertEqual([r['pool_key'] for r in wsw.view_rows(snap, expanded=True)],
+                         [dp.QMAX_POOL_KEY, dp.CODEBUDDY_POOL_KEY])
 
 
 # ---------------------------------------------------------------- 空闲自动关机
