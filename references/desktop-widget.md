@@ -57,6 +57,15 @@ sidecar、绝不 migrate、绝不回落成空表冒充空闲。
   `finished` 不一概当绿灯；这是**最近一次调用的记录**，不是永久健康状态，更不是
   业务验收。“上轮限额”仅在主力限额标记仍绑定该池最新 attempt 时显示，属历史标记，
   不实时查额度。
+- CodeBuddy 两个精确池（`codebuddy:deepseek-v4.1-flash`、`codebuddy:glm-5.3-flash`）
+  已纳入展示专用 `QUOTA_DISPLAY_ONLY_POOLS`（不改变调度限额组）：正式入口在终态错误原始
+  字节落盘后、finish 释放前，仅按 `_cb_failure_facts` 的结构化 429/硬限额证据经
+  `record_main_force_limit` 落 `main_force_limits`（绑真实 attempt + 证据 sha256）；成功/
+  认证/网络/权限/正文中的 429 字样不误标，两池独立落标（DeepSeek 限额不污染 GLM）。浮窗
+  **无在途**时主状态醒目显示“上轮限额”（专属色 `_QUOTA_LIMIT_COLOR`，非空闲灰/运行绿），
+  有任何在途时在途状态优先、不被历史限额遮盖；底部详情说明其仅代表上一轮证据，不代表实时
+  余额、不猜恢复时间、不新增冷却、不阻止下一轮最高优先重试。该显示**不改** `state`/占用
+  计数/空闲关机判定原语义，也不将历史限额算作活任务。
 - 点击行在底部显示当前任务完整 ID、阶段与最近时间；界面不显示 token、argv、prompt、
   原始错误正文或任何秘密。
 - 勾选行状态（BW-WIDGET-IDLE-20261018-S2）：`未开启 / 空闲中 · 剩余 mm:ss 关机 /

@@ -398,6 +398,45 @@ class TestLastResultAndLimits(_WidgetBase):
                          'WHERE pool_key=?', (_iso(T0), dp.QMAX_POOL_KEY))
         self.assertFalse(self._row(self._snap(), dp.QMAX_POOL_KEY)['prev_limited'])
 
+    def test_codebuddy_prev_limit_shows_main_state_when_idle_and_isolated(self):
+        """BW-WIDGET-QUOTA-20261019-S5：CodeBuddy 精确池上轮限额标记在**无在途**时主状态醒目
+        显示“上轮限额”（非空闲绿/非空闲灰），占用计数与空闲判定原语义不变；两 CodeBuddy 模型
+        独立落标——DeepSeek 限额不污染 GLM；有在途时在途状态优先、不被历史限额覆盖。"""
+        with closing(self._conn()) as conn:
+            # 只有 deepseek 池落标并绑定其最新 attempt。
+            conn.execute('INSERT INTO main_force_limits(pool_key, limited, task_id, '
+                         'attempt_token, recorded_at_utc) VALUES(?,?,?,?,?)',
+                         (dp.CODEBUDDY_POOL_KEY, 1, 'T-cb', 'cb-old', _iso(T0)))
+            self._insert(conn, 'cb-old', dp.CODEBUDDY_POOL_KEY, 'finished',
+                         started=T0, ended=T0, terminal='finished', success=0)
+        snap = self._snap()
+        cb = self._row(snap, dp.CODEBUDDY_POOL_KEY)
+        self.assertTrue(cb['prev_limited'])
+        self.assertEqual(cb['state'], 'idle')          # DB/容量/idle 判定原语义不变
+        self.assertEqual(cb['main_state_label'], '上轮限额')
+        # GLM 未落标 → 不受 DeepSeek 限额连带。
+        glm = self._row(snap, dp.CODEBUDDY_GLM_POOL_KEY)
+        self.assertFalse(glm['prev_limited'])
+        self.assertEqual(glm['main_state_label'], '空闲')
+        # 在途优先：deepseek 有真实 running 时主状态显示在途，绝不被历史限额遮盖。
+        with closing(self._conn()) as conn:
+            self._insert(conn, 'cb-run', dp.CODEBUDDY_POOL_KEY, 'running',
+                         started=T0, child_pid=4321,
+                         child_created='2026-10-08T15:00:00+00:00')
+        snap2 = self._snap(probe=_probe({4321: {'pid': 4321, 'state': 'alive',
+                                                'created': '2026-10-08T15:00:00+00:00'}}))
+        cb2 = self._row(snap2, dp.CODEBUDDY_POOL_KEY)
+        self.assertEqual(cb2['state'], 'running')
+        self.assertEqual(cb2['main_state_label'], '运行中')
+        # 后续新成功 attempt 顶掉旧标记 token → 不再显旧限额（标记持久但已不绑定最新）。
+        with closing(self._conn()) as conn:
+            conn.execute('UPDATE attempts SET state=?, terminal=?, success=?, ended_at_utc=? '
+                         'WHERE token=?', ('finished', 'finished', 1, _iso(T0), 'cb-run'))
+        snap3 = self._snap()
+        cb3 = self._row(snap3, dp.CODEBUDDY_POOL_KEY)
+        self.assertFalse(cb3['prev_limited'])
+        self.assertNotEqual(cb3['main_state_label'], '上轮限额')
+
 
 class TestFailureHonesty(_WidgetBase):
 

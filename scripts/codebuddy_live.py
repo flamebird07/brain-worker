@@ -346,6 +346,8 @@ def run(cfg, *, workspace, prompt_file, out_dir, stage, task_id, model, tools_it
     parsed = {}
     ev_files = {}
     evidence = {}
+    failure_facts = None
+    main_force_limit_rec = None
     try:
         (out / 'stdout.jsonl').write_bytes(stdout_bytes)
         (out / 'stderr.log').write_bytes(stderr_bytes)
@@ -447,6 +449,26 @@ def run(cfg, *, workspace, prompt_file, out_dir, stage, task_id, model, tools_it
     except Exception as exc:  # noqa: BLE001 - 解析/落盘失败不外泄；终态仍按真实退出释放
         facts = dict(facts, downstream_error=type(exc).__name__)
 
+    # BW-WIDGET-QUOTA-20261019-S5：终态错误原始字节已落盘后、finish 释放前记录 CodeBuddy
+    # 精确池的明确限额标记（复用 dp.record_main_force_limit 现有 attempt/证据 sha256 强绑接口）。
+    # 只认 _cb_failure_facts 的结构化 quota_429（严格来自 errors/errors_info 独立 429 或
+    # HTTP 429 前缀，绝不扫描正文），且仅在协议失败终态落标——成功/认证/网络/权限/正文中的
+    # 429 不误标。两 CodeBuddy 精确池独立落标，DeepSeek 限额不污染 GLM。落标异常绝不阻断
+    # 真实终态释放（不新增冷却、不阻止下一轮最高优先重试、不猜恢复时间、不查询余额）。
+    protocol_success_for_limit = bool(parsed.get('protocol_success') and ec_exit == 0)
+    if (failure_facts is not None and failure_facts.get('quota_429')
+            and not protocol_success_for_limit
+            and pool_key in dp.QUOTA_DISPLAY_ONLY_POOLS):
+        try:
+            ev_sha = _sha(stdout_bytes) if stdout_bytes else None
+            main_force_limit_rec = dp.record_main_force_limit(
+                dispatch_store, pool_key, task_id=task_id, attempt_token=claim,
+                evidence_path=str(out / 'stdout.jsonl'),
+                evidence_sha256=ev_sha)
+        except Exception as rec_exc:  # noqa: BLE001 - 落标失败不得阻断真实终态释放
+            main_force_limit_rec = {'recorded': False, 'pool_key': pool_key,
+                                    'error': type(rec_exc).__name__}
+
     execution_success = bool(parsed.get('protocol_success') and ec_exit == 0 and not timed_out)
     success = bool(execution_success and binding.get('bound'))
     try:
@@ -469,6 +491,7 @@ def run(cfg, *, workspace, prompt_file, out_dir, stage, task_id, model, tools_it
             'started_at_utc': started_at_utc.isoformat(),
             'finished_at_utc': finished_at_utc.isoformat(),
             'passed': passed, 'business_verified': False,
+            'main_force_limit': main_force_limit_rec,
             'usage': parsed.get('usage'), 'model_usage': parsed.get('model_usage'),
             'observed_models': parsed.get('observed_models'),
             'report_text_sha256': _sha(report_text.encode('utf-8')) if report_text else None}

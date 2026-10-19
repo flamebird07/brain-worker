@@ -76,6 +76,17 @@ _STATE_PRIORITY = ('running', 'unknown', 'reserved')
 # 同池只要有一个 PID 探针未确认的在途（死 PID/复用/探测未知/running 却无匹配活 PID），
 # 主行必须显著「待核实」，绝不被同池另一个真 running 掩盖成绿灯。
 _DISPLAY_PRIORITY = ('unknown', 'running', 'reserved')
+# BW-WIDGET-QUOTA-20261019-S5：主行“上轮限额”展示标签（纯展示，绝不写回 DB/容量/idle 判定）。
+PREV_LIMIT_LABEL = '上轮限额'
+
+
+def _main_state_display(state, state_label, prev_limited):
+    """纯格式函数：无在途（state 不在 _STATE_PRIORITY）且仍绑定最新 attempt 的上轮限额标记
+    命中时，主状态醒目标为“上轮限额”；有任何在途（running/unknown/reserved）时在途状态优先，
+    绝不被历史限额覆盖。只返回展示标签，不改变 state/db_state/占用计数/空闲判定原语义。"""
+    if prev_limited and state not in _STATE_PRIORITY:
+        return PREV_LIMIT_LABEL
+    return state_label
 
 
 def _display_state(db_state, pid_check):
@@ -268,6 +279,7 @@ def read_snapshot(store_path=None, *, now=None, pid_probe=None):
             'own_active': len(own), 'state': state,
             'db_state': db_state,
             'state_label': STATE_LABELS[state], 'window_blocked': window_blocked,
+            'main_state_label': _main_state_display(state, STATE_LABELS[state], prev_limited),
             'last_result': last_result, 'last_result_label': RESULT_LABELS[last_result],
             'prev_limited': prev_limited,
             'attempts': attempts,
@@ -507,7 +519,8 @@ def detail_text(row):
     lines.append(f"最近结果：{row['last_result_label']}"
                  + ('（success 缺失=未知，不当通过）' if row['last_result'] == 'unknown' else ''))
     if row['prev_limited']:
-        lines.append('上轮限额：标记仍绑定该池最新 attempt（历史标记，非实时额度）')
+        lines.append('上轮限额：仅上一轮绑定该池最新 attempt 的结构化 429/硬限额证据；'
+                     '不代表实时余额、不猜恢复时间、不新增冷却，也不阻止下一轮最高优先重试')
     return '\n'.join(lines)
 
 
@@ -592,6 +605,9 @@ _FG = '#e6e8f0'
 _SUB = '#9aa0b4'
 _STATE_COLORS = {'running': '#59d98c', 'reserved': '#e6c266', 'unknown': '#f08a6a',
                  'idle': '#8288a0', 'window_closed': '#7aa5e8', 'read_failed': '#e8737f'}
+# BW-WIDGET-QUOTA-20261019-S5：无在途但仍有上轮限额标记时的醒目色（既非空闲灰，也非运行绿；
+# 仅覆盖展示层主状态文字与颜色，不改 row['state']/容量计数/空闲判定原始语义）。
+_QUOTA_LIMIT_COLOR = '#e6a23c'
 # 主界面宽 500：必须完整放下最长行名（如「Qoder CN／token plan／Qwen-3.8-Max」）+
 # 状态 + 占用，关键名称绝不截断。收起条只保留 总占用/展开/关闭 三要素（收起时隐藏
 # 置顶按钮与长标题），230 宽内绝不裁剪必需信息。
@@ -813,14 +829,14 @@ def run_gui(store_path=None, interval=2.0):
         for row in snap['rows']:
             w = row_widgets[row['pool_key']]
             color = _STATE_COLORS[row['state']]
-            label = row['state_label']
+            label = row.get('main_state_label') or row['state_label']
             if row['window_blocked'] and row['state'] in _STATE_PRIORITY:
                 label += '·时段外新派'
+            elif row['prev_limited'] and label == PREV_LIMIT_LABEL:
+                color = _QUOTA_LIMIT_COLOR
             w['state'].configure(text=label, fg=color)
             cap = '∞' if row['capacity'] is None else str(row['capacity'])
             occ = f"{row['active']}/{cap}"
-            if row['prev_limited']:
-                occ += ' 上轮限额'
             w['occ'].configure(text=occ)
         if selected['pk']:
             _select(selected['pk'])

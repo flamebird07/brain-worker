@@ -293,6 +293,7 @@ LUNA_KEY = f'{LUNA_RUNTIME}:{LUNA_MODEL}'
 # 自动恢复探针/评分/新服务/外部 API；恢复只由用户明确额度恢复/重置后人工解除。
 QUOTA_LIMITABLE_POOLS = (QMAX_POOL_KEY, CN_MAX_POOL_KEY, CN_CUSTOM_MAX_POOL_KEY,
                          CLAUDE_POOL_KEY)
+QUOTA_DISPLAY_ONLY_POOLS = (CODEBUDDY_POOL_KEY, CODEBUDDY_GLM_POOL_KEY)
 
 # attempt 状态机：在途（占容量）与已释放（不占容量）。
 ACTIVE_STATES = ('reserved', 'running', 'unknown')
@@ -862,11 +863,12 @@ def record_main_force_limit(store_path=None, pk=None, *, task_id=None, attempt_t
     漂移一律拒绝（拒漂移），绝不凭一个 flag 就把主力钉死。幂等：对同一池重复记录只刷新
     证据与时间戳，仍 limited=1，并清空之前的解除痕迹（released_at/release_note）。"""
     now = now or utcnow()
-    if pk not in QUOTA_LIMITABLE_POOLS:
+    if pk not in QUOTA_LIMITABLE_POOLS and pk not in QUOTA_DISPLAY_ONLY_POOLS:
         return {'recorded': False, 'pool_key': pk, 'limited': False,
-                'reasons': [f'{pk!r} is not a quota-limitable main force pool; only '
-                            f'{QUOTA_LIMITABLE_POOLS} carry explicit-limit markers '
-                            '(ZCode uses quota_control availability; Flash is never limited)']}
+                'reasons': [f'{pk!r} is not a quota-limitable or display-only pool; only '
+                            f'{QUOTA_LIMITABLE_POOLS + QUOTA_DISPLAY_ONLY_POOLS} carry '
+                            'explicit-limit markers (ZCode uses quota_control availability; '
+                            'Flash is never limited)']}
     drift = []
     if not evidence_path or not evidence_sha256:
         drift.append('an explicit-limit marker must bind a real error-evidence path and '
@@ -933,9 +935,9 @@ def release_main_force_limit(store_path=None, pk=None, *, note=None, now=None) -
     """人工解除接口：仅在用户明确额度恢复/重置后把 limited 置 0（保留历史行与解除时间/备注）。
     绝不宣称余额/免费、绝不靠成功旧日志自动清标记、绝不自动恢复。无标记行则无可解除。"""
     now = now or utcnow()
-    if pk not in QUOTA_LIMITABLE_POOLS:
+    if pk not in QUOTA_LIMITABLE_POOLS and pk not in QUOTA_DISPLAY_ONLY_POOLS:
         return {'released': False, 'pool_key': pk,
-                'reasons': [f'{pk!r} is not a quota-limitable main force pool']}
+                'reasons': [f'{pk!r} is not a quota-limitable or display-only pool']}
     with closing(connect(store_path)) as conn:
         conn.execute('BEGIN IMMEDIATE')
         try:

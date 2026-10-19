@@ -565,6 +565,91 @@ class TestLiveTransport(unittest.TestCase):
             self.assertEqual(row['state'], 'reserved')
             self.assertEqual(dp._count_active(conn, QMAX), 1)
 
+    def test_real_structured_429_records_codebuddy_limit_and_isolates_glm(self):
+        """BW-WIDGET-QUOTA-20261019-S5：正式 CodeBuddy 入口真实结构化 429（result.errors 里
+        独立 status=429）在终态原始字节落盘后、finish 释放前按精确 pool_key 落 main_force_limits；
+        绑定真实 attempt/证据 sha256；DeepSeek 限额不污染 GLM（独立池）；落标不影响本任务释放。
+        BW-WIDGET-QUOTA-20261019-S6：CodeBuddy 展示池不影响路由——_main_force_limit_active
+        对 CodeBuddy 恒 False，不阻止下一轮真实尝试。"""
+        stream = _success_stream(self.report, errors=[{'status': 429,
+                                                       'message': 'rate limited'}])
+        out = self._run(stdout=stream, returncode=1, task='q429', outname='q429')
+        self.assertFalse(out['protocol_success'], out)
+        self.assertTrue(out['main_force_limit']['recorded'], out['main_force_limit'])
+        self.assertEqual(out['main_force_limit']['pool_key'], CB)
+        # 表行确实写入（widget 能读出）。
+        with closing(dp.connect(self.store)) as conn:
+            row = conn.execute('SELECT limited FROM main_force_limits WHERE pool_key=?',
+                               (CB,)).fetchone()
+            self.assertIsNotNone(row)
+            self.assertEqual(int(row['limited']), 1)
+        # 路由不受影响：_main_force_limit_active 对 CodeBuddy 恒 False。
+        self.assertFalse(dp.main_force_limited(self.store, CB, now=NIGHT))
+        # GLM 独立，绝不被 DeepSeek 限额连带。
+        self.assertFalse(dp.main_force_limited(self.store, dp.CODEBUDDY_GLM_POOL_KEY,
+                                               now=NIGHT))
+        # 记录不阻塞释放：本任务 codebuddy 占位已真实释放。
+        with closing(dp.connect(self.store)) as conn:
+            self.assertEqual(dp._count_active(conn, CB), 0)
+
+    def test_body_429_string_not_marked(self):
+        """正文/错误串中间出现 '429' 字样（非开头独立码、非结构化 status/code）不误标。"""
+        stream = _success_stream(self.report, errors=['upstream hiccup 429 retry later'])
+        out = self._run(stdout=stream, returncode=1, task='body', outname='body')
+        self.assertFalse(out['protocol_success'], out)
+        self.assertIsNone(out['main_force_limit'], out)
+        self.assertFalse(dp.main_force_limited(self.store, CB, now=NIGHT))
+
+    def test_auth_error_not_marked_as_quota(self):
+        """认证失败错误载体不串型为限额：结构化 auth 文案不触发 429 落标。"""
+        stream = _success_stream(
+            self.report,
+            errors=[{'message': 'Custom model authentication failed. Please check '
+                                'if your API Key is correctly configured and valid.'}])
+        out = self._run(stdout=stream, returncode=1, task='auth', outname='auth')
+        self.assertFalse(out['protocol_success'], out)
+        self.assertIsNone(out['main_force_limit'], out)
+        self.assertFalse(dp.main_force_limited(self.store, CB, now=NIGHT))
+
+    def test_success_does_not_mark_limit(self):
+        """成功终态绝不落限额标记（不假成功、不误标）。"""
+        stream = _success_stream(self.report)
+        out = self._run(stdout=stream, returncode=0, task='ok2', outname='ok2')
+        self.assertTrue(out['passed'], out)
+        self.assertIsNone(out['main_force_limit'], out)
+        self.assertFalse(dp.main_force_limited(self.store, CB, now=NIGHT))
+
+    def test_dispatch_store_none_with_env_var_still_records(self):
+        """BW-WIDGET-QUOTA-20261019-S6：dispatch_store=None + BRAIN_WORKER_DISPATCH_STORE 环境变量
+        指向临时库时，限额标记仍正确落盘（CLI 省略 --dispatch-store 走默认路径场景）。"""
+        import tempfile as _tf
+        tmp = _tf.NamedTemporaryFile(suffix='.sqlite3', delete=False)
+        env_store = tmp.name
+        tmp.close()
+        os.unlink(env_store)
+        self.addCleanup(lambda: os.path.exists(env_store) and os.unlink(env_store))
+        stream = _success_stream(self.report, errors=[{'status': 429,
+                                                      'message': 'rate limited'}])
+        pf = self._prompt_file()
+        out_dir = self.base / 'envstore'
+        factory = stub.make_popen_factory(stdout=stream, returncode=1)
+        with mock.patch.dict(os.environ, {'BRAIN_WORKER_DISPATCH_STORE': env_store}):
+            result = cl.run(self.cfg, workspace=str(self.work), prompt_file=pf,
+                            out_dir=out_dir, stage=self.stage, task_id='envq',
+                            model=CB_MODEL, tools_items=['Read', 'Write'],
+                            prompt_sha256=cl._sha(pf.read_bytes()),
+                            dispatch_store=None, popen_factory=factory,
+                            child_prober=lambda pid: {'state': 'dead', 'created': None},
+                            timeout_seconds=60)
+        self.assertFalse(result['protocol_success'])
+        self.assertIsNotNone(result.get('main_force_limit'))
+        self.assertTrue(result['main_force_limit']['recorded'], result['main_force_limit'])
+        with closing(dp.connect(env_store)) as conn:
+            row = conn.execute('SELECT limited FROM main_force_limits WHERE pool_key=?',
+                               (CB,)).fetchone()
+            self.assertIsNotNone(row)
+            self.assertEqual(int(row['limited']), 1)
+
     def seed_foreign(self, runtime, model, pk, task):
         with closing(dp.connect(self.store)) as conn:
             conn.execute('INSERT INTO attempts(token, task_id, runtime, model, pool_key, '
