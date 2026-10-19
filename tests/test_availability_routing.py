@@ -67,12 +67,13 @@ class _TmpBase(unittest.TestCase):
         self.ws.mkdir()
         # 绝不使用真实/共享池：显式临时库，且断言不是默认路径。
         self.assertNotEqual(str(self.dispatch), str(dp.default_store_path()))
-        # BW-CODEBUDDY-MAIN-S3 + BW-WORKER-WIDGET-20261018-S3：本文件的历史层序/满池断言
-        # （Max > claude > Z、总 N 满）都是在 CodeBuddy 恢复之前写的。这里先真实占住
-        # CodeBuddy deepseek 与 GLM 各自的独立 1 槽（GLM 为额度条件池，夹具只作占位、
-        # 绝不进 AUTO 候选），使 AUTO 仍按旧层序选择、`_fill_six` 补满其余 12 槽后总量
-        # 正好 14；CodeBuddy 作为新最高层由独立 tests/test_codebuddy_reactivation.py
-        # 验证，绝不放宽任何安全断言。
+        # BW-CODEBUDDY-MAIN-S3 + BW-WORKER-WIDGET-20261018-S3 + BW-OPENCODE-20261019-S3：
+        # 本文件的历史层序/满池断言（Max > claude > Z、总 N 满）都是在 CodeBuddy 恢复之前
+        # 写的。这里先真实占住 CodeBuddy deepseek 与 GLM 各自的独立 1 槽（GLM 为额度条件池，
+        # 夹具只作占位、绝不进 AUTO 候选），使 AUTO 仍按旧层序选择、`_fill_six` 补满其余
+        # 14 槽（含 BW-OPENCODE-20261019-S3 起两个 OpenCode 免费模型各 1 独立槽）后总量
+        # 正好 16；CodeBuddy 作为新最高层由独立 tests/test_codebuddy_reactivation.py
+        # 验证，两个 OpenCode 槽由 _fill_six 真实 reserve 占住，绝不放宽任何安全断言。
         with contextlib.closing(dp.connect(self.dispatch)) as conn:
             conn.execute('INSERT INTO attempts(token, task_id, runtime, model, pool_key, '
                          "state, reserved_at_utc) VALUES(?,?,?,?,?,?,?)",
@@ -108,19 +109,24 @@ class _TmpBase(unittest.TestCase):
         return dp.status(self.dispatch, now=T0)['pools'][pk]['active']
 
     def _fill_six(self):
-        # BW-CLAUDE-CAPACITY2 十二满基线：zcode×2 + 两内置 Max 各 1 + CN 自定义 Max×2
-        # + 两地区 Flash 各 2 + claude:deepseek-flash×2（T0=北京周四 23:00 offhours，
-        # 时段门放行）。全部经显式 executor 逐一确定性 claim。
+        # BW-CLAUDE-CAPACITY2 + BW-OPENCODE-20261019-S3 满池基线：zcode×2 + 两内置 Max 各 1
+        # + CN 自定义 Max×2 + 两地区 Flash 各 2 + claude:deepseek-flash×2 + 两 OpenCode 免费
+        # 模型各 1（T0=北京周四 23:00 offhours，时段门放行；OpenCode 本无时段门）。
+        # setUp 另占住 CodeBuddy 两独立槽 → 总量正好 16。全部经显式 executor 逐一确定性
+        # claim，绝不删除任何安全断言。
         toks = []
         combos = [('zcode', 'GLM-5.3'), ('zcode', 'GLM-5.3'),
                   ('qoder', 'Qwen3.8-Max'), ('qodercn', 'Qwen3.8-Max'),
                   ('qodercn', 'Qwen-3.8-Max'), ('qodercn', 'Qwen-3.8-Max'),
                   ('qoder', 'Qwen3.8-Flash'), ('qoder', 'Qwen3.8-Flash'),
                   ('qodercn', 'Qwen3.8-Flash'), ('qodercn', 'Qwen3.8-Flash'),
-                  ('claude', 'deepseek-flash'), ('claude', 'deepseek-flash')]
+                  ('claude', 'deepseek-flash'), ('claude', 'deepseek-flash'),
+                  ('opencode', dp.OPENCODE_DEEPSEEK_MODEL),
+                  ('opencode', dp.OPENCODE_GLM_MODEL)]
         for i, (rt, md) in enumerate(combos):
             ex = ('zcode' if rt == 'zcode' else
                   'claude' if rt == 'claude' else
+                  'opencode' if rt == 'opencode' else
                   'qodercn' if rt == 'qodercn' else 'qoder')
             r = dp.reserve(self.dispatch, task_id=f'f{i}', runtime=rt, model=md,
                            workspace=str(self._ws_for(f'f{i}')), prompt_sha256='p',
@@ -435,11 +441,13 @@ class DispatchRoutingTests(_TmpBase):
         self.assertEqual(self._active(ZCODE), 0)
 
     def test_reclaim_skips_blocked_zcode(self):
-        # BW-SIMPLE-PRIORITY-RETRY-S4 政策：历史 hold 不再作候选剔除，capacity 降级必须
-        # **真实**填满所有 12 槽（含 ZCode×2）才能记录票据；靠旧 hold 假装 Z 不可用已失效。
-        # 夹具改成在同一临时 dispatch 库上真实 reserved ZCode 两个占位（无真实进程/模型
-        # 调用），再按原意填满其余非 Z 槽 → ask_record 记录 capacity 降级 → 释放一个
-        # QMax 名额 → claim_due 原子回收落到 QMax，Z 仍满不吞新槽。绝不新增机制。
+        # BW-SIMPLE-PRIORITY-RETRY-S4 + BW-OPENCODE-20261019-S3 政策：历史 hold 不再作候选
+        # 剔除，capacity 降级必须**真实**填满所有 14 个候选槽（含 ZCode×2 与两 OpenCode
+        # 免费槽；加上 setUp 的 CodeBuddy 两槽共 16）才能记录票据；靠旧 hold 假装 Z
+        # 不可用已失效。夹具改成在同一临时 dispatch 库上真实 reserved ZCode 两个占位
+        # （无真实进程/模型调用），再按原意填满其余非 Z 槽（含两 OpenCode）→ ask_record
+        # 记录 capacity 降级 → 释放一个 QMax 名额 → claim_due 原子回收落到 QMax，Z 仍满
+        # 不吞新槽。绝不新增机制、绝不删除安全断言。
         self._hold_zcode()
         toks = []
         # 追加 ZCode×2 真实 reserved 占位（同 temp 库、无真实进程）。
@@ -482,6 +490,14 @@ class DispatchRoutingTests(_TmpBase):
             r = dp.reserve(self.dispatch, task_id=f'cl{i}', runtime='claude',
                            model='deepseek-flash', workspace=str(self._ws_for(f'cl{i}')),
                            prompt_sha256='p', stage='s1', now=T0, executor='claude')
+            self.assertTrue(r.get('allowed') and r.get('token'), r)
+            toks.append(r['token'])
+        # BW-OPENCODE-20261019-S3：两个 OpenCode 免费槽同属默认 scope 受信任候选，也必须
+        # 真实占住——仍有空位时 capacity 降级依旧属伪造耗尽，绝不放宽该守卫。
+        for i, md in enumerate(dp.OPENCODE_MODELS):
+            r = dp.reserve(self.dispatch, task_id=f'oc{i}', runtime='opencode',
+                           model=md, workspace=str(self._ws_for(f'oc{i}')),
+                           prompt_sha256='p', stage='s1', now=T0, executor='opencode')
             self.assertTrue(r.get('allowed') and r.get('token'), r)
             toks.append(r['token'])
         sc = self._scope('rc')
@@ -582,15 +598,16 @@ class LunaStateMachineTests(_TmpBase):
         self.assertEqual(self._luna_active(), 0)
 
     def test_degradation_ask_allowed_below_six_full_with_evidence(self):
-        """BW-SIMPLE-PRIORITY-RETRY-S5：历史 ZCode hold 不再作为客观证据——S3 起普通轮
-        仍会真实尝试 Z，quota-only ask 必须被拒。这里先真实填满 12 槽，再用
+        """BW-SIMPLE-PRIORITY-RETRY-S5 + BW-OPENCODE-20261019-S3：历史 ZCode hold 不再作为
+        客观证据——S3 起普通轮仍会真实尝试 Z，quota-only ask 必须被拒。这里先真实填满
+        全部候选槽（_fill_six 起含两 OpenCode 免费槽，总量 16），再用
         degradation_reason='capacity' 记录票据；同时保留对 quota-only ask 的拒绝断言，
         证明新政策下旧 availability 不足以冒充耗尽。"""
-        # 真实填满 12 槽（含 Z 的两个占位）→ capacity 降级有客观证据。
+        # 真实填满全部候选槽（含 Z 的两个占位与两 OpenCode 槽）→ capacity 降级有客观证据。
         self._fill_six()
         ask = dp.ask_record(self.dispatch, task_id='dg', scope=self._scope('dg'),
                             ask_message_id='m1', now=T0, degradation_reason='capacity',
-                            degradation_detail='all 12 domestic slots are in-flight',
+                            degradation_detail='all 16 domestic slots are in-flight',
                             quota_store=self.quota)
         self.assertTrue(ask['recorded'], ask)
         # 独立任务：即使 _hold_zcode 也不足以支撑 quota-only ask（客观证据必须真实）。
@@ -623,7 +640,8 @@ class LunaStateMachineTests(_TmpBase):
         self.assertFalse(ask['recorded'], ask)
         self.assertTrue(any('objective evidence' in r for r in ask['reasons']),
                         ask['reasons'])
-        # 独立任务下用真实填满 12 槽 + capacity 记录票据（默认 ask 语义）。这里再补一层
+        # 独立任务下用真实填满全部候选槽（含两 OpenCode 免费槽，总量 16）+ capacity
+        # 记录票据（默认 ask 语义）。这里再补一层
         # 语义：即便有 capacity 票据且已过 301s 截止、无用户回复，也不得由"超时"直接
         # 授权 Luna——只有用户明确 reply='luna' 才允许（见 test_degradation_explicit_luna_reply_claims）。
         # 但为保留"超时非授权"的字面语义并与既有 auto-Luna-after-deadline 用例区分，

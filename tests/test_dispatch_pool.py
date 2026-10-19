@@ -55,7 +55,8 @@ class _PoolBase(unittest.TestCase):
         # 因 active>=capacity=1 跳过它；CodeBuddy 作为新最高层由独立
         # tests/test_codebuddy_reactivation.py 验证。BW-WORKER-WIDGET-20261018-S3：GLM 独立
         # 1 槽，其占位由 fill_domestic 经真实 reserve（带当轮额度条件授权）补齐。
-        # 总量 14 = 本占位 1 + fill 13（含 GLM 1）。
+        # 总量 16 = 本占位 1 + fill 15（含 GLM 1 与两 OpenCode 免费槽各 1，
+        # BW-OPENCODE-20261019 现行口径）。
         with closing(dp.connect(self.store)) as conn:
             conn.execute('INSERT INTO attempts(token, task_id, runtime, model, pool_key, '
                          "state, reserved_at_utc) VALUES(?,?,?,?,?,?,?)",
@@ -131,17 +132,21 @@ class _PoolBase(unittest.TestCase):
         return r['token']
 
     def fill_domestic(self):
-        """补满 13 个非 CodeBuddy-deepseek 国内名额（setUp 已真实占住 CodeBuddy deepseek
-        1 槽 → 合计 14）：主力 codebuddy:glm-5.3-flash=1（BW-WORKER-WIDGET-20261018-S3 起
+        """补满 15 个非 CodeBuddy-deepseek 国内名额（setUp 已真实占住 CodeBuddy deepseek
+        1 槽 → 合计 16）：主力 codebuddy:glm-5.3-flash=1（BW-WORKER-WIDGET-20261018-S3 起
         独立 1 槽，经真实 reserve + 当轮额度条件授权填入）、zcode:GLM-5.3=2、
         qoder:Qwen3.8-Max=1、qodercn:Qwen3.8-Max=1、
-        qodercn:Qwen-3.8-Max=2、claude:deepseek-flash=2，同级兜底 qoder:Qwen3.8-Flash=2、
+        qodercn:Qwen-3.8-Max=2、claude:deepseek-flash=2、两 OpenCode 免费模型各 1
+        （BW-OPENCODE-20261019：opencode:deepseek-v4.1-flash-free 与
+        opencode:glm-5.3-flash-free 各独立 1 槽、无时段门/无额度前提，经显式
+        executor='opencode' 真实 claim 补齐），同级兜底 qoder:Qwen3.8-Flash=2、
         qodercn:Qwen3.8-Flash=2。全部经显式 executor 逐一 claim 以保证确定性（CN 池只能经
         executor='qodercn' 入口，claude 经 executor='claude'，GLM 经 executor='codebuddy'
-        且必须显式 codebuddy_glm_allowed=True；AUTO 永不自动选中 CN 内置）。
+        且必须显式 codebuddy_glm_allowed=True，OpenCode 经 executor='opencode'；AUTO
+        永不自动选中 CN 内置）。
         返回 token 列表，顺序为
         [glm, zcode, zcode, qoderMax, cnMax, cnCustomA, cnCustomB, claude, claude,
-         qoderFlash, qoderFlash, cnFlash, cnFlash]。
+         qoderFlash, qoderFlash, cnFlash, cnFlash, ocDeepseek, ocGlm]。
         """
         glm = dp.reserve(self.store, task_id='fglm', runtime='codebuddy',
                          model='glm-5.3-flash',
@@ -161,7 +166,9 @@ class _PoolBase(unittest.TestCase):
                 ('f8', 'qoder', 'Qwen3.8-Flash', 'qoder'),
                 ('f9', 'qoder', 'Qwen3.8-Flash', 'qoder'),
                 ('f10', 'qodercn', 'Qwen3.8-Flash', 'qodercn'),
-                ('f11', 'qodercn', 'Qwen3.8-Flash', 'qodercn')]
+                ('f11', 'qodercn', 'Qwen3.8-Flash', 'qodercn'),
+                ('f12', 'opencode', dp.OPENCODE_DEEPSEEK_MODEL, 'opencode'),
+                ('f13', 'opencode', dp.OPENCODE_GLM_MODEL, 'opencode')]
         toks += [self.reserve_exec(t, rt, md, ex) for (t, rt, md, ex) in plan]
         st = dp.status(self.store, now=T0)
         self.assertEqual(st['domestic']['active'], dp.DOMESTIC_TOTAL_CAPACITY)
@@ -172,6 +179,8 @@ class _PoolBase(unittest.TestCase):
         self.assertEqual(st['pools']['qodercn:Qwen3.8-Max']['active'], 1)
         self.assertEqual(st['pools']['qodercn:Qwen-3.8-Max']['active'], 2)
         self.assertEqual(st['pools']['claude:deepseek-flash']['active'], 2)
+        self.assertEqual(st['pools']['opencode:deepseek-v4.1-flash-free']['active'], 1)
+        self.assertEqual(st['pools']['opencode:glm-5.3-flash-free']['active'], 1)
         self.assertEqual(st['pools']['qoder:Qwen3.8-Flash']['active'], 2)
         self.assertEqual(st['pools']['qodercn:Qwen3.8-Flash']['active'], 2)
         return toks
@@ -179,10 +188,13 @@ class _PoolBase(unittest.TestCase):
 
 class CapacityAndKnownPoolTests(_PoolBase):
     def test_capacity_table_matches_allocation_decision(self):
-        # BW-CODEBUDDY-MAIN-S3 + BW-WORKER-WIDGET-20261018-S3 真实主力 + 两地区 Flash 14 槽：
+        # BW-CODEBUDDY-MAIN-S3 + BW-WORKER-WIDGET-20261018-S3 + BW-OPENCODE-20261019
+        # 真实主力 + 两地区 Flash 16 槽：
         # ZCode=2、两内置 Max 各 1、CN 自定义 Max=2、claude:deepseek-flash=2、
         # codebuddy:deepseek-v4.1-flash=1、codebuddy:glm-5.3-flash=1（两 CodeBuddy 模型
-        # 各自独立 1 槽）、两地区 Flash 各 2；CN DeepSeek-Flash 已退出正常池，保留池名但
+        # 各自独立 1 槽）、opencode:deepseek-v4.1-flash-free=1、
+        # opencode:glm-5.3-flash-free=1（两 OpenCode 免费模型各独立 1 槽）、
+        # 两地区 Flash 各 2；CN DeepSeek-Flash 已退出正常池，保留池名但
         # capacity=0。
         self.assertEqual(dp.capacity_for('zcode:GLM-5.3'), 2)
         self.assertEqual(dp.capacity_for('qoder:Qwen3.8-Max'), 1)
@@ -196,7 +208,9 @@ class CapacityAndKnownPoolTests(_PoolBase):
         self.assertEqual(dp.capacity_for('qoder:Unknown-Model'), 0)
         self.assertEqual(dp.capacity_for('codebuddy:deepseek-v4.1-flash'), 1)
         self.assertEqual(dp.capacity_for('codebuddy:glm-5.3-flash'), 1)
-        self.assertEqual(dp.DOMESTIC_TOTAL_CAPACITY, 14)
+        self.assertEqual(dp.capacity_for('opencode:deepseek-v4.1-flash-free'), 1)
+        self.assertEqual(dp.capacity_for('opencode:glm-5.3-flash-free'), 1)
+        self.assertEqual(dp.DOMESTIC_TOTAL_CAPACITY, 16)
 
     def test_is_known_pool(self):
         for pk in ('zcode:GLM-5.3', 'qoder:Qwen3.8-Max',
@@ -224,7 +238,8 @@ class CapacityAndKnownPoolTests(_PoolBase):
         self.assertFalse(r.get('sent', True))
 
     def test_reserve_respects_pool_capacity(self):
-        # 1:1 轮转下不能连续预留同一主力；合法填满六槽后任何国内组合都 capacity_full。
+        # 1:1 轮转下不能连续预留同一主力；合法填满全部 16 国内槽后任何国内组合都
+        # capacity_full（BW-OPENCODE-20261019 起总量 16，含两 OpenCode 免费槽）。
         self.fill_domestic()
         over = dp.reserve(self.store, task_id='c2', runtime='zcode', model='GLM-5.3',
                           workspace=str(self._ws_for('c2')), prompt_sha256='p',
@@ -278,9 +293,10 @@ class MainForceRotationTests(_PoolBase):
         self.assertClaimed(r, 'qoder:Qwen3.8-Max')
 
     def test_select_when_both_main_full_routes_to_overflow(self):
-        # 全部主力填满（zcode×2 + 两内置 Max 各 1 + CN 自定义 Max×2 + claude×2）后经显式
-        # executor 确定性占位，AUTO select zcode 主力全满 → 同级 Flash 兜底，两区平票按
-        # pool_key stable tie 选国际 Flash。
+        # 全部主力填满（zcode×2 + 两内置 Max 各 1 + CN 自定义 Max×2 + claude×2 +
+        # 两 OpenCode 免费槽各 1 + CBGLM 1，setUp 已占 CodeBuddy DeepSeek）
+        # 经显式 executor 确定性占位，AUTO select zcode 主力全满
+        # → 同级 Flash 兜底，两区平票按 pool_key stable tie 选国际 Flash。
         self.reserve_exec('m0', 'zcode', 'GLM-5.3', 'zcode')
         self.reserve_exec('m1', 'zcode', 'GLM-5.3', 'zcode')
         self.reserve_exec('m2', 'qoder', 'Qwen3.8-Max', 'qoder')
@@ -289,6 +305,9 @@ class MainForceRotationTests(_PoolBase):
         self.reserve_exec('m5', 'qodercn', 'Qwen-3.8-Max', 'qodercn')
         self.reserve_exec('m6', 'claude', 'deepseek-flash', 'claude')
         self.reserve_exec('m7', 'claude', 'deepseek-flash', 'claude')
+        self.reserve_exec('m8', 'opencode', dp.OPENCODE_DEEPSEEK_MODEL, 'opencode')
+        self.reserve_exec('m9', 'opencode', dp.OPENCODE_GLM_MODEL, 'opencode')
+        self.reserve_exec('m10', 'codebuddy', dp.CODEBUDDY_GLM_MODEL, 'codebuddy')
         r = self.select('of', 'zcode', 'GLM-5.3')
         self.assertRouting(r, 'qoder:Qwen3.8-Flash')
 
@@ -308,7 +327,9 @@ class OverflowRoutingTests(_PoolBase):
         self.assertIn(r['selected']['pool_key'], dp.MAIN_FORCE_KEYS)
 
     def test_flash_allowed_when_main_force_full(self):
-        # 全部主力填满后，AUTO 直接请求国际 Flash → 主力满不再拦，同级 Flash 有空位即 claim。
+        # 全部主力（含两 OpenCode 免费槽，BW-OPENCODE-20261019 层序 tier4；含 CBGLM tier5，
+        # BW-LIMIT30-20261019-S3 额度独立始终参与候选）填满后，AUTO 直接请求 Flash → 主力
+        # 满不再拦，同级 Flash 有空位即 claim。
         self.reserve_exec('m0', 'zcode', 'GLM-5.3', 'zcode')
         self.reserve_exec('m1', 'zcode', 'GLM-5.3', 'zcode')
         self.reserve_exec('m2', 'qoder', 'Qwen3.8-Max', 'qoder')
@@ -317,6 +338,9 @@ class OverflowRoutingTests(_PoolBase):
         self.reserve_exec('m5', 'qodercn', 'Qwen-3.8-Max', 'qodercn')
         self.reserve_exec('m6', 'claude', 'deepseek-flash', 'claude')
         self.reserve_exec('m7', 'claude', 'deepseek-flash', 'claude')
+        self.reserve_exec('m8', 'opencode', dp.OPENCODE_DEEPSEEK_MODEL, 'opencode')
+        self.reserve_exec('m9', 'opencode', dp.OPENCODE_GLM_MODEL, 'opencode')
+        self.reserve_exec('m10', 'codebuddy', dp.CODEBUDDY_GLM_MODEL, 'codebuddy')
         r = self.select('fok', 'qoder', 'Qwen3.8-Flash')
         self.assertClaimed(r, 'qoder:Qwen3.8-Flash')
 
@@ -329,9 +353,13 @@ class OverflowRoutingTests(_PoolBase):
         self.reserve_exec('m5', 'qodercn', 'Qwen-3.8-Max', 'qodercn')
         self.reserve_exec('m6', 'claude', 'deepseek-flash', 'claude')
         self.reserve_exec('m7', 'claude', 'deepseek-flash', 'claude')
+        self.reserve_exec('m8', 'opencode', dp.OPENCODE_DEEPSEEK_MODEL, 'opencode')
+        self.reserve_exec('m9', 'opencode', dp.OPENCODE_GLM_MODEL, 'opencode')
+        self.reserve_exec('m10', 'codebuddy', dp.CODEBUDDY_GLM_MODEL, 'codebuddy')
         self.reserve_exec('f0', 'qoder', 'Qwen3.8-Flash', 'qoder')
         self.reserve_exec('f1', 'qoder', 'Qwen3.8-Flash', 'qoder')
-        # AUTO 入口请求国际 Flash：三主力与国际 Flash 均满，CN Flash 同级兜底仍有空位 →
+        # AUTO 入口请求国际 Flash：全部主力（含两 OpenCode 免费槽与 CBGLM）与国际 Flash
+        # 均满，CN Flash 同级兜底仍有空位 →
         # routing_required 选 CN Flash（不因自身满就报整池 full），且未真正占槽。
         r = self.select('f2', 'qoder', 'Qwen3.8-Flash')
         self.assertFalse(r.get('allowed'), r)
@@ -845,9 +873,9 @@ class StatusTests(_PoolBase):
         self.reserve('q', 'qoder', 'Qwen3.8-Max')
         st = dp.status(self.store, now=T0)
         self.assertEqual(set(st['pools']), set(dp.CAPACITY))
-        self.assertEqual(st['domestic']['capacity'], 14)
+        self.assertEqual(st['domestic']['capacity'], 16)
         self.assertEqual(st['domestic']['active'], 3)   # 2 本次 + 1 CodeBuddy 基线占位
-        self.assertEqual(st['domestic']['free'], 11)
+        self.assertEqual(st['domestic']['free'], 13)
         self.assertFalse(st['domestic']['full'])
         self.assertEqual(st['rotation']['committed_zcode'], 1)
         self.assertEqual(st['rotation']['committed_qoder'], 1)
@@ -859,8 +887,8 @@ class StatusTests(_PoolBase):
         dp.claim_due(self.store, task_id='L', now=T0 + timedelta(seconds=400),
                      _preclaim=False)
         st = dp.status(self.store, now=T0)
-        # Luna 在途不占国内名额口径（国内仍为 14/14，Luna 单列且无上限）。
-        self.assertEqual(st['domestic']['active'], 14)
+        # Luna 在途不占国内名额口径（国内仍为 16/16，Luna 单列且无上限）。
+        self.assertEqual(st['domestic']['active'], 16)
         self.assertEqual(st['pools'][dp.LUNA_KEY]['active'], 1)
 
 
@@ -933,8 +961,9 @@ class MainForceLimitTests(_PoolBase):
         self.assertIsNotNone(snaps2[self.QMAX]['released_at_utc'])
 
     def test_record_rejects_non_limitable_pools(self):
-        """ZCode、任一 Flash、退休 DeepSeek、Luna 均不落标；limited 恒 False。"""
-        for pk in ('zcode:GLM-5.3', 'qoder:Qwen3.8-Flash',
+        """两地区 Flash、退休 DeepSeek、Luna 均不落标；limited 恒 False。ZCode 自
+        BW-LIMIT30-20261019-S3 起可承载真实限额标记（见下一用例），不再是拒绝项。"""
+        for pk in ('qoder:Qwen3.8-Flash',
                    'qodercn:Qwen3.8-Flash', 'qodercn:DeepSeek-Flash',
                    dp.LUNA_KEY):
             with self.subTest(pk=pk):
@@ -946,6 +975,23 @@ class MainForceLimitTests(_PoolBase):
                 self.assertFalse(r.get('drift'), r)
                 self.assertIn('not a quota-limitable', r['reasons'][0])
                 self.assertFalse(dp.main_force_limited(self.store, pk, now=T0))
+
+    def test_zcode_can_carry_real_limit_marker(self):
+        """BW-LIMIT30-20261019-S3：ZCode/GLM-5.3 真实结构化 429 可绑定真实 attempt 与
+        错误证据落标；30 分钟窗口由 `_quota_limit_window_active` 只读判定。"""
+        tok = self.reserve_exec('zmark', 'zcode', 'GLM-5.3', 'zcode',
+                                pk='zcode:GLM-5.3')
+        ev_path, ev_sha = self._evidence('zcode-limit.json')
+        rec = dp.record_main_force_limit(self.store, 'zcode:GLM-5.3', task_id='zmark',
+                                         attempt_token=tok, evidence_path=ev_path,
+                                         evidence_sha256=ev_sha, now=T0)
+        self.assertTrue(rec['recorded'], rec)
+        self.assertTrue(dp.main_force_limited(self.store, 'zcode:GLM-5.3', now=T0))
+        with closing(dp.connect(self.store)) as conn:
+            self.assertTrue(dp._quota_limit_window_active(
+                conn, 'zcode:GLM-5.3', T0 + timedelta(seconds=1799)))
+            self.assertFalse(dp._quota_limit_window_active(
+                conn, 'zcode:GLM-5.3', T0 + timedelta(seconds=1800)))
 
     def test_record_rejects_missing_attempt(self):
         ev_path, ev_sha = self._evidence()
@@ -1198,6 +1244,116 @@ class MainForceLimitTests(_PoolBase):
         self.assertEqual(self._state(tok_cn), 'reserved')
 
 
+class QuotaLimitWindowTests(_PoolBase):
+    """BW-LIMIT30-20261019-S3：zcode:GLM-5.3 与 claude:deepseek-flash 的真实失败
+    （ZCode 结构化 429 / Claude 402 余额不足或明确配额 429）落 main_force_limits 后，
+    新派发在该池 1800 秒内跳过；恰好 1800 秒后按原优先级恢复可选，原错误证据不清、
+    不声称额度恢复、无需手动重置。已运行 attempt 不受影响；其它池独立。"""
+
+    ZC = 'zcode:GLM-5.3'
+    CL = 'claude:deepseek-flash'
+
+    def _mark(self, pk, task, token):
+        import hashlib as _h
+        ev = self.base / f'{task}-limit.json'
+        ev.write_text('{"errors":[{"status":429}]}\n', encoding='utf-8', newline='\n')
+        rec = dp.record_main_force_limit(
+            self.store, pk, task_id=task, attempt_token=token,
+            evidence_path=str(ev), evidence_sha256=_h.sha256(ev.read_bytes()).hexdigest(),
+            now=T0)
+        self.assertTrue(rec['recorded'], rec)
+
+    def _claim(self, task, runtime, model, now):
+        return dp.reserve(self.store, task_id=task, runtime=runtime, model=model,
+                          workspace=str(self._ws_for(task)), prompt_sha256='p',
+                          executor=runtime, now=now, _preclaim=False)
+
+    def test_zcode_1799_refuses_1800_allows_and_keeps_error(self):
+        tok = self.reserve_exec('zw', 'zcode', 'GLM-5.3', 'zcode')
+        self._mark(self.ZC, 'zw', tok)
+        # 不同 workspace、独立连接（同一临时库）→ 同样跳过该池。
+        for task in ('zw2', 'zw3'):
+            r = self._claim(task, 'zcode', 'GLM-5.3', T0 + timedelta(seconds=1799))
+            self.assertFalse(r.get('allowed'), r)
+            self.assertEqual(r['reason'], 'main_force_limited', r)
+            self.assertIn('1800', ' '.join(r.get('reasons') or []))
+        # 恰好 1800 秒：按原优先级恢复可选；原始错误证据仍在，未声称恢复。
+        ok = self._claim('zw4', 'zcode', 'GLM-5.3', T0 + timedelta(seconds=1800))
+        self.assertTrue(ok.get('allowed'), ok)
+        self.assertEqual(ok['pool_key'], self.ZC)
+        self.assertTrue(dp.main_force_limited(
+            self.store, self.ZC, now=T0 + timedelta(seconds=1800)))
+
+    def test_claude_1799_refuses_1800_allows(self):
+        tok = self.reserve_exec('cw', 'claude', 'deepseek-flash', 'claude')
+        self._mark(self.CL, 'cw', tok)
+        r = self._claim('cw2', 'claude', 'deepseek-flash',
+                        T0 + timedelta(seconds=1799))
+        self.assertFalse(r.get('allowed'), r)
+        self.assertEqual(r['reason'], 'main_force_limited', r)
+        ok = self._claim('cw3', 'claude', 'deepseek-flash',
+                         T0 + timedelta(seconds=1800))
+        self.assertTrue(ok.get('allowed'), ok)
+        self.assertEqual(ok['pool_key'], self.CL)
+        # 两池互相独立：Claude 限额绝不连带 ZCode。
+        z = self._claim('cw4', 'zcode', 'GLM-5.3', T0 + timedelta(seconds=60))
+        self.assertTrue(z.get('allowed'), z)
+        self.assertEqual(z['pool_key'], self.ZC)
+
+    def test_reserved_consume_refused_and_released_inside_window(self):
+        tok = self.reserve_exec('zc', 'zcode', 'GLM-5.3', 'zcode')
+        self._mark(self.ZC, 'zc', tok)
+        out = dp.consume_for_entry(self.store, task_id='zc', runtime='zcode',
+                                   model='GLM-5.3',
+                                   workspace=str(self._ws_for('zc')),
+                                   prompt_sha256='p', claim_token=tok,
+                                   now=T0 + timedelta(seconds=1))
+        self.assertFalse(out.get('allowed'), out)
+        self.assertEqual(out['reason'], 'main_force_limited', out)
+        self.assertTrue(out.get('capacity_released'), out)
+        self.assertEqual(self._state(tok), 'start_failed')
+        # 记录/拒绝/释放全程不遗留写锁：后续普通预留仍可立即成功。
+        nxt = self._claim('zc-next', 'qoder', 'Qwen3.8-Max', T0 + timedelta(seconds=2))
+        self.assertTrue(nxt.get('allowed'), nxt)
+
+    def test_auto_never_selects_windowed_pool(self):
+        # 占满更高层与 ZCode 之外的可用主力（含 CBGLM、OpenCode），使 AUTO 原本会落到 ZCode。
+        self.reserve_exec('aglm', 'codebuddy', 'glm-5.3-flash', 'codebuddy')
+        for i, (rt, md) in enumerate((('qoder', 'Qwen3.8-Max'),
+                                      ('qodercn', 'Qwen3.8-Max'),
+                                      ('qodercn', 'Qwen-3.8-Max'))):
+            self.reserve_exec(f'amax{i}', rt, md, rt)
+        self.reserve_exec('amax3', 'qodercn', 'Qwen-3.8-Max', 'qodercn')
+        for i in range(2):
+            self.reserve_exec(f'acl{i}', 'claude', 'deepseek-flash', 'claude')
+        self.reserve_exec('aoc1', 'opencode', dp.OPENCODE_DEEPSEEK_MODEL, 'opencode')
+        self.reserve_exec('aoc2', 'opencode', dp.OPENCODE_GLM_MODEL, 'opencode')
+        tok = self.reserve_exec('az', 'zcode', 'GLM-5.3', 'zcode')
+        self._mark(self.ZC, 'az', tok)
+        r = dp.select_and_claim(
+            self.store, task_id='aauto', runtime='zcode', model='GLM-5.3',
+            workspace=str(self._ws_for('aauto')), prompt_sha256='p',
+            now=T0 + timedelta(seconds=60), executor='auto', _preclaim=False)
+        chosen = (r.get('selected') or {}).get('pool_key') or r.get('pool_key')
+        self.assertNotEqual(chosen, self.ZC, r)
+        if r.get('routing_required'):
+            self.assertIn(r['selected']['pool_key'], dp.OVERFLOW_KEYS, r)
+
+    def test_marker_older_than_30min_never_blocks(self):
+        # 旧“永久 hold/未来 hard_hold”语义不得延长：标记的真实失败已超过 30 分钟 → 新派发
+        # 不再跳过（旧的 availability 未来阻断另由 test_simple_priority_retry 覆盖）。
+        tok = self.reserve_exec('oz', 'zcode', 'GLM-5.3', 'zcode')
+        self._mark(self.ZC, 'oz', tok)
+        later = T0 + timedelta(hours=6)
+        with closing(dp.connect(self.store)) as conn:
+            self.assertFalse(dp._quota_limit_window_active(conn, self.ZC, later))
+            elig = dp._eligible_main_forces(conn, False, later)
+        self.assertIn(self.ZC, elig)
+        ok = self._claim('oz2', 'zcode', 'GLM-5.3', later)
+        self.assertTrue(ok.get('allowed'), ok)
+        self.assertEqual(ok['pool_key'], self.ZC)
+
+
 class BeijingMainForceWindowTests(_PoolBase):
     """BW-MAX-WINDOW-20261010-S1 + BW-CUSTOM-MAX-NIGHT-20261010-S1：三个 Qoder Max 主力
     （国际内置 qoder:Qwen3.8-Max、CN 内置 qodercn:Qwen3.8-Max、CN 自定义
@@ -1263,10 +1419,13 @@ class BeijingMainForceWindowTests(_PoolBase):
 
     def test_auto_daytime_falls_to_flash_when_zcode_full(self):
         # ZCode 两槽占满 + 真实工作日高峰（北京周一 10:00：两内置 Max 时段外、claude 高峰
-        # 门关闭，均为不可选候选）+ 自定义 Max 也占满 → AUTO 请求内置 Max 应兜底到同级
+        # 门关闭，均为不可选候选）+ 自定义 Max 也占满 + 两 OpenCode 免费槽（tier4，
+        # BW-OPENCODE-20261019 现行层序）也各占满 + CBGLM（tier5，BW-LIMIT30 额度独立始终
+        # 候选）也占满 → AUTO 请求内置 Max 应兜底到同级
         # Flash，绝不落任一个 Qoder 内置 Max，也绝不因 NOON(12:00) 恰在 claude 高峰
         # 排除端点外（12:00–14:00 午间可派）而把 AUTO 选中到 claude 槽。用显式
-        # executor 逐一确定性填满 ZCode 与自定义 Max（AUTO 轮换会先派内置 Max，此处不受影响）。
+        # executor 逐一确定性填满 ZCode、自定义 Max、两 OpenCode 与 CBGLM（AUTO 轮换会先派内置
+        # Max，此处不受影响）。
         WEEKDAY_PEAK = datetime(2026, 10, 12, 2, 0, 0, tzinfo=timezone.utc)  # 北京 10:00 周一
         self.reserve_exec('z1', 'zcode', 'GLM-5.3', 'zcode', pk='zcode:GLM-5.3')
         self.reserve_exec('z2', 'zcode', 'GLM-5.3', 'zcode', pk='zcode:GLM-5.3')
@@ -1274,6 +1433,12 @@ class BeijingMainForceWindowTests(_PoolBase):
                           pk='qodercn:Qwen-3.8-Max')
         self.reserve_exec('cu2', 'qodercn', 'Qwen-3.8-Max', 'qodercn',
                           pk='qodercn:Qwen-3.8-Max')
+        self.reserve_exec('oc1', 'opencode', dp.OPENCODE_DEEPSEEK_MODEL, 'opencode',
+                          pk=dp.OPENCODE_DEEPSEEK_POOL_KEY)
+        self.reserve_exec('oc2', 'opencode', dp.OPENCODE_GLM_MODEL, 'opencode',
+                          pk=dp.OPENCODE_GLM_POOL_KEY)
+        self.reserve_exec('cbg', 'codebuddy', dp.CODEBUDDY_GLM_MODEL, 'codebuddy',
+                          pk=dp.CODEBUDDY_GLM_POOL_KEY)
         r = dp.select_and_claim(self.store, task_id='a2', runtime='qodercn',
                                 model='Qwen3.8-Max', workspace=str(self._ws_for('a2')),
                                 prompt_sha256='p', now=WEEKDAY_PEAK, _preclaim=False)
@@ -1449,7 +1614,7 @@ class BeijingMainForceWindowTests(_PoolBase):
     def test_claim_due_degradation_uses_same_window_filter(self):
         # 白天降级 claim_due：原 scope 钉住国际 Max、该 Max 恰好有空位，也不回收 Max（同一
         # 时段候选过滤），保持 pending、如实 main_force_window_closed，绝不静默换模型或偷偷
-        # 启动 Max。先填满八槽记录票据，再释放国际 Max 制造"有空位但在时段外"。
+        # 启动 Max。先填满全部国内槽（现 16）记录票据，再释放国际 Max 制造"有空位但在时段外"。
         toks = self.fill_domestic()
         ws = str(self._ws_for('cd'))
         scope = {'task_id': 'cd', 'stage': 's1', 'chat_id': 'c1', 'workspace': ws,

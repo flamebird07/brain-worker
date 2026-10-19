@@ -1637,6 +1637,18 @@ def main():
             attempt_id=availability_attempt_id,
             source='zcode_direct terminal envelope',
             evidence_path=_oer.get('path'), evidence_sha256=_oer.get('sha256'))
+        # BW-LIMIT30-20261019-S3：同一真实结构化 429 原件同时绑定到 dispatch_pool 的
+        # main_force_limits（精确池 zcode:GLM-5.3），供浮窗与新派发 1800 秒只读窗口使用。
+        # 只在真实失败证据路径/SHA 与真实 attempt 都存在时落标；落标失败不阻断终态释放。
+        if claim_token is not None and _oer.get('path') and _oer.get('sha256'):
+            try:
+                summary['zcode_main_force_limit_recorded'] = dp.record_main_force_limit(
+                    dispatch_store, dp.ZCODE_POOL_KEY, task_id=task_id,
+                    attempt_token=claim_token, evidence_path=_oer.get('path'),
+                    evidence_sha256=_oer.get('sha256'))
+            except Exception as _limit_exc:  # noqa: BLE001 - 落标失败不阻断真实终态
+                summary['zcode_main_force_limit_recorded'] = {
+                    'recorded': False, 'error': type(_limit_exc).__name__}
     # 缺陷 6（B4）：不可用事实已发布（或本次不是受信任 429、无需发布）之后才允许把槽变回
     # 可再派生。BW-AVAILABILITY-20261009-B5：容量名额的释放**再推迟到接续冻结/原错误与输入
     # hash 保存完成之后**——在整个 cc.evaluate/build_handoff 期间必须一直持有同 workspace

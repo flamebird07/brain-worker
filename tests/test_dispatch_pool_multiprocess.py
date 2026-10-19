@@ -187,13 +187,14 @@ class _SpawnMixin(unittest.TestCase):
             return [dict(r) for r in conn.execute(sql, params).fetchall()]
 
     def _fill_six_via_api(self):
-        """真实 API 填满十四满基线（BW-CODEBUDDY-MAIN-S3 + BW-WORKER-WIDGET-20261018-S3：
-        codebuddy deepseek×1 + codebuddy GLM×1（各自独立 1 槽，GLM 需显式当轮额度条件
-        授权）+ zcode×2 + 两内置 Max 各 1 + CN 自定义 Max×2 + 两地区 Flash 各 2 +
-        claude 2；T0=北京周四 23:00 claude offhours）。全部经显式 executor 逐一 claim
-        保证确定性（CN 池只能经 executor='qodercn'，claude 经 executor='claude'，
-        codebuddy 两模型经 executor='codebuddy'，AUTO 轮换不保证落某特定主力），
-        返回 14 个 token。"""
+        """真实 API 填满十六满基线（BW-CODEBUDDY-MAIN-S3 + BW-WORKER-WIDGET-20261018-S3 +
+        BW-OPENCODE-20261019-S3：codebuddy deepseek×1 + codebuddy GLM×1（各自独立 1 槽，
+        GLM 需显式当轮额度条件授权）+ zcode×2 + 两内置 Max 各 1 + CN 自定义 Max×2 +
+        两地区 Flash 各 2 + claude 2 + 两个 OpenCode 免费模型各 1 独立槽；
+        T0=北京周四 23:00 claude offhours，OpenCode 无时段门）。全部经显式 executor
+        逐一 claim 保证确定性（CN 池只能经 executor='qodercn'，claude 经
+        executor='claude'，codebuddy 两模型经 executor='codebuddy'，OpenCode 经
+        executor='opencode'，AUTO 轮换不保证落某特定主力），返回 16 个 token。"""
         toks = []
         plan = [('codebuddy', 'deepseek-v4.1-flash', 'codebuddy'),
                 ('codebuddy', 'glm-5.3-flash', 'codebuddy'),
@@ -207,7 +208,9 @@ class _SpawnMixin(unittest.TestCase):
                 ('qodercn', 'Qwen3.8-Flash', 'qodercn'),
                 ('qodercn', 'Qwen3.8-Flash', 'qodercn'),
                 ('claude', 'deepseek-flash', 'claude'),
-                ('claude', 'deepseek-flash', 'claude')]
+                ('claude', 'deepseek-flash', 'claude'),
+                ('opencode', dp.OPENCODE_DEEPSEEK_MODEL, 'opencode'),
+                ('opencode', dp.OPENCODE_GLM_MODEL, 'opencode')]
         for i, (rt, md, ex) in enumerate(plan):
             out = dp.select_and_claim(self.store, task_id=f'base-{i}', runtime=rt,
                                       model=md, workspace=f'C:/mp/base-{i}',

@@ -35,7 +35,8 @@ import execution_control as ec  # noqa: E402
 import codebuddy_fallback as cbf  # noqa: E402
 
 SELECTION_MODES = ('auto', 'fixed', 'executor', 'temporary_fallback')
-EXECUTORS = ('auto', 'qoder', 'zcode', dp.CN_RUNTIME, 'claude', dp.CODEBUDDY_RUNTIME)
+EXECUTORS = ('auto', 'qoder', 'zcode', dp.CN_RUNTIME, 'claude', dp.CODEBUDDY_RUNTIME,
+             dp.OPENCODE_RUNTIME)
 TERMINAL_PREVIOUS_STATES = ('finished', 'start_failed', 'cancelled', 'reconciled_exit',
                             'native_failed', 'failed')
 BLOCKING_PREVIOUS_STATES = ('reserved', 'running', 'unknown', 'executing',
@@ -291,12 +292,11 @@ def _filter_candidates(conn, allowed, zcode_blocked, now, requirements=None,
         if _permission_incompatible(pk, requirements, controlled_file_ok):
             filters[pk] = 'permission_incompatible'
             continue
-        # BW-CODEBUDDY-GLM-FALLBACK-20261018：GLM 需要三条件同时成立——在授权集合内
-        # （外层已保证）、当轮 DeepSeek 真实失败（round_failed）、当轮 summary.json 证据
-        # 复验通过。任一不满足如实标 `codebuddy_quota_condition_not_met`，绝不静默启用，
-        # 也绝不因更高主力的普通授权/历史标记而放宽。
-        if pk == dp.CODEBUDDY_GLM_POOL_KEY and not codebuddy_glm_allowed:
-            filters[pk] = 'codebuddy_quota_condition_not_met'
+        # BW-LIMIT30-20261019-S3：ZCode/GLM-5.3 与 Claude/deepseek-flash 的最近真实
+        # 结构化 429/402 在 1800 秒只读窗口内跳过；恰好 1800 秒及更久按现有优先级重新
+        # 可选，不删除原标记/证据、不宣称额度恢复。每个精确池独立。
+        if dp._quota_limit_window_active(conn, pk, now):
+            filters[pk] = 'main_force_limited'
             continue
         if pk in failed_this_round:
             filters[pk] = 'already_tried_this_round'
@@ -449,35 +449,39 @@ def plan_stage_selection(authorization, *, previous=None, store_path=None, quota
         if not _allowed_candidate(pk):
             return _refuse('unauthorized_candidate', repr(pk))
 
-    # BW-CODEBUDDY-GLM-FALLBACK-20261018：GLM 三条件（授权集合包含 GLM + 当轮 DeepSeek
-    # 已真实失败 + 当轮 summary.json 明确 429/额度证据复验通过）。证据路径只从**本轮**
-    # authorization JSON 读取；缺省 None 即不授权，新轮不会继承旧轮路径/旧 persistent
-    # 标记/旧报告。证据畸形/失败只关闭 GLM，不影响其它主力的正常规划。
+    # BW-LIMIT30-20261019-S3 用户最新明确（覆盖 BW-CODEBUDDY-GLM-FALLBACK-20261018 的旧条件）：
+    # CodeBuddy / glm-5.3-flash 与 deepseek-v4.1-flash 额度独立、各自独立 1 槽；规划阶段不再
+    # 要求“当轮 DeepSeek 真实限额证据”，也不要求 DeepSeek 本轮先失败。GLM 只要求出现在
+    # allowed_candidates 授权集合内（未授权绝不扩权），优先级仍是 ZCode 之后、两区 Flash 之前。
+    # 旧 `codebuddy_quota_evidence` 仅作兼容诊断：缺失/畸形不再拒绝规划；历史证据不改写。
     raw_evidence = auth.get('codebuddy_quota_evidence')
-    if raw_evidence is not None and not isinstance(raw_evidence, str):
-        # 不回显任意嵌套输入（可能夹带敏感内容），只报类型名。
-        return _refuse('invalid_codebuddy_quota_evidence',
-                       type(raw_evidence).__name__)
-    quota_evidence = cbf.verify_quota_evidence(raw_evidence)
+    quota_evidence = None
+    if isinstance(raw_evidence, str):
+        quota_evidence = cbf.verify_quota_evidence(raw_evidence)
     glm_authorized = dp.CODEBUDDY_GLM_POOL_KEY in allowed
     glm_deepseek_failed = dp.CODEBUDDY_POOL_KEY in round_failed
-    glm_allowed = bool(glm_authorized and glm_deepseek_failed
-                       and quota_evidence.get('ok'))
+    glm_allowed = bool(glm_authorized)
     # 脱敏回执：只有路径/哈希/原因码/分类，不含任何原始错误文本或请求头。
     receipt['codebuddy_quota_evidence'] = {
         'provided': raw_evidence is not None,
-        'path': quota_evidence.get('path'),
-        'sha256': quota_evidence.get('sha256'),
-        'ok': bool(quota_evidence.get('ok')),
-        'reason': quota_evidence.get('reason'),
-        'failure_types': list(quota_evidence.get('failure_types') or []),
-        'source': 'current_round_summary_json',
+        'required': False,
+        'path': (quota_evidence or {}).get('path'),
+        'sha256': (quota_evidence or {}).get('sha256'),
+        'ok': bool((quota_evidence or {}).get('ok')),
+        'reason': ((quota_evidence or {}).get('reason')
+                   if isinstance(raw_evidence, str) else
+                   ('ignored_non_string_legacy_argument' if raw_evidence is not None else
+                    'not_required')),
+        'failure_types': list((quota_evidence or {}).get('failure_types') or []),
+        'source': 'legacy_diagnostic_only',
     }
     receipt['codebuddy_glm_allowed'] = glm_allowed
     receipt['codebuddy_glm_condition'] = {
         'authorized': glm_authorized,
+        'independent_from_deepseek': True,
+        'quota_evidence_required': False,
         'deepseek_failed_this_round': glm_deepseek_failed,
-        'quota_evidence_ok': bool(quota_evidence.get('ok')),
+        'quota_evidence_ok': bool((quota_evidence or {}).get('ok')),
         'allowed': glm_allowed,
     }
 

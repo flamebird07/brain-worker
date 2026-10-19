@@ -164,7 +164,8 @@ except ImportError:  # isolated revision tree / standalone tests
 # ------------------------------------------------------------------ 池定义
 # BW-POOL-SPLIT-20261010-S2 + BW-MAX-WINDOW-20261010-S2 用户 2026-10-10 最新分配：
 #   六池布局（BW-CLAUDE-CAPACITY2 起含 claude 2 槽；BW-CODEBUDDY-MAIN-S3 再加 CodeBuddy
-#   精确模型 1 槽；BW-WORKER-WIDGET-20261018-S3 起 CodeBuddy GLM 独立 1 槽）、当前调度总数 14：
+#   精确模型 1 槽；BW-WORKER-WIDGET-20261018-S3 起 CodeBuddy GLM 独立 1 槽；
+#   BW-OPENCODE-20261019 再加两个 OpenCode 免费模型各 1 槽）、当前调度总数 16：
 #   主力（四池共 6 槽，同属 best-effort 1:1 的两个组）：
 #     zcode:GLM-5.3=2（Z 组）、qoder:Qwen3.8-Max=1、qodercn:Qwen3.8-Max=1（国际/CN 内置
 #     Max，属 Qoder 组，仅北京时间 22:00 含至次日 08:00 不含作主力）、
@@ -190,16 +191,20 @@ except ImportError:  # isolated revision tree / standalone tests
 # BW-WORKER-WIDGET-20261018-S3（用户 2026-10-18 最新明确）：codebuddy:deepseek-v4.1-flash
 # 与 codebuddy:glm-5.3-flash **不共享名额，各自独立 1 槽**（旧「同一物理 1 槽」口径作废）。
 # 当前 AUTO 层序：CodeBuddy deepseek(0) > 三 Qoder Max(1) > claude(2) > ZCode(3) >
-# CodeBuddy GLM(4，仅当轮 DeepSeek 真实限额证据成立时进候选) > 两地区 Flash 兜底。
-# claude 仍 2 槽。物理调度总数 DOMESTIC_TOTAL_CAPACITY = 10(主力，含两个 CodeBuddy 各 1)
-# + 4(两地区 Flash) = 14（由 MAIN_FORCE+OVERFLOW 求和自动得出）。WorkBuddy 仍 human-relay、
-# CodeBuddy 其它旧模型（新旧 GLM 之外的组合）仍不恢复。
+# 两 OpenCode 免费模型(4，同级、各自独立 1 槽、无时段门/无限额条件) >
+# CodeBuddy GLM(5，额度独立的低层补位；BW-LIMIT30-20261019-S3 起不再要求当轮 DeepSeek
+# 限额证据，缺省候选即含) > 两地区 Flash 兜底。
+# claude 仍 2 槽。物理调度总数 DOMESTIC_TOTAL_CAPACITY = 12(主力，含两个 CodeBuddy 各 1
+# 与两 OpenCode 各 1) + 4(两地区 Flash) = 16（由 MAIN_FORCE+OVERFLOW 求和自动得出）。
+# WorkBuddy 仍 human-relay、CodeBuddy 其它旧模型（新旧 GLM 之外的组合）仍不恢复。
 MAIN_FORCE_POOLS = (('codebuddy', 'deepseek-v4.1-flash'),
                     ('zcode', 'GLM-5.3'),
                     ('qoder', 'Qwen3.8-Max'),
                     ('qodercn', 'Qwen3.8-Max'),
                     ('qodercn', 'Qwen-3.8-Max'),
                     ('claude', 'deepseek-flash'),
+                    ('opencode', 'deepseek-v4.1-flash-free'),
+                    ('opencode', 'glm-5.3-flash-free'),
                     ('codebuddy', 'glm-5.3-flash'))
 MAIN_FORCE_CAPACITY = {'codebuddy:deepseek-v4.1-flash': 1,
                        'codebuddy:glm-5.3-flash': 1,
@@ -207,7 +212,9 @@ MAIN_FORCE_CAPACITY = {'codebuddy:deepseek-v4.1-flash': 1,
                        'qoder:Qwen3.8-Max': 1,
                        'qodercn:Qwen3.8-Max': 1,
                        'qodercn:Qwen-3.8-Max': 2,
-                       'claude:deepseek-flash': 2}
+                       'claude:deepseek-flash': 2,
+                       'opencode:deepseek-v4.1-flash-free': 1,
+                       'opencode:glm-5.3-flash-free': 1}
 OVERFLOW_POOLS = (('qoder', 'Qwen3.8-Flash'), ('qodercn', 'Qwen3.8-Flash'))
 OVERFLOW_CAPACITY = {'qoder:Qwen3.8-Flash': 2, 'qodercn:Qwen3.8-Flash': 2}
 # BW-POOL-SPLIT-20261010-S2：CN DeepSeek-Flash 从正常池退出，但保留池名与 0 容量条目，
@@ -218,7 +225,7 @@ LUNA_RUNTIME = 'luna'
 LUNA_MODEL = 'native'
 LUNA_ASK_TIMEOUT_SECONDS = 300
 DOMESTIC_TOTAL_CAPACITY = (sum(MAIN_FORCE_CAPACITY.values())
-                           + sum(OVERFLOW_CAPACITY.values()))  # 10 (两个 CodeBuddy 各 1) + 4 = 14
+                           + sum(OVERFLOW_CAPACITY.values()))  # 12 (两个 CodeBuddy+两 OpenCode) + 4 = 16
 
 # pool_key -> capacity（None 表示无上限，仅 Luna；0 表示已退出正常池但保留历史真实在途）。
 CAPACITY = {}
@@ -229,18 +236,21 @@ for _rk in LEGACY_RETIRED_POOL_KEYS:
 CAPACITY['luna:native'] = None
 # BW-CLAUDE-DEEPSEEK-S3：claude:deepseek-flash 已并入 MAIN_FORCE_POOLS/CAPACITY（独立第三公平组
 # claude），故其容量已在上面 CAPACITY.update 中登记；BW-CLAUDE-CAPACITY2 起容量为 2。
-# 关键口径（BW-WORKER-WIDGET-20261018-S3 现行权威）：
-#  - DOMESTIC_TOTAL_CAPACITY = 14：两个 CodeBuddy 模型（deepseek-v4.1-flash / glm-5.3-flash）
-#    **各独立 1 槽、互不占位互斥**，claude 与两者在途都计入国内总在途（_domestic_active
+# 关键口径（BW-OPENCODE-20261019 现行权威）：
+#  - DOMESTIC_TOTAL_CAPACITY = 16：两个 CodeBuddy 模型（deepseek-v4.1-flash / glm-5.3-flash）
+#    与两个 OpenCode 免费模型（deepseek-v4.1-flash-free / glm-5.3-flash-free）
+#    **各独立 1 槽、互不占位互斥**，claude 与它们在途都计入国内总在途（_domestic_active
 #    只排除 Luna）；
 #  - _select_main_force 按主力优先级层排序：codebuddy:deepseek-v4.1-flash 最高 > 三 Qoder
-#    Max > claude:deepseek-flash > zcode:GLM-5.3 > codebuddy:glm-5.3-flash（额度条件补位）。
+#    Max > claude:deepseek-flash > zcode:GLM-5.3 > 两 OpenCode 同级 >
+#    codebuddy:glm-5.3-flash（低层补位，额度独立，BW-LIMIT30-20261019-S3）。
 #    committed 仍只作历史记账、不参与跨层排序，低层绝不凭历史计数抢高层名额；
 #  - claude 受 deepseek_offpeak 的北京时间工作日高峰门约束（高峰不得新派）；
 #  - codebuddy:deepseek-v4.1-flash **不受任何时段门约束**：既不套 Claude 官方 API 离峰窗，
-#    也不套 Max 北京夜间窗；仅经自身 capacity=1 与总在途 14 守卫，无任何跨模型回退。
-#    codebuddy:glm-5.3-flash 同样无时段门，但仅在当轮 DeepSeek 真实明确限额证据复验通过
-#    （codebuddy_glm_allowed=True）时才进候选，仅经自身 capacity=1 守卫。
+#    也不套 Max 北京夜间窗；仅经自身 capacity=1 与总在途 16 守卫，无任何跨模型回退。
+#    两个 OpenCode 免费模型同样无时段门、无额度前提，仅经各自 capacity=1 与总守卫；
+#  - codebuddy:glm-5.3-flash 同样无时段门，额度独立（BW-LIMIT30-20261019-S3 起不再要求
+#    当轮 DeepSeek 限额证据，缺省候选即含），仅经自身 capacity=1 守卫。
 #    CodeBuddy 其它旧模型仍不恢复、不进候选池。
 CLAUDE_RUNTIME = 'claude'
 CLAUDE_MODEL = 'deepseek-flash'
@@ -262,6 +272,16 @@ CODEBUDDY_CAPACITY = MAIN_FORCE_CAPACITY[CODEBUDDY_POOL_KEY]
 CODEBUDDY_GLM_MODEL = 'glm-5.3-flash'
 CODEBUDDY_GLM_POOL_KEY = f'{CODEBUDDY_RUNTIME}:{CODEBUDDY_GLM_MODEL}'
 CODEBUDDY_GLM_CAPACITY = MAIN_FORCE_CAPACITY[CODEBUDDY_GLM_POOL_KEY]
+# BW-OPENCODE-20261019 用户明确：OpenCode 独立 CLI 只开放两个**精确免费模型 ID**
+# （deepseek-v4.1-flash-free / glm-5.3-flash-free），各自独立 1 槽、同级，优先级低于
+# ZCode 且高于 CodeBuddy GLM（额度独立）；无时段门、无 CodeBuddy 额度前提、绝不自动付费回退。
+OPENCODE_RUNTIME = 'opencode'
+OPENCODE_DEEPSEEK_MODEL = 'deepseek-v4.1-flash-free'
+OPENCODE_GLM_MODEL = 'glm-5.3-flash-free'
+OPENCODE_MODELS = (OPENCODE_DEEPSEEK_MODEL, OPENCODE_GLM_MODEL)
+OPENCODE_POOL_KEYS = tuple(f'{OPENCODE_RUNTIME}:{m}' for m in OPENCODE_MODELS)
+OPENCODE_DEEPSEEK_POOL_KEY = OPENCODE_POOL_KEYS[0]
+OPENCODE_GLM_POOL_KEY = OPENCODE_POOL_KEYS[1]
 # 已弃用（BW-WORKER-WIDGET-20261018-S3）：两个 CodeBuddy 模型改为各自独立 1 槽，不再存在
 # 跨模型共享物理槽。旧同名常量仅保留空元组供既有 import 兼容，任何代码/文案都不得再据此
 # 推导共享容量或跨模型占位互斥。
@@ -291,8 +311,14 @@ LUNA_KEY = f'{LUNA_RUNTIME}:{LUNA_MODEL}'
 # 两地区 Flash 兜底永不被限额标记误挡；自定义 Max 与内置 Max 各自独立落标、互不连坐。标记只是
 # 布尔不可用 + pool_key + 真实 attempt + 错误证据路径/哈希，绝不查余额、不带定时器/期限/
 # 自动恢复探针/评分/新服务/外部 API；恢复只由用户明确额度恢复/重置后人工解除。
+# BW-LIMIT30-20261019-S3 用户最新明确：ZCode/GLM-5.3 与 Claude/deepseek-flash 的真实结构化
+# 429（Claude 另含真实 402 Insufficient Balance）落 main_force_limits 后，只在新派发的
+# **1800 秒只读窗口**内跳过；窗口到期按现有优先级重新可选。原错误原件不清除、不宣称额度
+# 恢复、不需要手动重置。Qoder Max 的既有标记语义不变（本窗口只作用于下列两个精确池）。
+QUOTA_LIMIT_WINDOW_SECONDS = 1800
+QUOTA_LIMIT_WINDOW_POOLS = ('zcode:GLM-5.3', CLAUDE_POOL_KEY)
 QUOTA_LIMITABLE_POOLS = (QMAX_POOL_KEY, CN_MAX_POOL_KEY, CN_CUSTOM_MAX_POOL_KEY,
-                         CLAUDE_POOL_KEY)
+                         CLAUDE_POOL_KEY, 'zcode:GLM-5.3')
 QUOTA_DISPLAY_ONLY_POOLS = (CODEBUDDY_POOL_KEY, CODEBUDDY_GLM_POOL_KEY)
 
 # attempt 状态机：在途（占容量）与已释放（不占容量）。
@@ -742,7 +768,7 @@ def _domestic_active(conn) -> int:
     """国内总在途保护计数（BW-POOL-SPLIT-20261010-S3 + BW-CLAUDE-DEEPSEEK-S3）：统计**所有
     非 Luna 的在途 attempt**，含 claude:deepseek-flash 以及仍在途的 retired DeepSeek 与超额
     旧 Max（迁移债务）。这样即便某个新池按各自容量看似有空位，只要真实总在途已达物理总容量
-    （现为 14：主力含两个 CodeBuddy 各 1 + claude 2 + 两地区 Flash 各 2），就不会派出超额的国内槽；减少容量不杀
+    （现为 16：主力含两个 CodeBuddy 各 1、两个 OpenCode 各 1 + claude 2 + 两地区 Flash 各 2），就不会派出超额的国内槽；减少容量不杀
     老任务，老任务依真实终态自然释放后计数才下降。Luna（救援池、无上限）不计入国内总额。"""
     row = conn.execute(
         'SELECT COUNT(*) AS n FROM attempts WHERE pool_key != ? AND state IN (%s)'
@@ -751,15 +777,59 @@ def _domestic_active(conn) -> int:
 
 
 def _main_force_limit_active(conn, pk) -> bool:
-    """事务内只读回核：该主力池是否被**明确限额**标记为不可用（limited=1）。只有两个
-    Qoder Max（QUOTA_LIMITABLE_POOLS）可承载标记；ZCode（走 quota_control availability）、
-    两地区 Flash 兜底、retired DeepSeek、Luna 一律返回 False（绝不误挡 Flash / 绝不误挡
-    ZCode 的既有 availability 口径）。"""
+    """事务内只读回核：该主力池是否被**明确限额**标记为不可用（limited=1）。这是原始标记
+    诊断口径（不清除、不按时间篡改）；是否阻断新派发由 `_quota_limit_window_active` 按
+    1800 秒真实失败窗口单独判定。ZCode/Claude 可承载标记；两地区 Flash 兜底、retired
+    DeepSeek、Luna 一律返回 False（绝不误挡 Flash / 绝不误挡其它池）。"""
     if pk not in QUOTA_LIMITABLE_POOLS:
         return False
     row = conn.execute('SELECT limited FROM main_force_limits WHERE pool_key=?',
                        (pk,)).fetchone()
     return bool(row is not None and int(row['limited']) == 1)
+
+
+def _limit_reference_utc(conn, row):
+    """限额窗口的真实参照时刻：优先绑定 attempt 的 ended_at_utc（真实失败终态时刻），
+    终态尚未落盘才回退标记 recorded_at_utc。绝不用其它操作的 updated_at 顶替，也不在
+    ON CONFLICT 之外改写 recorded_at。"""
+    ref = row['recorded_at_utc']
+    token = row['attempt_token']
+    if token:
+        att = conn.execute('SELECT ended_at_utc FROM attempts WHERE token=?',
+                           (token,)).fetchone()
+        if att is not None and att['ended_at_utc']:
+            ref = att['ended_at_utc']
+    return ref
+
+
+def _quota_limit_window_active(conn, pk, now=None) -> bool:
+    """BW-LIMIT30-20261019-S3：仅 ZCode/GLM-5.3 与 Claude/deepseek-flash 两个精确池，
+    从绑定真实失败的 ended_at_utc（回退 recorded_at_utc）起 0<=age<1800 秒内阻止新派发。
+    恰好 1800 秒及更久返回 False（按现有优先级重新可选），但绝不删除原标记/证据、绝不
+    宣称额度恢复。缺失/无时区/无法解析/未来时间不伪造有效窗口（不永久挡新轮）。每个
+    pool_key 独立判定，互不连带。"""
+    if pk not in QUOTA_LIMIT_WINDOW_POOLS:
+        return False
+    now = now or utcnow()
+    row = conn.execute('SELECT limited, attempt_token, recorded_at_utc '
+                       'FROM main_force_limits WHERE pool_key=?', (pk,)).fetchone()
+    if row is None or int(row['limited']) != 1:
+        return False
+    # BW-LIMIT30-20261019-S4 缺口 2：绑定 attempt 的 ended_at_utc/recorded_at_utc 可能是
+    # 历史上非法/损坏时间串，`fromisoformat` 会抛 ValueError——绝不能让只读窗口判定把整条
+    # 派发路径带崩。非法时间等同"无法解析"：本窗口判定返回 False（不伪造有效限额窗口、
+    # 不永久挡新轮），但**绝不删除或改写** main_force_limits 原标记与错误证据（不伪造恢复，
+    # 原始 limited=1 事实仍在 status/诊断里如实回显）。
+    try:
+        ref = _parse(_limit_reference_utc(conn, row))
+    except (ValueError, TypeError):
+        return False
+    if ref is None or ref.tzinfo is None:
+        return False
+    if now.tzinfo is None:
+        now = now.replace(tzinfo=timezone.utc)
+    age = (now - ref).total_seconds()
+    return 0 <= age < QUOTA_LIMIT_WINDOW_SECONDS
 
 
 def _rotation_row(conn):
@@ -1023,33 +1093,22 @@ def _probe_allowed(quota_store, probe_ticket, now=None):
 
 
 def _eligible_main_forces(conn, zcode_blocked, now=None, codebuddy_glm_allowed=False):
-    """可用主力集合（BW-POOL-SPLIT-20261010-S3 + BW-MAX-WINDOW-20261010-S1）：三主力明确
-    限额都自动跳过、不查询余额；两个 Qoder 内置 Max 还受北京时间主力时段门约束。
-    - ZCode:GLM-5.3 被持久 availability 阻断（hard_hold / bounded backoff /
-      recovery_unverified）时剔除——保持既有 quota_control 口径不变；
-    - 三个 Qoder Max（国际 qoder:Qwen3.8-Max、CN 内置 qodercn:Qwen3.8-Max 与 CN 自定义
-      qodercn:Qwen-3.8-Max）被 `_main_force_limit_active` 明确限额标记命中时剔除（同一事务
-      内只读回核）；
-    - BW-MAX-WINDOW-20261010-S1 + BW-CUSTOM-MAX-NIGHT-20261010-S1：这三 Qoder Max 在北京
-      时间非 22:00（含）至 08:00（不含）时段的**新派工候选**里剔除（`_max_window_blocks`）；
-      ZCode 主力不受时段约束，两地区 Flash 兜底永不被时段/限额误挡。
-    先过滤合格候选，再在可用主力间做 best-effort 平衡（绝不把名额分给不可用/已限额/
-    非时段的主力）。
-    BW-SIMPLE-PRIORITY-RETRY-S3 用户政策：普通 AUTO 轮次不再据**历史** ZCode availability
-    或三 Qoder Max/Claude 的**明确限额**标记剔除候选——每轮直接从最高优先级真实候选起，
-    真实 429/失败才落库保留诊断原件、成功/失败 CAS 结算不变；历史 availability/限额仅作
-    诊断记录，不再永久或到期后挡新轮真实尝试。这里**只保留时段门**（窗口/容量/权限/工作区
-    /unknown/审批拒绝照常，绝不过滤绕过）。`zcode_blocked` 入参保留仅为兼容旧签名/其它
-    调用点与显式 purpose=probe 生命周期；普通候选集不再据此剔除。"""
+    """可用主力集合（BW-POOL-SPLIT-20261010-S3 + BW-MAX-WINDOW-20261010-S1 +
+    BW-LIMIT30-20261019-S3）：先按时段门与 1800 秒真实限额窗口过滤，再在可用主力间按
+    现有优先级层选择。
+    - 三个 Qoder Max 在北京时间非 22:00（含）至 08:00（不含）时段的**新派工候选**里剔除；
+    - ZCode/GLM-5.3 与 Claude/deepseek-flash 若绑定了**真实结构化 429/402** 且距该真实
+      失败结束不足 1800 秒，剔除；恰好 1800 秒及更久按现有优先级重新可选（不删除原标记，
+      不宣称恢复）。其它池（Qoder Max 的既有标记、CodeBuddy、Flash）不受该时间窗口影响；
+    - `codebuddy_glm_allowed` 仅为旧调用兼容保留：BW-LIMIT30-20261019-S3 起 GLM 与
+      DeepSeek 额度独立，不再需要任何当轮 DeepSeek 限额证据，始终按自身 1 槽参与候选。
+    BW-SIMPLE-PRIORITY-RETRY-S3 的历史标记不挡新轮政策，只对上述两个精确池的 1800 秒
+    真实窗口例外；其它历史 availability/限额仍仅作诊断。"""
     eligible = set()
     for k in MAIN_FORCE_KEYS:
-        # BW-CODEBUDDY-GLM-FALLBACK-20261018：GLM 是**仅额度条件成立时**才可用的低层
-        # 补位；默认（无当轮 DeepSeek 明确限额证据）绝不进入候选，绝不因本轮其它主力
-        # 失败/满而自动启用。该布尔只能由 stage_selection/正式入口在复验当前轮
-        # summary.json 证据后显式传入；历史标记/旧报告/普通失败一律不算。
-        if k == CODEBUDDY_GLM_POOL_KEY and not codebuddy_glm_allowed:
-            continue
         if _max_window_blocks(k, now):
+            continue
+        if _quota_limit_window_active(conn, k, now):
             continue
         eligible.add(k)
     return eligible
@@ -1071,7 +1130,8 @@ def _scope_combo_from_scope(scope):
     model = (scope or {}).get('model')
     exec_runtime = {'qoder': 'qoder', 'zcode': 'zcode',
                     CN_RUNTIME: CN_RUNTIME, 'claude': 'claude',
-                    CODEBUDDY_RUNTIME: CODEBUDDY_RUNTIME}.get(executor)
+                    CODEBUDDY_RUNTIME: CODEBUDDY_RUNTIME,
+                    OPENCODE_RUNTIME: OPENCODE_RUNTIME}.get(executor)
     if runtime and exec_runtime and str(runtime) != exec_runtime:
         return None, True
     combo_runtime = exec_runtime or (str(runtime) if runtime else None)
@@ -1099,9 +1159,6 @@ def _scope_allowed_candidates(scope, zcode_blocked, codebuddy_glm_allowed=False)
     if combo is not None:
         if combo == ZCODE_POOL_KEY and zcode_blocked:
             return []
-        # GLM 显式 combo 也不例外：没有当轮额度证据就绝不作为受信任候选。
-        if combo == CODEBUDDY_GLM_POOL_KEY and not codebuddy_glm_allowed:
-            return []
         return [combo]
     if executor == 'zcode':
         return [] if zcode_blocked else [ZCODE_POOL_KEY]
@@ -1113,15 +1170,15 @@ def _scope_allowed_candidates(scope, zcode_blocked, codebuddy_glm_allowed=False)
         # 显式指定 claude 入口：只有独立 claude 池自身，绝不跨到其它国内槽或 Flash/回退模型。
         return [CLAUDE_POOL_KEY]
     if executor == CODEBUDDY_RUNTIME:
-        # 显式指定 CodeBuddy 入口：默认只有独立 codebuddy:deepseek-v4.1-flash 池自身，绝不
-        # 跨到其它国内槽、Flash 或任何回退模型。仅当调用方已复验当轮明确限额证据并显式
-        # 授权 GLM 时，才把同一物理槽的 GLM 逻辑 key 加入（更高层 deepseek 仍优先）。
-        if codebuddy_glm_allowed:
-            return [CODEBUDDY_POOL_KEY, CODEBUDDY_GLM_POOL_KEY]
-        return [CODEBUDDY_POOL_KEY]
+        # 显式指定 CodeBuddy 入口：两个精确模型各自独立 1 槽，均直接可用（BW-LIMIT30-
+        # 20261019-S3 撤销”GLM 需当轮 DeepSeek 限额证据”的前置门；额度互不连带）。
+        return [CODEBUDDY_POOL_KEY, CODEBUDDY_GLM_POOL_KEY]
+    if executor == OPENCODE_RUNTIME:
+        # 显式 OpenCode 入口：只列两个精确免费模型，同级、无时段门/额度前提，绝不跨到
+        # CodeBuddy/其它池，也绝不自动付费回退。
+        return list(OPENCODE_POOL_KEYS)
     mains = [k for k in MAIN_FORCE_KEYS
-             if not (k == ZCODE_POOL_KEY and zcode_blocked)
-             and not (k == CODEBUDDY_GLM_POOL_KEY and not codebuddy_glm_allowed)]
+             if not (k == ZCODE_POOL_KEY and zcode_blocked)]
     # 默认/auto 受信任候选：三主力在前、两地区 Flash 同级兜底在后；已 retired 的 CN
     # DeepSeek-Flash 不在候选集合中，任何 AUTO 派工绝不新落该池。
     return mains + list(OVERFLOW_KEYS)
@@ -1150,15 +1207,15 @@ def _select_main_force(conn, requested_pk, now, eligible=None):
     order = list(MAIN_FORCE_KEYS)
     if eligible is not None:
         order = [k for k in order if k in eligible]
-    else:
-        # BW-CODEBUDDY-GLM-FALLBACK-20261018：GLM 是额度条件补位，默认候选集**不含**它。
-        # 只有调用方显式传入的 eligible（已由上层复验当轮 DeepSeek 明确限额证据）包含 GLM
-        # 时才参与排序；缺省 eligible=None 绝不能凭「其它主力都满/不可用」自动启用 GLM。
-        order = [k for k in order if k != CODEBUDDY_GLM_POOL_KEY]
+    # BW-LIMIT30-20261019-S3：GLM 与 DeepSeek 额度独立，默认候选同样包含 GLM（层=4，
+    # ZCode 之后、两区 Flash 之前）；不再需要当轮 DeepSeek 限额证据。
     avail = []
     for pk in order:
         cap = capacity_for(pk)
         if cap is None:
+            continue
+        # 两个精确池的真实 1800 秒限额窗口：只影响新派发，已运行 attempt 原样保留。
+        if _quota_limit_window_active(conn, pk, now):
             continue
         # BW-WORKER-WIDGET-20261018-S3：所有池（含两个 CodeBuddy 模型）都按自身独立
         # 容量与自身在途数判断空位，绝不做跨模型占位互斥。
@@ -1170,13 +1227,15 @@ def _select_main_force(conn, requested_pk, now, eligible=None):
     # BW-CODEBUDDY-MAIN-S3：最高优先层为 codebuddy:deepseek-v4.1-flash（无时段门），其后依序
     # 三 Qoder Max、claude:deepseek-flash、zcode:GLM-5.3（全天可用者垫底）。低层绝不凭历史
     # committed 抢高层名额；最高层不合格或无空位才落到下一层。
-    # BW-CODEBUDDY-GLM-FALLBACK-20261018 完整层序：CodeBuddy deepseek(0) > CN 自定义 Max
-    # 与两内置 Max(1) > Claude(2) > ZCode(3) > CodeBuddy GLM(4) > 两地区 Flash（主力之外）。
-    # GLM 只会在 eligible 已含它（当轮额度证据成立）时参与排序；否则根本不进 avail。
+    # 完整层序：CodeBuddy deepseek(0) > CN 自定义 Max 与两内置 Max(1) > Claude(2) >
+    # ZCode(3) > 两 OpenCode 同级(4) > CodeBuddy GLM(5，额度独立，缺省候选即含) > 两地区 Flash（主力之外）。
+    # BW-LIMIT30-20261019-S3：GLM 默认参与排序（不再要求当轮 DeepSeek 限额证据），仅当
+    # 授权候选未含它、或它自身处于真实 1800 秒限额窗口时才被剔除。
     tier = {CODEBUDDY_POOL_KEY: 0,
             QMAX_POOL_KEY: 1, CN_MAX_POOL_KEY: 1, CN_CUSTOM_MAX_POOL_KEY: 1,
             CLAUDE_POOL_KEY: 2, ZCODE_POOL_KEY: 3,
-            CODEBUDDY_GLM_POOL_KEY: 4}
+            OPENCODE_DEEPSEEK_POOL_KEY: 4, OPENCODE_GLM_POOL_KEY: 4,
+            CODEBUDDY_GLM_POOL_KEY: 5}
     # BW-CUSTOM-MAX-RESUME-20261018-S1：Max 层内自定义子优先（在途数/tie 之前）——
     # qodercn:Qwen-3.8-Max 先于两个内置 Max，两内置之间仍按在途数平衡。保留原 tier 数值，
     # 仅加一个子键，不新建优先级框架。
@@ -1244,15 +1303,15 @@ def _domestic_policy(conn, requested_pk, now, executor='auto', eligible=None,
       数选择；本池有空也不绕过层序；选中≠请求 → routing；主力都不可用/已满 → 两地区 Flash
       同级兜底；两 Flash 也满才 full。
     - 迁移债务总额守卫（BW-CLAUDE-DEEPSEEK-S4 起对全部国内池生效，含 claude/codebuddy）：
-      真实国内在途（含在途 retired DeepSeek 与超额旧 Max）已达总 14 时，即便某池按各自容量
-      看似有空也一律 full，绝不派第 15 个。"""
+      真实国内在途（含在途 retired DeepSeek 与超额旧 Max）已达总 16 时，即便某池按各自容量
+      看似有空也一律 full，绝不派第 17 个。"""
     if requested_pk == LUNA_KEY:
         return 'reject_luna', None
     if requested_pk in LEGACY_RETIRED_POOL_KEYS:
         return 'unknown_pool', None
     # BW-CLAUDE-DEEPSEEK-S4 + BW-CODEBUDDY-MAIN-S3：claude/codebuddy 已计入
-    # DOMESTIC_TOTAL_CAPACITY=14，总守卫必须同样约束：真实国内在途（含迁移债务/旧超额在途）
-    # 已满 14 时，即便该池按自身容量看似有空也绝不派第 15 个。显式点名 claude
+    # DOMESTIC_TOTAL_CAPACITY=16，总守卫必须同样约束：真实国内在途（含迁移债务/旧超额在途）
+    # 已满 16 时，即便该池按自身容量看似有空也绝不派第 17 个。显式点名 claude
     # （executor='claude' 或 None）保持
     # 精确组合：时段/限额/总守卫都过且有空位才 claim，否则如实拒绝，绝不回退国内模型；
     # AUTO 请求 claude（executor='auto'）绝不绕过三组公平选择——落入下方 auto 分支，与
@@ -1265,18 +1324,22 @@ def _domestic_policy(conn, requested_pk, now, executor='auto', eligible=None,
                 # AUTO 的 claude 入口高峰请求：如实拒绝新派，绝不绕过公平选择偷认领自己。
                 return 'main_force_window_closed', None
         else:
+            # BW-LIMIT30-20261019-S3：真实 402 Insufficient Balance / 明确额度 429 落标后
+            # 1800 秒内不新派；到期自动按现有优先级重新可选，不删原标记、不宣称恢复。
+            if _quota_limit_window_active(conn, CLAUDE_POOL_KEY, now):
+                return 'main_force_limited', None
             if _domestic_active(conn) >= DOMESTIC_TOTAL_CAPACITY:
                 return 'full', None
             if _max_window_blocks(CLAUDE_POOL_KEY, now):
                 return 'main_force_window_closed', None
             # BW-SIMPLE-PRIORITY-RETRY-S3：历史明确限额标记不再挡普通新一轮（真实尝试失败
-            # 才落诊断、CAS 结算不变）；claude 仍受总守卫与时段门约束，绝不误放第 15 个。
+            # 才落诊断、CAS 结算不变）；claude 仍受总守卫与时段门约束，绝不误放第 17 个。
             if _count_active(conn, CLAUDE_POOL_KEY) < capacity_for(CLAUDE_POOL_KEY):
                 return 'claim', CLAUDE_POOL_KEY
             return 'full', None
     # BW-CODEBUDDY-MAIN-S3：codebuddy:deepseek-v4.1-flash 是最高优先独立主力（capacity=1），
     # **不受任何时段门约束**（不套 Claude 离峰窗、不套 Max 夜间窗）。显式点名 CodeBuddy
-    # （executor='codebuddy' 或 None）保持精确组合：只在总守卫（14）与本池自身 capacity=1
+    # （executor='codebuddy' 或 None）保持精确组合：只在总守卫（16）与本池自身 capacity=1
     # 有空时 claim，否则如实拒绝，绝不跨模型回退到其它国内池/Flash；历史旧 GLM/WorkBuddy
     # 冷却一律不挡此新模型（本分支只认新 pool_key，不查任何冷却）。BW-WORKER-WIDGET-
     # 20261018-S3：GLM 在途**不再**挡本池（各自独立 1 槽）。AUTO 请求 codebuddy
@@ -1291,16 +1354,14 @@ def _domestic_policy(conn, requested_pk, now, executor='auto', eligible=None,
             if _has_own_capacity(conn, CODEBUDDY_POOL_KEY):
                 return 'claim', CODEBUDDY_POOL_KEY
             return 'full', None
-    # BW-CODEBUDDY-GLM-FALLBACK-20261018 + BW-WORKER-WIDGET-20261018-S3：GLM 是额度条件
-    # 补位，**独立 1 槽**，必须同时满足（1）调用方显式授权 codebuddy_glm_allowed=True
-    # （只能来自当轮 DeepSeek 真实明确限额证据的复验）与（2）自身 capacity=1 真实有空位；
-    # 否则如实拒绝，绝不自动切换/重派、绝不消耗通用 reserve 的容量来"证明"额度、绝不给
-    # Max 夜间窗或 Claude 离峰窗待遇（无时段门）。DeepSeek 在途**不再**挡 GLM 自身名额。
+    # BW-CODEBUDDY-GLM-FALLBACK-20261018 + BW-WORKER-WIDGET-20261018-S3 +
+    # BW-LIMIT30-20261019-S3：GLM 与 deepseek-v4.1-flash 额度独立、各自独立 1 槽；不再需要
+    # 当轮 DeepSeek 明确限额证据。GLM 仍是层=4（ZCode 之后、两区 Flash 之前），仅在自身
+    # capacity=1 真实有空位时 claim，绝不自动切换/重派、绝不消耗通用 reserve 来“证明”额度、
+    # 绝不给 Max 夜间窗或 Claude 离峰窗待遇（无时段门）。DeepSeek 在途不挡 GLM 自身名额。
     if requested_pk == CODEBUDDY_GLM_POOL_KEY:
         if executor not in ('auto', CODEBUDDY_RUNTIME, None):
             return 'executor_conflict', None
-        if not codebuddy_glm_allowed:
-            return 'codebuddy_quota_condition_not_met', None
         if executor != 'auto':
             if _domestic_active(conn) >= DOMESTIC_TOTAL_CAPACITY:
                 return 'full', None
@@ -1308,15 +1369,26 @@ def _domestic_policy(conn, requested_pk, now, executor='auto', eligible=None,
                 return 'claim', CODEBUDDY_GLM_POOL_KEY
             return 'full', None
         # executor='auto'：不直接认领，落入下方统一 auto 分支；更高优先主力全部
-        # 受限/满/不合格后才轮到 tier=4 的 GLM。
+        # 受限/满/不合格后才轮到 tier=5 的 GLM。
+    # BW-OPENCODE-20261019：两个 OpenCode 免费模型各自独立 1 槽、同级、无时段门、
+    # 无额度前提。显式点名（executor='opencode' 或 None）时只在本池自身有空位时 claim，
+    # 满即如实 full，绝不自动付费回退/跨模型；AUTO 请求不直接认领，落入统一 auto 分支按
+    # tier=4 公平选择（两模型之间按真实在途数 + stable tie 平衡）。
+    if requested_pk in OPENCODE_POOL_KEYS:
+        if executor not in ('auto', OPENCODE_RUNTIME, None):
+            return 'executor_conflict', None
+        if executor in (OPENCODE_RUNTIME, None):
+            if _domestic_active(conn) >= DOMESTIC_TOTAL_CAPACITY:
+                return 'full', None
+            if _has_own_capacity(conn, requested_pk):
+                return 'claim', requested_pk
+            return 'full', None
     # 迁移债务总额守卫（BW-POOL-SPLIT-20261010-S3）：总在途已满 DOMESTIC_TOTAL_CAPACITY
-    # （现为 14）→ 任何新国内 claim 都不得放行（减少容量不杀老任务，老任务真实终态自然
+    # （现为 16）→ 任何新国内 claim 都不得放行（减少容量不杀老任务，老任务真实终态自然
     # 释放后计数才下降）。
     if _domestic_active(conn) >= DOMESTIC_TOTAL_CAPACITY:
         return 'full', None
     elig = set(eligible) if eligible is not None else set(MAIN_FORCE_KEYS)
-    if not codebuddy_glm_allowed:
-        elig.discard(CODEBUDDY_GLM_POOL_KEY)
 
     if executor == 'qoder':
         if requested_pk == QMAX_POOL_KEY:
@@ -1390,6 +1462,10 @@ def _domestic_policy(conn, requested_pk, now, executor='auto', eligible=None,
         # 去重/unknown 在途照常约束，绝不抢占别人的在途名额）。真实失败才落 availability
         # 诊断、成功仍 epoch/attempt CAS 结算，不假装 healthy。显式 recovery probe 的
         # 生命周期/陈旧成功保护由 quota_control 入口与结算独立保证，不在此前置拦截。
+        # BW-LIMIT30-20261019-S3：若最近一次真实结构化 429 距其 ended_at_utc 不足 1800 秒，
+        # 直接 ZCode 入口必须零 Popen 拒绝；恰好 1800 秒及更久自动恢复现有优先级可选。
+        if _quota_limit_window_active(conn, requested_pk, now):
+            return 'main_force_limited', None
         cap = capacity_for(requested_pk)
         if cap is not None and _count_active(conn, requested_pk) < cap:
             return 'claim', requested_pk
@@ -1397,6 +1473,9 @@ def _domestic_policy(conn, requested_pk, now, executor='auto', eligible=None,
 
     # executor == 'codebuddy' 但请求的不是精确恢复组合：绝不落回 AUTO 选择/别的池。
     if executor == CODEBUDDY_RUNTIME:
+        return 'executor_conflict', None
+    # executor == 'opencode' 但请求的不是两个精确免费组合：绝不落回 AUTO/别的池。
+    if executor == OPENCODE_RUNTIME:
         return 'executor_conflict', None
 
     # executor == 'auto'
@@ -1592,17 +1671,15 @@ def select_and_claim(store_path=None, *, task_id, runtime, model, workspace,
                 conn.execute('ROLLBACK')
                 return _reject('main_force_window_closed', task_id, pk,
                                [_window_closed_reason(pk)])
-            if verdict == 'codebuddy_quota_condition_not_met':
+            if verdict == 'main_force_limited':
                 conn.execute('ROLLBACK')
-                return _reject('codebuddy_quota_condition_not_met', task_id, pk,
-                               ['CodeBuddy GLM-5.3-Flash is a quota-conditional low-tier '
-                                "backup: it may only be selected when the current round's "
-                                'codebuddy:deepseek-v4.1-flash attempt has valid explicit '
-                                'quota/429 evidence (summary.json envelope) and all '
-                                'applicable higher-priority main forces are unavailable; '
-                                'a generic reservation/claim token or an old persistent '
-                                'limit mark is never proof of that condition, so no '
-                                'automatic switch or re-dispatch is performed'])
+                return _reject('main_force_limited', task_id, pk,
+                               [f'{pk} has a real structured quota failure less than '
+                                '1800 seconds old; new dispatch is skipped inside that '
+                                'read-only window (the original failure evidence is kept, '
+                                'no quota recovery is claimed, and no manual reset is '
+                                'required). After 1800 seconds the pool becomes selectable '
+                                'again at its existing priority'])
             if verdict == 'reject_luna':
                 conn.execute('ROLLBACK')
                 return _reject('luna_requires_ticket', task_id, pk,
@@ -1639,7 +1716,7 @@ def select_and_claim(store_path=None, *, task_id, runtime, model, workspace,
                                     'and never falls back to another model or an old CodeBuddy '
                                     'channel; wait for the real terminal release']
                 elif pk == CODEBUDDY_GLM_POOL_KEY:
-                    full_reasons = [f'{pk} (quota-conditional CodeBuddy / glm-5.3-flash) is '
+                    full_reasons = [f'{pk} (low-tier fallback CodeBuddy / glm-5.3-flash) is '
                                     f'at its own independent capacity of '
                                     f'{CODEBUDDY_GLM_CAPACITY} (it does not share a slot '
                                     f'with {CODEBUDDY_POOL_KEY}); a second concurrent '
@@ -1741,15 +1818,14 @@ def reserve(store_path=None, *, task_id, runtime, model, workspace, prompt_sha25
                 conn.execute('ROLLBACK')
                 return _reject('main_force_window_closed', task_id, pk,
                                [_window_closed_reason(pk)])
-            if verdict == 'codebuddy_quota_condition_not_met':
+            if verdict == 'main_force_limited':
                 conn.execute('ROLLBACK')
-                return _reject('codebuddy_quota_condition_not_met', task_id, pk,
-                               ['reserve never pre-empts the quota condition: '
-                                'CodeBuddy GLM-5.3-Flash may only be reserved when the '
-                                "current round's DeepSeek attempt has valid explicit "
-                                'quota/429 evidence and higher-priority main forces are '
-                                'unavailable; a reservation is capacity-only and is never '
-                                'proof of authorization'])
+                return _reject('main_force_limited', task_id, pk,
+                               [f'{pk} has a real structured quota failure less than '
+                                '1800 seconds old; reserve is skipped inside that read-only '
+                                'window without clearing the original failure evidence or '
+                                'claiming quota recovery. After 1800 seconds the pool '
+                                'becomes selectable again at its existing priority'])
             if verdict == 'reject_luna':
                 conn.execute('ROLLBACK')
                 return _reject('luna_requires_ticket', task_id, pk,
@@ -1776,7 +1852,7 @@ def reserve(store_path=None, *, task_id, runtime, model, workspace, prompt_sha25
                                    'concurrent dispatch is refused and never falls back to '
                                    'another model or an old CodeBuddy channel')
                 elif pk == CODEBUDDY_GLM_POOL_KEY:
-                    full_reason = (f'{pk} (quota-conditional CodeBuddy / glm-5.3-flash) is '
+                    full_reason = (f'{pk} (low-tier fallback CodeBuddy / glm-5.3-flash) is '
                                    f'at its own independent capacity of '
                                    f'{CODEBUDDY_GLM_CAPACITY} (it does not share a slot with '
                                    f'{CODEBUDDY_POOL_KEY}); no second concurrent dispatch is '
@@ -1901,13 +1977,14 @@ def consume_for_entry(store_path=None, *, task_id, runtime, model, workspace,
                             'reason': 'claim_invalid', 'pool_key': pool_key(runtime, model),
                             'task_id': task_id, 'reasons': check['reasons'],
                             'drift': check['drift']}
-                # BW-CODEBUDDY-GLM-FALLBACK-20261018：claim token 只是容量/工作区占位，
-                # **不是**额度条件证明。入口若未在启动前重新复验当轮明确的 DeepSeek 限额
-                # 证据，就绝不能消费 GLM 的预留：reserved 的本任务占位在同一事务内释放为
-                # start_failed（只释放自己，绝不抢占/泄漏），running/unknown 旧状态原样
-                # 保留并拒绝重复启动；绝不自动切换模型或重派。
-                if row['pool_key'] == CODEBUDDY_GLM_POOL_KEY \
-                        and not codebuddy_glm_allowed:
+                # BW-LIMIT30-20261019-S3：GLM 与 DeepSeek 额度独立，claim token 消费不再
+                # 要求当轮 DeepSeek 限额证据；旧 `codebuddy_glm_allowed` 参数仅兼容保留。
+                # BW-LIMIT30-20261019-S3：ZCode/Claude 的最近真实结构化 429/402 距绑定
+                # attempt 的 ended_at_utc 不足 1800 秒时，消费已预留 token 也一致拒绝：
+                # 只把本 token 的 reserved 释放为 start_failed（绝不泄漏、绝不抢占别人的
+                # 名额）；running/unknown 旧在途原样保留，只拒绝重复启动。
+                if row['pool_key'] in QUOTA_LIMIT_WINDOW_POOLS \
+                        and _quota_limit_window_active(conn, row['pool_key'], now):
                     cur = conn.execute(
                         "UPDATE attempts SET state='start_failed', "
                         "terminal='start_failed', ended_at_utc=? WHERE token=? "
@@ -1919,19 +1996,20 @@ def consume_for_entry(store_path=None, *, task_id, runtime, model, workspace,
                         conn.execute('ROLLBACK')
                     return {'allowed': False, 'sent': False, 'claimed': False,
                             'token': None, 'routing_required': False,
-                            'reason': 'codebuddy_quota_condition_not_met',
+                            'reason': 'main_force_limited',
                             'pool_key': row['pool_key'], 'task_id': task_id,
                             'capacity_released': released,
-                            'reasons': ['CodeBuddy GLM-5.3-Flash requires a fresh '
-                                        "verification of the current round's explicit "
-                                        'DeepSeek quota evidence at the formal entry; a '
-                                        'claim token is capacity-only and is never proof '
-                                        'of the switch condition — the start is refused '
-                                        'without any automatic model switch or re-dispatch'
+                            'reasons': [f'{row["pool_key"]} has a real structured quota '
+                                        'failure less than 1800 seconds old (measured from '
+                                        'the bound attempt ended_at_utc, falling back to '
+                                        'the marker recorded_at_utc); new dispatch is '
+                                        'skipped inside that read-only window and the '
+                                        'original failure evidence is not cleared. After '
+                                        '1800 seconds the pool becomes selectable again '
+                                        'at its existing priority'
                                         + (' and this attempt\'s own reserved placeholder '
-                                           'was released to start_failed (real release, '
-                                           'no capacity leak)'
-                                           if released else
+                                           'was released to start_failed (real release, no '
+                                           'capacity leak)' if released else
                                            '; the attempt is no longer reserved, so its '
                                            'original state and in-flight placeholder are '
                                            'preserved (no false release)')]}

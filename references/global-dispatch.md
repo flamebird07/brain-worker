@@ -1,6 +1,6 @@
 # 全局并发容量池与 1:1 路由（global-dispatch）
 
-CN 自定义 Max 恢复声明（BW-CUSTOM-MAX-RESUME-20261018-S1）：用户已于 2026-10-18 明确解除暂停，`qodercn:Qwen-3.8-Max`（Qoder CN自定义、带连字符）恢复正式授权候选；主脑新阶段授权集合恢复精确 `qodercn:Qwen-3.8-Max`。当前配置总 14 槽（BW-WORKER-WIDGET-20261018-S3 用户 2026-10-18 最新明确：`codebuddy:deepseek-v4.1-flash` 与 `codebuddy:glm-5.3-flash` **不共享名额、各自独立 1 槽**，GLM 已计入 `MAIN_FORCE_CAPACITY`/物理总和；旧「同一物理 1 槽、总 13」口径作废，仅属历史），授权可新派上限 14，自定义仍 2 槽；既有在途/unknown 继续占位直至真实终态自然释放，不终止或抢占。历史事实：2026-10-15 至恢复前曾按 BW-CUSTOM-MAX-PAUSE-20261015 暂停该组合，当时授权可新派上限为 11；该暂停只是授权候选软排除，不存在需要清理的真实 DB 暂停锁，本次不清真实池/历史限额/在途。恢复不等于认证或额度现场已验证：不查询余额、不探测模型。内置`qodercn:Qwen3.8-Max`、国际Max、两区Flash、CodeBuddy精确模型及其他既有规则不变。
+CN 自定义 Max 恢复声明（BW-CUSTOM-MAX-RESUME-20261018-S1）：用户已于 2026-10-18 明确解除暂停，`qodercn:Qwen-3.8-Max`（Qoder CN自定义、带连字符）恢复正式授权候选；主脑新阶段授权集合恢复精确 `qodercn:Qwen-3.8-Max`。当前配置总 16 槽（BW-OPENCODE-20261019-S3：新增两个 OpenCode 免费精确模型 `opencode:deepseek-v4.1-flash-free` 与 `opencode:glm-5.3-flash-free` **各独立 1 槽**计入 `MAIN_FORCE_CAPACITY`/物理总和，无时段门、无 CodeBuddy 当轮额度前提；其前为 BW-WORKER-WIDGET-20261018-S3 总 14——用户 2026-10-18 最新明确：`codebuddy:deepseek-v4.1-flash` 与 `codebuddy:glm-5.3-flash` **不共享名额、各自独立 1 槽**，GLM 已计入 `MAIN_FORCE_CAPACITY`/物理总和；旧「同一物理 1 槽、总 13」口径作废，仅属历史），授权可新派上限 16，自定义仍 2 槽；既有在途/unknown 继续占位直至真实终态自然释放，不终止或抢占。历史事实：2026-10-15 至恢复前曾按 BW-CUSTOM-MAX-PAUSE-20261015 暂停该组合，当时授权可新派上限为 11；该暂停只是授权候选软排除，不存在需要清理的真实 DB 暂停锁，本次不清真实池/历史限额/在途。恢复不等于认证或额度现场已验证：不查询余额、不探测模型。内置`qodercn:Qwen3.8-Max`、国际Max、两区Flash、CodeBuddy精确模型及其他既有规则不变。
 
 每轮按优先级重试（BW-SIMPLE-PRIORITY-RETRY-S3，覆盖下方旧的「availability/限额先剔除」叙述）：每个新调度轮都从时段/容量/权限/授权与明确停用仍合格的**最高优先级**候选起真实尝试；同一 `runtime:model` 本轮最多一次，真实失败才在本轮换下一个，下一新轮重新从最高优先级起。`dispatch_pool` 的 AUTO 普通候选集合不再据历史 ZCode availability 或三 Qoder Max/Claude `main_force_limits` 剔除（`_eligible_main_forces`/`_domestic_policy` 只保留时段/容量/总守卫/工作区/unknown/权限门）；历史标记仅作诊断，真实尝试失败才落库、成功仍 epoch/attempt CAS，不假装 healthy、不清旧 hold、不伪造成功，普通入口无需 recovery probe。显式 `executor='zcode'` 权威原子门与 `purpose='probe'` 生命周期保持原样兼容。本轮失败列表由主脑经 `stage_selection` 的 authorization JSON（`round_failed_candidates`）维护，仅作本轮内存过滤、绝不落新库/定时器/自动监控，也不扩大 `allowed_candidates` 授权集合；当轮所有已授权候选都试过则诚实无候选、不再派。
 
@@ -10,44 +10,50 @@ CN 自定义 Max 恢复声明（BW-CUSTOM-MAX-RESUME-20261018-S1）：用户已�
 > `quota_control` 的**额度冷却门禁**是两回事：容量并发 ≠ 额度。落地口径以本文件为准，实现以
 > `scripts/dispatch_pool.py` 为准，二者不一致时以代码为准并回修文档。
 
-## 分配决策（当前有效，BW-POOL-SPLIT-20261010-S2/S3 + BW-MAX-WINDOW-20261010-S2 六池定型 + BW-CLAUDE-DEEPSEEK-S3/S4 + BW-CLAUDE-CAPACITY2 claude 扩为 2 槽 + BW-MAIN-PRIORITY-20261011-S1 + BW-CODEBUDDY-MAIN-S3 CodeBuddy 精确模型恢复为最高优先）
+## 分配决策（当前有效，BW-POOL-SPLIT-20261010-S2/S3 + BW-MAX-WINDOW-20261010-S2 六池定型 + BW-CLAUDE-DEEPSEEK-S3/S4 + BW-CLAUDE-CAPACITY2 claude 扩为 2 槽 + BW-MAIN-PRIORITY-20261011-S1 + BW-CODEBUDDY-MAIN-S3 CodeBuddy 精确模型恢复为最高优先 + BW-OPENCODE-20261019-S3 两 OpenCode 免费模型各 1 独立槽）
 
 所有会话共享同一个持久池，绝不各自为政：
 
 | 角色 | 组合（`runtime:model`） | 每组合真实在途上限 | 说明 |
 | --- | --- | --- | --- |
 | 主力（最高优先，BW-CODEBUDDY-MAIN-S3） | `codebuddy:deepseek-v4.1-flash` | 1 | 独立 CodeBuddy CLI 主模型（界面名 Deepseek-V4.1-Flash）；优先级层=0（高于全部 Qwen3.8-Max），**不受任何时段门**（既不套 Claude 离峰窗、也不套 Max 北京夜间窗）；仅经正式入口 `codebuddy_live` 传输；无跨模型回退；**BW-WORKER-WIDGET-20261018-S3：与下一行 GLM 各自独立 1 槽、互不占位互斥** |
-| 主力（条件补位，BW-CODEBUDDY-GLM-FALLBACK-20261018 + BW-WORKER-WIDGET-20261018-S3） | `codebuddy:glm-5.3-flash` | 1（独立，不与 `codebuddy:deepseek-v4.1-flash` 共享） | 优先级层=4（ZCode 之后、两区 Flash 之前）；**仅当轮 DeepSeek 已真实失败且当轮 `summary.json` 明确 429/额度证据复验通过**时进入候选；授权集合可含它但缺条件仍排除；**已计入 `MAIN_FORCE_CAPACITY`/物理总和（独立 1 槽）**；两模型可并发各 1 在途，各自第 2 个仍拒绝，结束只释放自己的槽 |
+| 主力（低层补位，BW-CODEBUDDY-GLM-FALLBACK-20261018 + BW-WORKER-WIDGET-20261018-S3 + BW-OPENCODE-20261019-S3 + BW-LIMIT30-20261019-S3 覆盖旧证据门） | `codebuddy:glm-5.3-flash` | 1（独立，不与 `codebuddy:deepseek-v4.1-flash` 共享） | 优先级层=5（两 OpenCode 之后、两区 Flash 之前；BW-OPENCODE-20261019-S3 插层后由 4 改为 5）；**与 DeepSeek 额度独立，缺省候选即含，不再要求当轮 DeepSeek 真实失败或当轮限额证据**（旧"证据复验通过才进候选"口径仅属历史，已被覆盖）；**已计入 `MAIN_FORCE_CAPACITY`/物理总和（独立 1 槽）**；两模型可并发各 1 在途，各自第 2 个仍拒绝，结束只释放自己的槽 |
 | 主力 | `zcode:GLM-5.3` | 2 | 优先级层=3：CodeBuddy、三 Qoder Max、`claude:deepseek-flash` 全部不合格或无空位才轮到；旧跨层 committed 1:1 属历史、已被覆盖 |
+| 主力（BW-OPENCODE-20261019-S3） | `opencode:deepseek-v4.1-flash-free` | 1 | OpenCode CLI 免费精确模型（界面名 deepseek-v4.1-flash-free）；优先级层=4（ZCode 之后、CodeBuddy GLM（额度独立，层=5）之前，与 `opencode:glm-5.3-flash-free` 同层、pool_key stable tie）；**无时段门**（既不套 Claude 离峰窗、也不套 Max 北京夜间窗）、**无 CodeBuddy 当轮额度前提**；已计入 `MAIN_FORCE_POOLS`/`MAIN_FORCE_KEYS`/`MAIN_FORCE_CAPACITY`（独立 1 槽）；显式 `executor='opencode'` 只认两个精确免费组合，**无跨模型回退、无付费模型回退**；仅经正式入口 `scripts/opencode_direct.py` 传输 |
+| 主力（BW-OPENCODE-20261019-S3） | `opencode:glm-5.3-flash-free` | 1 | OpenCode CLI 另一免费精确模型（界面名 glm-5.3-flash-free）；优先级层=4，与上一行 OpenCode deepseek **同层独立 1 槽**（互不占位互斥）；同样**无时段门、无额度前提**；精确模型硬门，绝不自动落付费模型；仅经正式入口 `scripts/opencode_direct.py` 传输 |
 | 主力 | `qoder:Qwen3.8-Max` | 1 | 国际 Max 主力；明确限额命中时经 `main_force_limits` 自动跳过，不查余额；**BW-MAX-WINDOW-20261010-S1：作为主力仅北京时间 22:00（含）至次日 08:00（不含）参与新派工，其余时段 AUTO 自动跳过、主脑显式 `reserve` 如实拒绝** |
 | 主力 | `qodercn:Qwen3.8-Max` | 1 | CN 内置 Max 主力；独立池，不受国际 Max 标记影响，限额规则同国际 Max；**BW-MAX-WINDOW-20261010-S1：主力时段门同国际 Max（北京时间 22:00 含至 08:00 不含）** |
 | 主力 | `qodercn:Qwen-3.8-Max` | 2 | CN 自定义主力（友好名带连字符 `Qwen-3.8-Max`，与内置 `Qwen3.8-Max` 不同）；属 Qoder 主力组，优先级层=1；**BW-CUSTOM-MAX-RESUME-20261018-S1：Max 层内子优先键先于两内置 Max（在途数之前），自定义满 2 槽才落内置；两内置同级按真实在途数平衡；用户已于 2026-10-18 解除暂停、恢复授权候选（历史暂停仅属当时状态）**；**BW-CUSTOM-MAX-NIGHT-20261010-S1：纳入主力时段门（作为主力仅北京时间 22:00 含至次日 08:00 不含参与新派工，其余时段 AUTO 自动跳过、主脑显式 `reserve`/`consume` 如实拒绝），并复用 `main_force_limits` 限额判定，各自 pool_key 独立落标、对两内置 Max 无连带** |
 | 兜底 | `qoder:Qwen3.8-Flash` | 2 | 与 CN Flash **同级**；`AUTO` 在合格可用主力均不可用或已满时从两区 Flash 选（可跨国际/CN），明确 `executor='qoder'` 时按本地区约束 |
 | 兜底 | `qodercn:Qwen3.8-Flash` | 2 | 与 `qoder:Qwen3.8-Flash` 同级；`AUTO` 可跨区选，明确 `executor='qodercn'` 时按本地区约束 |
 | 退休 | `qodercn:DeepSeek-Flash` | 0 | 新派发退休（`LEGACY_RETIRED_POOL_KEYS`，`_domestic_policy` 返 `unknown_pool`），仅供已存在旧在途 attempt 按真实 runtime/model 计入总数并真实终态释放 |
-| 主力（claude 2 槽，BW-CLAUDE-DEEPSEEK-S2/S3/S4 + BW-CLAUDE-CAPACITY2） | `claude:deepseek-flash` | 2 | Claude Code CLI / deepseek-flash：容量 2（BW-CLAUDE-CAPACITY2 由 1 扩为 2），**已登记入 `MAIN_FORCE_POOLS`/`MAIN_FORCE_KEYS`/`MAIN_FORCE_CAPACITY`**，`DOMESTIC_TOTAL_CAPACITY = 14`（BW-WORKER-WIDGET-20261018-S3 当前权威：含 CodeBuddy deepseek 1 与 GLM 独立 1；**原 12 槽一项未减**），claude 在途**计入** `_domestic_active`；属**独立组 claude**（committed 由 `_count_committed_claude` 从真实 attempts 统计，绝不污染 committed_zcode/committed_qoder），**AUTO 可选**；BW-CODEBUDDY-MAIN-S3 当前口径：优先级层=2，排 CodeBuddy（层=0）与三 Qoder Max（层=1）之后、`zcode:GLM-5.3`（层=3）之前——Max 全不可用时 claude 允许窗且有空位即优先于 Z（旧“平票排 Z2/Qoder 之后”属历史口径、已被覆盖）；显式 `executor='claude'`/点名该 combo 保持精确组合、无跨模型回退；受 `deepseek_offpeak` 时段门约束（工作日 09:00–12:00、14:00–18:00 高峰不得新派；其余/周末/2026 假日全天可派）；可承载 `main_force_limits` 明确限额标记 |
+| 主力（claude 2 槽，BW-CLAUDE-DEEPSEEK-S2/S3/S4 + BW-CLAUDE-CAPACITY2） | `claude:deepseek-flash` | 2 | Claude Code CLI / deepseek-flash：容量 2（BW-CLAUDE-CAPACITY2 由 1 扩为 2），**已登记入 `MAIN_FORCE_POOLS`/`MAIN_FORCE_KEYS`/`MAIN_FORCE_CAPACITY`**，`DOMESTIC_TOTAL_CAPACITY = 16`（BW-OPENCODE-20261019-S3 当前权威：另含两个 OpenCode 免费模型各独立 1 槽；基线 BW-WORKER-WIDGET-20261018-S3 为 14，含 CodeBuddy deepseek 1 与 GLM 独立 1；**原 12 槽一项未减**），claude 在途**计入** `_domestic_active`；属**独立组 claude**（committed 由 `_count_committed_claude` 从真实 attempts 统计，绝不污染 committed_zcode/committed_qoder），**AUTO 可选**；BW-CODEBUDDY-MAIN-S3 当前口径：优先级层=2，排 CodeBuddy（层=0）与三 Qoder Max（层=1）之后、`zcode:GLM-5.3`（层=3）之前——Max 全不可用时 claude 允许窗且有空位即优先于 Z（旧“平票排 Z2/Qoder 之后”属历史口径、已被覆盖）；显式 `executor='claude'`/点名该 combo 保持精确组合、无跨模型回退；受 `deepseek_offpeak` 时段门约束（工作日 09:00–12:00、14:00–18:00 高峰不得新派；其余/周末/2026 假日全天可派）；可承载 `main_force_limits` 明确限额标记 |
 | 救援 | `luna:native` | 无上限 | 只经 `claim-due` 竞争裁决，绝不被自动选中 |
 
-- **国内合计上限 = 14**（BW-WORKER-WIDGET-20261018-S3 当前权威：`DOMESTIC_TOTAL_CAPACITY =
-  主力 10（codebuddy deepseek 1 + codebuddy glm 1 + zcode 2 + 两内置 Max 各 1 + CN 自定义 2
-  + claude 2）+ 两地区 Flash 各 2（4）= 14`，`_domestic_active ≥ 14`
-  时任何新国内 claim 一律 `full`、**绝不派第 15 个**，仍在途的退休 DeepSeek 与超额旧 Max
+- **国内合计上限 = 16**（BW-OPENCODE-20261019-S3 当前权威：`DOMESTIC_TOTAL_CAPACITY =
+  主力 12（codebuddy deepseek 1 + codebuddy glm 1 + zcode 2 + 两内置 Max 各 1 + CN 自定义 2
+  + claude 2 + opencode deepseek-free 1 + opencode glm-free 1）+ 两地区 Flash 各 2（4）= 16`，
+  `_domestic_active ≥ 16`
+  时任何新国内 claim 一律 `full`、**绝不派第 17 个**，仍在途的退休 DeepSeek 与超额旧 Max
   等迁移债务同样计入总数）：
   `codebuddy:deepseek-v4.1-flash`=1 + `codebuddy:glm-5.3-flash`=1（两 CodeBuddy 模型**不共享
   名额、各自独立 1 槽**，不同工作区可并发各 1 在途，各自第 2 个仍拒绝，结束只释放自己）+
   `zcode:GLM-5.3`=2 + 国际内置 Max=1 + CN 内置 Max=1 +
-  CN 自定义主力=2 + `claude:deepseek-flash`=2 + 国际 Flash=2 + CN Flash=2。
+  CN 自定义主力=2 + `claude:deepseek-flash`=2 + `opencode:deepseek-v4.1-flash-free`=1 +
+  `opencode:glm-5.3-flash-free`=1（两 OpenCode 免费模型亦**各自独立 1 槽、互不占位**，
+  无时段门、无额度前提）+ 国际 Flash=2 + CN Flash=2。
   status/正式预览/reserve/consume/finish 全部按各自 pool_key 独立计数，绝不再做跨模型
   占位互斥（旧 `_shared_active` 共享组求和已随用户最新授权废弃移除；`CODEBUDDY_SHARED_POOL_KEYS`
   仅保留为空元组兼容旧引用，不再有任何共享语义）。退休 DeepSeek
   新派发不占额度但既有在途仍计入总数。
-  **配置总数 14，授权可新派上限 14**（BW-CUSTOM-MAX-RESUME-20261018-S1 已解除
+  **配置总数 16，授权可新派上限 16**（BW-CUSTOM-MAX-RESUME-20261018-S1 已解除
   CN 自定义 Max 暂停；历史暂停期曾为授权上限 11，属当时状态）；配置容量与既有在途不变。
-  **原 12 槽一项未减**。（历史：本表旧版曾记为“国际 Max 各 2 + CN DeepSeek 补充 2、合计 6→8”，
+  **原 14 槽（及更早 12 槽）一项未减**。（历史：本表旧版曾记为“国际 Max 各 2 + CN DeepSeek 补充 2、合计 6→8”，
   S2/S3 收为五池总 8，BW-MAX-WINDOW-20261010-S2 加入 CN 自定义主力升为六池总 10，
   BW-CLAUDE-DEEPSEEK-S3/S4 再加 claude 主力槽升为总 11，BW-CLAUDE-CAPACITY2 将 claude 扩为
   2 槽升为总 12；BW-CODEBUDDY-MAIN-S3 计入 CodeBuddy 1 槽升为总 13；BW-WORKER-WIDGET-
-  20261018-S3 起 GLM 独立 1 槽升为总 14，详见 §11。以上历史数字均被当前 14/14 口径覆盖；
+  20261018-S3 起 GLM 独立 1 槽升为总 14；BW-OPENCODE-20261019-S3 两 OpenCode 免费模型各独立
+  1 槽升为总 16，详见 §11。以上历史数字（含 14）均被当前 16/16 口径覆盖；
   2026-10-15 至 2026-10-18 的暂停期曾为 13/11，BW-CODEBUDDY-GLM-FALLBACK-20261018 至
   BW-WORKER-WIDGET-20261018-S3 之间曾为共享槽总 13。）
 - **Luna 无数量上限**，但它不计入国内名额，也永远不在正常路由里被派生。
@@ -64,7 +70,9 @@ CN 自定义 Max 恢复声明（BW-CUSTOM-MAX-RESUME-20261018-S1）：用户已�
 - **北京时间固定按 UTC+8 折算**：`_beijing_hour(now)` 先把 `now` 归一到 UTC 再加 8 小时取
   小时；`_main_force_window_open` 判 `h≥22 或 h<8`——22:00 可选、08:00 不可选（左闭右开）。
 - **门控这三个 Qoder Max**（`WINDOW_GATED_MAIN_FORCES = (qoder:Qwen3.8-Max,
-  qodercn:Qwen3.8-Max, qodercn:Qwen-3.8-Max)`）；`zcode:GLM-5.3` 主力、两地区
+  qodercn:Qwen3.8-Max, qodercn:Qwen-3.8-Max)`）；`zcode:GLM-5.3` 主力、两 OpenCode 免费模型
+  （BW-OPENCODE-20261019-S3：`opencode:deepseek-v4.1-flash-free` / `opencode:glm-5.3-flash-free`
+  走 `_max_window_blocks` 恒 false，不套任何时段门）、两地区
   `Qwen3.8-Flash` 兜底、`luna:native` 救援、已退休 `qodercn:DeepSeek-Flash` 一律不受时段约束。
 - **AUTO 白天自动跳过**：`_eligible_main_forces(conn, zcode_blocked, now)` 在非时段把三个 Qoder
   Max 从合格主力里剔除，`_select_main_force` 只在剩余合格主力里按优先级层排序（BW-MAIN-PRIORITY-
@@ -84,7 +92,8 @@ CN 自定义 Max 恢复声明（BW-CUSTOM-MAX-RESUME-20261018-S1）：用户已�
 - **降级 `claim_due` 使用同一候选过滤**：国内回收经同一 `_eligible_main_forces` 过滤，钉住任一
   Qoder Max 的原 scope 在非时段保持 pending（如实 `main_force_window_closed`/`model_unavailable`），
   绝不回收 Max、绝不改派别的模型、绝不当作 Luna。
-- 活任务不追杀：本门只影响**新** `reserve`/`consume`/`claim_due`，不改静态总容量 12、不弱化
+- 活任务不追杀：本门只影响**新** `reserve`/`consume`/`claim_due`，不改静态总容量（本门落地时为
+  12，当前权威为 BW-OPENCODE-20261019-S3 的 16）、不弱化
   capacity/锁/限额，已 running/unknown 占位与真实终态释放逻辑完全不变。不加定时器/余额查询/
   数据库表/后台任务。
 
@@ -99,8 +108,8 @@ BW-CLAUDE-CAPACITY2 扩为 2 槽）。可派工槽位由 10 增至 **11**、再�
 - **容量与公平组**：`CAPACITY['claude:deepseek-flash']=2`（BW-CLAUDE-CAPACITY2 由 1 增至 2），且进入 `MAIN_FORCE_POOLS`/
   `MAIN_FORCE_KEYS`/`MAIN_FORCE_CAPACITY`，故 `DOMESTIC_TOTAL_CAPACITY=12`；`_domestic_active`
   统计**所有非 Luna 在途 attempt**（含 claude 与仍在途的退休 DeepSeek/超额旧 Max 迁移债务），
-  达当前权威总数 14（BW-WORKER-WIDGET-20261018-S3）时任何新国内 claim 一律 `full`、
-  **绝不派第 15 个**。committed 计数用**独立**统计
+  达当前权威总数 16（BW-OPENCODE-20261019-S3；BW-WORKER-WIDGET-20261018-S3 时为 14）时任何新国内 claim 一律 `full`、
+  **绝不派第 17 个**。committed 计数用**独立**统计
   `_count_committed_claude`（真实 attempts，`child_pid NOT NULL`），**绝不污染**
   `committed_zcode`/`committed_qoder`；BW-MAIN-PRIORITY-20261011-S1 当前口径：claude 优先级层=1
   （三 Qoder Max=0 之后、ZCode=2 之前），旧 `_grp_rank` 平票排 Z2/Qoder 之后的跨层 1:1 属历史、
@@ -110,8 +119,9 @@ BW-CLAUDE-CAPACITY2 扩为 2 槽）。可派工槽位由 10 增至 **11**、再�
   显式 `executor='claude'` 或点名 `claude:deepseek-flash` 组合走**精确组合**硬约束，
   绝不跨到其它池、**无跨模型回退**；`executor` 与请求组合冲突 → `executor_conflict`。
 - **`_domestic_policy` claude 分支顺序（S4 收口 + BW-CLAUDE-CAPACITY2）**：`executor_conflict` →
-  **总 14 守卫先判**（`_domestic_active ≥ 14` → `full`，迁移债务满 14 时即便 claude 自身有空位
-  也绝不派第 15）→ 时段门（`main_force_window_closed`）→ 限额（`full`）→ 本池空位 `claim` →
+  **总守卫先判**（当前权威 `_domestic_active ≥ 16` → `full`，BW-OPENCODE-20261019-S3；此前 14；
+  迁移债务满总数时即便 claude 自身有空位
+  也绝不派第 17 个）→ 时段门（`main_force_window_closed`）→ 限额（`full`）→ 本池空位 `claim` →
   本池满 `full`。
 - **时段门（`deepseek_offpeak.py`，北京时间固定 UTC+8）**：周一至周五除去中国法定节假日，
   09:00（含）–12:00（不含）、14:00（含）–18:00（不含）为**高峰，不得新派**；其余时段、周末、
@@ -125,8 +135,21 @@ BW-CLAUDE-CAPACITY2 扩为 2 槽）。可派工槽位由 10 增至 **11**、再�
   `running`/`unknown` 绝不假释放——与三 Qoder Max 夜间门同一机制、同一段拒绝/释放代码路径。
 - **限额标记复用**：claude 纳入 `QUOTA_LIMITABLE_POOLS`，仅在**同一条真实错误条目内绑定的**
   结构化 429/硬限额证据下 `record_main_force_limit` 落标，`main_force_limits` 自动跳过新派、
-  绝不查余额；无证据不自动清标，恢复只由人工 `release_main_force_limit`。取消退出码
-  （`4294967295`/`-1`）与 SIG **绝不判为 429**。
+  绝不查余额；无证据不自动清标。取消退出码（`4294967295`/`-1`）与 SIG **绝不判为 429**。
+  **BW-LIMIT30-20261019-S3/S4**：claude 的正式入口另认**真实 402 Insufficient Balance 硬余额**
+  独立分类（`facts.hard_balance_402`，绝不冒充 HTTP 429；认证 401 即便文案带余额也不按 402
+  处理；普通正文 402/网络错误不触发），与明确额度 429 同样落标。`zcode:GLM-5.3` 自同日起纳入
+  `QUOTA_LIMITABLE_POOLS`：其真实结构化 429 原件在写既有 `quota_control.zcode_availability`
+  之外**同时**绑定落 `main_force_limits`，供浮窗与派发窗口使用。
+- **1800 秒只读限额窗口（BW-LIMIT30-20261019-S3/S4）**：仅 `zcode:GLM-5.3` 与
+  `claude:deepseek-flash` 两个精确池，从绑定 attempt 的真实 `ended_at_utc`（终态未落盘才回退
+  标记 `recorded_at_utc`）起 `0<=age<1800` 秒内跳过**新派发**（reserve/select_and_claim/
+  consume 三口径一致；consume 拒绝只把本 token 的 reserved 真实释放为 start_failed，不泄漏锁、
+  不抢占他人在途）；恰好 1800 秒及更久按现有优先级自动重新可选——**不删除原标记/错误证据、
+  不宣称额度恢复、不要求手动重置、不沿用旧永久 hold/24 小时**。非法/无时区/未来时间不伪造
+  有效窗口（只读判定不 ValueError 崩溃、不据杂项 `updated_at` 延长暂停，未知证据原样保留）。
+  已 running 的同池其它进程原样不动；每池独立判定互不连带；浮窗运行显示优先于历史限额。
+  其它池（Qoder Max 既有标记、CodeBuddy 展示-only、Flash 兜底）不受该窗口影响。
 - **入口与生命周期**：`scripts/claude_direct.py` 运行时 `claude`，`-p --output-format stream-json
   --verbose`、默认 `--permission-mode bypassPermissions --dangerously-skip-permissions`
   （2026-10-18用户明确要求直接启用）；常用工具 Read/Glob/Grep/Edit/Write/Bash，无需逐文件或逐命令登记。
@@ -151,7 +174,7 @@ BW-CLAUDE-CAPACITY2 扩为 2 槽）。可派工槽位由 10 增至 **11**、再�
 > （全套通过、含 1 项平台跳过；确切用例数以最近一次原样运行与 SKILL.md 为准），
 > 零网络、零凭据、零真实额度查询、零真实模型启动。
 
-## 主力优先级排序 CodeBuddy deepseek > Max > Claude > ZCode > 条件 CodeBuddy GLM > Flash（BW-CODEBUDDY-MAIN-S3 + BW-CODEBUDDY-GLM-FALLBACK-20261018）
+## 主力优先级排序 CodeBuddy deepseek > Max > Claude > ZCode > 两 OpenCode 免费模型（同层）> CodeBuddy GLM（低层补位，额度独立） > Flash（BW-CODEBUDDY-MAIN-S3 + BW-CODEBUDDY-GLM-FALLBACK-20261018 + BW-OPENCODE-20261019-S3 + BW-LIMIT30-20261019-S3）
 
 `select_and_claim` 在无显式 claim 时做**原子路由选择**，顺序如下：
 
@@ -169,13 +192,18 @@ BW-CLAUDE-CAPACITY2 扩为 2 槽）。可派工槽位由 10 增至 **11**、再�
 4. **（仅默认 AUTO 且未明确绑定组合时）** 请求主力：在**合格可用**主力之间按**优先级层**排序选
    目标——**`codebuddy:deepseek-v4.1-flash`（层=0，最高、无时段门）最优先，三
    Qwen-3.8-Max（国际内置/CN 内置/CN 自定义，层=1）次之，`claude:deepseek-flash`（层=2）
-   再次，`zcode:GLM-5.3`（层=3）其后；`codebuddy:glm-5.3-flash`（层=4）只在调用方显式
-   `eligible` 含它（当轮 DeepSeek 失败 + 当轮明确限额证据成立）时参与，且在两区 Flash 之前**；
+   再次，`zcode:GLM-5.3`（层=3）其后，两 OpenCode 免费模型 `opencode:deepseek-v4.1-flash-free` /
+   `opencode:glm-5.3-flash-free`（BW-OPENCODE-20261019-S3，**同层=4**、无时段门、无额度前提，
+   层内按真实在途数平衡、平票 pool_key stable tie）再其后；`codebuddy:glm-5.3-flash`（层=5，
+   BW-OPENCODE-20261019-S3 插层后由 4 改为 5）**BW-LIMIT30-20261019-S3
+   起与 DeepSeek 额度独立、缺省候选即含（不再要求当轮 DeepSeek 失败/限额证据前置门）**，
+   且在两区 Flash 之前**；
    Max 层内 CN 自定义 `qodercn:Qwen-3.8-Max` 子优先于两内置 Max（该子键在在途数之前），
    自定义满 2 槽才落内置，两内置同级按真实在途数平衡；历史 committed 计数、请求池偏好与在途数
    **绝不能**让低层抢高层，最高层全部不合格或无空位才落下一层；**同层内真实在途数少者优先，
-   平票才优先请求的组合，再按 pool_key stable tie**。缺省 `eligible=None` **绝不**自动纳入
-   GLM；`_select_main_force` 的默认候选明确排除它。
+   平票才优先请求的组合，再按 pool_key stable tie**。缺省 `eligible=None` **同样包含 GLM**
+   （BW-LIMIT30-20261019-S3 覆盖旧"默认候选明确排除 GLM"口径）；GLM 仅自身满位/受自身守卫时
+   不参与。
    - 目标就是当前入口且有容量 → claim；
    - 目标是**另一个**合格主力组合 → `routing_required`（当前入口不是被选中组合，**不先提交错
      模型、不浪费或重复占用名额**，改由被选中入口继续）；
@@ -183,8 +211,9 @@ BW-CLAUDE-CAPACITY2 扩为 2 槽）。可派工槽位由 10 增至 **11**、再�
    - 无合格可用主力时按两区 Flash **同级**选（`AUTO` 可跨国际/CN 选合格候选），任一区 Flash 仍有
      空槽即 `routing_required` 指向该区（调用入口已是该区 Flash 则直接 claim），**不因其中一区
      Flash 满就报整池 full**；
-   - 各主力（CodeBuddy 两模型各自独立 1 槽 + `zcode` 2 + 两内置 Max + CN 自定义 Max 2 + claude 2）
-     与两区 Flash 均满（**总 14 全满**；授权可新派上限 14）才
+   - 各主力（CodeBuddy 两模型各自独立 1 槽 + `zcode` 2 + 两内置 Max + CN 自定义 Max 2 + claude 2
+     + 两 OpenCode 免费模型各独立 1 槽）
+     与两区 Flash 均满（**总 16 全满**；授权可新派上限 16）才
      `capacity_full`。**候选均无可用槽不等于物理满**，
      降级原因与是否授权按 §执行器约束 及后文区分处理。
 
@@ -196,53 +225,64 @@ Z2/Qoder 之后）属历史行为，已由 BW-MAIN-PRIORITY-20261011-S1 明确�
 文档不宣称严格均衡。`reserve` 与 `select_and_claim` 共用同一套统一国内策略（`_domestic_policy`）：
 **默认 AUTO 不绕过优先级排序**（AUTO 的 claude 入口请求同样经 `_select_main_force` 统一排序，
 不绕过选择）；但**受信任主脑明确给出的 executor/已授权 executor+model 组合是硬
-约束**，优先于优先级层（见 §执行器约束 与 §B4 加固）——有空位的指定 Qoder/Flash/Claude/ZCode 绝不因
+约束**，优先于优先级层（见 §执行器约束 与 §B4 加固）——有空位的指定 Qoder/Flash/Claude/ZCode/OpenCode 绝不因
 排序被改道，也不擅自跨区。
 
-## CodeBuddy 精确模型主力与条件 GLM 补位（BW-CODEBUDDY-MAIN-S3 + BW-CODEBUDDY-GLM-FALLBACK-20261018 + BW-WORKER-WIDGET-20261018-S3 两模型独立名额）
+## CodeBuddy 精确模型主力与 GLM 低层补位（BW-CODEBUDDY-MAIN-S3 + BW-CODEBUDDY-GLM-FALLBACK-20261018 + BW-WORKER-WIDGET-20261018-S3 两模型独立名额 + BW-LIMIT30-20261019-S3 额度独立覆盖旧证据门）
 
 用户明确授权独立 CodeBuddy CLI 物理名额 1、最高优先级：`codebuddy:deepseek-v4.1-flash`
 （界面名 Deepseek-V4.1-Flash）为正式主力；`codebuddy:glm-5.3-flash`（界面名 GLM-5.3-Flash）
-仅作为条件低层补位，且自 BW-WORKER-WIDGET-20261018-S3（用户 2026-10-18 最新明确）起与
-deepseek **不共享名额、各自独立 1 槽**（旧「同一物理槽」口径作废，仅属历史）。WorkBuddy 与
+作为低层补位（优先级层=5，位于两 OpenCode 免费模型同层=4 之后，BW-OPENCODE-20261019-S3），自 BW-WORKER-WIDGET-20261018-S3（用户 2026-10-18 最新明确）起与
+deepseek **不共享名额、各自独立 1 槽**（旧「同一物理槽」口径作废，仅属历史）；自
+BW-LIMIT30-20261019-S3（用户 2026-10-19 最新明确）起二者**额度独立**——GLM 不再要求
+当轮 DeepSeek 限额证据前置门（旧"当轮证据复验"口径已被覆盖、仅属历史，历史证据不改写）。
+WorkBuddy 与
 CodeBuddy 其它旧模型（含其它旧 GLM 组合）仍 human-relay；用户没有授权恢复它们。
 
 - 容量：`CAPACITY['codebuddy:deepseek-v4.1-flash']=1` 与
   `CAPACITY['codebuddy:glm-5.3-flash']=1`，两者都进入 `MAIN_FORCE_POOLS`/
-  `MAIN_FORCE_KEYS`/`MAIN_FORCE_CAPACITY`；`DOMESTIC_TOTAL_CAPACITY=14`，配置 14、
-  授权可新派上限 14。status/正式预览/reserve/consume/finish 一律按各自 pool_key
+  `MAIN_FORCE_KEYS`/`MAIN_FORCE_CAPACITY`；`DOMESTIC_TOTAL_CAPACITY=16`（BW-OPENCODE-20261019-S3
+  当前口径；BW-WORKER-WIDGET-20261018-S3 时为 14），配置 16、
+  授权可新派上限 16。status/正式预览/reserve/consume/finish 一律按各自 pool_key
   独立计数：不同工作区两模型可并发各 1 在途，同模型第 2 个仍拒绝，结束只释放自己的槽，
   绝不再做跨模型占位互斥。
 - 优先级：`_select_main_force` 第一键层序 `codebuddy deepseek=0 > 三 Max=1 > claude=2 >
-  zcode=3 > codebuddy glm=4`，Flash 在主力之外；Max 层内 CN 自定义 `qodercn:Qwen-3.8-Max`
-  先于两内置 Max，两内置之间按真实在途数平衡。**缺省 `eligible=None` 时 GLM 被明确排除**；
-  只有上层显式传入含 GLM 的 `eligible`（已完成当轮证据复验）才参与排序。
-- GLM 条件：授权集合包含 `codebuddy:glm-5.3-flash` + 本轮 `round_failed_candidates` 含
-  `codebuddy:deepseek-v4.1-flash` + 当轮 `summary.json` 复验通过，三者同时成立。缺证据、
-  普通失败、网络/auth/权限、取消码、成功正文 429 字样、旧轮文件、旧 `main_force_limits`
-  标记、reserve/claim token 均不启用；权限拒绝绝不触发换模型。
-- 证据回执：只含路径/SHA-256/原因码/`ec.FAILURE_TYPES` 白名单分类；runtime/model 只回报
-  已知身份或 None，exit_code 只回报数字；原始错误、headers、Cookie、密钥、令牌不回显。
+  zcode=3 > 两 opencode 免费=4 > codebuddy glm=5`（BW-OPENCODE-20261019-S3 插层：GLM 由 4 改 5），
+  Flash 在主力之外；Max 层内 CN 自定义 `qodercn:Qwen-3.8-Max`
+  先于两内置 Max，两内置之间按真实在途数平衡。**缺省 `eligible=None` 时同样包含 GLM**
+  （BW-LIMIT30-20261019-S3：GLM 与 DeepSeek 额度独立，无证据也参与层序；旧"仅显式 eligible
+  含它才参与"口径仅属历史）。
+- GLM 条件（BW-LIMIT30-20261019-S3 覆盖旧三条件门）：授权集合包含 `codebuddy:glm-5.3-flash`
+  即可参与候选与排序；**不再要求**本轮 `round_failed_candidates` 含
+  `codebuddy:deepseek-v4.1-flash`，**也不再要求**当轮 `summary.json` 证据复验通过；容量
+  （各 1 独立槽）与优先级（两 OpenCode 后、两区 Flash 前）不变。缺省/畸形/旧轮的
+  `codebuddy_quota_evidence` 都不构成拒绝理由；正常授权/容量/工作区/同任务/真实权限拒绝门
+  不动；权限拒绝绝不触发换模型。历史证据与旧口径文档不改写。
+- 证据回执（若用户提供兼容参数）：只含路径/SHA-256/原因码/`ec.FAILURE_TYPES` 白名单分类；
+  runtime/model 只回报已知身份或 None，exit_code 只回报数字；原始错误、headers、Cookie、
+  密钥、令牌不回显。BW-LIMIT30-20261019-S3 起该回执仅为诊断，不是派发前提。
 - 无时段门：`_max_window_blocks` 对两个 CodeBuddy 逻辑池恒 false——不套 Claude 离峰窗，
-  也不套 Max 北京 22:00–08:00 窗；各受自身独立 capacity=1、总在途 14、同 task/workspace/unknown/
-  权限守卫。
-- 路由：显式 `executor='codebuddy'` 只认这两个精确组合；GLM 缺条件返回
-  `codebuddy_quota_condition_not_met`，满/总满如实 `capacity_full`，绝不跨模型回退；AUTO
+  也不套 Max 北京 22:00–08:00 窗；各受自身独立 capacity=1、总在途 16、同 task/workspace/unknown/
+  权限守卫。两池也不在 1800 秒限额窗口池内。
+- 路由：显式 `executor='codebuddy'` 只认这两个精确组合；GLM 额度独立、无证据前置门
+  （旧 `codebuddy_quota_condition_not_met` 拒绝仅属历史口径），满/总满如实 `capacity_full`，
+  绝不跨模型回退；AUTO
   请求 codebuddy 不绕过统一层序；其它 executor 绝不改派到 codebuddy。
 - 每轮只试一次：本轮真实失败由主脑在 `round_failed_candidates` 记下，下一候选继续；下一新轮
   重新从最高层起。不因旧额度/旧冷却挡新模型，不查余额、不新增冷却/表/服务、不删真实锁。
-- 入口：`codebuddy_live`（唯一 Popen 处，精确模型硬门、GLM 当轮证据门、`consume_for_entry`/
+- 入口：`codebuddy_live`（唯一 Popen 处，精确模型硬门、`consume_for_entry`/
   `bind_child`/`finish` 生命周期、MCP 空/hooks 禁用/无 fallback、真实起止时间、显式超时可选）。
-  正式 GLM 另带 `--codebuddy-quota-evidence <本轮 summary.json 绝对路径>`；缺 proof 在读配置/
-  建 outdir/claim/Popen 前拒绝。生产 `codebuddy_direct.main()` 只对这两个精确模型移交 live。
+  BW-LIMIT30-20261019-S3 起 GLM **不再有待派发前的当轮证据门**：`--codebuddy-quota-evidence`
+  仅兼容保留、缺省照常进入正常授权/容量/工作区/真实权限流程。
+  生产 `codebuddy_direct.main()` 只对这两个精确模型移交 live。
 - 工具证据：`execution_evidence_ok` 只表示原始工具调用有成功匹配回执，不代表业务验收；零工具
   纯文本传输可合法通过，但零工具工程报告没有工程执行证据。
 
 ## 执行器约束与 availability 资格过滤（BW-AVAILABILITY-20261009-B2）
 
 `select_and_claim`/`reserve`/`consume_for_entry`/`claim_due` 新增可选 `executor`
-（`auto`|`qoder`|`zcode`|`claude`，缺省 `auto`）与 `quota_store`/`quota_routes` 透传。**先过滤合格候选，
-再在可用主力之间按优先级层排序（CodeBuddy deepseek > Max > Claude > ZCode > 条件 CodeBuddy GLM，同层在途平衡）**：
+（`auto`|`qoder`|`zcode`|`claude`|`codebuddy`|`opencode`，缺省 `auto`）与 `quota_store`/`quota_routes` 透传。**先过滤合格候选，
+再在可用主力之间按优先级层排序（CodeBuddy deepseek > Max > Claude > ZCode > 两 OpenCode 免费模型同层 > CodeBuddy GLM（低层补位，额度独立，BW-LIMIT30-20261019-S3），同层在途平衡）**：
 
 - **availability 资格过滤走 param-or-env 的正式默认持久源**：解析顺序为显式 `quota_store` →
   环境变量 `BRAIN_WORKER_QUOTA_STORE` → 受信任默认持久文件 `qc.default_store_path()`（即
@@ -257,12 +297,19 @@ CodeBuddy 其它旧模型（含其它旧 GLM 组合）仍 human-relay；用户�
   （如 executor=qoder 却请求 zcode 组合）→ `executor_conflict` 拒绝。
 - **`executor='zcode'`**：ZCode 被 availability 阻断 → `zcode_unavailable` 拒绝（**不改道到别的
   主力、不落 Flash**）；有空位则 claim，满则 `capacity_full`（无 Flash 回退）。
+- **`executor='opencode'`（BW-OPENCODE-20261019-S3）**：只认两个精确免费组合
+  `opencode:deepseek-v4.1-flash-free` / `opencode:glm-5.3-flash-free`（各自独立 1 槽）；有空位则
+  claim 自身池，本池满或总 16 已满 → 如实 `full`/`capacity_full`，**绝不跨模型回退、绝不回落到
+  付费模型、绝不改道别的执行器**；请求组合与 executor 冲突（如 executor=opencode 却请求其它
+  runtime 组合）→ `executor_conflict`；其它 executor 的请求绝不改派到 opencode。无时段门、
+  无 CodeBuddy 当轮额度前提。
 - **`executor='auto'`（缺省）**：保留历史 committed 计数记账，只在**合格**主力间按优先级层排序
-  （CodeBuddy > CN 自定义 Max > 两内置 Max 同级平衡 > Claude > GLM，BW-CODEBUDDY-MAIN-S3，
+  （CodeBuddy > CN 自定义 Max > 两内置 Max 同级平衡 > Claude > 两 OpenCode 免费同级 > GLM（额度独立），
+  BW-CODEBUDDY-MAIN-S3 + BW-OPENCODE-20261019-S3，
   Max 层内次序见 BW-CUSTOM-MAX-RESUME-20261018-S1）；
   请求 ZCode 但其被阻断 → 改道到可用主力/同级 Flash；各主力与国际 Flash 都满而 CN Flash 有空槽 →
-  改道 CN Flash（入口已是 CN Flash 则 claim），**主力（含 CodeBuddy 与 claude）与两区 Flash 也满
-  （总 14 全满；授权可新派上限 14）才 `capacity_full`**，**绝不改道回不可用的
+  改道 CN Flash（入口已是 CN Flash 则 claim），**主力（含 CodeBuddy、claude 与两 OpenCode 免费模型）与两区 Flash 也满
+  （总 16 全满；授权可新派上限 16）才 `capacity_full`**，**绝不改道回不可用的
   ZCode**，也**不改道回别的池去互换明确指定的组合**。**不清库、不重置轮换计数**、不新增评分/额度逻辑。
 - **消费 token 前复检**：`consume_for_entry` 走 `--dispatch-claim` token 路径时，在同一事务里
   **重新校验 ZCode availability**；若预留后通道转为不可用，则释放**本次自己**的 reserved 占位
@@ -276,12 +323,14 @@ CodeBuddy 其它旧模型（含其它旧 GLM 组合）仍 human-relay；用户�
 
 - **combo 硬约束**：`executor`+`runtime`+`model` 明确组合（含 `qoder:Qwen3.8-Flash`）贯穿
   `reserve/select_and_claim/consume_for_entry/claim_due`，作为候选集合硬边界——受信任主脑明确
-  已授权的组合**不因别的候选有空位而被拒绝**；默认 AUTO 主力优先/容量/主力排序（现为优先级层
-  Max > Claude > GLM，见上文；BW-CODEBUDDY-MAIN-S3 后为 CodeBuddy > Max > Claude > GLM）与各池真实容量
+  已授权的组合**不因别的候选有空位而被拒绝**；默认 AUTO 主力优先/容量/主力排序（历史曾为优先级层
+  Max > Claude > GLM；BW-CODEBUDDY-MAIN-S3 后为 CodeBuddy > Max > Claude > GLM；BW-OPENCODE-20261019-S3
+  当前为 CodeBuddy > Max > Claude > ZCode > 两 OpenCode 免费同层 > CodeBuddy GLM（额度独立））与各池真实容量
   （BW-MAX-WINDOW-20261010-S2 后为六池总 10：`zcode`=2、两内置 Max 各 1、CN 自定义 Max=2、两区 Flash 各 2；
   BW-CLAUDE-DEEPSEEK-S3/S4 起把 claude 登记为第 11 主力槽 → **总 11**，BW-CLAUDE-CAPACITY2 扩为
   2 槽 → **总 12**，BW-CODEBUDDY-MAIN-S3 计入 CodeBuddy 1 槽 → **总 13**，BW-WORKER-WIDGET-
-  20261018-S3 起 CodeBuddy GLM 独立 1 槽 → **当前权威总 14**；原 10 槽一项未减）
+  20261018-S3 起 CodeBuddy GLM 独立 1 槽 → 总 14，BW-OPENCODE-20261019-S3 两 OpenCode 免费模型
+  各独立 1 槽 → **当前权威总 16**；原 10/14 槽均一项未减）
   为既定政策不变（并发 2/4 为 Skill 政策、非已核实 Qoder 进程上限）。
 - **国内回收尊重原 scope**：`claim_due` 用 `_scope_allowed_candidates` 依原 scope 组合/executor
   收窄候选（绑 Qoder 只回收 QMax/Flash，绝不因 ZCode 有空位改派 ZCode）；绑 ZCode 且被阻断 →
@@ -295,13 +344,15 @@ CodeBuddy 其它旧模型（含其它旧 GLM 组合）仍 human-relay；用户�
   即过滤不可用 ZCode；派工写事务内不调用写额度 helper。
 - **竞态与 Luna 保护**：429 事实**先于**可再派空槽发布（`_preclaim_reconcile` 要求 child+wrapper
   双死且创建身份匹配，auto 回收只放执行容量不清 availability）；`reply`/`claim_due` 保护
-  claimed/settled/cancelled/launch_unknown，settled 票据不被迟到/重复回复重开；物理满（当前权威总 14，含 CodeBuddy 两模型各 1 槽与 claude 2 槽）与
+  claimed/settled/cancelled/launch_unknown，settled 票据不被迟到/重复回复重开；物理满（当前权威总 16，含 CodeBuddy 两模型各 1 槽、claude 2 槽与两 OpenCode 免费模型各 1 槽）与
   “合格候选耗尽”分列报告，误报不自动 Luna。
 
 ## 入口在 Popen 前的唯一容量门
 
-各真实直连入口（国际 Qoder、Qoder CN、ZCode、Claude 与 `codebuddy:deepseek-v4.1-flash`
-精确模型）在**创建输出目录、Popen 之前**必须消费或校验一个容量 claim，**不能靠提示词或一个
+各真实直连入口（国际 Qoder、Qoder CN、ZCode、Claude、`codebuddy:deepseek-v4.1-flash`
+精确模型与 BW-OPENCODE-20261019-S3 两个 OpenCode 免费精确模型
+`opencode:deepseek-v4.1-flash-free` / `opencode:glm-5.3-flash-free`，正式入口
+`scripts/opencode_direct.py`，精确模型硬门、无付费回退）在**创建输出目录、Popen 之前**必须消费或校验一个容量 claim，**不能靠提示词或一个
 传入布尔跳过**（WorkBuddy 与 CodeBuddy 其它旧模型仍 human-relay，仅提示词人工中继，不进池、
 不占名额）：
 
@@ -356,7 +407,7 @@ CodeBuddy 其它旧模型（含其它旧 GLM 组合）仍 human-relay；用户�
 
 Luna 是**救援**通道，无数量上限，但绝不无条件启动。流程：
 
-1. 国内名额全满时（BW-QODER-CN-20261010-A2 起阈值随总 8 更新，BW-MAX-WINDOW-20261010-S2 加入 CN 自定义主力后再升为总 10，BW-CLAUDE-DEEPSEEK-S3/S4 加入 claude 主力槽后升为总 11，BW-CLAUDE-CAPACITY2 扩 claude 为 2 槽后升为总 12，BW-CODEBUDDY-MAIN-S3 计入 CodeBuddy 1 槽后升为总 13，BW-WORKER-WIDGET-20261018-S3 起 CodeBuddy GLM 独立 1 槽后为**当前权威总 14（原 12 槽一项未减；授权可新派上限 14）**，含两内置 Max/自定义 Max/CN 补充/claude/CodeBuddy 两模型；判定走
+1. 国内名额全满时（BW-QODER-CN-20261010-A2 起阈值随总 8 更新，BW-MAX-WINDOW-20261010-S2 加入 CN 自定义主力后再升为总 10，BW-CLAUDE-DEEPSEEK-S3/S4 加入 claude 主力槽后升为总 11，BW-CLAUDE-CAPACITY2 扩 claude 为 2 槽后升为总 12，BW-CODEBUDDY-MAIN-S3 计入 CodeBuddy 1 槽后升为总 13，BW-WORKER-WIDGET-20261018-S3 起 CodeBuddy GLM 独立 1 槽后为总 14，BW-OPENCODE-20261019-S3 两 OpenCode 免费模型各独立 1 槽后为**当前权威总 16（原 14 槽一项未减；授权可新派上限 16）**，含两内置 Max/自定义 Max/CN 补充/claude/CodeBuddy 两模型/两 OpenCode 免费模型；判定走
    `_domestic_active ≥ DOMESTIC_TOTAL_CAPACITY`），**宿主先真的问用户**“外部 agent 还是 Luna”。Python 只落库票据，
    **绝不谎称已经问过或已经派生 Luna**——真实提问与原生工具调用由宿主负责。
 2. `dp.ask_record(task_id, ...)` 记录一次真实提问票据，开始 **300 秒**计时
@@ -365,8 +416,8 @@ Luna 是**救援**通道，无数量上限，但绝不无条件启动。流程�
 3. 用户回复 → `dp.reply(task_id, choice)`（`luna`/`external_agent`/`domestic`/`cancel`）。
    **一旦回复，`claim_due` 不再自动裁决**——等待超时不当作默认无限授权。
 4. 到期竞争裁决 `dp.claim_due(task_id, now)`：只有票据 `pending`、已过 deadline、未回复、未
-   claim，**且国内总 14 名额（含自定义主力、CN 补充候选、claude 2 槽与 CodeBuddy 两模型各自
-   独立 1 槽）确实全满**（`_domestic_active ≥ DOMESTIC_TOTAL_CAPACITY`）时，
+   claim，**且国内总 16 名额（含自定义主力、CN 补充候选、claude 2 槽、CodeBuddy 两模型各自
+   独立 1 槽与两 OpenCode 免费模型各独立 1 槽）确实全满**（`_domestic_active ≥ DOMESTIC_TOTAL_CAPACITY`）时，
    才在同一 `BEGIN IMMEDIATE` 事务里创建一个 `luna:native`
    attempt 并把票据置 `claimed`，返回 `launch_state='host_must_call_native'`（**宿主仍须真实
    调用原生工具**，池只给竞争裁决与名额，不代跑）。
@@ -387,14 +438,14 @@ Luna 是**救援**通道，无数量上限，但绝不无条件启动。流程�
   `ask_record` 对**任何已存在票据**直接拒绝并回读 `state`/`deadline_utc`/`reply_choice`（纯 INSERT，
   无 `ON CONFLICT` 重置）；`pending` 不重置计时器。
 - **票据 scope 损坏/缺失 → fail-closed**（`scope_corrupt=True`，绝不据损坏数据启动 Luna 或 reclaim）。
-- **可用性不足的降级决策**：当**国内名额未满总 14（含自定义主力、CN 补充候选、claude 2 槽与 CodeBuddy 两模型各自独立的 1 槽）** 但因 availability 不足以正常派工时，允许一次新的
+- **可用性不足的降级决策**：当**国内名额未满总 16（含自定义主力、CN 补充候选、claude 2 槽、CodeBuddy 两模型与两 OpenCode 免费模型各自独立的 1 槽）** 但因 availability 不足以正常派工时，允许一次新的
   降级 `ask_record`，须带**独立、客观的降级理由** `degradation_reason ∈ {quota, auth, capacity}` +
   `degradation_detail`；`quota` 理由必须由 §3b availability 的客观证据支撑
   （`_zcode_availability_blocked`），无证据则拒绝；`capacity` 理由必须经 `_scope_allowed_candidates`
   客观核验受信任候选（含 CN 补充候选）确已排空——仍有空槽（例如 CN 还有位）时**拒绝降级、优先用国内候选**。
-  降级票据**绕过“总 14 全满”前提**，但
+  降级票据**绕过“总 16 全满”前提**，但
   **非 capacity 的超时绝不可替代显式授权**：只有用户显式回复 `luna` 才 claim Luna；等待超时
-  ≠ 授权（`degraded && reply != luna` → 拒绝）。**总 14 全满 + 真实提问 + 300s + 用户授权**的既有规则不变。
+  ≠ 授权（`degraded && reply != luna` → 拒绝）。**总 16 全满 + 真实提问 + 300s + 用户授权**的既有规则不变。
 
 ## 与额度门禁的边界（quota ≠ concurrency）
 
@@ -409,7 +460,7 @@ Luna 是**救援**通道，无数量上限，但绝不无条件启动。流程�
   时保持单在途语义。
 - **CodeBuddy 旧限流与旧占位完全不变**；当前容量池只登记两个精确逻辑模型
   `codebuddy:deepseek-v4.1-flash` 与 `codebuddy:glm-5.3-flash`（各自独立 1 个物理槽、互不
-  占位互斥；后者仅当轮 DeepSeek 明确限额证据成立时可用），其它 CodeBuddy 旧模型与 WorkBuddy 仍只做完整提示词
+  占位互斥；后者额度独立、缺省候选即含，不再要求当轮 DeepSeek 限额证据（BW-LIMIT30-20261019-S3）），其它 CodeBuddy 旧模型与 WorkBuddy 仍只做完整提示词
   人工交接，不进容量池、不新增直连、生成提示词不记成已派发。
 
 ## CLI（宿主/主脑可真实操作，全部输出 JSON）
@@ -455,7 +506,7 @@ store，复用既有 `dispatch_pool` 权威方法
 `_main_force_limit_active`/`_max_window_blocks`/`_select_main_force`/`_scope_allowed_candidates`），
 **不复制**主力排序/日历/额度算法（主力选择始终复用单一权威 `_select_main_force`，
 BW-CODEBUDDY-MAIN-S3 与 BW-CODEBUDDY-GLM-FALLBACK-20261018 的
-CodeBuddy deepseek > Max > Claude > ZCode > 条件 CodeBuddy GLM 优先级对本入口同样生效，
+CodeBuddy deepseek > Max > Claude > ZCode > 两 OpenCode 免费模型（同层，BW-OPENCODE-20261019-S3）> CodeBuddy GLM（低层补位，额度独立，BW-LIMIT30-20261019-S3）优先级对本入口同样生效，
 绝不另造排序）。
 用途是：主脑**先规划、再生成精确入口参数**，最终正式
 入口仍原子复核——规划快照**绝不是**占位、派发或实时成功证明。
@@ -519,8 +570,8 @@ CodeBuddy deepseek > Max > Claude > ZCode > 条件 CodeBuddy GLM 优先级对本
   给出的本地区集合取交集，**绝不跨区**；地区外候选在 `candidate_filters` 如实显示
   `not_authorized`，**绝不把未选范围显示成 `eligible`**。
 - **AUTO 候选全集与 `not_authorized` 语义（BW-CANDIDATE-SCOPE-S1）**：AUTO 的
-  `allowed_candidates` 从真实用户原话/原 scope **保留完整已授权候选**（当前 8 候选＝CodeBuddy
-  精确模型 + 三 Qoder Max + claude + zcode + 两区 Flash）；时段/明确限额/容量/ZCode availability 等**动态不可用只写
+  `allowed_candidates` 从真实用户原话/原 scope **保留完整已授权候选**（当前 10 候选＝CodeBuddy
+  精确模型 + 三 Qoder Max + claude + zcode + 两 OpenCode 免费模型 + 两区 Flash）；时段/明确限额/容量/ZCode availability 等**动态不可用只写
   `candidate_filters`**（`window_closed`/`explicitly_limited`/`capacity_full`/`zcode_unavailable`），
   **绝不改写 `allowed_candidates` 去绕过**。某 `runtime:model` 失败（含内置两 Max 落 `explicitly_limited`）
   **不泛化成整个 executor**，CN 自定义 `qodercn:Qwen-3.8-Max` 仍**独立评估**、优先级仍属 Qoder Max 层（层=1，仅次于 CodeBuddy 精确模型）。`not_authorized`
@@ -573,7 +624,7 @@ CodeBuddy deepseek > Max > Claude > ZCode > 条件 CodeBuddy GLM 优先级对本
   不强制附 `--command-contract`/`--file-scope-contract`，也不因缺这两份契约把 edit+Bash/写在派发前
   当违规拒绝（前述严格逐字命令契约与受控逐文件契约仍是**可选加固**，用户要求精确命令/文件范围或
   本身就是精确严格计划时继续套用、原样不放宽）。这条只降“本 Skill 自加的默认硬门”，**不改动**
-  `CAPABILITY['zcode'].fine_grained=False`、国内 14 槽、CodeBuddy deepseek > Max > Claude > ZCode > 条件 CodeBuddy GLM 优先级、额度、同真实工作区
+  `CAPABILITY['zcode'].fine_grained=False`、国内 16 槽、CodeBuddy deepseek > Max > Claude > ZCode > 两 OpenCode 免费模型（同层）> CodeBuddy GLM（低层补位，额度独立，BW-LIMIT30-20261019-S3）优先级、额度、同真实工作区
   单写入、在途单占位，也不扩任何生产/GitHub/凭据/外部写入授权。普通路径只注入任务工具授权 broker、
   不注入普通 `executionPort`，Bash 交给**官方原生 executionPort** 执行；真实测试执行由 `execution_evidence`
   门禁回读官方 raw Bash 结果 `result.perf.detail.command`（completed+严格整数 exit0）据实核验
@@ -740,7 +791,7 @@ executing/awaiting_acceptance` 或**未独立验收**时拒绝新选择（不抢
 - 容量池是 `sqlite3` 单文件持久锁，不是分布式协调服务；跨机器不共享（同一用户同一机器跨
   cwd/版本共享即达标）。
 - 同层在途平衡是 best-effort，短暂偏差不自动纠正；跨层是硬性优先级层（CodeBuddy deepseek >
-  Max > Claude > ZCode > 条件 CodeBuddy GLM，见上）。旧跨层 committed 1:1 属历史口径、已被
+  Max > Claude > ZCode > 两 OpenCode 免费模型（同层）> CodeBuddy GLM（低层补位，额度独立，BW-LIMIT30-20261019-S3），见上）。旧跨层 committed 1:1 属历史口径、已被
   BW-MAIN-PRIORITY-20261011-S1 覆盖。
 - Luna 的真实提问、原生工具调用、agentID 写回全部依赖宿主；池只持久化票据与竞争裁决，
   无法证明宿主真的问了或真的启动了——`launch_unknown` 就是对这一非幂等窗口的保守兜底。
@@ -761,16 +812,18 @@ executing/awaiting_acceptance` 或**未独立验收**时拒绝新选择（不抢
 > 绝不自动重派；worker 说"我结束了"不算终态，必须宿主回读原生回执；国内 attempt
 > 永不经过 settle-native 退出。
 
-## 11. 六池 + claude 2 槽 + CodeBuddy 两模型各 1 槽真实分配与主力明确限额（2026-10-10/11/17/18，BW-POOL-SPLIT-20261010-S2/S3/S5 + BW-MAX-WINDOW-20261010-S2 + BW-CLAUDE-DEEPSEEK-S3/S4 + BW-CLAUDE-CAPACITY2 + BW-CODEBUDDY-MAIN-S3 + BW-WORKER-WIDGET-20261018-S3）
+## 11. 六池 + claude 2 槽 + CodeBuddy 两模型各 1 槽 + 两 OpenCode 免费模型各 1 槽真实分配与主力明确限额（2026-10-10/11/17/18/19，BW-POOL-SPLIT-20261010-S2/S3/S5 + BW-MAX-WINDOW-20261010-S2 + BW-CLAUDE-DEEPSEEK-S3/S4 + BW-CLAUDE-CAPACITY2 + BW-CODEBUDDY-MAIN-S3 + BW-WORKER-WIDGET-20261018-S3 + BW-OPENCODE-20261019-S3）
 
-> 当前有效口径（覆盖本节历史数字）：物理 `DOMESTIC_TOTAL_CAPACITY=14`，其中
-> `codebuddy:deepseek-v4.1-flash=1` 与 `codebuddy:glm-5.3-flash=1` **各自独立、不共享名额**
+> 当前有效口径（覆盖本节历史数字）：物理 `DOMESTIC_TOTAL_CAPACITY=16`，其中新增
+> `opencode:deepseek-v4.1-flash-free=1` 与 `opencode:glm-5.3-flash-free=1`（BW-OPENCODE-20261019-S3，
+> **各自独立 1 槽、同层=4、无时段门、无 CodeBuddy 当轮额度前提、无付费回退**；原 14 槽一项未减）；
+> 此前 `codebuddy:deepseek-v4.1-flash=1` 与 `codebuddy:glm-5.3-flash=1` **各自独立、不共享名额**
 > （BW-WORKER-WIDGET-20261018-S3 用户 2026-10-18 最新明确；旧「GLM 为同一物理槽逻辑别名、
 > 总 13」口径作废、仅属历史）；BW-CUSTOM-MAX-RESUME-20261018-S1 解除 CN 自定义 Max
 > 暂停（暂停期曾为授权上限 11，属历史状态）。
-> 绝不派第 15 个；历史 8/10/11/12/13 均属被覆盖的旧记录。
+> 绝不派第 17 个；历史 8/10/11/12/13/14 均属被覆盖的旧记录。
 
-S2/S3 定型的国内真实容量经 BW-MAX-WINDOW-20261010-S2 加入 CN 自定义主力后为六池：`zcode:GLM-5.3=2`、国际内置 `qoder:Qwen3.8-Max=1`、CN 内置 `qodercn:Qwen3.8-Max=1`、CN 自定义 `qodercn:Qwen-3.8-Max=2`、`qoder:Qwen3.8-Flash=2`、`qodercn:Qwen3.8-Flash=2`；**BW-CLAUDE-DEEPSEEK-S3/S4 追加主力 `claude:deepseek-flash=1`（独立第三公平组，见上文 Claude 章节）→ 物理总容量 11，BW-CLAUDE-CAPACITY2 将该池由 1 扩为 2 → 物理总容量 12**；**BW-CODEBUDDY-MAIN-S3 再追加 `codebuddy:deepseek-v4.1-flash=1`（最高优先、无时段门）→ 物理总容量 13**；**BW-WORKER-WIDGET-20261018-S3 起 `codebuddy:glm-5.3-flash` 由「同一物理槽逻辑别名」改为独立 1 槽并计入 `MAIN_FORCE_CAPACITY` → 物理总容量 14**；`qodercn:DeepSeek-Flash` 退休为 0（`LEGACY_RETIRED_POOL_KEYS`）但既有在途 attempt 仍计入 `_domestic_active` 总数、真实终态自然释放；`luna:native` 无上限、仅救援。**现行 `DOMESTIC_TOTAL_CAPACITY=14`、绝不派第 15 个；原 12 槽一项未减**。CN 内置模型真实名 `Qwen3.8-Max`/`Qwen3.8-Flash`（**不是** `Qwen-3.8-*`）；自定义主力用带连字符的友好名 `Qwen-3.8-Max` 与内置区分（2026-10-18 已恢复新派工，历史暂停事实保留）。
+S2/S3 定型的国内真实容量经 BW-MAX-WINDOW-20261010-S2 加入 CN 自定义主力后为六池：`zcode:GLM-5.3=2`、国际内置 `qoder:Qwen3.8-Max=1`、CN 内置 `qodercn:Qwen3.8-Max=1`、CN 自定义 `qodercn:Qwen-3.8-Max=2`、`qoder:Qwen3.8-Flash=2`、`qodercn:Qwen3.8-Flash=2`；**BW-CLAUDE-DEEPSEEK-S3/S4 追加主力 `claude:deepseek-flash=1`（独立第三公平组，见上文 Claude 章节）→ 物理总容量 11，BW-CLAUDE-CAPACITY2 将该池由 1 扩为 2 → 物理总容量 12**；**BW-CODEBUDDY-MAIN-S3 再追加 `codebuddy:deepseek-v4.1-flash=1`（最高优先、无时段门）→ 物理总容量 13**；**BW-WORKER-WIDGET-20261018-S3 起 `codebuddy:glm-5.3-flash` 由「同一物理槽逻辑别名」改为独立 1 槽并计入 `MAIN_FORCE_CAPACITY` → 物理总容量 14**；**BW-OPENCODE-20261019-S3 追加两个 OpenCode 免费精确模型 `opencode:deepseek-v4.1-flash-free=1` 与 `opencode:glm-5.3-flash-free=1`（同层=4，CodeBuddy GLM 由层=4 改层=5、额度独立；无时段门、无额度前提、无付费回退）→ 物理总容量 16**；`qodercn:DeepSeek-Flash` 退休为 0（`LEGACY_RETIRED_POOL_KEYS`）但既有在途 attempt 仍计入 `_domestic_active` 总数、真实终态自然释放；`luna:native` 无上限、仅救援。**现行 `DOMESTIC_TOTAL_CAPACITY=16`、绝不派第 17 个；原 14 槽（及更早 12 槽）一项未减**。CN 内置模型真实名 `Qwen3.8-Max`/`Qwen3.8-Flash`（**不是** `Qwen-3.8-*`）；自定义主力用带连字符的友好名 `Qwen-3.8-Max` 与内置区分（2026-10-18 已恢复新派工，历史暂停事实保留）。
 
 S5 增加 Qoder Max 池的**明确限额**闭环（BW-MAX-WINDOW-20261010-S2 把自定义 CN 主力并入承载范围）：
 - **限额承载范围**：`QUOTA_LIMITABLE_POOLS = (qoder:Qwen3.8-Max, qodercn:Qwen3.8-Max, qodercn:Qwen-3.8-Max)`。自定义 CN 主力复用同一标记机制，各自 pool_key 独立落标、对两内置 Max 无连带。ZCode 仍走 `quota_control` availability；任一 Flash、退休 DeepSeek、Luna 永不落标；绝不误挡 Flash、绝不动 ZCode 既有 availability 口径。

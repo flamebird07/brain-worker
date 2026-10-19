@@ -108,8 +108,66 @@ class TransportDiagnosisTests(unittest.TestCase):
                   'result': text, 'session_id': 's'}
             f = cd.classify_result(_summary(ev), 1, '', is_engineering_task=False)
             self.assertFalse(f['quota_429'], text)
+            self.assertFalse(f['hard_balance_402'], text)
+            self.assertFalse(f['quota_limited'], text)
             self.assertIsNone(f['failure_kind'], text)
             self.assertIsNone(f['transport_error'], text)
+
+    def test_structured_402_insufficient_balance_is_hard_quota_not_429(self):
+        # BW-LIMIT30-20261019-S3：真实 402 余额不足是硬额度事实，必须落限额；
+        # 但绝不冒充 HTTP 429（quota_429 保持 False）。
+        ev = {'subtype': 'success', 'is_error': True,
+              'result': 'API Error: 402 Insufficient Balance',
+              'errors': [{'status': 402, 'message': 'Insufficient Balance'}],
+              'session_id': 's'}
+        f = cd.classify_result(_summary(ev), 1, '', is_engineering_task=False)
+        self.assertTrue(f['hard_balance_402'], f)
+        self.assertTrue(f['quota_limited'], f)
+        self.assertFalse(f['quota_429'], f)
+        self.assertIsNone(f['failure_kind'])
+        self.assertIsNone(f['transport_error'])
+
+    def test_string_402_balance_is_hard_quota(self):
+        ev = {'subtype': 'error_during_execution', 'is_error': True,
+              'result': 'API Error: 402 Insufficient Balance', 'session_id': 's'}
+        f = cd.classify_result(_summary(ev), 1, '', is_engineering_task=False)
+        self.assertTrue(f['hard_balance_402'], f)
+        self.assertTrue(f['quota_limited'], f)
+        self.assertFalse(f['quota_429'], f)
+
+    def test_402_balance_text_outside_error_carrier_never_triggers(self):
+        # 成功正文（is_error=false）里的 402/余额字样绝不进错误载体。
+        ev = {'subtype': 'success', 'is_error': False,
+              'result': 'report says: 402 Insufficient Balance in a previous run',
+              'session_id': 's'}
+        f = cd.classify_result(_summary(ev), 0, '', is_engineering_task=False)
+        self.assertFalse(f['hard_balance_402'], f)
+        self.assertFalse(f['quota_limited'], f)
+        self.assertFalse(f['quota_429'], f)
+
+    def test_cancel_exit_code_and_network_error_never_trigger_quota(self):
+        # 取消码 4294967295 / -1 与 ECONNRESET 都不是限额。
+        for code in (4294967295, -1):
+            ev = {'subtype': 'error_during_execution', 'is_error': True,
+                  'result': 'cancel requested', 'session_id': 's'}
+            f = cd.classify_result(_summary(ev), code, '', is_engineering_task=False)
+            self.assertFalse(f['quota_limited'], (code, f))
+            self.assertFalse(f['hard_balance_402'], (code, f))
+        ev = {'subtype': 'error_during_execution', 'is_error': True,
+              'result': 'ECONNRESET while reading upstream', 'session_id': 's'}
+        f = cd.classify_result(_summary(ev), 1, '', is_engineering_task=False)
+        self.assertFalse(f['quota_limited'], f)
+        self.assertEqual(f['failure_kind'], 'transport_error')
+        self.assertEqual(f['transport_error']['code'], 'ECONNRESET')
+
+    def test_401_with_balance_text_never_hard_balance(self):
+        ev = {'subtype': 'error_during_execution', 'is_error': True,
+              'result': 'API Error: 401 Unauthorized (balance not checked)',
+              'errors': [{'status': 401, 'message': 'Insufficient Balance? no'}],
+              'session_id': 's'}
+        f = cd.classify_result(_summary(ev), 1, '', is_engineering_task=False)
+        self.assertFalse(f['hard_balance_402'], f)
+        self.assertFalse(f['quota_limited'], f)
 
     def test_http_auth_payment_error_with_embedded_transport_code_not_transport(self):
         # 反例 1：错误文本夹带 ECONNRESET，但结构化状态明确是 401 认证错误；

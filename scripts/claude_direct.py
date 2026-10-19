@@ -1010,6 +1010,16 @@ _HTTP_AUTH_PAYMENT_LEADING_RE = re.compile(
     re.IGNORECASE)
 _AUTH_PAYMENT_CATEGORIES = ('auth', 'authentication', 'authorization',
                             'payment', 'billing')
+# BW-LIMIT30-20261019-S3：真实 402 Insufficient Balance 是硬余额/额度事实，必须与
+# HTTP 429 分开分类（绝不把 402 标成 429）。只认真实错误载体里 402 与余额文本同条目
+# 绑定；普通正文里的 402/余额字样、认证 401、网络错误都不触发。
+_BALANCE_402_TEXT_RE = re.compile(
+    r'insufficient\s+balance|余额不足|额度不足', re.IGNORECASE)
+# 硬余额字符串**只认开头 402**（不复用 401|402 的 auth/payment 通用前缀正则）：
+# "API Error: 401 Insufficient Balance" 是 401 认证失败，绝不冒充 402 硬余额。
+_BALANCE_402_LEADING_RE = re.compile(
+    r'^\s*(?:api\s*error\s*[:\-]?\s*)?(?:http\s*(?:status\s*)?[:\s]*)?402\b',
+    re.IGNORECASE)
 _STRUCTURED_MESSAGE_KEYS = ('message', 'error', 'detail', 'msg')
 
 
@@ -1035,6 +1045,48 @@ def _explicit_auth_or_payment(errors, errors_info, result_event: dict) -> bool:
             return False
         if isinstance(item, str):
             return bool(_HTTP_AUTH_PAYMENT_LEADING_RE.match(item))
+        return False
+
+    for item in errors or []:
+        if _check(item):
+            return True
+    info_items = errors_info if isinstance(errors_info, list) else (
+        [errors_info] if errors_info else [])
+    if any(_check(item) for item in info_items):
+        return True
+    if result_event.get('is_error') and isinstance(result_event.get('result'), str):
+        return _check(result_event['result'])
+    return False
+
+
+def _explicit_hard_balance_402(errors, errors_info, result_event: dict) -> bool:
+    """真实错误载体里是否有 **402 + Insufficient Balance**（硬余额/额度事实）。
+
+    只读白名单：结构化 status/status_code/statusCode == 402 且 message/error/detail/msg
+    命中窄余额文本；字符串必须是开头独立 402/HTTP 402 且含余额文本。401 认证、普通 402
+    Payment Required、成功正文里的 402/余额字样、ECONNRESET 等网络错误一律不命中。
+    该事实独立于 `quota_429`，绝不把 402 冒充成 HTTP 429。
+    """
+    def _texts(item):
+        return [item.get(k) for k in _STRUCTURED_MESSAGE_KEYS
+                if isinstance(item.get(k), str)]
+
+    def _check(item):
+        if isinstance(item, dict):
+            status = None
+            for key in ('status', 'status_code', 'statusCode'):
+                try:
+                    value = int(item.get(key))
+                except (TypeError, ValueError):
+                    continue
+                status = value
+                break
+            if status != 402:
+                return False
+            return any(_BALANCE_402_TEXT_RE.search(t) for t in _texts(item))
+        if isinstance(item, str):
+            return bool(_BALANCE_402_LEADING_RE.match(item)
+                        and _BALANCE_402_TEXT_RE.search(item))
         return False
 
     for item in errors or []:
@@ -1155,6 +1207,12 @@ def classify_result(summary: dict, exit_code: int, stderr_text: str,
     protocol_success = bool(subtype_ok and not is_error and exit_code == 0
                             and not errors and not parse_error)
     quota_429 = ec.explicit_429(errors, errors_info) if (errors or errors_info) else False
+    # BW-LIMIT30-20261019-S3：真实 402 Insufficient Balance 是独立的硬余额/额度事实，
+    # 不与 HTTP 429 混标；普通正文 402、认证 401、网络错误不触发。
+    hard_balance_402 = bool(
+        (errors or errors_info)
+        and _explicit_hard_balance_402(errors, errors_info, result_event))
+    quota_limited = bool(quota_429 or hard_balance_402)
     ok_receipts = summary.get('ok_receipt_ids') or []
     missing_receipts = summary.get('missing_receipt_ids') or []
     orphan_results = summary.get('orphan_result_ids') or []
@@ -1177,7 +1235,7 @@ def classify_result(summary: dict, exit_code: int, stderr_text: str,
         (errors or errors_info)
         and _explicit_auth_or_payment(errors, errors_info, result_event))
     transport_error = None
-    if not quota_429 and not approval_denial and not auth_or_payment:
+    if not quota_limited and not approval_denial and not auth_or_payment:
         transport_error = _transport_error(result_event, errors, errors_info,
                                            ok_receipts, summary.get('session_id'))
     facts = {
@@ -1186,6 +1244,8 @@ def classify_result(summary: dict, exit_code: int, stderr_text: str,
         'is_error': is_error,
         'protocol_success': protocol_success,
         'quota_429': bool(quota_429),
+        'hard_balance_402': hard_balance_402,
+        'quota_limited': quota_limited,
         'parse_error': parse_error,
         'malformed_lines': summary.get('malformed_lines', 0),
         'tool_use_count': summary.get('tool_use_count', 0),
@@ -1713,7 +1773,8 @@ def run(cfg: dict, *, workspace: str, prompt_file: Path, out_dir: Path, stage: s
                                             encoding='utf-8')
         ev['evidence_sha256'] = _sha(Path(ev['summary_json']).read_bytes())
         # 明确限额：用真实载体/最终文件的正确 SHA record_main_force_limit，成功后才释放。
-        if facts.get('quota_429'):
+        # BW-LIMIT30-20261019-S3：真实 402 Insufficient Balance 同样落标（独立于 429 分类）。
+        if facts.get('quota_limited'):
             evid_path = ev.get('result_json') or ev.get('events_jsonl')
             evid_sha = ev.get('result_sha256') or ev.get('events_sha256')
             if evid_path and evid_sha:
@@ -1740,7 +1801,7 @@ def run(cfg: dict, *, workspace: str, prompt_file: Path, out_dir: Path, stage: s
     # released=true**；下游异常 / 真实限额登记失败一律不得 passed=0。
     bind_ok = child_verified if bind_child_pid else True
     release_ok = bool(isinstance(release, dict) and release.get('released') is True)
-    limit_ok = (bool(limit_recorded) if facts.get('quota_429') else True)
+    limit_ok = (bool(limit_recorded) if facts.get('quota_limited') else True)
     passed = bool(success and ev.get('result_sha256') and bind_ok
                   and release_ok and not facts.get('downstream_error') and limit_ok)
     return {'sent': True, 'dispatched': True, 'started': started,

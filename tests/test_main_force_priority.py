@@ -7,7 +7,8 @@
 - Max 全不可用时，Claude 允许窗且有空位优先于 Z；Claude 满/限额/峰值才 Z；
 - 同层内保持现有在途平衡与 tie 方式；rotation 历史计数照旧保留；
 - 全部主力无可用槽才 Flash；只允许 Z / 固定 Flash 时不强制 Max；CN 约束不跨区；
-- 14 总槽（BW-WORKER-WIDGET-20261018-S3 起两 CodeBuddy 模型各独立 1 槽）、unknown 在途、
+- 16 总槽（BW-OPENCODE-20261019 起两 CodeBuddy + 两 OpenCode 免费模型各独立 1 槽；
+  CodeBuddy 最高层名额由 build_store 预占以保留旧层序断言）、unknown 在途、
   workspace 冲突、北京 22/08 边界与 DeepSeek 独立时间门不变；
 - stage_selection 复用单一权威 `_select_main_force`，同一新优先级。
 """
@@ -267,6 +268,16 @@ class HighLevelDispatchTests(_Base):
         for i in range(2):
             self.assertTrue(self.reserve(f'cl{i}', 'claude', 'deepseek-flash',
                                          'claude').get('allowed'))
+        # BW-OPENCODE-20261019：两个 OpenCode 免费模型 tier4 也在主力里，必须一并占满，
+        # 否则 AUTO 会选中仍空的 OpenCode 而非兜底 Flash（旧层序断言才继续成立）。
+        self.assertTrue(self.reserve('od1', 'opencode', dp.OPENCODE_DEEPSEEK_MODEL,
+                                     'opencode').get('allowed'))
+        self.assertTrue(self.reserve('od2', 'opencode', dp.OPENCODE_GLM_MODEL,
+                                     'opencode').get('allowed'))
+        # BW-LIMIT30-20261019-S3：CBGLM tier5 额度独立始终参与候选，必须一并占满，
+        # 否则 AUTO 会选中仍空的 GLM 而非兜底 Flash。
+        self.assertTrue(self.reserve('cbg', 'codebuddy', dp.CODEBUDDY_GLM_MODEL,
+                                     'codebuddy').get('allowed'))
 
     def test_flash_only_when_all_mains_unavailable(self):
         self.occupy_all_mains()
@@ -306,10 +317,12 @@ class HighLevelDispatchTests(_Base):
         self.assertEqual(r2['reason'], 'workspace_in_flight')
 
     def test_total_capacity_and_slots(self):
-        # BW-WORKER-WIDGET-20261018-S3 当前权威总数 14：两 CodeBuddy 模型各独立 1 槽。
-        self.assertEqual(dp.DOMESTIC_TOTAL_CAPACITY, 14)
+        # BW-OPENCODE-20261019 当前权威总数 16：两 CodeBuddy + 两 OpenCode 免费模型各独立 1 槽。
+        self.assertEqual(dp.DOMESTIC_TOTAL_CAPACITY, 16)
         self.assertEqual(dp.capacity_for(CODEBUDDY), 1)
         self.assertEqual(dp.capacity_for('codebuddy:glm-5.3-flash'), 1)
+        self.assertEqual(dp.capacity_for(dp.OPENCODE_DEEPSEEK_POOL_KEY), 1)
+        self.assertEqual(dp.capacity_for(dp.OPENCODE_GLM_POOL_KEY), 1)
         self.assertEqual(dp.capacity_for(ZCODE), 2)
         self.assertEqual(dp.capacity_for(QMAX), 1)
         self.assertEqual(dp.capacity_for(CN_MAX), 1)

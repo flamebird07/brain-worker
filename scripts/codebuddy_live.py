@@ -3,12 +3,12 @@
 BW-CODEBUDDY-MAIN-S3 / BW-CODEBUDDY-GLM-FALLBACK-20261018：这是**唯一**允许对
 CodeBuddy 精确模型执行正式 Popen 的生产入口，且只服务两个组合 ——
 `codebuddy` + `deepseek-v4.1-flash`（界面名 Deepseek-V4.1-Flash，最高优先主力）；
-`codebuddy` + `glm-5.3-flash`（界面名 GLM-5.3-Flash，**仅当轮明确 DeepSeek 限额证据成立**
-时的低层补位；与 deepseek 各有独立 1 槽，国内总容量 14）。其它 CodeBuddy 旧模型（含其它
-旧 GLM 组合）与 WorkBuddy 一律由 `codebuddy_direct.main()` 的 `manual_relay_only` 拒绝路径
-在**任何副作用之前**挡下，绝不进入本模块。GLM 还必须在读取用户私有配置、创建 outdir、
-容量认领或 Popen 之前，由 `codebuddy_fallback.verify_quota_evidence` 复验当轮 summary.json；
-缺证据/普通失败/认证/网络/权限/成功正文里的 429 字样一律拒绝，零副作用。
+`codebuddy` + `glm-5.3-flash`（界面名 GLM-5.3-Flash；与 deepseek **额度独立**、各有独立
+1 槽，国内总容量 14）。其它 CodeBuddy 旧模型（含其它旧 GLM 组合）与 WorkBuddy 一律由
+`codebuddy_direct.main()` 的 `manual_relay_only` 拒绝路径在**任何副作用之前**挡下，绝不
+进入本模块。BW-LIMIT30-20261019-S3 起，GLM **不再**要求“当轮 DeepSeek 真实限额证据”：
+`--codebuddy-quota-evidence` 仅作兼容诊断，缺省/畸形都不阻断；真正的门仍是授权、容量、
+工作区、同任务与真实权限拒绝。
 
 设计边界（严格对齐任务政策，不新增服务/库/配置系统）：
 - 复用 `codebuddy_direct` 已保留的纯函数：`build_argv` / `parse_stream` /
@@ -63,7 +63,7 @@ import dispatch_pool as dp  # 共享原子容量池（同目录，标准库）
 import execution_control as ec  # 控制面预检（同目录）
 import prompt_contract as pc  # 三入口共享九节契约（同目录）
 import codebuddy_direct as cb  # 已保留的纯解析/argv/权限/失败事实函数（同目录）
-import codebuddy_fallback as cbf  # 当轮明确 429/额度证据只读复验（同目录）
+import codebuddy_fallback as cbf  # 失败事实只读复验工具（同目录；证据门已于 BW-LIMIT30-20261019-S3 撤销）
 
 RUNTIME = 'codebuddy'
 MODEL = 'deepseek-v4.1-flash'  # 默认/最高优先模型（界面名 Deepseek-V4.1-Flash）
@@ -182,25 +182,16 @@ def run(cfg, *, workspace, prompt_file, out_dir, stage, task_id, model, tools_it
                             'fallback is reactivated here (zero side effects before '
                             'dispatch)']}
 
-    # (0b) GLM 额度条件：必须在 outdir/配置/认领/Popen 之前复验当轮 summary.json。claim token
-    #      不是证明；普通网络/认证/权限/容量失败、旧轮证据、成功正文含 429 字样均不通过。
-    #      DeepSeek（默认）调用完全不受该参数影响。
-    glm_allowed = False
+    # (0b) BW-LIMIT30-20261019-S3 用户最新明确：GLM 与 DeepSeek 额度独立、各自独立 1 槽。
+    # 旧 `codebuddy_quota_evidence` 仅保留为兼容诊断参数，**不再是启动条件**；缺失/畸形
+    # 也不拒绝。DeepSeek（默认）调用完全不受该参数影响。
+    glm_allowed = (model == GLM_MODEL)
     quota_evidence = None
-    if model == GLM_MODEL:
-        quota_evidence = cbf.verify_quota_evidence(codebuddy_quota_evidence)
-        if not quota_evidence.get('ok'):
-            return {'dispatch_failed': True, 'sent': False, 'dispatched': False,
-                    'reason': 'codebuddy_quota_condition_not_met',
-                    'codebuddy_quota_evidence': _evidence_summary(quota_evidence),
-                    'reasons': ['CodeBuddy GLM-5.3-Flash is a quota-conditional low-tier '
-                                "backup: the current round's codebuddy:"
-                                'deepseek-v4.1-flash summary.json must show a terminal '
-                                'error failure envelope with explicit 429/quota evidence '
-                                f'(verification reason: {quota_evidence.get("reason")!r}); '
-                                'no config read, no outdir, no claim and no Popen are '
-                                'performed']}
-        glm_allowed = True
+    if model == GLM_MODEL and codebuddy_quota_evidence is not None:
+        try:
+            quota_evidence = cbf.verify_quota_evidence(codebuddy_quota_evidence)
+        except Exception:  # noqa: BLE001 - legacy diagnostic must never block dispatch
+            quota_evidence = {'ok': False, 'reason': 'legacy_diagnostic_error'}
 
     # (1) outdir 必须不存在（存在即 0 Popen，绝不覆写旧证据）。
     if Path(out_dir).exists():
@@ -506,16 +497,13 @@ def build_parser():
     ap.add_argument('--task-id', required=True, dest='task_id')
     ap.add_argument('--model', default=MODEL,
                     help=f'must be one of the two exact reactivated models {MODELS}; no '
-                         'fallback, no other CodeBuddy model, never WorkBuddy. '
-                         f'{GLM_MODEL} additionally requires '
-                         '--codebuddy-quota-evidence.')
+                         'fallback, no other CodeBuddy model, never WorkBuddy. Both models '
+                         'have independent 1-slot quotas; GLM needs no quota evidence.')
     ap.add_argument('--codebuddy-quota-evidence', dest='codebuddy_quota_evidence',
                     default=None,
-                    help='Absolute path to the CURRENT round summary.json with explicit '
-                         'terminal 429/quota evidence for codebuddy:deepseek-v4.1-flash. '
-                         'Only used for --model glm-5.3-flash; DeepSeek calls ignore it. '
-                         'Missing/invalid evidence refuses GLM before any config read, '
-                         'outdir, claim or Popen.')
+                    help='LEGACY compatibility-only diagnostic path. It is never required '
+                         'and never blocks dispatch (BW-LIMIT30-20261019-S3: CodeBuddy GLM '
+                         'and DeepSeek quotas are independent).')
     ap.add_argument('--config', default=str(DEFAULT_CONFIG),
                     help='entry config JSON with absolute node/cli (user-side; never '
                          'commit copies of credentials)')
@@ -565,20 +553,9 @@ def main(argv=None) -> int:
                                       'wall-clock limit (no silent default is applied)']},
                          ensure_ascii=False))
         return 2
-    # GLM：在读取用户私有配置之前先复验当轮明确限额证据；不通过则零配置读取、零 outdir、
-    # 零认领、零 Popen。run() 内部还会在真正启动前再次复验（claim token 不是证明）。
-    if str(args.model) == GLM_MODEL:
-        early_evidence = cbf.verify_quota_evidence(args.codebuddy_quota_evidence)
-        if not early_evidence.get('ok'):
-            print(json.dumps({'dispatch_failed': True, 'sent': False, 'dispatched': False,
-                              'reason': 'codebuddy_quota_condition_not_met',
-                              'codebuddy_quota_evidence': _evidence_summary(early_evidence),
-                              'reasons': ['GLM-5.3-Flash requires current-round explicit '
-                                          'DeepSeek quota evidence; verification refused '
-                                          f'with reason {early_evidence.get("reason")!r} '
-                                          'before reading the private entry config']},
-                             ensure_ascii=False))
-            return 2
+    # BW-LIMIT30-20261019-S3：GLM 与 DeepSeek 额度独立，不再在读取配置前要求当轮
+    # DeepSeek 限额证据；旧 `--codebuddy-quota-evidence` 仅作兼容诊断，缺省照常进入正式
+    # 入口（工作区/容量/权限/同任务/真实权限拒绝门完全不变）。
     cfg = cb.load_entry_config(args.config)
     tools_items = cb.parse_tools_arg(args.tools)
     plan = None

@@ -162,6 +162,56 @@ class PreflightTests(unittest.TestCase):
         with self.assertRaises(ValueError):
             ec.validate_plan(plan)
 
+    # ---- BW-OPENCODE-20261019-S3：OpenCode 整工具模式能力（绝不当逐文件沙箱） ----
+    def test_opencode_capability_flags_are_whole_tool_only(self):
+        # 能力表权威：opencode 既无逐文件 Edit/Bash 表达力，也无外部只读目录 grant。
+        self.assertEqual(ec.CAPABILITY['opencode'],
+                         {'fine_grained': False, 'read_dirs': False})
+
+    def test_opencode_fine_grained_capability_refused(self):
+        g = _grants(rules=('Bash(python -V)',), tools=('Bash',))
+        plan = _plan(runtime='opencode', model='deepseek-v4.1-flash-free',
+                     grants={'edits': g['edits'], 'bash': g['bash'],
+                             'read_dirs': g['read_dirs']},
+                     tool_visibility=g['tool_visibility'],
+                     visible_tools=g['visible_tools'],
+                     allowed_tools=g['allowed_tools'],
+                     disallowed_tools=g['disallowed_tools'])
+        actual = _actual(runtime='opencode', model='deepseek-v4.1-flash-free', grants=g)
+        r = ec.preflight(plan, actual)
+        self.assertFalse(r['ok'])
+        self.assertTrue(any('cannot express per-file' in x for x in r['reasons']),
+                        r['reasons'])
+
+    def test_opencode_read_dirs_refused(self):
+        g = _grants(add_dirs=('C:\\ref',))
+        plan = _plan(runtime='opencode', model='glm-5.3-flash-free',
+                     grants={'edits': g['edits'], 'bash': g['bash'],
+                             'read_dirs': g['read_dirs']},
+                     tool_visibility=g['tool_visibility'],
+                     visible_tools=g['visible_tools'],
+                     allowed_tools=g['allowed_tools'],
+                     disallowed_tools=g['disallowed_tools'])
+        actual = _actual(runtime='opencode', model='glm-5.3-flash-free', grants=g)
+        r = ec.preflight(plan, actual)
+        self.assertFalse(r['ok'])
+        self.assertTrue(any('no external read-only directory' in x for x in r['reasons']))
+
+    def test_opencode_plain_read_plan_passes_preflight(self):
+        # 无精确 edits/bash/read_dirs 的普通只读计划：整工具模式下如实通过预检
+        # （不代表逐文件沙箱；OpenCode 权限由配置层 '*' deny + read/edit allow 表达）。
+        g = _grants(rules=('Read',))
+        plan = _plan(runtime='opencode', model='deepseek-v4.1-flash-free',
+                     grants={'edits': g['edits'], 'bash': g['bash'],
+                             'read_dirs': g['read_dirs']},
+                     tool_visibility=g['tool_visibility'],
+                     visible_tools=g['visible_tools'],
+                     allowed_tools=g['allowed_tools'],
+                     disallowed_tools=g['disallowed_tools'])
+        actual = _actual(runtime='opencode', model='deepseek-v4.1-flash-free', grants=g)
+        r = ec.preflight(plan, actual)
+        self.assertTrue(r['ok'], r['reasons'])
+
 
 class ControlledFileProfileTests(unittest.TestCase):
     """execution_control 对 ZCode 精确 Edit 的受控文件 profile 独立复核：只有本次可信入口

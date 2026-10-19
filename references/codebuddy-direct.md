@@ -1,19 +1,22 @@
 # CodeBuddy Code CLI 本机直连（当前精确模型恢复 + 历史解析档案）
 
-> **当前状态（2026-10-18，BW-CODEBUDDY-GLM-FALLBACK-20261018 + BW-WORKER-WIDGET-20261018-S3）：
+> **当前状态（2026-10-18，BW-CODEBUDDY-GLM-FALLBACK-20261018 + BW-WORKER-WIDGET-20261018-S3；
+> 2026-10-19 BW-LIMIT30-20261019-S3 覆盖旧 GLM 证据门——明确新要求覆盖旧条件，历史证据不改写）：
 > 恢复两个精确模型，二者不共享名额、各自独立物理 1 槽，物理总 14。**
 > - `codebuddy:deepseek-v4.1-flash`：最高优先主力，无时段门；
-> - `codebuddy:glm-5.3-flash`：仅当轮 DeepSeek 已真实失败且当轮 `summary.json` 带明确
->   429/额度证据时的低层补位，层序在 ZCode 之后、两区 Qwen3.8-Flash 之前。
+> - `codebuddy:glm-5.3-flash`：低层补位，层序在 ZCode 之后、两区 Qwen3.8-Flash 之前；
+>   **与 DeepSeek 额度独立，缺省候选即含，不再要求"当轮 DeepSeek 已真实失败且当轮
+>   `summary.json` 带明确 429/额度证据"前置门**（容量各 1 独立槽与优先级均不变）。
 >
 > 正式可执行传输只在 `scripts/codebuddy_live.py`：由 `scripts/codebuddy_direct.py` 的 `main()`
-> 在 `--model` 精确等于上述两个模型之一时惰性移交；GLM 还必须在读取私有配置、创建输出目录、
-> 容量认领或 Popen 之前复验 `--codebuddy-quota-evidence` 指向的**当轮**证据。其它 CodeBuddy
+> 在 `--model` 精确等于上述两个模型之一时惰性移交；`--codebuddy-quota-evidence`（BW-LIMIT30-20261019-S3
+> 起）**仅作兼容诊断参数，不再作为 GLM 派发要求**，缺省/畸形都在读配置/建输出目录/容量认领/Popen
+> 之前照常放行进入正常授权/容量/工作区/同任务/真实权限门。其它 CodeBuddy
 > 旧模型（含其它旧 GLM 组合）与 WorkBuddy 仍在读配置/提示词、建输出目录、额度门禁或 Popen
 > 之前无条件拒绝（`sent=false`、`manual_relay_only`、非成功退出码、零副作用），只生成可复制
 > 提示词人工转交。控制面 `execution_control.preflight` 同样只对这两个精确模型放行。
-> 授权集合可含精确 GLM，但缺当轮 quota 条件时仍排除；旧轮证据、旧 `main_force_limits` 标记、
-> reserve/claim token 都不是证据。本文其余内容保留为历史解析/诊断档案（原调用形状、事件流、
+> 授权集合含精确 GLM 即可参与（旧 `codebuddy_quota_condition_not_met` 证据门口径已被覆盖）；
+> 旧轮证据、旧 `main_force_limits` 标记、reserve/claim token 都不是证据。本文其余内容保留为历史解析/诊断档案（原调用形状、事件流、
 > 额度冷却与错误分类口径），旧失败链的回放管线仍保留在**仅测试**的
 > `tests/offline_codebuddy_harness.py::replay_dispatch`，在隔离合成 stub 下回放旧失败链。
 
@@ -22,17 +25,18 @@
 - 池与优先级：两个逻辑模型**各自独立物理 `capacity=1`、互不占位互斥**（BW-WORKER-WIDGET-
   20261018-S3 用户 2026-10-18 最新明确；旧「共用同一物理 1 槽」口径作废、仅属历史）；
   `deepseek-v4.1-flash` 为 AUTO 最高层，`glm-5.3-flash` 为 ZCode 之后、两区 Flash 之前的
-  条件补位。不同工作区两模型可并发各 1 在途；同模型第 2 个
+  低层补位。不同工作区两模型可并发各 1 在途；同模型第 2 个
   `reserved`/`running`/`unknown` 仍拒绝；一个结束只释放自己的槽。显式 `executor='codebuddy'`
-  只认这两个精确组合，绝不跨模型回退；GLM 缺当轮证据时返回
-  `codebuddy_quota_condition_not_met`。总配置 14；BW-CUSTOM-MAX-RESUME-20261018-S1 已解除
+  只认这两个精确组合，绝不跨模型回退。总配置 14；BW-CUSTOM-MAX-RESUME-20261018-S1 已解除
   CN 自定义 Max 暂停（自定义 2 槽；历史暂停期上限 11 属
   当时状态）。Max 层内自定义先于两内置。
-- 额度条件：GLM 只有在授权集合包含它、**本轮** DeepSeek 在 `round_failed_candidates` 中，
-  且 `--codebuddy-quota-evidence` / authorization JSON 的 `codebuddy_quota_evidence` 指向
-  本轮 `summary.json` 并复验通过时才可派。证据回执只含路径/SHA-256/原因码/白名单分类，
-  不回显原始错误、headers、Cookie、密钥或令牌。无时间闸：每轮必须重建当轮证据，旧路径/
-  旧 failed 列表不会被自动判定新旧后继承；旧 DB 限额标记也不会自动启用 GLM。
+- 额度独立（BW-LIMIT30-20261019-S3 覆盖旧"当轮证据"条件）：GLM 与 deepseek-v4.1-flash
+  额度独立，规划/正式入口/池**不再要求**本轮 `round_failed_candidates` 含 DeepSeek、也不再
+  要求 `--codebuddy-quota-evidence` / `codebuddy_quota_evidence` 复验通过；该参数若保留仅作
+  兼容诊断，缺省/畸形不拒绝派发。缺省候选即含 GLM（层=4 不变，未减容量、未改优先级；GLM
+  仍 ZCode 后、两区 Flash 前）。证据回执（若提供）仍只含路径/SHA-256/原因码/白名单分类，
+  不回显原始错误、headers、Cookie、密钥或令牌。历史证据不改写；正常授权/容量/工作区/同任务/
+  真实权限拒绝门不动。旧 DB 限额标记与取消码/正文 429 等仍不构成任何派发依据。
 - 容量生命周期：`consume_for_entry(executor='codebuddy')` 认领 → `mark_running` → `bind_child`
   （必须 `bound=true`）→ 真实退出后 `finish`；启动前失败 `start_failed` 释放；已启动但终态
   无法确认 `mark_unknown` 保留占位。绝不误清别人的锁、不删真实锁、不新建冷却表/服务。
@@ -53,13 +57,15 @@
 
 1. 用 `scripts/prompt_contract.py` 生成含完整九节契约的可复制提示词文本（与任务原文一并给出）。
 2. 由人工把该提示词复制到外部 CodeBuddy/WorkBuddy Agent 执行；除精确 `deepseek-v4.1-flash`
-   与带当轮明确限额证据的 `glm-5.3-flash` 外，主脑/Skill/CLI 不提交新的直连调用。
+   与精确 `glm-5.3-flash`（BW-LIMIT30-20261019-S3 起独立额度直连，不再带当轮证据要求）外，
+   主脑/Skill/CLI 不提交新的直连调用。
 3. 记录只标 `manual_relay_only`/`sent=false`，不得把“生成了提示词”当作“已派发/已验收”。
 
 ## 历史直连调用形状（仅存档）
 
 以下为**历史直连形状（仅存档）**；现在**只有** `--model deepseek-v4.1-flash` 或
-`--model glm-5.3-flash`（后者另带当轮 `--codebuddy-quota-evidence`）会经
+`--model glm-5.3-flash`（后者 BW-LIMIT30-20261019-S3 起不再需要 `--codebuddy-quota-evidence`，
+该参数仅兼容保留）会经
 `codebuddy_direct.main()` 移交 `codebuddy_live.main()`（新增 `--task-id`，证据/容量/超时
 参数见该入口 `--help`），其它模型仍被生产入口固定拒绝。历史形状只作解析档案：
 

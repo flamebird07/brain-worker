@@ -76,10 +76,11 @@ class TempStoreMixin:
         self.assertNotEqual(str(self.store), str(dp.default_store_path()))
         # 显式确保没有意外读到默认库/env 覆盖。
         self.saved_env = os.environ.pop('BRAIN_WORKER_DISPATCH_STORE', None)
-        # BW-CODEBUDDY-MAIN-S3 + BW-WORKER-WIDGET-20261018-S3：本文件的历史层序
-        # （Max > claude > Z）与“填满即满”夹具写于 CodeBuddy 恢复之前。先真实占住
-        # CodeBuddy deepseek 与 GLM 各自的独立 1 槽（GLM 为额度条件池，夹具只作占位），
-        # 使旧层序断言原样成立，且 fill_domestic 补 12 槽后总量正好 14（不靠虚拟同一路径、
+        # BW-CODEBUDDY-MAIN-S3 + BW-WORKER-WIDGET-20261018-S3 + BW-OPENCODE-20261019-S3：
+        # 本文件的历史层序（Max > claude > Z）与"填满即满"夹具写于 CodeBuddy 恢复之前。
+        # 先真实占住 CodeBuddy deepseek 与 GLM 各自的独立 1 槽（GLM 为额度条件池，夹具
+        # 只作占位），使旧层序断言原样成立，且 fill_domestic 补 14 槽（BW-OPENCODE-20261019-S3
+        # 起含两个 OpenCode 免费模型各 1 独立槽）后总量正好 16（不靠虚拟同一路径、
         # 不放宽任何断言）。
         with closing(dp.connect(self.store)) as conn:
             conn.execute('INSERT INTO attempts(token, task_id, runtime, model, pool_key, '
@@ -111,14 +112,17 @@ class TempStoreMixin:
                 (token, task_id, runtime, model, pool, state, child_pid, child_created,
                  wrapper_pid, wrapper_created))
 
-    def fill_domestic(self, prefix='seed', n=12):
-        # BW-CLAUDE-CAPACITY2 真实七主力 + 两地区 Flash 12 槽：zcode×2 + 两内置 Max 各 1 +
-        # CN 自定义 Max×2 + claude:deepseek-flash×2（容量由 1 增至 2）+ 两地区 Flash 各 2
-        # （CN DeepSeek-Flash 已 retired，不再作为在途基线）。
+    def fill_domestic(self, prefix='seed', n=14):
+        # BW-CLAUDE-CAPACITY2 + BW-OPENCODE-20261019-S3：真实主力 + 两地区 Flash 共 14 槽：
+        # zcode×2 + 两内置 Max 各 1 + CN 自定义 Max×2 + claude:deepseek-flash×2（容量由 1
+        # 增至 2）+ 两地区 Flash 各 2 + 两个 OpenCode 免费模型各 1 独立槽（CN DeepSeek-Flash
+        # 已 retired，不再作为在途基线）。配合 setUp 的 CodeBuddy 两占位共 16，恰为
+        # DOMESTIC_TOTAL_CAPACITY。绝不删除任何安全断言。
         pools = ['zcode:GLM-5.3'] * 2 + ['qoder:Qwen3.8-Max'] \
             + ['qodercn:Qwen3.8-Max'] + ['qodercn:Qwen-3.8-Max'] * 2 \
             + ['claude:deepseek-flash'] * 2 \
-            + ['qoder:Qwen3.8-Flash'] * 2 + ['qodercn:Qwen3.8-Flash'] * 2
+            + ['qoder:Qwen3.8-Flash'] * 2 + ['qodercn:Qwen3.8-Flash'] * 2 \
+            + [dp.OPENCODE_DEEPSEEK_POOL_KEY, dp.OPENCODE_GLM_POOL_KEY]
         for i in range(n):
             self.seed_attempt(f'{prefix}-{i}', f'{prefix}-task-{i}', pools[i])
 
@@ -158,9 +162,11 @@ class TestUnifiedPolicy(TempStoreMixin, unittest.TestCase):
         self.assertEqual(out['reason'], 'luna_requires_ticket')
 
     def test_fill_all_slots_then_one_more_rejected(self):
-        # BW-CLAUDE-CAPACITY2 真实七主力 + 两 Flash 共 12 槽（claude×2）：经显式 executor 逐槽
-        # 确定性 claim（各池不超自身容量），每次 assert allowed；填满 12 后任何 AUTO 国内组合才
-        # capacity_full 且 domestic_full。Z4：不同 task 用独立 workspace 目录（真实单写入守卫）。
+        # BW-CLAUDE-CAPACITY2 + BW-OPENCODE-20261019-S3：主力 + 两地区 Flash + 两 OpenCode
+        # 免费槽共 14 槽（claude×2、opencode 各 1）：经显式 executor 逐槽确定性 claim（各池
+        # 不超自身容量），每次 assert allowed；配合 setUp 的 CodeBuddy 两占位填满 16 后任何
+        # AUTO 国内组合才 capacity_full 且 domestic_full。Z4：不同 task 用独立 workspace
+        # 目录（真实单写入守卫）。
         fill = [('t0', 'zcode', 'GLM-5.3', 'zcode'),
                 ('t1', 'zcode', 'GLM-5.3', 'zcode'),
                 ('t2', 'qoder', 'Qwen3.8-Max', 'qoder'),
@@ -172,7 +178,9 @@ class TestUnifiedPolicy(TempStoreMixin, unittest.TestCase):
                 ('t4', 'qoder', 'Qwen3.8-Flash', 'qoder'),
                 ('t5', 'qoder', 'Qwen3.8-Flash', 'qoder'),
                 ('t6', 'qodercn', 'Qwen3.8-Flash', 'qodercn'),
-                ('t7', 'qodercn', 'Qwen3.8-Flash', 'qodercn')]
+                ('t7', 'qodercn', 'Qwen3.8-Flash', 'qodercn'),
+                ('t8', 'opencode', dp.OPENCODE_DEEPSEEK_MODEL, 'opencode'),
+                ('t9oc', 'opencode', dp.OPENCODE_GLM_MODEL, 'opencode')]
         for tid, rt, md, ex in fill:
             out = dp.select_and_claim(self.store, task_id=tid, runtime=rt, model=md,
                                       workspace=f'C:/w/{tid}', prompt_sha256='p' * 64,
@@ -634,11 +642,15 @@ class TestOverflowNotSubstitutedZ2(TempStoreMixin, unittest.TestCase):
 
     def _fill_mains(self):
         # 全部主力填满：zcode×2 + 两内置 Max 各 1 + CN 自定义 Max×2 + claude×2
-        # （BW-CLAUDE-CAPACITY2：claude 容量由 1 增至 2，第 11–12 槽主力，须一并占满才回落到 Flash）。
+        # （BW-CLAUDE-CAPACITY2：claude 容量由 1 增至 2，第 11–12 槽主力，须一并占满才回落到
+        # Flash）+ 两个 OpenCode 免费模型各 1 独立槽（BW-OPENCODE-20261019-S3：tier 4 主力，
+        # 不占满则 AUTO 会如实路由到 OpenCode 而非 Flash，回落断言语义不变、不放宽）。
         for i, pool in enumerate(['zcode:GLM-5.3'] * 2 + ['qoder:Qwen3.8-Max']
                                  + ['qodercn:Qwen3.8-Max']
                                  + ['qodercn:Qwen-3.8-Max'] * 2
-                                 + ['claude:deepseek-flash'] * 2):
+                                 + ['claude:deepseek-flash'] * 2
+                                 + [dp.OPENCODE_DEEPSEEK_POOL_KEY,
+                                    dp.OPENCODE_GLM_POOL_KEY]):
             self.seed_attempt(f'm-{i}', f'm-task-{i}', pool)
 
     def test_select_and_claim_main_full_routes_to_flash_no_substitution(self):

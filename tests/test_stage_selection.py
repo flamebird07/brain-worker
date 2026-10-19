@@ -44,10 +44,10 @@ T_DAY = datetime(2026, 10, 8, 2, 0, 0, tzinfo=timezone.utc)     # 北京 10:00�
 ALL_MAINS = list(dp.MAIN_FORCE_KEYS)
 ALL_FLASH = list(dp.OVERFLOW_KEYS)
 # BW-CODEBUDDY-MAIN-S3：本文件大量用例验证的是 CodeBuddy 恢复前的旧层序
-# （三 Qoder Max > claude > zcode）。这些用例把授权候选明确收窄为“不含 CodeBuddy”的
+# （三 Qoder Max > claude > zcode）。这些用例把授权候选明确收窄为”不含 CodeBuddy”的
 # 旧集合，从而原样验证旧层序而不放宽任何断言；CodeBuddy 作为新最高层由独立
 # tests/test_codebuddy_reactivation.py 验证（含自动/显式入口与容量）。
-LEGACY_MAINS = [k for k in ALL_MAINS if k != dp.CODEBUDDY_POOL_KEY]
+LEGACY_MAINS = [k for k in ALL_MAINS if k not in (dp.CODEBUDDY_POOL_KEY, dp.CODEBUDDY_GLM_POOL_KEY)]
 CN_MAINS = [k for k in ALL_MAINS if k.startswith('qodercn:')]
 CN_FLASH = 'qodercn:Qwen3.8-Flash'
 
@@ -174,6 +174,32 @@ class AuthorizationTests(_Base):
         self.assertEqual(r['refused'], 'invalid_executor', r)
         r = self.plan(self.auth('executor', 'T', 's2', ALL_MAINS + ALL_FLASH, executor=123))
         self.assertEqual(r['refused'], 'invalid_executor', r)
+
+    # ---- BW-OPENCODE-20261019-S3：executor='opencode' 只在本执行器两独立槽内选择 ----
+    def test_executor_opencode_selects_own_pool_no_window_gate(self):
+        self.build_store()
+        # 工作日高峰（T_DAY）：三 Max/claude 时段门外，OpenCode 无时段门仍如实可选，
+        # 且绝不跨执行器——别区候选一律 not_authorized。
+        auth = self.auth('executor', 'T', 's2', ALL_MAINS + ALL_FLASH,
+                         executor='opencode')
+        r = self.plan(auth, now=T_DAY)
+        self.assertEqual(r['refused'], None, r)
+        self.assertEqual(r['selected_reason'], 'executor_region_main', r)
+        self.assertIn(r['selected']['pool_key'], dp.OPENCODE_POOL_KEYS, r)
+        self.assertEqual(r['candidate_filters']['qoder:Qwen3.8-Max'], 'not_authorized')
+        self.assertEqual(r['candidate_filters'][dp.ZCODE_POOL_KEY], 'not_authorized')
+
+    def test_executor_opencode_full_refuses_never_crosses(self):
+        self.build_store()
+        # 两 OpenCode 独立槽都真实占满后，executor='opencode' 规划如实拒绝，绝不借
+        # 别的执行器/别的模型（包括同区 Flash）顶替。
+        self.reserve('o1', 'opencode', dp.OPENCODE_DEEPSEEK_MODEL, executor='opencode')
+        self.reserve('o2', 'opencode', dp.OPENCODE_GLM_MODEL, executor='opencode')
+        auth = self.auth('executor', 'T2', 's2', ALL_MAINS + ALL_FLASH,
+                         executor='opencode')
+        r = self.plan(auth, task='T2')
+        self.assertEqual(r['selected'], None, r)
+        self.assertEqual(r['refused'], 'no_eligible_candidate', r)
 
 
 class WindowAndLimitTests(_Base):
@@ -858,7 +884,8 @@ class TaskScopeTests(_Base):
 
     def test_pure_hard_edits_keep_controlled_profile_consistency(self):
         """纯 hard Edit：仍 required controlled profile 与正式 preflight 同口径；
-        Z eligible 故无 incompatibility 明细。"""
+        ZCode 走受控文件 profile 故 eligible（无 incompatibility 明细）；两个 OpenCode
+        免费模型不支持逐文件硬授权，如实出现在明细里（绝不因"整池空诊断"而放过）。"""
         self.build_store()
         r = self.plan(self.auth('auto', 'T', 's2', ALL_MAINS + ALL_FLASH), now=T_DAY,
                       permission_grants={'edits': ['Edit(source/f1.cjs)'], 'bash': [],
@@ -866,7 +893,10 @@ class TaskScopeTests(_Base):
                       task_scope={'edits': ['source/f1.cjs'], 'bash': [], 'read_dirs': []})
         self.assertEqual(r['candidate_filters'][dp.ZCODE_POOL_KEY], 'eligible', r)
         self.assertTrue(r['controlled_file_profile_required'], r)
-        self.assertEqual(r['permission_incompatibility_details'], {})
+        details = r['permission_incompatibility_details']
+        self.assertNotIn(dp.ZCODE_POOL_KEY, details, details)
+        self.assertIn(dp.OPENCODE_DEEPSEEK_POOL_KEY, details, details)
+        self.assertIn(dp.OPENCODE_GLM_POOL_KEY, details, details)
 
     def test_scope_never_bypasses_existing_guards(self):
         """fixed 不换执行器、缺 Z 授权、availability 阻断、在途、工作区冲突都不被

@@ -989,12 +989,14 @@ def main():
     BW-CODEBUDDY-MAIN-S3 / BW-CODEBUDDY-GLM-FALLBACK-20261018 / BW-WORKER-WIDGET-20261018-S3：
     只有独立 CodeBuddy CLI 的两个**精确**模型被恢复并移交生产传输入口 `codebuddy_live.main()`：
     - `deepseek-v4.1-flash`（界面名 Deepseek-V4.1-Flash）：最高优先主力；
-    - `glm-5.3-flash`（界面名 GLM-5.3-Flash）：**仅当轮明确 DeepSeek 限额证据成立**时
-      启用的低层补位；自 BW-WORKER-WIDGET-20261018-S3（用户 2026-10-18 最新明确）起与
+    - `glm-5.3-flash`（界面名 GLM-5.3-Flash）：低层补位、额度独立——自 BW-LIMIT30-20261019-S3
+      起不再要求当轮 DeepSeek 限额证据（旧证据门口径作废，`--codebuddy-quota-evidence`
+      仅作兼容参数）；自 BW-WORKER-WIDGET-20261018-S3（用户 2026-10-18 最新明确）起与
       deepseek **不共享名额、各自独立物理 1 槽**（旧「共用同一物理 1 槽」口径作废）。
     两者都经 consume_for_entry 容量认领 + 绑定自身子 PID + 真实终态释放，shell=False、
     stdin 完整契约、cwd 隔离、MCP 空、hooks 禁用、无自动登录/升级/子代理/回退模型；GLM 的
-    额度证据/独立容量/层序在 codebuddy_live 与 dispatch_pool 内继续强制。**其它任何 CodeBuddy
+    独立容量/层序在 codebuddy_live 与 dispatch_pool 内继续强制（旧额度证据门自
+    BW-LIMIT30-20261019-S3 起不再强制）。**其它任何 CodeBuddy
     旧模型（包括其它旧 GLM 组合）与 WorkBuddy 一律保持既有 manual_relay_only 拒绝**：在
     读取配置/提示词、创建输出目录、进入额度门禁或 Popen 之前无条件拒绝，返回
     sent=false/manual_relay_only 的 JSON 与非成功退出码，零副作用。模型判定只读 argv

@@ -11,17 +11,17 @@ BW-WORKER-WIDGET-20261018-S2 边界（必须遵守）：
   子 PID 死亡、创建身份不明或 PID 复用**都不释放占位**；但展示层主行状态绝不只信
   DB `running`——没有匹配活 PID 的 running 在主行显著标「待核」（待核优先，不被同池
   另一个真 running 掩盖），只有创建身份匹配的活 PID 才显示「运行中」。
-- 两个 CodeBuddy 模型（deepseek-v4.1-flash / glm-5.3-flash）**各自独立 1 槽、互不占位
-  互斥**（BW-WORKER-WIDGET-20261018-S3 用户最新明确），两行独立计数，物理总 14
-  （`dp.DOMESTIC_TOTAL_CAPACITY`）。
-- Luna（`luna:native`）为可选外援行：无上限、不计入 14、不套本机 child PID 探针。
+- 两个 CodeBuddy 模型（deepseek-v4.1-flash / glm-5.3-flash）与两个 OpenCode 免费模型
+  （deepseek-v4.1-flash-free / glm-5.3-flash-free）**各自独立 1 槽、互不占位互斥**，
+  各行独立计数，物理总 16（`dp.DOMESTIC_TOTAL_CAPACITY`）。
+- Luna（`luna:native`）为可选外援行：无上限、不计入 16、不套本机 child PID 探针。
 - 界面不显示 token、argv、prompt、原始错误正文或任何秘密；`--once` 输出的 JSON
   同样只含脱敏后的状态字段。
 - 空闲自动关机（BW-WIDGET-IDLE-20261018-S2）：默认不勾选、不持久化；勾选后连续
   30 分钟“有效空闲”才由 GUI 路径经 finalize 复核触发系统既有
   `shutdown.exe /s /t 0`（不加 /f、不重启）；import/--once/未勾选/关闭绝不触发。
 - 桌面交互（BW-WIDGET-HOVER-20261019-S1/S2）：默认精简只列 `display_state=running`
-  的行；hover 整窗展开全部 10 行，移出边界约 200ms 收回；精简/展开同宽 560、动态高度
+  的行；hover 整窗展开全部 12 行，移出边界约 200ms 收回；精简/展开同宽 560、动态高度
   并夹紧屏幕（贴底时整体上移、完整内容优先）；无手动收起/展开按钮；hover 只切视图，
   绝不勾选/停用/重置空闲关机 controller。真实运行中的行（含未知+运行混池）不展示历史
   限额，`prev_limited` 原始证据与 30 分钟计时保持不变。
@@ -34,7 +34,7 @@ import subprocess
 import sys
 import threading
 import time
-from datetime import datetime
+from datetime import datetime, timedelta
 from pathlib import Path
 
 _SCRIPTS_DIR = Path(__file__).resolve().parent
@@ -43,9 +43,13 @@ if str(_SCRIPTS_DIR) not in sys.path:
 
 import dispatch_pool as dp  # noqa: E402
 import stage_selection as ss  # noqa: E402
+try:
+    import deepseek_offpeak as offpeak  # noqa: E402
+except Exception:  # noqa: BLE001 - 缺模块时 Claude 时段外退回纯「时段外」标签
+    offpeak = None
 
 # ------------------------------------------------------------------ 展示常量
-# 9 个可派组合按现有主力优先级显示（BW-CUSTOM-MAX-RESUME-20261018-S1 层序），
+# 11 个可派组合按现有主力优先级显示（BW-OPENCODE-20261019 层序），
 # 另加可选 Luna 外援行；退休池（qodercn:DeepSeek-Flash、WorkBuddy 等）不显示成可派，
 # 但其真实在途仍计入总占用（见 retired_active）。
 ROW_DEFS = (
@@ -55,8 +59,12 @@ ROW_DEFS = (
     (dp.QMAX_POOL_KEY, 'Qoder 国际／Qwen3.8-Max', '主力 Max · 国际内置 · 夜间窗'),
     (dp.CLAUDE_POOL_KEY, 'Claude Code／deepseek-flash', '主力 · 空闲时段门'),
     (dp.ZCODE_POOL_KEY, 'ZCode／GLM-5.3', '主力 · 全天'),
+    (dp.OPENCODE_DEEPSEEK_POOL_KEY, 'OpenCode／deepseek-v4.1-flash-free',
+     '主力 · 独立 1 槽 · 无时段门'),
+    (dp.OPENCODE_GLM_POOL_KEY, 'OpenCode／glm-5.3-flash-free',
+     '主力 · 独立 1 槽 · 无时段门'),
     (dp.CODEBUDDY_GLM_POOL_KEY, 'CodeBuddy／GLM-5.3-Flash',
-     '条件补位 · 独立 1 槽 · 需当轮 DeepSeek 限额证据'),
+     '独立 1 槽 · 与 DeepSeek 额度独立 · 无证据前置门'),
     (dp.QFLASH_POOL_KEY, 'Qoder 国际／Qwen3.8-Flash', '兜底'),
     (dp.CN_FLASH_POOL_KEY, 'Qoder CN／Qwen3.8-Flash', '兜底'),
     (dp.LUNA_KEY, 'Luna／原生外援', '可选 · 无上限 · 不计入国内总数'),
@@ -64,6 +72,92 @@ ROW_DEFS = (
 
 STATE_LABELS = {'running': '运行中', 'unknown': '待核实', 'reserved': '已预留',
                 'idle': '空闲', 'window_closed': '时段外', 'read_failed': '读取失败'}
+
+# 时段外展示（仅显示层，不改时段门/容量/派工/关机行为）：
+# - 三个 Qoder Max：固定夜间窗口 22:00（含）–次日 08:00（不含），不写"北京时间"。
+# - Claude（deepseek-flash）：显示下一个连续可派区间（复用 deepseek_offpeak 纯函数，
+#   UTC+8 工作日/周末/法定假日），周末/假日连续放行绝不硬截到"次日 09:00"；跨日/跨月
+#   用"次日 HH:MM"或"MM-DD HH:MM"标注日期消歧；无网络日历。
+MAX_WINDOW_CLOSED_LABEL = '时段外（22:00–次日08:00）'
+_MAX_WINDOW_POOLS = tuple(getattr(dp, 'WINDOW_GATED_MAIN_FORCES', ()))
+
+
+def _bj_minute_of(dt_naive) -> int:
+    return dt_naive.hour * 60 + dt_naive.minute
+
+
+def _claude_blocked_probe(dt_naive) -> bool:
+    """naive 北京时间该分钟是否"关闭新派"（复用 offpeak 纯函数，绝不再次 to_beijing，
+    避免对已是北京时间的入参二次 +8）。与 classify_dispatch 判定顺序一致：
+    周末/假日放行；已知工作日仅高峰关闭；未知年度仅高峰保守关闭。"""
+    if offpeak.is_weekend(dt_naive):
+        return False
+    if offpeak.year_known(dt_naive):
+        if offpeak.is_holiday(dt_naive):
+            return False
+        return offpeak.in_peak_minutes(dt_naive)
+    return offpeak.in_peak_minutes(dt_naive)
+
+
+def claude_next_open_window(bj_now):
+    """给定 naive 北京时间，若当前不可派，返回下一个连续可派区间的 (start, end)
+    （均为 naive datetime，end 不含）。可派或 offpeak 不可用时返回 None。
+    纯函数、无网络；周末/法定假日整天放行，故放行区间可连续跨过整个假期/周末，
+    绝不硬截成"次日 09:00"。"""
+    if offpeak is None or bj_now is None:
+        return None
+    if not _claude_blocked_probe(bj_now):
+        return None
+    midnight = bj_now.replace(hour=0, minute=0, second=0, microsecond=0)
+    start = None
+    for lo, hi in offpeak.PEAK_INTERVALS:
+        if lo <= _bj_minute_of(bj_now) < hi:
+            start = midnight + timedelta(minutes=hi)
+            break
+    if start is None:
+        return None
+    end = start
+    cap = 15 * 24 * 60
+    opened = False
+    for _ in range(cap):
+        if _claude_blocked_probe(end):
+            opened = True
+            break
+        end = end + timedelta(minutes=1)
+    if not opened:
+        return None
+    return (start, end)
+
+
+def _fmt_claude_interval(start, end):
+    """把 (start,end) naive 北京时间格式化成"下次…"片段。同日只写 HH:MM；目标日正好
+    是次日写"次日HH:MM"；更远的跨日/跨月写"MM-DD HH:MM"消歧（周末/假日连续放行）。"""
+    s = f'{start:%H:%M}'
+    day_delta = (end.date() - start.date()).days
+    if day_delta <= 0:
+        e = f'{end:%H:%M}'
+    elif day_delta == 1:
+        e = f'次日{end:%H:%M}'
+    else:
+        e = f'{end:%m-%d %H:%M}'
+    return f'下次{s}–{e}'
+
+
+def window_closed_display_label(pk, now):
+    """时段外行的展示标签（仅显示）。三 Qoder Max → 固定夜间窗口；Claude → 下一个
+    连续可派区间；offpeak 缺失/无法解析时退回纯 STATE_LABELS['window_closed']。"""
+    if pk in _MAX_WINDOW_POOLS:
+        return MAX_WINDOW_CLOSED_LABEL
+    if pk == getattr(dp, 'CLAUDE_POOL_KEY', None) and offpeak is not None:
+        try:
+            bj = offpeak.to_beijing(now if now is not None else dp.utcnow())
+            win = claude_next_open_window(bj)
+            if win is not None:
+                return f'时段外（{_fmt_claude_interval(*win)}）'
+        except Exception:  # noqa: BLE001 - 展示层永不冒进，退回纯标签
+            pass
+    return STATE_LABELS['window_closed']
+
 RESULT_LABELS = {'passed': '上轮调用通过', 'failed': '上轮调用未通过',
                  'unknown': '上轮调用待核', 'none': '暂无调用记录'}
 PID_CHECK_LABELS = {
@@ -87,6 +181,9 @@ PREV_LIMIT_LABEL = '上轮限额'
 # 期限——从绑定 attempt 的 ended_at_utc（终态未落盘回退标记 recorded_at_utc）起 0<=age<1800 秒
 # 显示；恰好 1800 秒及更久只撤下历史提示，绝不声称额度恢复。纯展示窗口，不改 DB/调度/重试/冷却。
 QUOTA_LIMIT_WINDOW_SECONDS = 1800
+# BW-LIMIT30-20261019-S3：浮窗 30 分钟窗口覆盖 CodeBuddy/deepseek、ZCode/GLM-5.3 与
+# Claude/deepseek-flash 三个精确池；其它池（Qoder Max 等）保持原有 token 规则。
+WINDOW_LIMIT_POOLS = (dp.CODEBUDDY_POOL_KEY, dp.ZCODE_POOL_KEY, dp.CLAUDE_POOL_KEY)
 
 
 def _within_recent_window(ref_text, now, window_seconds):
@@ -113,9 +210,10 @@ def _quota_window_limited(lim, bound_ended, now, window_seconds=QUOTA_LIMIT_WIND
 
 
 def _prev_limited_for(pk, lim, latest_any, bound_ended, now):
-    """按池选择限额展示规则：仅精确 dp.CODEBUDDY_POOL_KEY（deepseek-v4.1-flash）用半小时
-    真实窗口；其余池保持原有“标记仍绑定该池最新 attempt”的既有规则，不改动其它模型现有期限。"""
-    if pk == dp.CODEBUDDY_POOL_KEY:
+    """按池选择限额展示规则：CodeBuddy/deepseek、ZCode/GLM-5.3 与 Claude/deepseek-flash
+    使用半小时真实窗口（BW-LIMIT30-20261019-S3 扩展）；其余池保持原有“标记仍绑定该池最新
+    attempt”的既有规则，不改动其它模型现有期限。"""
+    if pk in WINDOW_LIMIT_POOLS:
         return _quota_window_limited(lim, bound_ended, now)
     return bool(
         lim is not None and int(lim.get('limited') or 0) == 1
@@ -256,11 +354,11 @@ def read_snapshot(store_path=None, *, now=None, pid_probe=None):
                 limits[r['pool_key']] = dict(r)
         except sqlite3.Error:
             limits = {}
-        # BW-WIDGET-QUOTA30-20261019-S3：CodeBuddy deepseek 精确池的半小时展示窗口需要其
-        # 绑定 attempt 的真实 ended_at_utc（只读，绝不改写限额写入端或 attempt）。
+        # BW-WIDGET-QUOTA30-20261019-S3 / BW-LIMIT30-20261019-S3：三个半小时窗口池的展示
+        # 需要其绑定 attempt 的真实 ended_at_utc（只读，绝不改写限额写入端或 attempt）。
         bound_ended = {}
         for pk_l, lim_l in limits.items():
-            if pk_l != dp.CODEBUDDY_POOL_KEY:
+            if pk_l not in WINDOW_LIMIT_POOLS:
                 continue
             if int(lim_l.get('limited') or 0) != 1 or not lim_l.get('attempt_token'):
                 continue
@@ -336,14 +434,18 @@ def read_snapshot(store_path=None, *, now=None, pid_probe=None):
         prev_limited = _prev_limited_for(pk, lim, latest_any,
                                           bound_ended.get(pk), now)
         has_true_running = any(a['display_state'] == 'running' for a in attempts)
+        # 时段外行的展示标签富化（仅显示层）：三 Qoder Max 固定夜间窗口 / Claude 下一个
+        # 连续可派区间；其它状态沿用 STATE_LABELS。
+        state_label = (window_closed_display_label(pk, now)
+                       if state == 'window_closed' else STATE_LABELS[state])
         rows.append({
             'pool_key': pk, 'label': label, 'note': note,
             'capacity': capacity, 'active': len(own),
             'own_active': len(own), 'state': state,
             'db_state': db_state,
-            'state_label': STATE_LABELS[state], 'window_blocked': window_blocked,
+            'state_label': state_label, 'window_blocked': window_blocked,
             'main_state_label': _main_state_display(
-                state, STATE_LABELS[state], prev_limited, has_true_running),
+                state, state_label, prev_limited, has_true_running),
             'last_result': last_result, 'last_result_label': RESULT_LABELS[last_result],
             'prev_limited': prev_limited,
             'attempts': attempts,
@@ -586,7 +688,12 @@ def detail_text(row):
     if row['prev_limited'] and not row_has_true_running(row):
         if row['pool_key'] == dp.CODEBUDDY_POOL_KEY:
             lines.append('上轮限额：近 30 分钟内的真实限额/429 错误记录（按绑定 attempt 的真实终止时间计时），'
-                         '仅代表历史期限、不代表实时余额、不猜恢复时间、不新增冷却，也不阻止下一轮最高优先重试；'
+                         '仅代表历史期限展示窗口、不代表实时余额、不猜恢复时间、不阻止下一轮最高优先重试；'
+                         '超过 30 分钟仅撤下本提示，绝不声称额度已恢复')
+        elif row['pool_key'] in WINDOW_LIMIT_POOLS:
+            lines.append('上轮限额：近 30 分钟内的真实限额/402 余额不足/429 错误记录（按绑定 attempt 的真实终止时间计时），'
+                         '仅代表历史期限、不代表实时余额、不猜恢复时间；30 分钟内新派发跳过该池，'
+                         '满 30 分钟后按原优先级恢复可选（原错误证据保留，无需手动重置）；'
                          '超过 30 分钟仅撤下本提示，绝不声称额度已恢复')
         else:
             lines.append('上轮限额：该标记仍绑定此池最新 attempt 的历史限额记录，'
@@ -757,7 +864,7 @@ def row_badges(row):
     badges = []
     if row.get('state') != 'running' and row_has_true_running(row):
         badges.append(('run', '含运行'))
-    if row.get('window_blocked') and compact_state_text(row) != '时段外':
+    if row.get('window_blocked') and not str(compact_state_text(row)).startswith('时段外'):
         badges.append(('window', '时段外'))
     if row_shows_limit(row):
         badges.append(('limit', '限额'))
@@ -817,7 +924,7 @@ def run_gui(store_path=None, interval=2.0):
 
     tk.Frame(shell, bg=_BORDER, height=1).pack(fill='x', pady=(8, 6))
 
-    # --- 摘要：总占用/14 与运行数常驻；待核/预留/限额/Luna/其他在途只在非零时出现，
+    # --- 摘要：总占用/16 与运行数常驻；待核/预留/限额/Luna/其他在途只在非零时出现，
     # 顺序固定，动态切换不留多余分隔点，零项不再占位。
     summary_frame = tk.Frame(shell, bg=_BG)
     summary_frame.pack(fill='x')
@@ -886,7 +993,7 @@ def run_gui(store_path=None, interval=2.0):
     footer_lbl = tk.Label(shell, textvariable=footer_var, bg=_BG, fg=_DIM,
                           font=font_small, anchor='w')
 
-    # --- 10 行卡片（ROW_DEFS 顺序/名称原样，完整不截断；左色条+行卡层次）。
+    # --- 12 行卡片（ROW_DEFS 顺序/名称原样，完整不截断；左色条+行卡层次）。
     row_widgets = {}
     for pk, label, _note in ROW_DEFS:
         card = tk.Frame(rows_frame, bg=_CARD, highlightbackground=_BORDER,
@@ -904,7 +1011,7 @@ def run_gui(store_path=None, interval=2.0):
         badges = tk.Frame(inner, bg=_CARD, cursor='hand2')
         badges.grid(row=0, column=1, sticky='e', padx=(6, 6))
         state = tk.Label(inner, text='', bg=_CARD, fg=_SUB, font=font_bold, anchor='e',
-                         cursor='hand2')
+                         wraplength=160, justify='right', cursor='hand2')
         state.grid(row=0, column=2, sticky='e')
         occ = tk.Label(inner, text='', bg=_CARD, fg=_SUB, font=font, anchor='e',
                        cursor='hand2')

@@ -6,19 +6,22 @@
   成功正文 429、普通/网络/auth/权限失败均按既有分类）；
 - 回执脱敏：任意合成敏感标记不得经 `diagnostics.failure_types`、runtime/model/exit_code
   形状回显，只保留既有白名单分类与已知身份/数字；
-- 层序：DeepSeek 本轮失败且 GLM 条件成立时，Max/Claude/ZCode 仍优先，GLM 在 Flash 前；
-  授权集合缺 GLM 不扩权；新轮无证据不启用；GLM 失败后落 Flash；
-- `_select_main_force` 缺省 eligible=None 绝不自动纳入 GLM，显式 eligible 才参与排序；
+- 层序：BW-LIMIT30-20261019-S3 起 GLM 与 DeepSeek 额度独立，无证据也参与层序；Max/
+  Claude/ZCode 仍优先，GLM 在 Flash 前；授权集合缺 GLM 不扩权；GLM 失败后落 Flash；
+- `_select_main_force` 缺省 eligible=None 也包含 GLM（自身满位时仍不得选中），显式
+  eligible 才限制范围；
 - 独立名额（BW-WORKER-WIDGET-20261018-S3 用户最新明确，覆盖旧共享 1 槽口径）：
   DeepSeek 与 GLM 各独立 1 槽、互不占位互斥；同模型第 2 个在途仍拒绝；并发同模型只有
-  一个赢家、两模型可同时各赢一个；finish 只释放自己的槽；物理总 14 不双计、status
-  按各自独立容量口径；
-- planner 与正式 reserve/consume 裁决一致；正式 GLM 缺 proof 在配置读取/outdir/claim/
-  Popen 前拒绝；带 proof 的 CLI argv/model/pool/evidence 正确，不硬记 DeepSeek；
+  一个赢家、两模型可同时各赢一个；finish 只释放自己的槽；物理总 16（BW-OPENCODE-20261019
+  起含两 OpenCode 免费模型各 1 槽）不双计、status 按各自独立容量口径；
+- planner 与正式 reserve/consume 裁决一致（均不要求 DeepSeek 限额证据）；正式 GLM 无
+  proof 仍可进入配置读取并 Popen；带 proof 的 CLI argv/model/pool/evidence 正确，不硬记
+  DeepSeek；
 - 其它旧 CodeBuddy 模型与 WorkBuddy 仍退休。
 """
 import io
 import json
+import os
 import sys
 import tempfile
 import unittest
@@ -55,7 +58,11 @@ ZCODE = 'zcode:GLM-5.3'
 QFLASH = 'qoder:Qwen3.8-Flash'
 CN_FLASH = 'qodercn:Qwen3.8-Flash'
 MAXES = (QMAX, CN_MAX, CN_CUSTOM_MAX)
-HIGHER_THAN_GLM = (CB, QMAX, CN_MAX, CN_CUSTOM_MAX, CLAUDE, ZCODE)
+# BW-OPENCODE-20261019：两 OpenCode 免费模型 tier4 高于条件 GLM tier5；GLM 兜底测试必须
+# 把它们也算进"更高优先层"并一并占满，否则 AUTO 会落到仍空的 OpenCode 而非 GLM。
+# 这只是如实反映现有层序（不改 GLM 独立调度规则），非降低排序。
+HIGHER_THAN_GLM = (CB, QMAX, CN_MAX, CN_CUSTOM_MAX, CLAUDE, ZCODE,
+                   dp.OPENCODE_DEEPSEEK_POOL_KEY, dp.OPENCODE_GLM_POOL_KEY)
 ALL_CANDIDATES = list(dp.MAIN_FORCE_KEYS) + list(dp.OVERFLOW_KEYS)
 SHA = 'p' + '0' * 63
 SECRET = 'SYNTHETIC_SECRET_SHOULD_NOT_BE_ECHOED'
@@ -220,11 +227,24 @@ class TestQuotaEvidenceSanitized(_Base):
 
 
 class TestSelectMainForceDefault(_Base):
-    def test_default_eligible_none_never_includes_glm(self):
-        # 直接把所有非 GLM 主力容量视为 0（GLM 自身仍有空位），缺省 eligible 仍不得选 GLM。
+    def test_default_eligible_none_can_include_glm(self):
+        # BW-LIMIT30-20261019-S3：GLM 与 DeepSeek 额度独立，缺省候选含 GLM。
+        # 所有更高层容量为 0、GLM 自身仍有空位 → 缺省 eligible 落到 GLM（层=4）。
         def _cap(pk):
             return 1 if pk == GLM else 0
 
+        with mock.patch.object(dp, 'capacity_for', side_effect=_cap):
+            with closing(dp.connect(self.store)) as conn:
+                target, reason = dp._select_main_force(conn, GLM, T_NIGHT)
+        self.assertEqual(target, GLM)
+        self.assertEqual(reason, 'main_force_selected')
+
+    def test_default_eligible_none_skips_full_glm(self):
+        # 安全边界不退化：GLM 自己满位时仍不得被缺省选中。
+        def _cap(pk):
+            return 1 if pk == GLM else 0
+
+        self.seed(GLM, 1)
         with mock.patch.object(dp, 'capacity_for', side_effect=_cap):
             with closing(dp.connect(self.store)) as conn:
                 target, reason = dp._select_main_force(conn, GLM, T_NIGHT)
@@ -296,24 +316,28 @@ class TestPlannerGlmCondition(_Base):
         self.assertNotEqual(receipt['selected']['pool_key'], GLM)
         self.assertEqual(receipt['selected_reason'], 'flash_fallback_selected')
 
-    def test_new_round_without_evidence_does_not_enable_glm(self):
+    def test_new_round_without_evidence_still_enables_glm(self):
+        # BW-LIMIT30-20261019-S3：撤销“当轮 DeepSeek 真实限额证据”前置门。
         receipt = self.plan(self.auth(),
                             round_failed_candidates=list(HIGHER_THAN_GLM))
-        self.assertFalse(receipt['codebuddy_glm_allowed'], receipt)
-        self.assertEqual(receipt['candidate_filters'][GLM],
-                         'codebuddy_quota_condition_not_met')
-        self.assertEqual(receipt['selected_reason'], 'flash_fallback_selected')
+        self.assertTrue(receipt['codebuddy_glm_allowed'], receipt)
+        self.assertEqual(receipt['candidate_filters'][GLM], 'eligible')
+        self.assertEqual(receipt['selected']['pool_key'], GLM, receipt)
+        self.assertEqual(receipt['selected_reason'], 'main_force_selected')
+        self.assertFalse(receipt['codebuddy_glm_condition']['quota_evidence_required'])
+        self.assertTrue(receipt['codebuddy_glm_condition']['independent_from_deepseek'])
 
-    def test_ordinary_failed_evidence_does_not_enable_glm(self):
+    def test_ordinary_failed_evidence_is_legacy_diagnostic_only(self):
+        # 普通失败证据只作兼容诊断，既不放行也不阻断（GLM 本就独立）。
         receipt = self.plan(
             self.auth(), round_failed_candidates=list(HIGHER_THAN_GLM),
             codebuddy_quota_evidence=self.evidence(
                 name='ordinary.json', failure_types=['model_execution_failure'],
                 errors=[{'status': 500, 'message': 'ordinary failure'}]))
-        self.assertFalse(receipt['codebuddy_glm_allowed'], receipt)
-        self.assertEqual(receipt['candidate_filters'][GLM],
-                         'codebuddy_quota_condition_not_met')
-        self.assertEqual(receipt['selected_reason'], 'flash_fallback_selected')
+        self.assertTrue(receipt['codebuddy_glm_allowed'], receipt)
+        self.assertEqual(receipt['candidate_filters'][GLM], 'eligible')
+        self.assertEqual(receipt['selected']['pool_key'], GLM, receipt)
+        self.assertFalse(receipt['codebuddy_quota_evidence']['required'])
 
     def test_glm_failure_falls_to_flash(self):
         receipt = self.plan(
@@ -326,54 +350,58 @@ class TestPlannerGlmCondition(_Base):
         self.assertIn(receipt['selected']['pool_key'], (QFLASH, CN_FLASH))
         self.assertEqual(receipt['selected_reason'], 'flash_fallback_selected')
 
-    def test_old_db_limit_mark_alone_does_not_enable_glm(self):
+    def test_old_db_limit_mark_without_timestamp_does_not_block_glm(self):
+        # 旧库只有裸 limited 标记、无可用时间参照 → 1800 秒窗口不成立，不得误挡。
         with closing(dp.connect(self.store)) as conn:
             conn.execute('INSERT INTO main_force_limits(pool_key, limited) '
                          'VALUES(?,1)', (GLM,))
             conn.execute('PRAGMA journal_mode=DELETE')
         receipt = self.plan(self.auth(),
                             round_failed_candidates=list(HIGHER_THAN_GLM))
-        self.assertFalse(receipt['codebuddy_glm_allowed'], receipt)
-        self.assertEqual(receipt['candidate_filters'][GLM],
-                         'codebuddy_quota_condition_not_met')
+        self.assertTrue(receipt['codebuddy_glm_allowed'], receipt)
+        self.assertEqual(receipt['candidate_filters'][GLM], 'eligible')
+        self.assertEqual(receipt['selected']['pool_key'], GLM, receipt)
 
 
 class TestFormalGateConsistency(_Base):
     def test_planner_selection_matches_formal_claim_and_consume(self):
-        evidence = self.evidence()
+        # BW-LIMIT30-20261019-S3：planner 与正式入口都不再要求 DeepSeek 限额证据，
+        # 两处裁决一致；GLM 仍只占自己的独立 1 槽，绝不占用 DeepSeek 名额。
         receipt = ss.plan_stage_selection(
             {'selection_mode': 'auto', 'quote': '用户真实原话',
              'authorization_scope': {'task_id': 'T', 'stage': 's'},
              'allowed_candidates': list(ALL_CANDIDATES),
-             'round_failed_candidates': list(HIGHER_THAN_GLM),
-             'codebuddy_quota_evidence': evidence},
+             'round_failed_candidates': list(HIGHER_THAN_GLM)},
             store_path=self.store, task_id='T', stage='s',
             workspace=self.ws('T'), now=T_NIGHT)
         self.assertEqual(receipt['selected']['pool_key'], GLM, receipt)
-        # 正式 reserve：没有显式当轮条件布尔 → 与 planner 缺证据时一致拒绝。
-        denied = dp.reserve(self.store, task_id='f1', runtime='codebuddy',
-                            model=GLM_MODEL, workspace=self.ws('f1'),
-                            prompt_sha256=SHA, stage='s', now=T_NIGHT,
-                            executor='codebuddy', codebuddy_glm_allowed=False,
-                            _preclaim=False)
-        self.assertFalse(denied.get('allowed'), denied)
-        self.assertEqual(denied['reason'], 'codebuddy_quota_condition_not_met')
-        # 条件成立 → 正式入口允许认领；随后缺条件的消费不能借 claim token 启动。
-        claimed = dp.reserve(self.store, task_id='f2', runtime='codebuddy',
-                             model=GLM_MODEL, workspace=self.ws('f2'),
+        self.assertTrue(receipt['codebuddy_glm_allowed'], receipt)
+        # 正式 reserve：无证据、无条件布尔 → 与 planner 一致允许。
+        claimed = dp.reserve(self.store, task_id='f1', runtime='codebuddy',
+                             model=GLM_MODEL, workspace=self.ws('f1'),
                              prompt_sha256=SHA, stage='s', now=T_NIGHT,
-                             executor='codebuddy', codebuddy_glm_allowed=True,
+                             executor='codebuddy', codebuddy_glm_allowed=False,
                              _preclaim=False)
         self.assertTrue(claimed.get('allowed'), claimed)
         consumed = dp.consume_for_entry(
-            self.store, task_id='f2', runtime='codebuddy', model=GLM_MODEL,
-            workspace=self.ws('f2'), prompt_sha256=SHA, stage='s',
+            self.store, task_id='f1', runtime='codebuddy', model=GLM_MODEL,
+            workspace=self.ws('f1'), prompt_sha256=SHA, stage='s',
             claim_token=claimed['token'], now=T_NIGHT, executor='codebuddy',
             codebuddy_glm_allowed=False)
-        self.assertFalse(consumed.get('allowed'), consumed)
-        self.assertEqual(consumed['reason'], 'codebuddy_quota_condition_not_met')
-        self.assertTrue(consumed.get('capacity_released'), consumed)
-        # 真正的条件消费成功（reserved → running），GLM 只占自己的独立 1 槽。
+        self.assertTrue(consumed.get('allowed'), consumed)
+        with closing(dp.connect(self.store)) as conn:
+            self.assertEqual(dp._count_active(conn, GLM), 1)
+            self.assertEqual(dp._count_active(conn, CB), 0)
+        # 终态释放后，同槽可再次成功消费（GLM 只占自己的独立 1 槽）。
+        # 终态释放：该 attempt 已被 consume_for_entry 消费为 running 并记录了真实 owner
+        # （wrapper_pid=os.getpid()、wrapper_created=mock 身份 'c1'）。BW-LIMIT30-20261019-S4
+        # 缺口 3：无 child 的 running attempt 位于 Popen-bind 窗口，必须由**合法 owner 亲证**
+        # （wrapper 身份一致）才可 cancelled 释放——传 wrapper_pid=None 会正确落到
+        # owner_unverified（生产 release 语义不放宽）。这里注入与记录一致的 owner 身份，
+        # 绑定真实终态释放，而不是放松生产门。
+        rel = dp.finish(self.store, claimed['token'], terminal='cancelled',
+                        now=T_NIGHT, wrapper_pid=os.getpid(), wrapper_created='c1')
+        self.assertTrue(rel.get('released') or rel.get('settled'), rel)
         claimed2 = dp.reserve(self.store, task_id='f3', runtime='codebuddy',
                               model=GLM_MODEL, workspace=self.ws('f3'),
                               prompt_sha256=SHA, stage='s', now=T_NIGHT,
@@ -496,8 +524,9 @@ class TestIndependentModelSlots(_Base):
             self.assertEqual(dp._count_active(conn, CB), 1)
             self.assertEqual(dp._count_active(conn, GLM), 1)
 
-    def test_total_physical_capacity_14_and_status_independent_counts(self):
-        self.assertEqual(dp.DOMESTIC_TOTAL_CAPACITY, 14)
+    def test_total_physical_capacity_16_and_status_independent_counts(self):
+        # BW-OPENCODE-20261019 起物理总 16：两 OpenCode 免费模型各独立 1 槽、独立计数。
+        self.assertEqual(dp.DOMESTIC_TOTAL_CAPACITY, 16)
         self.assertEqual(dp.CAPACITY[GLM], 1)
         self.assertEqual(dp.MAIN_FORCE_CAPACITY[GLM], 1)
         self.seed(CB, 1)
@@ -507,11 +536,13 @@ class TestIndependentModelSlots(_Base):
         self.seed(CN_MAX, 1)
         self.seed(CN_CUSTOM_MAX, 2)
         self.seed(CLAUDE, 2)
+        self.seed(dp.OPENCODE_DEEPSEEK_POOL_KEY, 1)
+        self.seed(dp.OPENCODE_GLM_POOL_KEY, 1)
         self.seed(QFLASH, 2)
         self.seed(CN_FLASH, 2)
         st = dp.status(self.store, now=T_NIGHT)
-        self.assertEqual(st['domestic']['capacity'], 14)
-        self.assertEqual(st['domestic']['active'], 14)
+        self.assertEqual(st['domestic']['capacity'], 16)
+        self.assertEqual(st['domestic']['active'], 16)
         self.assertEqual(st['pools'][CB]['active'], 1)
         self.assertEqual(st['pools'][CB]['free'], 0)
         self.assertEqual(st['pools'][GLM]['active'], 1)
@@ -519,7 +550,7 @@ class TestIndependentModelSlots(_Base):
         self.assertNotIn('shared_active', st['pools'][GLM])
         self.assertNotIn('shared_group', st['pools'][GLM])
         self.assertNotIn('shared_capacity', st['pools'][CB])
-        self.assertEqual(sum(p['active'] for p in st['pools'].values()), 14)
+        self.assertEqual(sum(p['active'] for p in st['pools'].values()), 16)
         for model in (GLM_MODEL, CB_MODEL):
             out = dp.reserve(self.store, task_id=f'full-{model}',
                              runtime='codebuddy',
@@ -574,7 +605,10 @@ class TestFormalLiveGlm(_Base):
         p.write_text('do a bounded read-only probe', encoding='utf-8')
         return p
 
-    def test_missing_proof_refuses_before_config_outdir_claim_popen(self):
+    def test_missing_proof_reaches_config_load_without_quota_refusal(self):
+        # BW-LIMIT30-20261019-S3：缺证据不再在读取配置前拒绝；入口直接进入配置读取。
+        # 配置不存在 → FileNotFoundError，且 stdout 没有任何 quota 拒绝 JSON、outdir 未创建、
+        # 零占位（证明旧前置门已撤销，且仍不产生副作用）。
         argv = ['--workspace', str(self.work),
                 '--prompt-file', str(self.base / 'missing-prompt.txt'),
                 '--output-dir', str(self.base / 'never-created'),
@@ -582,29 +616,34 @@ class TestFormalLiveGlm(_Base):
                 '--config', str(self.base / 'no-such-config.json')]
         buf = io.StringIO()
         with redirect_stdout(buf):
-            code = cl.main(argv)
-        self.assertEqual(code, 2)
-        out = json.loads(buf.getvalue())
-        self.assertEqual(out['reason'], 'codebuddy_quota_condition_not_met')
-        self.assertFalse(out['dispatched'])
+            with self.assertRaises(FileNotFoundError):
+                cl.main(argv)
+        self.assertEqual(buf.getvalue(), '')
         self.assertFalse((self.base / 'never-created').exists())
         with closing(dp.connect(self.store)) as conn:
             self.assertEqual(dp._count_active(conn, GLM), 0)
             self.assertEqual(dp._count_active(conn, CB), 0)
 
-    def test_run_missing_proof_zero_side_effects(self):
+    def test_run_missing_proof_dispatches_glm(self):
+        # 无 DeepSeek 证据 → 正式入口照常认领并 Popen；旧参数仅作兼容诊断。
         rec = {}
-        factory = stub.make_popen_factory(stdout=b'', record=rec)
+        stream = _stream(self.report, GLM_MODEL)
+        factory = stub.make_popen_factory(stdout=stream, returncode=0, record=rec)
         out = cl.run(self.cfg, workspace=str(self.work),
                      prompt_file=self._prompt(), out_dir=self.base / 'run-nope',
                      stage=self.stage, task_id='r', model=GLM_MODEL,
-                     tools_items=['Read'], prompt_sha256=SHA,
+                     tools_items=['Read'], prompt_sha256=cl._sha(
+                         (self.base / 'prompt.txt').read_bytes()),
                      dispatch_store=self.store, popen_factory=factory,
+                     child_prober=lambda pid: {'state': 'dead', 'created': None},
                      codebuddy_quota_evidence=None, now=T_NIGHT)
-        self.assertTrue(out.get('dispatch_failed'), out)
-        self.assertEqual(out['reason'], 'codebuddy_quota_condition_not_met')
-        self.assertNotIn('argv', rec)  # 未 Popen
-        self.assertFalse((self.base / 'run-nope').exists())
+        self.assertTrue(out.get('dispatched'), out)
+        self.assertTrue(out.get('passed'), out)
+        self.assertEqual(out['pool_key'], GLM)
+        self.assertTrue(out['codebuddy_glm_allowed'])
+        self.assertIsNone(out['codebuddy_quota_evidence'])
+        self.assertIn('argv', rec)  # 真实到达 Popen
+        self.assertEqual(rec['argv'][rec['argv'].index('--model') + 1], GLM_MODEL)
         with closing(dp.connect(self.store)) as conn:
             self.assertEqual(dp._count_active(conn, CB), 0)
 

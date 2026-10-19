@@ -47,6 +47,10 @@ CAPABILITY = {
     'qodercn': {'fine_grained': True, 'read_dirs': True},
     'codebuddy': {'fine_grained': True, 'read_dirs': False},
     'zcode': {'fine_grained': False, 'read_dirs': False},
+    # BW-OPENCODE-20261019：OpenCode CLI 走普通隔离整工具模式（read/edit 允许，其它工具
+    # 默认 deny），不能表达逐文件 Edit/Bash 规则，也没有外部只读目录 grant。绝不假称
+    # 它是逐文件沙箱；精确 grants 需求下由控制面如实标 permission_incompatible。
+    'opencode': {'fine_grained': False, 'read_dirs': False},
     # BW-CLAUDE-DEEPSEEK-S2：Claude Code CLI 支持逐文件 Edit(...)/原样 Bash(...) 细粒度授权
     # 与 --add-dir 外部只读目录，故 fine_grained/read_dirs 均为 True。这只是让控制面接受
     # claude 计划/精确工具授权；其它被退休组合的拒绝逻辑完全不受影响。

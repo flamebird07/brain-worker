@@ -58,13 +58,14 @@ class NativeLifecycleTests(unittest.TestCase):
     # routing_required 拒绝（fixture 不能反向松生产轮转）；合法顺序 Z,Max,Z,Max,
     # Flash,Flash，每次独立 workspace 并逐一核验 allowed/token/pool_key。
     def _fill_domestic(self):
-        # BW-CODEBUDDY-MAIN-S3 + BW-WORKER-WIDGET-20261018-S3 十四满：codebuddy deepseek×1
-        # + codebuddy GLM×1（各自独立 1 槽，GLM 需显式当轮额度条件授权）+ zcode×2 +
-        # 两内置 Max 各 1 + CN 自定义 Max×2 + 两地区 Flash 各 2 + claude:deepseek-flash×2
-        # （T0=北京周四 23:00，主力时段内且 claude offhours，真实 API 直接 claim）。
+        # BW-CODEBUDDY-MAIN-S3 + BW-WORKER-WIDGET-20261018-S3 + BW-OPENCODE-20261019-S3
+        # 十六满：codebuddy deepseek×1 + codebuddy GLM×1（各自独立 1 槽，GLM 需显式当轮
+        # 额度条件授权）+ zcode×2 + 两内置 Max 各 1 + CN 自定义 Max×2 + 两地区 Flash 各 2
+        # + claude:deepseek-flash×2 + 两个 OpenCode 免费模型各 1 独立槽（T0=北京周四 23:00，
+        # 主力时段内且 claude offhours，OpenCode 无时段门，真实 API 直接 claim）。
         # 全部经显式 executor 逐一确定性 claim（CN 池只能 executor='qodercn'，claude 只能
-        # executor='claude'，codebuddy 两模型只能 executor='codebuddy'，AUTO 轮换不保证落
-        # 某特定主力），每次核验 allowed/token/pool_key。
+        # executor='claude'，codebuddy 两模型只能 executor='codebuddy'，OpenCode 经
+        # executor='opencode'，AUTO 轮换不保证落某特定主力），每次核验 allowed/token/pool_key。
         plan = [('codebuddy', 'deepseek-v4.1-flash', 'codebuddy'),
                 ('codebuddy', 'glm-5.3-flash', 'codebuddy'),
                 ('zcode', 'GLM-5.3', 'zcode'), ('zcode', 'GLM-5.3', 'zcode'),
@@ -77,7 +78,9 @@ class NativeLifecycleTests(unittest.TestCase):
                 ('qodercn', 'Qwen3.8-Flash', 'qodercn'),
                 ('qodercn', 'Qwen3.8-Flash', 'qodercn'),
                 ('claude', 'deepseek-flash', 'claude'),
-                ('claude', 'deepseek-flash', 'claude')]
+                ('claude', 'deepseek-flash', 'claude'),
+                ('opencode', dp.OPENCODE_DEEPSEEK_MODEL, 'opencode'),
+                ('opencode', dp.OPENCODE_GLM_MODEL, 'opencode')]
         tokens = []
         for i, (runtime, model, ex) in enumerate(plan):
             out = dp.reserve(self.store, task_id=f'dom-{i}', runtime=runtime,
