@@ -157,6 +157,27 @@ class FakePopen:
 
 
 class PureFunctionTests(unittest.TestCase):
+    def test_json_progress_count_ignores_noise_and_counts_valid_events(self):
+        raw = (b'not-json\n'
+               b'{"type":"step_start"}\n'
+               b'{"message":"no type"}\n'
+               b'{"type":"text","part":{"text":"ok"}}\n')
+        self.assertEqual(od._json_progress_count(raw), 2)
+
+    def test_no_progress_watch_stops_real_silent_child(self):
+        proc = subprocess.Popen(
+            [sys.executable, '-c', 'import time; time.sleep(5)'],
+            stdin=subprocess.PIPE, stdout=subprocess.PIPE, stderr=subprocess.PIPE)
+        started = __import__('time').monotonic()
+        try:
+            with self.assertRaises(od.NoProgressExpired):
+                od._communicate_with_no_progress_watch(
+                    proc, b'', total_seconds=2, idle_seconds=0.15)
+        finally:
+            proc.kill()
+            proc.communicate(timeout=2)
+        self.assertLess(__import__('time').monotonic() - started, 1.5)
+
     def test_build_argv_shape_and_model_hard_gate(self):
         argv = od.build_argv('C:/tools/opencode.exe', DEEPSEEK)
         self.assertEqual(argv, ['C:/tools/opencode.exe', 'run', '--pure', '--model',
@@ -170,6 +191,7 @@ class PureFunctionTests(unittest.TestCase):
     def test_default_timeout_is_bounded(self):
         self.assertGreater(od.DEFAULT_TIMEOUT_SECONDS, 0)
         self.assertLessEqual(od.DEFAULT_TIMEOUT_SECONDS, 3600)
+        self.assertEqual(od.DEFAULT_NO_PROGRESS_TIMEOUT_SECONDS, 300)
 
     def test_example_config_is_loadable_and_minimal(self):
         cfg = od.load_entry_config(str(od.EXAMPLE_CONFIG))

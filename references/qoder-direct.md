@@ -66,6 +66,8 @@ Qoder 界面/任务 scope 里列出的文件只是**准备输入**，不自动�
 
 主脑生成 Qoder 精确文件任务时固定走四步：
 
+正式入口可以直接使用 `--task-scope <scope.json>` 完成这四步中的规则生成：入口在容量 claim 和 Popen 之前读取 scope、调用同一个 `qoder_permissions.build_permissions`，并把生成结果写入 `request.json.task_scope`。使用该参数时禁止混传 `--tools`、`--allowed-tools`、`--disallowed-tools` 或 `--add-dir`，避免 scope 与实际 argv 漂移。`stage_selection` 选中 Qoder/Qoder CN 时也会在回执写出同源 `qoder_permission_plan`，主脑可在正式派发前直接核对。
+
 1. 从任务书/已确认范围写 scope JSON：`edits` 是工作区根相对的具体文件，`bash` 是完整
    原样命令，`read_dirs` 只放已授权只读目录。
 2. 运行 `python <技能目录>/scripts/qoder_permissions.py --scope <scope.json>`。helper 始终

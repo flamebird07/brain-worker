@@ -866,3 +866,10 @@ S5 增加 Qoder Max 池的**明确限额**闭环（BW-MAX-WINDOW-20261010-S2 把
 - **AUTO/executor 路由保留**：`executor='qoder'` 请求 QMax 且未落标 → 直接 claim；已落标或已满 → 同 executor 内 Flash 兜底（`routing_required` 选 `qoder:Qwen3.8-Flash`），绝不复活限额 Max、绝不跨地区换 CN。`executor='qodercn'` 同规则镜像 CN Max→CN Flash。Luna 侧不变：domestic 任何时刻都不启用 Luna、unknown 保占位、明确模型不偷偷换。
 - **qoder_direct 落标时序**：真实失败终态（`protocol_success=False`）经 `_explicit_quota_limit_hit` 命中 + `_qoder_max_pool_key` 返回非 None → **先** `record_main_force_limit`（写 `stdout.json` 原字节 sha256 为证据）→ **再** 真实终态释放；落标异常绝不阻断真实终态释放（不泄漏锁）。
 - **离线回归覆盖**：`tests/test_dispatch_pool.py::MainForceLimitTests`（含自定义 CN 主力 record/read/release、consume 只释放本次 reserved、对两内置 Max 无连带）、`tests/test_qoder_cn_direct_offline.py::ExplicitQuotaLimitHitTests`、`tests/test_dispatch_pool_qodercn.py`（六池容量/退休 DeepSeek `unknown_pool`）、`tests/test_availability_routing.py`（回收/降级 combo 硬约束）、`tests/test_parallel_execution.py`（并发演练 qa Max + qb Flash）。Windows/Linux CI 矩阵都跑，零网络、零凭据、零真实额度查询。
+# 可解释选择与限额短窗到期新轮（BW-DISPATCH-WAIT-20261019-S1）
+
+`stage_selection` 的每次只读回执必须列出选中层级、全部合格候选、逐候选排除原因、所有更高优先级排除项和下一候选。AUTO 选择有机械不变量：选中项必须是合格集合中的最小优先级编号；不满足就以 `selection_priority_invariant_failed` 拒绝，不能静默越级。
+
+授权 JSON 可携带 `dispatch_round={id,started_at_utc}` 和 `round_failed_candidates`。当某个本轮失败候选存在真实结构化限额记录，且 1800 秒短窗恰好到期或已经到期，同时当前 task/workspace 没有在途，规划器自动产生 `round_transition`，轮号加一并清空旧轮失败集合，再从最高优先级选择。它不删除限额记录、不查询余额、不证明服务已恢复；真实调用仍可能再次返回限额。调用方必须保存回执中的新轮号和 `effective_round_failed_candidates`，不能继续复制旧轮输入。
+
+Qoder/Qoder CN 被选中且任务提供 `task_scope` 时，回执同时给出 `qoder_permission_plan`，正式入口用 `--task-scope` 消费同一 scope，在首次 Popen 前生成精确文件和命令规则。OpenCode 的 1800 秒总墙钟之外另有默认 300 秒无有效 JSON 事件看门狗；触发后分类为 `stalled_no_progress`，不冒充额度、认证或业务失败。

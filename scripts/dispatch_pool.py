@@ -217,6 +217,23 @@ MAIN_FORCE_CAPACITY = {'codebuddy:deepseek-v4.1-flash': 1,
                        'opencode:glm-5.3-flash-free': 1}
 OVERFLOW_POOLS = (('qoder', 'Qwen3.8-Flash'), ('qodercn', 'Qwen3.8-Flash'))
 OVERFLOW_CAPACITY = {'qoder:Qwen3.8-Flash': 2, 'qodercn:Qwen3.8-Flash': 2}
+
+# AUTO 的唯一优先级口径。stage_selection 的可解释回执与正式 claim 都复用它，避免
+# 文档层序、预览回执和真正派发各自维护一份数字。数字越小优先级越高；两个 Flash
+# 始终是最后兜底层。
+POOL_PRIORITY = {
+    'codebuddy:deepseek-v4.1-flash': 0,
+    'qodercn:Qwen-3.8-Max': 1,
+    'qoder:Qwen3.8-Max': 1,
+    'qodercn:Qwen3.8-Max': 1,
+    'claude:deepseek-flash': 2,
+    'zcode:GLM-5.3': 3,
+    'opencode:deepseek-v4.1-flash-free': 4,
+    'opencode:glm-5.3-flash-free': 4,
+    'codebuddy:glm-5.3-flash': 5,
+    'qoder:Qwen3.8-Flash': 6,
+    'qodercn:Qwen3.8-Flash': 6,
+}
 # BW-POOL-SPLIT-20261010-S2：CN DeepSeek-Flash 从正常池退出，但保留池名与 0 容量条目，
 # 让已有真实在途 attempt 仍能通过 `_count_active` 与 `finish/reconcile` 到达自然终态
 # 释放；不再有任何新 claim 落到该池（AUTO/executor=qodercn/显式 combo 均拒绝）。
@@ -836,6 +853,51 @@ def _quota_limit_window_active(conn, pk, now=None) -> bool:
     return 0 <= age < QUOTA_LIMIT_WINDOW_SECONDS
 
 
+def quota_limit_window_status(conn, pk, now=None) -> dict:
+    """返回结构化短窗状态，供只读选择器决定是否进入新调度轮。
+
+    只接受绑定在 ``main_force_limits`` 的真实结构化限额记录。无记录、已人工解除、时间
+    非法或未来时间均不冒充到期；恰满 1800 秒返回 ``expired``。本函数只读，不删除标记、
+    不宣称额度恢复，也不启动任何探针。
+    """
+    result = {'pool_key': pk, 'state': 'not_applicable', 'reference_utc': None,
+              'expires_at_utc': None, 'age_seconds': None}
+    if pk not in QUOTA_LIMIT_WINDOW_POOLS:
+        return result
+    row = conn.execute('SELECT limited, attempt_token, recorded_at_utc '
+                       'FROM main_force_limits WHERE pool_key=?', (pk,)).fetchone()
+    if row is None or int(row['limited']) != 1:
+        result['state'] = 'not_limited'
+        return result
+    try:
+        ref = _parse(_limit_reference_utc(conn, row))
+    except (ValueError, TypeError):
+        result['state'] = 'invalid_reference'
+        return result
+    if ref is None or ref.tzinfo is None:
+        result['state'] = 'invalid_reference'
+        return result
+    now = now or utcnow()
+    if now.tzinfo is None:
+        now = now.replace(tzinfo=timezone.utc)
+    age = (now - ref).total_seconds()
+    result['reference_utc'] = _iso(ref)
+    result['expires_at_utc'] = _iso(ref + timedelta(seconds=QUOTA_LIMIT_WINDOW_SECONDS))
+    result['age_seconds'] = age
+    if age < 0:
+        result['state'] = 'future_reference'
+    elif age < QUOTA_LIMIT_WINDOW_SECONDS:
+        result['state'] = 'active'
+    else:
+        result['state'] = 'expired'
+    return result
+
+
+def priority_for_pool(pk) -> int | None:
+    """返回 AUTO 层编号；未知/退休池返回 None。"""
+    return POOL_PRIORITY.get(pk)
+
+
 def _rotation_row(conn):
     row = conn.execute('SELECT * FROM rotation WHERE pool_group=?', ('main',)).fetchone()
     if row is None:
@@ -1239,11 +1301,6 @@ def _select_main_force(conn, requested_pk, now, eligible=None):
     # ZCode(3) > 两 OpenCode 同级(4) > CodeBuddy GLM(5，额度独立，缺省候选即含) > 两地区 Flash（主力之外）。
     # BW-LIMIT30-20261019-S3：GLM 默认参与排序（不再要求当轮 DeepSeek 限额证据），仅当
     # 授权候选未含它、或它自身处于真实 1800 秒限额窗口时才被剔除。
-    tier = {CODEBUDDY_POOL_KEY: 0,
-            QMAX_POOL_KEY: 1, CN_MAX_POOL_KEY: 1, CN_CUSTOM_MAX_POOL_KEY: 1,
-            CLAUDE_POOL_KEY: 2, ZCODE_POOL_KEY: 3,
-            OPENCODE_DEEPSEEK_POOL_KEY: 4, OPENCODE_GLM_POOL_KEY: 4,
-            CODEBUDDY_GLM_POOL_KEY: 5}
     # BW-CUSTOM-MAX-RESUME-20261018-S1：Max 层内自定义子优先（在途数/tie 之前）——
     # qodercn:Qwen-3.8-Max 先于两个内置 Max，两内置之间仍按在途数平衡。保留原 tier 数值，
     # 仅加一个子键，不新建优先级框架。
@@ -1251,7 +1308,7 @@ def _select_main_force(conn, requested_pk, now, eligible=None):
 
     def _key(item):
         pk, active = item
-        return (tier.get(pk, len(tier)), max_sub.get(pk, 0), active,
+        return (POOL_PRIORITY.get(pk, len(POOL_PRIORITY)), max_sub.get(pk, 0), active,
                 0 if pk == requested_pk else 1, pk)
 
     avail.sort(key=_key)

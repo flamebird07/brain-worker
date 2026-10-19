@@ -11,6 +11,10 @@ CN 自定义 Max 恢复声明（BW-CUSTOM-MAX-RESUME-20261018-S1）：用户已�
 
 限额短窗覆盖（BW-PRIORITY-REPAIR-20261019）：上段“历史标记不挡新轮”只指旧 availability/长期冷却。ZCode／GLM-5.3、Claude／deepseek-flash、CodeBuddy 国际／deepseek-v4.1-flash 的**最近一次真实结构化限额**在 1800 秒内必须从新派发候选过滤，恰满 1800 秒自动恢复原优先级；三者按精确 pool_key 独立，CodeBuddy／GLM-5.3-Flash 不被 DeepSeek 限额连带。AUTO 与显式入口执行同一短窗规则。
 
+新轮与可解释派工（BW-DISPATCH-WAIT-20261019-S1）：`stage_selection` 在确认本 task/workspace 没有在途后，若 `round_failed_candidates` 中某个真实结构化限额短窗已到期，自动结束旧 `dispatch_round`、清空旧轮失败集合并从最高优先级重新裁决；不清原限额证据、不宣称额度恢复。回执必须包含 `selected_priority`、`eligible_candidates`、`excluded_candidates_with_reason`、`higher_priority_exclusions`、`next_candidate`、`dispatch_round` 与可选 `round_transition`；AUTO 选中项若不是合格集合中的最小优先级编号，规划直接拒绝。调用方必须把回执中的 `dispatch_round` 和 `effective_round_failed_candidates` 带到下一次选择，不能继续复制过期旧列表。
+
+无进展与 Qoder 首派权限（BW-DISPATCH-WAIT-20261019-S1）：OpenCode 总墙钟仍为 1800 秒，但连续 300 秒没有任何可解析 JSON 事件时以 `stalled_no_progress` 收口、释放已确认终态的槽并进入下一候选；用户明确要求继续等待时可对该次入口传 `--no-progress-timeout-seconds 0`，只保留总墙钟。任务已有明确 `task_scope`（具体 edits/bash/read_dirs）且选中 Qoder/Qoder CN 时，规划回执直接生成 `qoder_permission_plan`；正式 `qoder_direct.py --task-scope <scope.json>` 在 Popen 前生成精确工具与允许规则，禁止再混传手工工具参数，确保第一次真实派发就使用精确文件与命令权限。
+
 
 # 主脑与苦力 Agent
 

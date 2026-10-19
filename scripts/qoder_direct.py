@@ -42,6 +42,7 @@ import execution_control as ec  # noqa: E402 任务级控制面（同目录，�
 import prompt_contract as pc  # noqa: E402 三入口共享九节契约（标准库，不反向导入本模块）
 import dispatch_pool as dp  # noqa: E402 跨会话并发容量池（同目录，标准库 sqlite3）
 import qoder_permission_watch as qpw  # noqa: E402 CN 会话权限拒绝监视（同目录，标准库）
+import qoder_permissions as qp  # noqa: E402 从任务 scope 生成首次派发的精确规则
 
 DEFAULT_CONFIG = _SCRIPTS_DIR / 'local-entry.json'
 DEFAULT_CN_CONFIG = _SCRIPTS_DIR / 'local-entry-cn.json'
@@ -701,6 +702,11 @@ def main():
                     help='Repeatable additional readable directory. Declaring a directory does '
                          'not grant edit permission; it only extends file visibility outside '
                          'the workspace root.')
+    ap.add_argument('--task-scope', dest='task_scope', default=None,
+                    help='JSON file with edits/bash/read_dirs. When supplied, the entry '
+                         'generates the exact Qoder tools and allow rules before Popen; '
+                         'manual --tools/--allowed-tools/--disallowed-tools/--add-dir '
+                         'may not be mixed with it.')
     ap.add_argument('--resume-session-id', '--session-id', dest='session_id', default=None,
                     help='Resume a known Qoder session using the official --resume flag.')
     ap.add_argument('--config', default=str(DEFAULT_CONFIG),
@@ -838,6 +844,34 @@ def main():
     if not work.is_dir() or not prompt.strip():
         ap.error('Existing workspace and non-empty prompt required')
     out = Path(args.output_dir).resolve()
+    task_scope_record = None
+    if args.task_scope:
+        if (args.tools or args.allowed_tools is not None
+                or args.disallowed_tools is not None or args.add_dirs is not None):
+            print(json.dumps({'task_scope_rejected': True, 'sent': False,
+                              'exit_code': 2,
+                              'reasons': ['--task-scope cannot be mixed with manual '
+                                          'tool or permission arguments']},
+                             ensure_ascii=False))
+            return 2
+        try:
+            scope_path = Path(args.task_scope).resolve(strict=True)
+            scope_bytes = scope_path.read_bytes()
+            scope_data = json.loads(scope_bytes.decode('utf-8'))
+            generated = qp.build_permissions(scope_data)
+        except (OSError, UnicodeDecodeError, ValueError, json.JSONDecodeError) as exc:
+            print(json.dumps({'task_scope_rejected': True, 'sent': False,
+                              'exit_code': 2, 'reasons': [str(exc)]}, ensure_ascii=False))
+            return 2
+        args.tools = ','.join(generated['visible_tools'])
+        args.allowed_tools = list(generated['allowed_tools'])
+        args.disallowed_tools = list(generated['disallowed_tools'])
+        args.add_dirs = list(generated['add_dirs'])
+        task_scope_record = {
+            'path': str(scope_path),
+            'sha256': hashlib.sha256(scope_bytes).hexdigest(),
+            'generated': generated,
+        }
     perms = effective_permission_rules(args.tools, args.allowed_tools,
                                         args.disallowed_tools, args.add_dirs)
     if is_cn:
@@ -1013,6 +1047,7 @@ def main():
                    'allowed_tools': list(perms['allowed_tools']),
                    'disallowed_tools': list(perms['disallowed_tools']),
                    'add_dirs': list(perms['add_dirs']),
+                   'task_scope': task_scope_record,
                    'stage': args.stage, 'chat_id': args.chat_id,
                    'resume_session_id': args.session_id,
                    'executor_identity': {

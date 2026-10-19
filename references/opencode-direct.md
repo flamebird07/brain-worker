@@ -5,6 +5,10 @@
 `MAIN_FORCE_CAPACITY`，国内总容量 14→**16**，原 14 槽一项未减）。实现以
 `scripts/opencode_direct.py` 为准，不一致时以代码为准并回修文档。
 
+## 无进展看门狗（BW-DISPATCH-WAIT-20261019-S1）
+
+总墙钟上限仍为 1800 秒。正式入口同时按 stdout JSONL 观察有效事件；连续 300 秒没有任何可解析且带 `type` 的事件时终止本次子进程并记录 `stalled_no_progress=true`、`termination_reason=stalled_no_progress`，保留原始 stdout/stderr，已确认终态后释放本槽。普通噪声、半行和不可解析文本不冒充进展。用户明确要求本次继续等待时可传 `--no-progress-timeout-seconds 0` 关闭无进展门，但总墙钟仍必须保留；负值在 Popen 前拒绝。
+
 ## 精确模型硬门（仅两个免费 ID，绝不付费回退）
 
 - `opencode:deepseek-v4.1-flash-free`（`--model deepseek-v4.1-flash-free`）与

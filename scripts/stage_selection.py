@@ -33,6 +33,7 @@ if str(_SCRIPTS) not in sys.path:
 import dispatch_pool as dp  # noqa: E402
 import execution_control as ec  # noqa: E402
 import codebuddy_fallback as cbf  # noqa: E402
+import qoder_permissions as qp  # noqa: E402
 
 SELECTION_MODES = ('auto', 'fixed', 'executor', 'temporary_fallback')
 USER_DIRECT_SELECTION_FIELD = 'user_direct_selection'
@@ -380,6 +381,9 @@ def plan_stage_selection(authorization, *, previous=None, store_path=None, quota
         'authorization_scope': auth.get('authorization_scope'),
         'allowed_candidates': list(auth.get('allowed_candidates') or []),
         'round_failed_candidates': [],
+        'effective_round_failed_candidates': [],
+        'dispatch_round': None,
+        'round_transition': None,
         'codebuddy_quota_evidence': None,
         'codebuddy_glm_allowed': False,
         'codebuddy_glm_condition': None,
@@ -388,6 +392,12 @@ def plan_stage_selection(authorization, *, previous=None, store_path=None, quota
         'session_reuse_allowed': False,
         'permission_requirements': None,
         'selected': None, 'selected_reason': None,
+        'selected_priority': None,
+        'eligible_candidates': [],
+        'excluded_candidates_with_reason': [],
+        'higher_priority_exclusions': [],
+        'next_candidate': None,
+        'qoder_permission_plan': None,
         'candidate_filters': {}, 'zcode_blocked': False, 'refused': None,
         'snapshot_note': ('snapshot time is not live capacity; the authoritative entry '
                           're-checks atomically; this snapshot is never a placeholder, a '
@@ -416,6 +426,7 @@ def plan_stage_selection(authorization, *, previous=None, store_path=None, quota
     except ValueError as exc:
         return _refuse('invalid_round_failed_candidates', str(exc))
     receipt['round_failed_candidates'] = list(round_failed)
+    receipt['effective_round_failed_candidates'] = list(round_failed)
     # task_scope 严格直查（BW-PERMISSION-SCOPE-S1）：畸形输入拒绝、不猜测；只进回执，
     # 不参与能力过滤/授权，绝不突变调用方原对象，也绝不弱化 permission_grants 硬合同。
     try:
@@ -547,6 +558,56 @@ def plan_stage_selection(authorization, *, previous=None, store_path=None, quota
         if dp._domestic_active(conn) >= dp.DOMESTIC_TOTAL_CAPACITY:
             return _refuse('domestic_total_full')
 
+        # BW-DISPATCH-ROUND-S1：结构化限额短窗到期且当前没有在途（上面的 task/workspace
+        # 门已核验）时，结束旧轮并清空**仅属于旧轮**的失败列表。这样“满 1800 秒恢复
+        # 原优先级”不会继续被 already_tried_this_round 永久挡住。这里不清额度记录、
+        # 不声称额度已经恢复，也不启动模型；正式入口仍会真实验证。
+        round_meta = auth.get('dispatch_round')
+        round_id = 1
+        round_started = None
+        if round_meta is not None:
+            if (not isinstance(round_meta, dict)
+                    or not isinstance(round_meta.get('id'), int)
+                    or round_meta.get('id') < 1
+                    or not isinstance(round_meta.get('started_at_utc'), str)):
+                return _refuse('invalid_dispatch_round')
+            round_id = round_meta['id']
+            try:
+                round_started = dp._parse(round_meta['started_at_utc'])
+            except (TypeError, ValueError):
+                return _refuse('invalid_dispatch_round')
+            if round_started is None or round_started.tzinfo is None:
+                return _refuse('invalid_dispatch_round')
+        expired = []
+        for failed_pk in round_failed:
+            if failed_pk not in set(allowed):
+                continue
+            limit = dp.quota_limit_window_status(conn, failed_pk, now)
+            if limit['state'] != 'expired':
+                continue
+            expiry = dp._parse(limit['expires_at_utc'])
+            # 有显式新轮且起点已经在到期点之后时，不重复滚轮；调用方应保存本回执。
+            if round_started is None or round_started < expiry:
+                expired.append(limit)
+        if expired:
+            old_id = round_id
+            round_id += 1
+            round_failed = []
+            receipt['effective_round_failed_candidates'] = []
+            receipt['round_transition'] = {
+                'from_round': old_id,
+                'to_round': round_id,
+                'reason': 'structured_limit_window_expired_no_inflight',
+                'expired_candidates': expired,
+            }
+            round_started = now
+        elif round_started is None:
+            round_started = now
+        receipt['dispatch_round'] = {
+            'id': round_id,
+            'started_at_utc': dp._iso(round_started),
+        }
+
         zcode_blocked = dp._zcode_availability_blocked(quota_store, now=now)
         receipt['zcode_blocked'] = bool(zcode_blocked)
 
@@ -615,6 +676,31 @@ def plan_stage_selection(authorization, *, previous=None, store_path=None, quota
                                              round_failed=round_failed,
                                              codebuddy_glm_allowed=glm_allowed)
         receipt['candidate_filters'] = _per_candidate_view(eff_allowed, filters)
+        eligible_rows = []
+        excluded_rows = []
+        for candidate in eff_allowed:
+            priority = dp.priority_for_pool(candidate)
+            if candidate in set(passed):
+                eligible_rows.append({
+                    'pool_key': candidate,
+                    'priority': priority,
+                    'active': dp._count_active(conn, candidate),
+                    'capacity': dp.capacity_for(candidate),
+                })
+            else:
+                excluded_rows.append({
+                    'pool_key': candidate,
+                    'priority': priority,
+                    'reason': filters.get(candidate, 'unknown'),
+                })
+        eligible_rows.sort(key=lambda row: (
+            row['priority'] if row['priority'] is not None else 999,
+            row['active'], row['pool_key']))
+        excluded_rows.sort(key=lambda row: (
+            row['priority'] if row['priority'] is not None else 999,
+            row['pool_key']))
+        receipt['eligible_candidates'] = eligible_rows
+        receipt['excluded_candidates_with_reason'] = excluded_rows
         receipt['permission_incompatibility_details'] = _permission_incompatibility_details(
             receipt['candidate_filters'], requirements)
 
@@ -640,6 +726,32 @@ def plan_stage_selection(authorization, *, previous=None, store_path=None, quota
 
         receipt['selected'] = _pk_parts(sel_pk)
         receipt['selected_reason'] = reason
+        receipt['selected_priority'] = dp.priority_for_pool(sel_pk)
+        receipt['next_candidate'] = next(
+            (_pk_parts(row['pool_key']) | {'priority': row['priority']}
+             for row in eligible_rows if row['pool_key'] != sel_pk), None)
+        if receipt['selected_priority'] is not None:
+            receipt['higher_priority_exclusions'] = [
+                row for row in excluded_rows
+                if row['priority'] is not None
+                and row['priority'] < receipt['selected_priority']]
+        # AUTO 必须选合格集合中最小层号；否则拒绝而不是静默越级。fixed/executor 是用户
+        # 显式限定，不能拿全局 AUTO 层级反向覆盖用户选择。
+        if eff_mode == 'auto' and eligible_rows:
+            min_priority = min(row['priority'] for row in eligible_rows
+                               if row['priority'] is not None)
+            if receipt['selected_priority'] != min_priority:
+                receipt['selected'] = None
+                receipt['selected_reason'] = None
+                return _refuse('selection_priority_invariant_failed')
+        # task_scope 在首次 Qoder 派发前直接生成同一份精确规则，避免先宽泛试错再补派。
+        if receipt['selected']['runtime'] in ('qoder', dp.CN_RUNTIME) and norm_scope:
+            try:
+                receipt['qoder_permission_plan'] = qp.build_permissions(norm_scope)
+            except ValueError as exc:
+                receipt['selected'] = None
+                receipt['selected_reason'] = None
+                return _refuse('qoder_permission_plan_invalid', str(exc))
         prev = previous or {}
         # 仅当 previous 显式属本 task、组合(runtime+model)相同、上轮为真实终态且已独立验收
         # 时才允许复用旧 session；缺 task_id 或来自 OTHER 任务一律不复用（绝不跨 task 继承

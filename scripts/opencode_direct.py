@@ -40,6 +40,7 @@ import re
 import shutil
 import subprocess
 import sys
+import time
 from datetime import datetime, timezone
 from pathlib import Path
 
@@ -61,6 +62,8 @@ EXAMPLE_CONFIG = _SCRIPTS_DIR / 'opencode-entry.json.example'
 
 # 有界墙钟：OpenCode 独占一个真实槽，必须有界，避免未知 writer 永久占位。
 DEFAULT_TIMEOUT_SECONDS = 1800
+# 连续没有任何可解析 JSON 事件时提前收口；用户可显式传 0 关闭本门并继续等总上限。
+DEFAULT_NO_PROGRESS_TIMEOUT_SECONDS = 300
 # kill 之后再给一次有界 communicate 收尸；仍卡住则如实标 unknown，绝不谎报释放。
 POST_KILL_GRACE_SECONDS = 60
 
@@ -99,6 +102,54 @@ _QUOTA_RE = re.compile(r'\b429\b|quota|rate[\s_-]*limit|usage[\s_-]*limit|'
                        r'credit|insufficient[\s_-]*balance', re.I)
 _TRANSPORT_RE = re.compile(r'econnreset|econnrefused|etimedout|eai_again|socket|'
                            r'network|unreachable|dns|tls|ssl', re.I)
+
+
+class NoProgressExpired(Exception):
+    """OpenCode 子进程仍存活，但连续一段时间没有任何有效 JSON 事件。"""
+
+
+def _json_progress_count(raw) -> int:
+    """只计数可解析且带 type 的 JSONL 事件；普通噪声/半行不冒充进展。"""
+    if not raw:
+        return 0
+    if isinstance(raw, str):
+        raw = raw.encode('utf-8', errors='replace')
+    count = 0
+    for line in raw.splitlines():
+        try:
+            event = json.loads(line.decode('utf-8', errors='replace'))
+        except (ValueError, AttributeError):
+            continue
+        if isinstance(event, dict) and isinstance(event.get('type'), str):
+            count += 1
+    return count
+
+
+def _communicate_with_no_progress_watch(proc, payload, total_seconds, idle_seconds,
+                                        monotonic=time.monotonic):
+    """用短等待片段观察 stdout JSONL；总墙钟和无进展墙钟彼此独立。"""
+    started = monotonic()
+    last_progress = started
+    observed = 0
+    first = True
+    while True:
+        current = monotonic()
+        total_left = total_seconds - (current - started)
+        idle_left = idle_seconds - (current - last_progress)
+        if total_left <= 0:
+            raise subprocess.TimeoutExpired(getattr(proc, 'args', 'opencode'), total_seconds)
+        if idle_left <= 0:
+            raise NoProgressExpired()
+        wait_for = max(0.05, min(1.0, total_left, idle_left))
+        try:
+            return proc.communicate(input=payload if first else None, timeout=wait_for)
+        except subprocess.TimeoutExpired as exc:
+            first = False
+            partial = exc.output or b''
+            progress = _json_progress_count(partial)
+            if progress > observed:
+                observed = progress
+                last_progress = monotonic()
 
 
 def _sha(data: bytes) -> str:
@@ -450,7 +501,7 @@ def _write_json(path: Path, obj) -> None:
 def run(cfg, *, workspace, prompt_file, out_dir, stage, task_id, model,
         prompt_sha256=None, claim_token=None, now=None, popen_factory=subprocess.Popen,
         environ=None, dispatch_store=None, child_prober=None, bind_child_pid=True,
-        plan=None, active_tasks=None, timeout_seconds=None,
+        plan=None, active_tasks=None, timeout_seconds=None, no_progress_timeout_seconds=None,
         clock_injected=None) -> dict:
     """正式 OpenCode 传输。任何前置/预检失败零 Popen；每个 run 只调用一次 CLI。"""
     if clock_injected is None:
@@ -458,6 +509,9 @@ def run(cfg, *, workspace, prompt_file, out_dir, stage, task_id, model,
     now = now or dp.utcnow()
     timeout_seconds = (DEFAULT_TIMEOUT_SECONDS if timeout_seconds is None
                        else int(timeout_seconds))
+    no_progress_timeout_seconds = (
+        DEFAULT_NO_PROGRESS_TIMEOUT_SECONDS if no_progress_timeout_seconds is None
+        else int(no_progress_timeout_seconds))
 
     # (0) 精确模型硬门 + 有界超时：任何副作用之前拒绝。
     if str(model) not in MODELS:
@@ -470,6 +524,11 @@ def run(cfg, *, workspace, prompt_file, out_dir, stage, task_id, model,
                 'reason': 'timeout_out_of_bounds',
                 'reasons': ['timeout_seconds must be positive; a bounded wall clock is '
                             'mandatory for an OpenCode real-slot writer']}
+    if no_progress_timeout_seconds < 0:
+        return {'dispatch_failed': True, 'sent': False, 'dispatched': False,
+                'reason': 'no_progress_timeout_out_of_bounds',
+                'reasons': ['no_progress_timeout_seconds must be zero (disabled) or '
+                            'positive']}
 
     # (1) outdir 必须不存在；绝不覆写旧证据。
     out = Path(out_dir)
@@ -532,6 +591,7 @@ def run(cfg, *, workspace, prompt_file, out_dir, stage, task_id, model,
     child_verified = False
     child_done = False
     timed_out = False
+    stalled_no_progress = False
     proc = None
     stdout_bytes = b''
     stderr_bytes = b''
@@ -579,10 +639,18 @@ def run(cfg, *, workspace, prompt_file, out_dir, stage, task_id, model,
                         'bind_required': True, 'unknown_guard': unknown_guard,
                         'business_verified': False}
         try:
-            stdout_bytes, stderr_bytes = proc.communicate(input=sent_payload,
-                                                          timeout=timeout_seconds)
-        except subprocess.TimeoutExpired:
-            timed_out = True
+            # 生产 Popen 走事件级看门狗；测试/显式注入的 Popen 工厂保留一次 communicate
+            # 契约，避免把测试替身的一次 TimeoutExpired 误解为“随后恢复”。看门狗本身另有
+            # 真实短生命周期子进程回归。
+            if no_progress_timeout_seconds and popen_factory is subprocess.Popen:
+                stdout_bytes, stderr_bytes = _communicate_with_no_progress_watch(
+                    proc, sent_payload, timeout_seconds, no_progress_timeout_seconds)
+            else:
+                stdout_bytes, stderr_bytes = proc.communicate(input=sent_payload,
+                                                              timeout=timeout_seconds)
+        except (subprocess.TimeoutExpired, NoProgressExpired) as timeout_exc:
+            timed_out = isinstance(timeout_exc, subprocess.TimeoutExpired)
+            stalled_no_progress = isinstance(timeout_exc, NoProgressExpired)
             proc.kill()
             try:
                 stdout_bytes, stderr_bytes = proc.communicate(
@@ -596,6 +664,8 @@ def run(cfg, *, workspace, prompt_file, out_dir, stage, task_id, model,
                     _write_json(out / 'process.json', {
                         'reason': 'post_kill_grace_stuck',
                         'timeout_seconds': timeout_seconds,
+                        'no_progress_timeout_seconds': no_progress_timeout_seconds,
+                        'stalled_no_progress': stalled_no_progress,
                         'post_kill_grace_seconds': POST_KILL_GRACE_SECONDS,
                         'child_pid': getattr(proc, 'pid', None),
                         'note': 'child still not reaped after kill + bounded grace; '
@@ -609,7 +679,8 @@ def run(cfg, *, workspace, prompt_file, out_dir, stage, task_id, model,
                 return {'dispatch_failed': False, 'sent': False, 'dispatched': True,
                         'launch_unknown': True, 'started': True, 'token': claim,
                         'pool_key': pool_key, 'child_verified': child_verified,
-                        'timed_out': True, 'post_kill_grace_stuck': True,
+                        'timed_out': timed_out, 'post_kill_grace_stuck': True,
+                        'stalled_no_progress': stalled_no_progress,
                         'unknown_guard': unknown_guard, 'business_verified': False}
         exit_code = getattr(proc, 'returncode', None)
         finished_at_utc = now if clock_injected else _now_utc()
@@ -652,13 +723,17 @@ def run(cfg, *, workspace, prompt_file, out_dir, stage, task_id, model,
         (out / 'sent-payload-stdin.bin').write_bytes(sent_payload)
         parsed = parse_events(stdout_bytes)
         protocol_success = bool(parsed['protocol_success'] and ec_exit == 0
-                                and not timed_out)
+                                and not timed_out and not stalled_no_progress)
         if ec_exit != 0:
             parsed['parse_errors'].append(f'process exited non-zero: {ec_exit}')
         if timed_out:
             parsed['parse_errors'].append(
                 f'bounded child wall-clock timeout after {timeout_seconds}s '
                 '(settled as failure, never healthy)')
+        if stalled_no_progress:
+            parsed['parse_errors'].append(
+                f'stalled_no_progress after {no_progress_timeout_seconds}s without '
+                'a valid JSON event (settled as failure, never healthy)')
         report_text = parsed.get('response_text') or ''
         if report_text:
             (out / 'response.md').write_bytes(report_text.encode('utf-8'))
@@ -687,7 +762,8 @@ def run(cfg, *, workspace, prompt_file, out_dir, stage, task_id, model,
 
         execution_evidence_ok = bool(parsed.get('execution_evidence_ok'))
         passed = bool(protocol_success and binding.get('bound')
-                      and execution_evidence_ok and not timed_out)
+                      and execution_evidence_ok and not timed_out
+                      and not stalled_no_progress)
         summary = {
             'runtime': RUNTIME, 'model': str(model), 'pool_key': pool_key,
             'requested_model': str(model),
@@ -695,6 +771,9 @@ def run(cfg, *, workspace, prompt_file, out_dir, stage, task_id, model,
             'identity_source': ('entry runtime + requested model; not a verified '
                                 'backend/account identity'),
             'exit_code': exit_code, 'timed_out': timed_out,
+            'stalled_no_progress': stalled_no_progress,
+            'termination_reason': ('stalled_no_progress' if stalled_no_progress else
+                                   ('wall_clock_timeout' if timed_out else None)),
             'protocol_success': protocol_success,
             'report_bound': bool(binding.get('bound')),
             'engineering_success': passed,
@@ -736,6 +815,7 @@ def run(cfg, *, workspace, prompt_file, out_dir, stage, task_id, model,
             'task_id': task_id, 'stage': stage,
             'argv': argv, 'shell': False, 'stdin_payload': True,
             'timeout_seconds': timeout_seconds,
+            'no_progress_timeout_seconds': no_progress_timeout_seconds,
             'prompt_sha256': actual_prompt_sha,
             'contract_sha256': _sha(contract_text.encode('utf-8')),
             'contract_sha256_caliber': 'utf-8 bytes of the contract prepended to stdin',
@@ -751,6 +831,9 @@ def run(cfg, *, workspace, prompt_file, out_dir, stage, task_id, model,
             'pid': getattr(proc, 'pid', None),
             'exit_code': exit_code,
             'timed_out': timed_out,
+            'stalled_no_progress': stalled_no_progress,
+            'termination_reason': ('stalled_no_progress' if stalled_no_progress else
+                                   ('wall_clock_timeout' if timed_out else None)),
             'started_at_utc': started_at_utc.isoformat(),
             'finished_at_utc': finished_at_utc.isoformat(),
         })
@@ -771,10 +854,10 @@ def run(cfg, *, workspace, prompt_file, out_dir, stage, task_id, model,
         report_text = report_text or ''
 
     protocol_success = bool(parsed.get('protocol_success') and ec_exit == 0
-                            and not timed_out)
+                            and not timed_out and not stalled_no_progress)
     execution_evidence_ok = bool(parsed.get('execution_evidence_ok'))
     success = bool(protocol_success and binding.get('bound') and execution_evidence_ok
-                   and not timed_out)
+                   and not timed_out and not stalled_no_progress)
     try:
         release = dp.finish(dispatch_store, claim, terminal='finished', success=success,
                             now=finished_at_utc, prober=child_prober)
@@ -786,6 +869,7 @@ def run(cfg, *, workspace, prompt_file, out_dir, stage, task_id, model,
     return {'sent': True, 'dispatched': True, 'started': started,
             'child_verified': child_verified, 'token': claim, 'exit_code': exit_code,
             'pool_key': pool_key, 'protocol_success': protocol_success,
+            'stalled_no_progress': stalled_no_progress,
             'report_bound': bool(binding.get('bound')),
             'execution_evidence_ok': execution_evidence_ok,
             'timed_out': timed_out, 'evidence': evidence, 'launched': True,
@@ -821,6 +905,11 @@ def build_parser():
                     default=None,
                     help=f'bounded wall clock (default {DEFAULT_TIMEOUT_SECONDS}s); '
                          'zero/negative values are refused')
+    ap.add_argument('--no-progress-timeout-seconds',
+                    dest='no_progress_timeout_seconds', type=int, default=None,
+                    help=f'kill and fail after this many seconds without a valid JSON '
+                         f'event (default {DEFAULT_NO_PROGRESS_TIMEOUT_SECONDS}s); '
+                         'zero explicitly disables the idle watchdog')
     return ap
 
 
@@ -837,6 +926,13 @@ def main(argv=None) -> int:
                           'reason': 'timeout_out_of_bounds',
                           'reasons': ['--timeout-seconds must be positive']},
                          ensure_ascii=False))
+        return 2
+    if (args.no_progress_timeout_seconds is not None
+            and args.no_progress_timeout_seconds < 0):
+        print(json.dumps({'dispatch_failed': True, 'sent': False, 'dispatched': False,
+                          'reason': 'no_progress_timeout_out_of_bounds',
+                          'reasons': ['--no-progress-timeout-seconds must be zero or '
+                                      'positive']}, ensure_ascii=False))
         return 2
     try:
         cfg = load_entry_config(args.config)
@@ -857,7 +953,8 @@ def main(argv=None) -> int:
               model=args.model, prompt_sha256=_sha(prompt_bytes),
               claim_token=args.dispatch_claim, dispatch_store=args.dispatch_store,
               plan=plan, active_tasks=active_tasks,
-              timeout_seconds=args.timeout_seconds)
+              timeout_seconds=args.timeout_seconds,
+              no_progress_timeout_seconds=args.no_progress_timeout_seconds)
     print(json.dumps(out, ensure_ascii=False))
     if not out.get('dispatched'):
         return 2

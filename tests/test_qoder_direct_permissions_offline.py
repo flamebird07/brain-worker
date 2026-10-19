@@ -347,6 +347,29 @@ def main() -> int:
           rE.returncode != 0 and not (outE / 'request.json').exists(),
           f'rc={rE.returncode}, stderr={rE.stderr.decode("utf-8","replace")[:220]}')
 
+    # ---------- task_scope 首派即生成精确文件/命令规则 ----------
+    scopep = RUN_DIR / 'task-scope.json'
+    scopep.write_text(json.dumps({
+        'edits': ['app/main.py', 'tests/test_main.py'],
+        'bash': ['python -m unittest tests.test_main'],
+        'read_dirs': [],
+    }), encoding='utf-8')
+    outF = RUN_DIR / 'f-task-scope'
+    rF = run_cli(outF, ['--task-scope', str(scopep)])
+    reqF = json.loads((outF / 'request.json').read_text(encoding='utf-8'))
+    check('task_scope generates exact rules on first real CLI dispatch',
+          rF.returncode == 0
+          and find_all(reqF['argv'], '--allowed-tools')
+          == ['Read', 'Glob', 'Grep', 'Edit(/app/main.py)',
+              'Edit(/tests/test_main.py)',
+              'Bash(python -m unittest tests.test_main)']
+          and reqF['task_scope']['sha256'], reqF.get('task_scope'))
+    outG = RUN_DIR / 'g-task-scope-mixed'
+    rG = run_cli(outG, ['--task-scope', str(scopep), '--tools', 'Read'])
+    check('task_scope refuses manual permission arguments before subprocess',
+          rG.returncode == 2 and not (outG / 'request.json').exists(),
+          rG.stdout.decode('utf-8', 'replace'))
+
     failed = [x for x in RESULTS if x['pass'] is False]
     print(f'== 权限参数离线测试汇总：{len(RESULTS) - len(failed)}/{len(RESULTS)} 通过 ==')
     for x in failed:

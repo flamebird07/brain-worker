@@ -25,7 +25,7 @@ import tempfile
 import unittest
 import unittest.mock
 from contextlib import closing
-from datetime import datetime, timezone
+from datetime import datetime, timedelta, timezone
 from pathlib import Path
 
 REPO = Path(__file__).resolve().parents[1]
@@ -147,6 +147,67 @@ class AuthorizationTests(_Base):
         r = self.plan(self.auth('auto', 'T', 's2', ALL_MAINS + ALL_FLASH))
         self.assertIsNone(r['refused'], r)
         self.assertFalse(r['user_direct_selection'])
+
+    def test_receipt_explains_priority_eligible_excluded_and_next(self):
+        self.build_store()
+        allowed = ALL_MAINS + ALL_FLASH
+        with closing(dp.connect(self.store)) as conn:
+            conn.execute(
+                'INSERT INTO main_force_limits(pool_key, limited, recorded_at_utc) '
+                'VALUES(?,1,?)', (dp.CODEBUDDY_POOL_KEY, dp._iso(T_DAY)))
+            conn.execute('PRAGMA journal_mode=DELETE')
+        r = self.plan(self.auth('auto', 'T', 's2', allowed), now=T_DAY)
+        self.assertIsNone(r['refused'], r)
+        self.assertEqual(r['selected_priority'], 3, r)
+        self.assertEqual(r['selected']['pool_key'], dp.ZCODE_POOL_KEY, r)
+        eligible = {x['pool_key']: x for x in r['eligible_candidates']}
+        self.assertEqual(eligible[dp.ZCODE_POOL_KEY]['priority'], 3)
+        excluded = {x['pool_key']: x for x in r['excluded_candidates_with_reason']}
+        self.assertEqual(excluded[dp.CODEBUDDY_POOL_KEY]['reason'], 'main_force_limited')
+        for pk in (dp.QMAX_POOL_KEY, dp.CN_MAX_POOL_KEY,
+                   dp.CN_CUSTOM_MAX_POOL_KEY):
+            self.assertEqual(excluded[pk]['reason'], 'window_closed')
+        self.assertEqual({x['pool_key'] for x in r['higher_priority_exclusions']},
+                         {dp.CODEBUDDY_POOL_KEY, dp.QMAX_POOL_KEY,
+                          dp.CN_MAX_POOL_KEY, dp.CN_CUSTOM_MAX_POOL_KEY,
+                          dp.CLAUDE_POOL_KEY})
+        self.assertEqual(r['next_candidate']['priority'], 4)
+
+    def test_expired_structured_limit_opens_new_round_and_restores_priority(self):
+        self.build_store()
+        failed_at = T_NIGHT
+        now = failed_at + timedelta(seconds=dp.QUOTA_LIMIT_WINDOW_SECONDS)
+        with closing(dp.connect(self.store)) as conn:
+            conn.execute(
+                'INSERT INTO main_force_limits(pool_key, limited, recorded_at_utc) '
+                'VALUES(?,1,?)', (dp.CLAUDE_POOL_KEY, dp._iso(failed_at)))
+            conn.execute('PRAGMA journal_mode=DELETE')
+        auth = self.auth('auto', 'T', 's2', [dp.CLAUDE_POOL_KEY, dp.ZCODE_POOL_KEY],
+                         round_failed_candidates=[dp.CLAUDE_POOL_KEY],
+                         dispatch_round={'id': 7,
+                                         'started_at_utc': dp._iso(failed_at)})
+        r = self.plan(auth, now=now)
+        self.assertIsNone(r['refused'], r)
+        self.assertEqual(r['dispatch_round']['id'], 8)
+        self.assertEqual(r['effective_round_failed_candidates'], [])
+        self.assertEqual(r['round_transition']['reason'],
+                         'structured_limit_window_expired_no_inflight')
+        self.assertEqual(r['selected']['pool_key'], dp.CLAUDE_POOL_KEY, r)
+
+    def test_task_scope_generates_first_qoder_permission_plan(self):
+        self.build_store()
+        scope = {'edits': ['app/main.py', 'tests/test_main.py'],
+                 'bash': ['python -m unittest tests.test_main'],
+                 'read_dirs': []}
+        r = self.plan(self.auth('auto', 'T', 's2', [dp.QMAX_POOL_KEY]),
+                      now=T_NIGHT, task_scope=scope)
+        self.assertIsNone(r['refused'], r)
+        plan = r['qoder_permission_plan']
+        self.assertEqual(plan['visible_tools'],
+                         ['Read', 'Glob', 'Grep', 'Edit', 'Write', 'Bash'])
+        self.assertIn('Edit(/app/main.py)', plan['allowed_tools'])
+        self.assertIn('Bash(python -m unittest tests.test_main)',
+                      plan['allowed_tools'])
 
     def test_recent_limits_and_day_windows_select_opencode_before_flash(self):
         self.build_store()
