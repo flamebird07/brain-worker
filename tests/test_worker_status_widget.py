@@ -1426,5 +1426,148 @@ class TestRealShutdownCommandMocked(unittest.TestCase):
         self.assertTrue(kwargs.get('check'))
 
 
+# ------------------------------------- 真实 Tk 布局高度回归（BW-HOVER-REPAIR-20261019-S6）
+class TestRealTkLayoutHeight(unittest.TestCase):
+    """用户现场确认：鼠标移开后模型行已隐藏，但外框尺寸没恢复。Root 真实 Tk 复现：
+    展开 height=710；行隐藏后 height 仍 643/requested=643——旧测试只断言行数为 0 所以
+    误通过。本类用**真实 Tk** 驱动生产 `apply_layout` 的 pack 决策，同时断言可见模型行数
+    与窗口 shell 的请求高度：紧凑无行时 rows_frame 必须退出布局、移出后高度恢复到紧凑
+    内容需要的高度（不是只撤下底部区块）；一条运行仍显示该行并按真实行数缩高；重新移入
+    展开仍显示全部；动态刷新（增/减运行行）高度跟随。无显示环境（无法创建 Tk）整体跳过，
+    由 Root 在有显示环境运行真实 Tk 与完整测试。"""
+
+    CARD_H = 30       # 单张行卡固定高，可确定算出 shell 请求高度
+    SUMMARY_H = 15
+    EMPTY_H = 40
+
+    def setUp(self):
+        try:
+            import tkinter as tk
+        except Exception:  # noqa: BLE001 - 无 tkinter 直接跳过，绝不影响离线断言
+            self.skipTest('tkinter unavailable')
+        try:
+            self.root = tk.Tk()
+        except Exception:  # noqa: BLE001 - 无显示环境（headless）诚实跳过，不伪报通过
+            self.skipTest('no display for real Tk regression')
+        self.tk = tk
+        self.root.withdraw()  # 不闪现窗口，仅用于几何测量
+        self.addCleanup(self._teardown)
+
+        self.shell = tk.Frame(self.root)
+        self.shell.pack()
+        self.frames = {
+            'summary': tk.Frame(self.shell, height=self.SUMMARY_H),
+            'rows': tk.Frame(self.shell),
+            'empty': tk.Frame(self.shell, height=self.EMPTY_H),
+            'compact_idle': tk.Frame(self.shell, height=12),
+            'idle': tk.Frame(self.shell, height=20),
+            'detail': tk.Frame(self.shell, height=50),
+            'footer': tk.Frame(self.shell, height=12),
+        }
+        self.cards = [tk.Frame(self.frames['rows'], height=self.CARD_H)
+                      for _ in range(12)]
+
+    def _teardown(self):
+        try:
+            self.root.destroy()
+        except Exception:  # noqa: BLE001
+            pass
+
+    def _set_visible(self, count):
+        """镜像生产 _set_rows：先 forget 全部卡，只 pack 前 count 张（fill='x', pady=2）。"""
+        for c in self.cards:
+            c.pack_forget()
+        for c in self.cards[:count]:
+            c.pack(fill='x', pady=2)
+        return tuple(range(count))
+
+    def _apply(self, expanded, visible, idle_compact=False):
+        wsw.apply_layout(self.frames, expanded=expanded,
+                         has_rows=bool(visible), idle_compact=idle_compact)
+        self.root.update_idletasks()
+        return self.frames['rows'].winfo_reqheight(), self.shell.winfo_reqheight()
+
+    def _packed_cards(self):
+        # The test root is intentionally withdrawn, so winfo_ismapped() is
+        # always false for descendants.  The pack manager state is the layout
+        # contract that apply_layout() controls and remains observable here.
+        return sum(1 for c in self.cards if c.winfo_manager() == 'pack')
+
+    def test_compact_zero_rows_drops_rows_frame_from_layout(self):
+        vis = self._set_visible(0)
+        self._apply(False, vis)
+        # 无可见行：rows_frame 绝不参与布局，empty_card 顶上，窗口收到紧凑内容高度。
+        self.assertEqual(self.frames['rows'].winfo_manager(), '')
+        self.assertEqual(self.frames['empty'].winfo_manager(), 'pack')
+        self.assertEqual(self._packed_cards(), 0)
+
+    def test_compact_one_running_shows_row_and_shrinks_by_real_count(self):
+        vis = self._set_visible(1)
+        _, one_h = self._apply(False, vis)
+        self.assertEqual(self.frames['rows'].winfo_manager(), 'pack')
+        self.assertEqual(self.frames['empty'].winfo_manager(), '')
+        self.assertEqual(self._packed_cards(), 1)
+
+        vis0 = self._set_visible(0)
+        _, zero_h = self._apply(False, vis0)
+        # 一条运行行与零运行占位使用不同内容高度；关键契约是 rows_frame
+        # 只在有真实行时参与布局。零运行占位本身可能比单张行卡更高。
+        self.assertNotEqual(one_h, zero_h)
+
+    def test_height_recovers_after_expand_then_collapse(self):
+        # 关键回归：先量紧凑零行高度，再展开成 12 行，再收回零行——高度必须回到初始值，
+        # 而非像旧缺陷那样停在展开时的 643/710 附近。
+        _, compact0 = self._apply(False, self._set_visible(0))
+        _, expanded = self._apply(True, self._set_visible(12))
+        self.assertEqual(self.frames['rows'].winfo_manager(), 'pack')
+        self.assertEqual(self.frames['empty'].winfo_manager(), '')
+        self.assertEqual(self._packed_cards(), 12)
+        self.assertGreater(expanded, compact0)
+        _, compact1 = self._apply(False, self._set_visible(0))
+        self.assertEqual(self.frames['rows'].winfo_manager(), '')
+        self.assertEqual(self._packed_cards(), 0)
+        # 收回后精确恢复到展开前的紧凑高度（旧代码 rows_frame 常驻会残留展开高度）。
+        self.assertEqual(compact1, compact0)
+        self.assertLess(compact1, expanded)
+
+    def test_dynamic_refresh_adds_and_removes_running_rows(self):
+        # 动态刷新：0 → 1 → 0 → 2，可见行数与 rows_frame 布局参与状态、高度同步跟随。
+        _, h0 = self._apply(False, self._set_visible(0))
+        self.assertEqual(self._packed_cards(), 0)
+        self.assertEqual(self.frames['rows'].winfo_manager(), '')
+
+        _, h1 = self._apply(False, self._set_visible(1))
+        self.assertEqual(self._packed_cards(), 1)
+        self.assertEqual(self.frames['rows'].winfo_manager(), 'pack')
+        self.assertNotEqual(h1, h0)
+
+        _, h0b = self._apply(False, self._set_visible(0))
+        self.assertEqual(self._packed_cards(), 0)
+        self.assertEqual(self.frames['rows'].winfo_manager(), '')
+        self.assertEqual(h0b, h0)  # 运行行消失后高度回到零运行值
+
+        _, h2 = self._apply(False, self._set_visible(2))
+        self.assertEqual(self._packed_cards(), 2)
+        self.assertGreater(h2, h1)
+
+    def test_reenter_expand_shows_all_again(self):
+        # 移出收回 → 重新移入展开：恢复全部 12 行且高度回到展开量级。
+        _, compact0 = self._apply(False, self._set_visible(0))
+        _, h_exp = self._apply(True, self._set_visible(12))
+        _, compact_recover = self._apply(False, self._set_visible(0))
+        self.assertEqual(compact_recover, compact0)
+        _, reexpand = self._apply(True, self._set_visible(12))
+        self.assertEqual(self._packed_cards(), 12)
+        self.assertEqual(self.frames['rows'].winfo_manager(), 'pack')
+        self.assertEqual(reexpand, h_exp)
+
+    def test_idle_compact_keeps_countdown_without_rows_frame(self):
+        vis = self._set_visible(0)
+        _, idle_h = self._apply(False, vis, idle_compact=True)
+        self.assertEqual(self.frames['rows'].winfo_manager(), '')
+        self.assertEqual(self.frames['compact_idle'].winfo_manager(), 'pack')
+        self.assertEqual(self.frames['empty'].winfo_manager(), 'pack')
+
+
 if __name__ == '__main__':
     unittest.main(verbosity=2)

@@ -25,6 +25,11 @@ BW-WORKER-WIDGET-20261018-S2 边界（必须遵守）：
   并夹紧屏幕（贴底时整体上移、完整内容优先）；无手动收起/展开按钮；hover 只切视图，
   绝不勾选/停用/重置空闲关机 controller。真实运行中的行（含未知+运行混池）不展示历史
   限额，`prev_limited` 原始证据与 30 分钟计时保持不变。
+- 收回高度恢复（BW-HOVER-REPAIR-20261019-S6）：`apply_layout` 统一决定各区块 pack；
+  紧凑且无可见行时绝不 pack `rows_frame`（空/残留 rows_frame 会保留展开时的请求高度，
+  导致鼠标移出后外框收不回），改由 empty_card 顶上，使窗口高度恢复到紧凑内容需要的高度；
+  有运行行时 rows_frame 参与并按真实行数缩高，展开仍显示全部。仅改布局 pack 决策，
+  不动 hover 事件、数据、调度、关机或模型顺序。
 """
 import argparse
 import json
@@ -924,6 +929,30 @@ def cancel_hover_after(root, hover):
         hover['after'] = None
 
 
+def apply_layout(frames, *, expanded, has_rows, idle_compact):
+    """按当前视图模式重排浮窗各区块的 pack 布局（真实 Tk 几何在此生效）。
+
+    BW-HOVER-REPAIR-20261019-S6：紧凑态且**无可见行**时绝不 pack `rows_frame`——
+    否则空/残留的 rows_frame 会保留展开时撑起的请求高度，鼠标移出后窗口只撤下底部
+    区块却收不回紧凑内容高度（Root 真实 Tk 复现：展开 710、行隐藏后仍 643）。
+    有运行行（has_rows）或展开时 rows_frame 正常参与布局，高度按真实行数缩；展开仍
+    显示全部。pack 顺序/参数与旧 `_apply_mode` 完全一致，只改「无行时不 pack rows_frame」。
+    """
+    for key in ('summary', 'rows', 'empty', 'compact_idle', 'idle', 'detail', 'footer'):
+        frames[key].pack_forget()
+    frames['summary'].pack(fill='x')
+    if has_rows:
+        frames['rows'].pack(fill='x', pady=(8, 0))
+    else:
+        frames['empty'].pack(fill='x', pady=(8, 0))
+    if expanded:
+        frames['idle'].pack(fill='x', pady=(8, 2))
+        frames['detail'].pack(fill='x', pady=(6, 0))
+        frames['footer'].pack(fill='x', pady=(6, 0))
+    elif idle_compact:
+        frames['compact_idle'].pack(fill='x', pady=(6, 0))
+
+
 def run_gui(store_path=None, interval=2.0):
     import tkinter as tk
 
@@ -1109,19 +1138,12 @@ def run_gui(store_path=None, interval=2.0):
         if layout_state['sig'] == sig:
             return
         layout_state['sig'] = sig
-        for widget in (summary_frame, rows_frame, empty_card, compact_idle_lbl,
-                       idle_frame, detail_frame, footer_lbl):
-            widget.pack_forget()
-        summary_frame.pack(fill='x')
-        rows_frame.pack(fill='x', pady=(8, 0))
-        if not has_rows:
-            empty_card.pack(fill='x', pady=(8, 0))
-        if mode == 'expanded':
-            idle_frame.pack(fill='x', pady=(8, 2))
-            detail_frame.pack(fill='x', pady=(6, 0))
-            footer_lbl.pack(fill='x', pady=(6, 0))
-        elif idle_compact:
-            compact_idle_lbl.pack(fill='x', pady=(6, 0))
+        apply_layout(
+            {'summary': summary_frame, 'rows': rows_frame, 'empty': empty_card,
+             'compact_idle': compact_idle_lbl, 'idle': idle_frame,
+             'detail': detail_frame, 'footer': footer_lbl},
+            expanded=(mode == 'expanded'), has_rows=has_rows,
+            idle_compact=idle_compact)
 
     def _place(height, cx=None, cy=None):
         """完整内容优先：高度取 shell 请求高度，位置只做屏幕内夹紧。
