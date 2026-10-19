@@ -800,6 +800,9 @@ _BADGE_WINDOW_FG = '#7f9bc4'
 _WIDTH = 560
 _MIN_H = 96
 _HOVER_COLLAPSE_MS = 200
+# 状态列最大换行像素（BW-OPENCODE-MERGE-20261019-S3）：时段外释义括号在语义边界另起
+# 一行后，仍需足够宽以整段放下最长的时间段（含跨日/跨月），绝不把“09:00”按像素拆开。
+_STATE_WRAPLENGTH = 200
 
 
 def row_has_true_running(row):
@@ -856,6 +859,18 @@ def compact_state_text(row):
         return row.get('state_label') or STATE_LABELS.get(state, state)
     return (row.get('main_state_label') or row.get('state_label')
             or STATE_LABELS.get(state, state))
+
+
+def wrapped_state_text(text):
+    """仅显示层换行：在状态词与释义括号的语义边界插入换行，使“时段外”独占一行、
+    “（下次18:00–次日09:00）”等完整时间段组成另一行；避免 Tk 按像素自动换行把时间
+    数字从中间拆开（如“09:0/0”）。只加换行，不更改任何数据字段、不截断时间段。"""
+    if not text:
+        return text
+    idx = text.find('（')
+    if idx > 0:
+        return f'{text[:idx]}\n{text[idx:]}'
+    return text
 
 
 def row_badges(row):
@@ -1011,7 +1026,7 @@ def run_gui(store_path=None, interval=2.0):
         badges = tk.Frame(inner, bg=_CARD, cursor='hand2')
         badges.grid(row=0, column=1, sticky='e', padx=(6, 6))
         state = tk.Label(inner, text='', bg=_CARD, fg=_SUB, font=font_bold, anchor='e',
-                         wraplength=160, justify='right', cursor='hand2')
+                         wraplength=_STATE_WRAPLENGTH, justify='right', cursor='hand2')
         state.grid(row=0, column=2, sticky='e')
         occ = tk.Label(inner, text='', bg=_CARD, fg=_SUB, font=font, anchor='e',
                        cursor='hand2')
@@ -1307,7 +1322,8 @@ def run_gui(store_path=None, interval=2.0):
             name_fg = _FG if row['state'] in _STATE_PRIORITY else _SUB
             occ_fg = _FG if row['active'] else _DIM
             w['name'].configure(fg=name_fg)
-            w['state'].configure(text=compact_state_text(row), fg=color)
+            w['state'].configure(text=wrapped_state_text(compact_state_text(row)),
+                                 fg=color)
             cap_text = '∞' if row['capacity'] is None else str(row['capacity'])
             w['occ'].configure(text=f"{row['active']}/{cap_text}", fg=occ_fg)
             w['accent'].configure(
