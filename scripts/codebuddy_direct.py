@@ -321,6 +321,44 @@ def parse_tools_arg(value) -> list[str]:
     return out
 
 
+def _top_level_rule_segments(value: str) -> list[str]:
+    """按顶层逗号切分规则值；括号内的逗号（Bash/Edit 等 scoped 规则参数）保留在
+    同一段。仅用于形状诊断，绝不改写或自动拆分传给 CLI 的原始规则。"""
+    segments: list[str] = []
+    buf: list[str] = []
+    depth = 0
+    for ch in value:
+        if ch == '(':
+            depth += 1
+        elif ch == ')' and depth > 0:
+            depth -= 1
+        if ch == ',' and depth == 0:
+            segments.append(''.join(buf))
+            buf = []
+        else:
+            buf.append(ch)
+    segments.append(''.join(buf))
+    return segments
+
+
+def validate_tool_rule_shape(rules, *, field: str) -> None:
+    """拒绝把多个裸工具名塞进单个 --allowed-tools/--disallowed-tools 值（如
+    `Read,Write,Edit,Bash,Glob,Grep`）。CLI 的这两个 flag 是 variadic 规则列表，
+    不是逗号列表；本入口绝不自动拆分，而是在容量认领与 Popen 之前明确失败，并提示
+    逐项重复 flag。括号内的逗号（Bash(command,with,commas)、
+    Edit(path,with,commas)）不是顶层逗号，维持原样合法。"""
+    for rule in rules or []:
+        segments = _top_level_rule_segments(rule)
+        if len(segments) > 1 and any(seg.strip() in ALLOWED_TOOLS for seg in segments):
+            raise ValueError(
+                f'{field} entry {rule!r} looks like multiple tool names joined by '
+                'top-level commas in one value; pass each rule as its own repeated '
+                'flag, for example --allowed-tools Read --allowed-tools Write. '
+                'This entry never splits a comma-joined value automatically. '
+                'Commas inside a scoped rule such as Bash(command,with,commas) or '
+                'Edit(path,with,commas) remain legal.')
+
+
 def _validate_rule_list(value, *, field: str):
     if value is None:
         return []
@@ -334,15 +372,19 @@ def _validate_rule_list(value, *, field: str):
                 raise ValueError(f'{field} entries must be non-empty and not '
                                  f'whitespace-only: {item!r}')
             out.append(item)
+        validate_tool_rule_shape(out, field=field)
         return out
     raise ValueError(f'{field} must be a list of strings or None, got {type(value).__name__}')
 
 
 def effective_permission_rules(tools_items, allowed_tools, disallowed_tools) -> dict:
-    """无显式 allow 时按 --tools 逐项回退；显式列表（含空）完全替代回退。"""
+    """无显式 allow 时按 --tools 逐项回退；显式列表（含空）完全替代回退。
+    显式规则同样做顶层逗号拼接工具名预检：在容量认领/Popen 之前拒绝，绝不自动拆分。"""
     allowed = (_validate_rule_list(allowed_tools, field='allowed_tools')
                if allowed_tools is not None else list(tools_items))
     disallowed = _validate_rule_list(disallowed_tools, field='disallowed_tools')
+    validate_tool_rule_shape(allowed, field='allowed_tools')
+    validate_tool_rule_shape(disallowed, field='disallowed_tools')
     return {'allowed_tools': allowed, 'disallowed_tools': disallowed}
 
 

@@ -1418,5 +1418,81 @@ class WindowsScopedGrantPureTests(unittest.TestCase):
         self.assertFalse(cb.is_windows_platform('darwin'))
 
 
+class ToolRuleShapePreflightTests(unittest.TestCase):
+    """BW-CONTINUE-20261019-S6：validate_tool_rule_shape 纯函数离线正反例——
+    拒绝把多个裸工具名用顶层逗号拼进单个 --allowed-tools/--disallowed-tools 值，
+    绝不自动拆分；括号内逗号（Bash/Edit scoped 参数）保留原样、维持合法；
+    逐 flag 重复的正常列表逐项通过；--tools 逗号白名单口径完全不变。"""
+
+    SPLIT_HINT = 'never splits a comma-joined value automatically'
+
+    def test_bare_tool_names_joined_by_commas_rejected(self):
+        for field in ('allowed_tools', 'disallowed_tools'):
+            with self.assertRaises(ValueError) as ctx:
+                cb.validate_tool_rule_shape(['Read,Write,Edit,Bash,Glob,Grep'],
+                                            field=field)
+            msg = str(ctx.exception)
+            self.assertIn(field, msg)
+            self.assertIn(self.SPLIT_HINT, msg)
+            self.assertIn('--allowed-tools Read --allowed-tools Write', msg)
+
+    def test_effective_rules_reject_joined_value_on_both_sides(self):
+        with self.assertRaises(ValueError):
+            cb.effective_permission_rules(['Read'], allowed_tools=['Read,Write'],
+                                           disallowed_tools=None)
+        with self.assertRaises(ValueError):
+            cb.effective_permission_rules(['Read'], allowed_tools=None,
+                                          disallowed_tools=['Bash,Grep'])
+
+    def test_per_item_repeated_flags_pass_unchanged(self):
+        rules = ['Read', 'Write', 'Edit', 'Bash', 'Glob', 'Grep']
+        out = cb.effective_permission_rules([], allowed_tools=rules,
+                                            disallowed_tools=['Bash'])
+        self.assertEqual(out['allowed_tools'], rules)  # 原样保留，绝不拆分/改写
+        self.assertEqual(out['disallowed_tools'], ['Bash'])
+
+    def test_commas_inside_parentheses_are_not_top_level(self):
+        ok = ['Bash(npm run build --no-audit,with,commas)',
+              'Edit(C:/proj/a,b/c.txt)', 'Read', 'Bash(git log,--oneline)']
+        out = cb.effective_permission_rules([], allowed_tools=ok, disallowed_tools=None)
+        self.assertEqual(out['allowed_tools'], ok)  # 括号内逗号逐字不变
+        segs = cb._top_level_rule_segments('Bash(npm,run,build),Read')
+        self.assertEqual(segs, ['Bash(npm,run,build)', 'Read'])
+        # 括号外才有顶层逗号：scoped 部分 + 裸工具名拼接 → 拒绝。
+        with self.assertRaises(ValueError):
+            cb.validate_tool_rule_shape(['Bash(npm,run),Read'], field='allowed_tools')
+
+    def test_non_tool_joined_values_pass_through_verbatim(self):
+        # 顶层逗号拼接但没有任何段是裸工具名：不猜测、不改写，逐字交给 CLI。
+        vals = ['WebSearch(deep,broad)', 'foo,bar']
+        out = cb.effective_permission_rules([], allowed_tools=vals,
+                                            disallowed_tools=None)
+        self.assertEqual(out['allowed_tools'], vals)
+
+    def test_trailing_comma_with_bare_tool_rejected(self):
+        with self.assertRaises(ValueError):
+            cb.validate_tool_rule_shape(['Read,'], field='allowed_tools')
+
+    def test_empty_and_none_shapes_are_zero_error(self):
+        cb.validate_tool_rule_shape(None, field='allowed_tools')
+        cb.validate_tool_rule_shape([], field='disallowed_tools')
+        out = cb.effective_permission_rules([], allowed_tools=None,
+                                            disallowed_tools=None)
+        self.assertEqual(out['allowed_tools'], [])
+        self.assertEqual(out['disallowed_tools'], [])
+
+    def test_tools_items_fallback_still_comma_whitelist_semantics(self):
+        # --tools 是单一逗号白名单字符串：parse_tools_arg 的逗号口径不因规则预检改变。
+        items = cb.parse_tools_arg('Read,Grep')
+        self.assertEqual(items, ['Read', 'Grep'])
+        out = cb.effective_permission_rules(items, allowed_tools=None,
+                                            disallowed_tools=None)
+        self.assertEqual(out['allowed_tools'], ['Read', 'Grep'])
+        argv = cb.build_argv({'node': 'node', 'cli': 'cli.js'}, 'C:/ws',
+                             'deepseek-v4.1-flash', items, None)
+        self.assertEqual(argv.count('--tools'), 1)
+        self.assertEqual(argv[argv.index('--tools') + 1], 'Read,Grep')
+
+
 if __name__ == '__main__':
     unittest.main()

@@ -893,6 +893,37 @@ def state_color(row):
     return _STATE_COLORS.get(row.get('state'), _SUB)
 
 
+def hover_poll_action(expanded, dragging, pointer_inside, pending):
+    """既有 150ms drain 循环的 hover 决策（纯函数，离线可测）：
+    - 拖动中一律不动作；
+    - 真实指针在窗内：有待收回计时则取消（重新移入/假 Leave 兜底）；
+    - 展开且真实指针在窗外：无待办才调度一次延迟回缩，重复刷新只等待、绝不重置计时；
+    - 其余无动作。"""
+    if dragging:
+        return 'none'
+    if pointer_inside:
+        return 'cancel' if pending else 'none'
+    if expanded:
+        return 'wait' if pending else 'schedule'
+    return 'none'
+
+
+def hover_should_collapse(expanded, dragging, pointer_inside):
+    """延迟回缩到点后的纯判定：仅在展开、非拖动且真实指针在窗外时收回。"""
+    return bool(expanded and not dragging and not pointer_inside)
+
+
+def cancel_hover_after(root, hover):
+    """取消待执行的回缩 after（重新移入/关闭共用），绝不让待办在窗口销毁后触发。"""
+    after_id = hover.get('after')
+    if after_id is not None:
+        try:
+            root.after_cancel(after_id)
+        except Exception:
+            pass
+        hover['after'] = None
+
+
 def run_gui(store_path=None, interval=2.0):
     import tkinter as tk
 
@@ -1137,15 +1168,13 @@ def run_gui(store_path=None, interval=2.0):
                 and y0 <= py < y0 + root.winfo_height())
 
     def _cancel_collapse():
-        if hover['after'] is not None:
-            try:
-                root.after_cancel(hover['after'])
-            except Exception:
-                pass
-            hover['after'] = None
+        cancel_hover_after(root, hover)
 
     def _on_enter(_event=None):
         if hover['dragging']:
+            return
+        # 控件重建/几何重排会合成 Enter：只有真实指针在窗内才展开或取消回缩。
+        if not _pointer_inside():
             return
         _cancel_collapse()
         if not hover['expanded']:
@@ -1159,11 +1188,8 @@ def run_gui(store_path=None, interval=2.0):
 
     def _maybe_collapse():
         hover['after'] = None
-        if hover['dragging']:
-            return
-        if _pointer_inside():
-            return
-        if hover['expanded']:
+        if hover_should_collapse(hover['expanded'], hover['dragging'],
+                                 _pointer_inside()):
             _set_expanded(False)
 
     def _drag_start(event, pk=None):
@@ -1439,6 +1465,12 @@ def run_gui(store_path=None, interval=2.0):
             pass
         if latest is not None:
             _render(latest)
+        action = hover_poll_action(hover['expanded'], hover['dragging'],
+                                   _pointer_inside(), hover['after'] is not None)
+        if action == 'schedule':
+            hover['after'] = root.after(_HOVER_COLLAPSE_MS, _maybe_collapse)
+        elif action == 'cancel':
+            _cancel_collapse()
         root.after(150, _drain)
 
     poller.start()

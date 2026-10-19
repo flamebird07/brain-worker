@@ -989,6 +989,53 @@ class TestCompactViewHelpers(unittest.TestCase):
                          [dp.QMAX_POOL_KEY, dp.CODEBUDDY_POOL_KEY])
 
 
+class _FakeAfterRoot:
+    def __init__(self):
+        self.cancelled = []
+
+    def after_cancel(self, after_id):
+        self.cancelled.append(after_id)
+
+
+class TestHoverCollapsePolling(unittest.TestCase):
+    """BW-HOVER-REPAIR-20261019-S3：复用既有 150ms drain 循环核对真实指针边界，
+    不新增线程/独立定时器。纯决策函数 + 假 root，不启动 Tk：漏 Leave 也回缩、
+    重复刷新不重置 200ms 计时、重新移入取消、拖动不收缩、关闭清理待办。"""
+
+    def test_missed_leave_still_schedules_one_collapse(self):
+        # 进入展开后指针移到窗外且未收到 Leave：下一 tick 必须调度一次延迟回缩。
+        self.assertEqual(wsw.hover_poll_action(True, False, False, False), 'schedule')
+
+    def test_repeated_refresh_does_not_reset_collapse_timer(self):
+        # 已有一个待办时，后续每 150ms 的刷新只等待，绝不重新 after(200) 导致永不触发。
+        for _ in range(10):
+            self.assertEqual(wsw.hover_poll_action(True, False, False, True), 'wait')
+
+    def test_reenter_cancels_pending_collapse(self):
+        self.assertEqual(wsw.hover_poll_action(True, False, True, True), 'cancel')
+        self.assertEqual(wsw.hover_poll_action(True, False, True, False), 'none')
+
+    def test_dragging_never_collapses_even_outside(self):
+        self.assertEqual(wsw.hover_poll_action(True, True, False, False), 'none')
+        self.assertEqual(wsw.hover_poll_action(True, True, False, True), 'none')
+        self.assertFalse(wsw.hover_should_collapse(True, True, False))
+
+    def test_collapse_due_only_when_expanded_outside_and_not_dragging(self):
+        self.assertTrue(wsw.hover_should_collapse(True, False, False))
+        self.assertFalse(wsw.hover_should_collapse(True, False, True))
+        self.assertFalse(wsw.hover_should_collapse(False, False, False))
+
+    def test_close_clears_pending_after(self):
+        fake = _FakeAfterRoot()
+        hover = {'after': 'collapse-job-1'}
+        wsw.cancel_hover_after(fake, hover)
+        self.assertEqual(fake.cancelled, ['collapse-job-1'])
+        self.assertIsNone(hover['after'])
+        # 无待办时关闭绝不多调 after_cancel。
+        wsw.cancel_hover_after(fake, hover)
+        self.assertEqual(fake.cancelled, ['collapse-job-1'])
+
+
 # ---------------------------------------------------------------- 空闲自动关机
 class _FakeClock:
     def __init__(self, start=100000.0):

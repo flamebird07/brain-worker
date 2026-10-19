@@ -2413,11 +2413,66 @@ def reconcile(store_path=None, *, now=None, prober=None, platform=None) -> dict:
 
 # ------------------------------------------------------------------ Luna 票据
 _SCOPE_KEYS = ('task_id', 'stage', 'chat_id', 'workspace', 'prompt_sha256')
+_LUNA_PREAUTH_KEY = 'luna_preauthorization'
+
+
+def _normalize_luna_preauthorization(value):
+    """校验 scope 里可选的**任务级 300 秒 Luna 预授权**（旧任务没有该键，行为不变）。
+    返回 (ok, normalized_or_None, reasons)。预授权必须是对本任务原话的明确授权：
+    authorized 必须为 true、seconds 必须恰为固定 300 秒、original_quote 与 scope_ref
+    非空；可选 round_failed_candidates 只能列出本轮真实失败过的候选池（不伪造全满、
+    不自动拆分/扩写用户原话）。"""
+    if value is None:
+        return True, None, []
+    if not isinstance(value, dict):
+        return False, None, [f'scope.{_LUNA_PREAUTH_KEY} must be a JSON object carrying '
+                             'the task-level 300-second Luna authorization']
+    reasons = []
+    if value.get('authorized') is not True:
+        reasons.append(f'scope.{_LUNA_PREAUTH_KEY}.authorized must be exactly true; a '
+                       'preauthorization is only the user\'s real explicit authorization')
+    seconds = value.get('seconds')
+    if isinstance(seconds, bool) or seconds != LUNA_ASK_TIMEOUT_SECONDS:
+        reasons.append(f'scope.{_LUNA_PREAUTH_KEY}.seconds must be exactly '
+                       f'{LUNA_ASK_TIMEOUT_SECONDS}; a task may neither shorten nor '
+                       'customize the fixed wait')
+    quote = value.get('original_quote')
+    if not isinstance(quote, str) or not quote.strip():
+        reasons.append(f'scope.{_LUNA_PREAUTH_KEY}.original_quote must be the user\'s '
+                       'non-empty original authorization wording; it is never inferred')
+    ref = value.get('scope_ref')
+    if not isinstance(ref, str) or not ref.strip():
+        reasons.append(f'scope.{_LUNA_PREAUTH_KEY}.scope_ref must be a non-empty '
+                       'reference to the original authorized scope/message')
+    failed = value.get('round_failed_candidates')
+    if failed is not None:
+        if not isinstance(failed, list) or not all(
+                isinstance(x, str) and x.strip() for x in failed):
+            reasons.append(f'scope.{_LUNA_PREAUTH_KEY}.round_failed_candidates must be a '
+                           'list of non-empty pool_key strings when present')
+        else:
+            failed = [x.strip() for x in failed]
+    if reasons:
+        return False, None, reasons
+    normalized = {'authorized': True, 'seconds': LUNA_ASK_TIMEOUT_SECONDS,
+                  'original_quote': quote.strip(), 'scope_ref': ref.strip()}
+    if failed is not None:
+        normalized['round_failed_candidates'] = failed
+    return True, normalized, []
+
+
+def _scope_luna_preauthorization(scope):
+    """返回已校验的预授权 dict；缺失/非法返回 None（调用方必须 fail-closed）。"""
+    ok, normalized, _ = _normalize_luna_preauthorization(
+        (scope or {}).get(_LUNA_PREAUTH_KEY))
+    return normalized if ok else None
 
 
 def _normalize_scope(scope):
     """原 scope 绑定核验：接受 dict 或 JSON 字符串，必须含 task/stage/chat/workspace/
-    promptSHA 五个键，task_id/workspace/prompt_sha256 非空。返回 (ok, dict, reasons)。"""
+    promptSHA 五个键，task_id/workspace/prompt_sha256 非空；可选
+    luna_preauthorization 必须是合法的任务级 300 秒明确授权。返回 (ok, dict, reasons)。
+    旧 scope 不含预授权键时完全维持原行为。"""
     if scope is None:
         return False, None, ['scope is required: the ticket must bind the original '
                              'task/stage/chat/workspace/prompt_sha256 being escalated']
@@ -2438,7 +2493,106 @@ def _normalize_scope(scope):
     for k in ('task_id', 'workspace', 'prompt_sha256'):
         if not parsed.get(k):
             return False, None, [f'scope.{k} must be non-empty']
+    pre_ok, _pre, pre_reasons = _normalize_luna_preauthorization(
+        parsed.get(_LUNA_PREAUTH_KEY))
+    if not pre_ok:
+        return False, None, pre_reasons
     return True, parsed, []
+
+
+def _scope_candidate_allowlist(scope):
+    """scope 可选 allowed_candidates（BW-CONTINUE-20261019-S7）：**仅**收窄本任务的候选
+    筛选（ask_record 降级核验、国内回收与 exhausted 判定），绝不改动全局路由。返回
+    (ok, set_or_None)：缺字段 (True, None) 保持旧兼容；合法非空、全部是已知未 retired
+    的国内 pool_key 返回 (True, set)；空列表、非字符串项、未知/retired/Luna 键一律
+    (False, None)——诚实拒绝，绝不把空/未知授权当作耗尽。"""
+    value = (scope or {}).get('allowed_candidates')
+    if value is None:
+        return True, None
+    if not isinstance(value, list) or not value or not all(
+            isinstance(x, str) and x.strip() for x in value):
+        return False, None
+    cand = {x.strip() for x in value}
+    for k in cand:
+        if k == LUNA_KEY or k in LEGACY_RETIRED_POOL_KEYS or k not in CAPACITY:
+            return False, None
+    return True, cand
+
+
+def _task_authorized_candidates(scope, zcode_blocked):
+    """统一的本任务候选筛选（ask_record 降级核验、claim_due 国内回收与最终 exhausted
+    共用）：先按票据原 scope 的 executor/combo 硬约束取受信任候选，再与合法非空的
+    scope.allowed_candidates 取交集（空/未知/冲突集合诚实拒绝为无候选，由调用方经
+    _preauth_candidates_exhausted 的 fail-closed 核验拦截，绝不当作耗尽），最后剔除
+    **本轮**真实失败过的候选——剔除只在携带合法任务级 luna_preauthorization 且给出
+    round_failed_candidates 时生效；缺授权完全维持旧候选行为。该筛选只会收窄、绝不
+    扩大用户授权，也绝不把未授权候选算进本任务。"""
+    allowed = _scope_allowed_candidates(scope, zcode_blocked)
+    if not allowed:
+        return allowed
+    ok_ac, allowlist = _scope_candidate_allowlist(scope)
+    if not ok_ac:
+        return []
+    if allowlist is not None:
+        allowed = [k for k in allowed if k in allowlist]
+    preauth = _scope_luna_preauthorization(scope)
+    if preauth is None:
+        return allowed
+    failed = set(preauth.get('round_failed_candidates') or [])
+    if not failed:
+        return allowed
+    return [k for k in allowed if k not in failed]
+
+
+def _preauth_candidates_exhausted(conn, scope, now, quota_store=None,
+                                  quota_routes=None):
+    """按**本任务原 scope** 判断本轮合格候选是否真的耗尽。只统计 scope 授权的候选；
+    round_failed_candidates 里本轮真实失败的候选不再重试；时段门、真实限额窗口、自身
+    容量都作为过滤原因。返回 (exhausted, free_candidate, details)；绝不伪造全满、
+    绝不强制探测、绝不清除任何冷却。没有有效预授权时返回 (False, None, reasons)。"""
+    preauth = _scope_luna_preauthorization(scope)
+    if preauth is None:
+        return False, None, ['no valid task-level luna_preauthorization in scope']
+    ok_ac, allowlist = _scope_candidate_allowlist(scope)
+    if not ok_ac:
+        return False, None, ['scope.allowed_candidates is present but empty, unknown or '
+                             'malformed; the task-level authorized candidate set cannot be '
+                             'trusted — fail-closed, an invalid or empty authorization is '
+                             'never counted as exhaustion']
+    failed = set(preauth.get('round_failed_candidates') or [])
+    _combo, combo_conflict = _scope_combo_from_scope(scope)
+    if combo_conflict:
+        return False, None, ['the original scope pins an ambiguous/unknown executor/model '
+                             'combo; fail-closed — no Luna takeover is inferred']
+    zcode_blocked = _zcode_availability_blocked(quota_store, now=now,
+                                                routes_path=quota_routes)
+    allowed = _scope_allowed_candidates(scope, zcode_blocked)
+    if allowlist is not None:
+        allowed = [k for k in allowed if k in allowlist]
+    if not allowed:
+        return False, None, ['the original scope authorizes no eligible domestic candidate '
+                             '(executor/combo hard constraint intersected with '
+                             'allowed_candidates); fail-closed rather than inventing '
+                             'exhaustion']
+    details = []
+    for k in allowed:
+        if k in failed:
+            details.append(f'{k}: already failed this round (round_failed_candidates)')
+            continue
+        cap = capacity_for(k)
+        if cap is None:
+            details.append(f'{k}: not a bounded domestic candidate')
+            continue
+        if _max_window_blocks(k, now):
+            details.append(f'{k}: time-window gate closed')
+            continue
+        if _quota_limit_window_active(conn, k, now):
+            details.append(f'{k}: inside its real 1800s quota-failure window')
+            continue
+        if _has_own_capacity(conn, k):
+            return False, k, [f'{k}: an authorized candidate still has a free slot']
+        details.append(f'{k}: full')
+    return True, None, details
 
 
 def ask_record(store_path=None, *, task_id, scope=None, ask_message_id=None,
@@ -2453,13 +2607,18 @@ def ask_record(store_path=None, *, task_id, scope=None, ask_message_id=None,
     - 六个国内名额必须确实全满（未满时优先国内，不该升级询问）；**除非**给出可信的
       降级决策（degradation_reason ∈ quota/auth/capacity + degradation_detail）：ZCode
       持久不可用（quota）等导致“可用主力不足”时，允许在六未满时记录一次降级询问；
-      quota 降级必须带客观证据（持久 ZCode availability 阻断行），绝不凭空降级；
+      缺预授权时 quota 降级必须带客观证据（持久 ZCode availability 阻断行），绝不凭空
+      降级；携带合法任务级预授权时 quota/auth/capacity 统一改经**本任务候选耗尽客观
+      核验**（不强制某个 ZCode 历史标记，其它模型真实 quota 同样可核验记录）；
+      scope.allowed_candidates（可选、仅本任务）为合法非空集合时与 executor/combo 授权
+      取交集，空/未知/冲突集合诚实拒绝，绝不把空授权当耗尽；
     - 等待固定 LUNA_ASK_TIMEOUT_SECONDS=300 秒：更短的 deadline_seconds 直接拒绝，
       更长也按固定 300 落库（任务不能任意缩短/自定义）。
     同一 task 只能有一个票据：任何已存在的票据（pending/claimed/replied/cancelled/
     settled）都拒绝重复记录——重复询问绝不重置原回复/计时/scope；重启不重置 deadline。
-    降级票据（degradation_reason 非空）绝不由超时授权 Luna：claim-due 要求用户明确
-    reply luna 才放行（非容量类超时不得替代明确授权）。
+    降级票据（degradation_reason 非空）默认不由超时授权 Luna：claim-due 要求用户明确
+    reply luna，或原单 scope 携带合法任务级 luna_preauthorization 且候选客观耗尽后
+    固定 300 秒无回复才放行（超时本身不得替代明确授权）。
     now 参数仅供确定性函数测试注入；宿主生产路径（CLI）始终使用真实 UTC。"""
     now = now or utcnow()
     ok, parsed_scope, scope_reasons = _normalize_scope(scope)
@@ -2503,22 +2662,42 @@ def ask_record(store_path=None, *, task_id, scope=None, ask_message_id=None,
                                'shorten the user-response window')
             if degraded:
                 # 降级询问允许在八槽未满时记录，但 quota 降级必须带客观持久 ZCode 不可用证据。
+                if ok:
+                    ok_ac, _allowlist = _scope_candidate_allowlist(parsed_scope)
+                    if not ok_ac:
+                        # BW-CONTINUE-20261019-S7：空/未知/畸形 allowed_candidates 诚实拒绝，
+                        # 绝不猜候选或冒充耗尽。
+                        reasons.append('scope.allowed_candidates is present but empty, '
+                                       'unknown or malformed: the authorized candidate set '
+                                       'for this task cannot be verified, so the '
+                                       'degradation ask is refused fail-closed instead of '
+                                       'guessing candidates or exhaustion')
                 if degradation_reason == 'quota':
-                    zcode_blocked = _zcode_availability_blocked(
-                        quota_store, now=now, routes_path=quota_routes)
-                    if not zcode_blocked:
-                        reasons.append('quota degradation requires objective evidence: '
-                                       'the persistent ZCode availability state must '
-                                       'actually block ZCode; a non-capacity timeout or '
-                                       'an unverified hunch is never a quota degradation')
+                    if _scope_luna_preauthorization(parsed_scope) is not None:
+                        # BW-CONTINUE-20261019-S7：携带合法任务级预授权时，quota 降级统一
+                        # 走下方**客观候选耗尽核验**（round_failed_candidates + 真实容量/
+                        # 限额窗口），不再强制某个 ZCode 历史阻断标记——其它模型的真实
+                        # quota 本轮全失败同样可核验记录。不造余额/恢复，不清任何真实冷却。
+                        pass
+                    else:
+                        # 缺预授权维持旧机制：必须带客观持久 ZCode 不可用证据。
+                        zcode_blocked = _zcode_availability_blocked(
+                            quota_store, now=now, routes_path=quota_routes)
+                        if not zcode_blocked:
+                            reasons.append('quota degradation requires objective evidence: '
+                                           'the persistent ZCode availability state must '
+                                           'actually block ZCode; a non-capacity timeout or '
+                                           'an unverified hunch is never a quota degradation')
                 elif degradation_reason == 'capacity':
                     # 缺陷 7：capacity 降级不能只凭一句字符串+detail 就宣称"所有受信任候选
                     # 都不可用"——必须客观核验受信任候选池是否真的排空。仍有受信任候选有空位
                     # 时优先用国内候选，绝不升级到问用户/待援。候选集合按票据 scope 的执行器/
-                    # combo 收窄：scope 明确只要 Qoder 时，ZCode 空位不是该任务的受信任候选。
+                    # combo 硬约束与本轮失败集合统一收窄（_task_authorized_candidates）：
+                    # scope 明确只要 Qoder 时，ZCode 空位不是该任务的受信任候选；本轮真实
+                    # 失败过的候选空位也不反向阻塞有预授权的降级询问。缺预授权保持旧行为。
                     zcode_blocked = _zcode_availability_blocked(
                         quota_store, now=now, routes_path=quota_routes)
-                    allowed_c = _scope_allowed_candidates(parsed_scope, zcode_blocked)
+                    allowed_c = _task_authorized_candidates(parsed_scope, zcode_blocked)
                     free_candidate = None
                     for k in allowed_c:
                         # 每个池（含两个 CodeBuddy 独立槽）都按自身容量判断真实空位
@@ -2532,6 +2711,27 @@ def ask_record(store_path=None, *, task_id, scope=None, ask_message_id=None,
                             f'{free_candidate} still has a free slot; prioritize the real '
                             'capacity instead of escalating to an ask (a capacity claim '
                             'must not fabricate exhaustion of authorized candidates)')
+                if ok and _scope_luna_preauthorization(parsed_scope) is not None \
+                        and degradation_reason in ('quota', 'auth'):
+                    # 有任务级预授权的降级询问必须核验**客观候选**，而不是 auth/quota
+                    # 字符串即可进：合法预授权 + 本任务受信任候选（剔除本轮已失败者）里
+                    # 仍有真实空位时先走国内，绝不落预授权询问票据；客观核验本身 fail-closed
+                    # 失败（歧义 combo、未授权任何候选等）同样拒绝记录。缺预授权保持旧行为。
+                    pa_exhausted, pa_free, pa_details = _preauth_candidates_exhausted(
+                        conn, parsed_scope, now, quota_store=quota_store,
+                        quota_routes=quota_routes)
+                    if pa_free is not None:
+                        reasons.append(
+                            'preauthorized degradation ask refused: the authorized '
+                            f'candidate {pa_free} still has a real free slot; prioritize '
+                            'domestic capacity instead of recording a preauthorized ask '
+                            '(an auth/quota detail string alone never admits the ticket)')
+                    elif not pa_exhausted:
+                        reasons.append(
+                            'preauthorized degradation ask refused fail-closed: the '
+                            'task-level objective candidate check must succeed for the '
+                            'preauthorization to apply')
+                        reasons.extend(pa_details)
             elif _domestic_active(conn) < DOMESTIC_TOTAL_CAPACITY:
                 reasons.append('domestic slots are not full; prioritize domestic '
                                'capacity instead of escalating to an ask')
@@ -2626,7 +2826,17 @@ def claim_due(store_path=None, *, task_id, now=None, scope=None,
         Python 绝不冒称已 spawn；启动后崩溃未写出 agentID → mark_launch_unknown，
         绝不自动重复启动。
     - 已 claimed / launch_unknown → 幂等拒绝（带 agent_id/launch_state），不重启；
-    - 已回复（非 luna）→ 超时不是默认无限授权，拒绝；未到期 → not_due。"""
+    - 已回复（非 luna）→ 超时不是默认无限授权，拒绝；未到期 → not_due。
+    - 降级票据唯一预授权例外：quota/auth/capacity 降级 + 原单 scope 内任务级
+      luna_preauthorization 合法且本轮合格候选真实耗尽（含容量耗尽）时，固定 300 秒无回复
+      按原单接续 Luna（复用原票据、单写入者守卫）；候选未耗尽、无/非法预授权仍一律拒绝，
+      capacity 降级且无预授权时维持旧的"必须明确 reply luna"拒绝。
+    - 统一的本轮候选筛选：票据原 scope 携带合法任务级预授权且给出 round_failed_candidates
+      时，本轮真实失败过的候选**不会**被 domestic_reclaim 重新认领（否则 299 秒一腾出空位
+      就把刚失败的组合再派一遍）；只有本任务受信任候选全部失败耗尽（失败型耗尽，不是
+      "只是满"）才落入 Luna 裁决——299 秒仍是 not_due，300 秒到期才 Luna 单赢家；纯 exact
+      combo 本轮失败后同样不再被旧 pinned 分支永久挡死。缺预授权时回收与 pinned 语义完全
+      照旧；用户 reply domestic/external/cancel、单写入者/活 writer 互斥、限额/时段门均不变。"""
     now = now or utcnow()
     with closing(connect(store_path)) as conn:
         conn.execute('BEGIN IMMEDIATE')
@@ -2699,6 +2909,13 @@ def claim_due(store_path=None, *, task_id, now=None, scope=None,
             reply_luna = row['state'] == 'replied' and row['reply_choice'] == 'luna'
             reply_domestic = row['state'] == 'replied' and row['reply_choice'] == 'domestic'
             degraded = bool(row['degradation_reason']) if 'degradation_reason' in row.keys() else False
+            # 统一本任务候选筛选的失败来源：票据原 scope 携带合法任务级预授权时，
+            # round_failed_candidates 里的候选是**本轮真实失败过**的组合——国内回收、
+            # ask_record 核验与最终 exhausted 共用同一剔除口径（只收窄、绝不扩大授权；
+            # 缺预授权时为空集合，保持旧行为）。
+            ticket_preauth = _scope_luna_preauthorization(parsed_ticket_scope)
+            ticket_round_failed = set(
+                (ticket_preauth or {}).get('round_failed_candidates') or [])
             zcode_blocked = _zcode_availability_blocked(quota_store, now=now,
                                                         routes_path=quota_routes)
             eligible = _eligible_main_forces(conn, zcode_blocked, now)
@@ -2711,6 +2928,19 @@ def claim_due(store_path=None, *, task_id, now=None, scope=None,
             scope_model = parsed_ticket_scope.get('model')
             scope_combo, scope_combo_conflict = _scope_combo_from_scope(parsed_ticket_scope)
             if not reply_luna and _domestic_active(conn) < DOMESTIC_TOTAL_CAPACITY:
+                # BW-CONTINUE-20261019-S7：票据 scope 若携带 allowed_candidates，只收窄
+                # **本任务**的回收候选（与 executor/combo 硬约束取交集），绝不改全局路由；
+                # 缺字段保持旧行为；空/未知/畸形集合诚实拒绝（不猜池回收，也绝不当作耗尽）。
+                ok_ac, scope_allowlist = _scope_candidate_allowlist(parsed_ticket_scope)
+                if not ok_ac:
+                    conn.execute('ROLLBACK')
+                    return {'claimed': False, 'task_id': task_id, 'state': row['state'],
+                            'reasons': ['the ticket scope carries an empty/unknown/'
+                                        'malformed allowed_candidates set; the authorized '
+                                        'candidate set for this task cannot be trusted, so '
+                                        'no domestic reclaim pool is guessed and an empty '
+                                        'authorization is never counted as exhaustion — '
+                                        'the ticket stays pending fail-closed']}
                 allowed = None
                 if scope_combo_conflict:
                     # executor/runtime 冲突或未知 model：fail-closed，无受信任候选，保持
@@ -2727,6 +2957,11 @@ def claim_due(store_path=None, *, task_id, now=None, scope=None,
                     # never international/ZCode, never Luna; retired DeepSeek-Flash is not a
                     # reclaim candidate either.
                     allowed = {CN_MAX_POOL_KEY, CN_CUSTOM_MAX_POOL_KEY, CN_FLASH_POOL_KEY}
+                if scope_allowlist is not None:
+                    # 与 executor/combo 收窄后的候选取交集；无执行器约束时也只允许
+                    # 名单内候选参与本任务回收。
+                    allowed = (set(scope_allowlist) if allowed is None
+                               else allowed & scope_allowlist)
                 if allowed is not None and ZCODE_POOL_KEY in allowed and zcode_blocked:
                     # 原 scope 只要 ZCode，但 ZCode 当前不可用：不回收、不 Luna，保持 pending。
                     conn.execute('ROLLBACK')
@@ -2738,7 +2973,15 @@ def claim_due(store_path=None, *, task_id, now=None, scope=None,
                                         'escalates to Luna — it stays pending waiting for a '
                                         'restored ZCode slot']
                                     + (zcode_blocked.get('reasons') or [])}
+                # 本轮已真实失败过的候选绝不作为 domestic_reclaim 重新认领（否则 299 秒
+                # 一旦腾出空位就会把刚失败的组合再派一遍）；与 ask_record/exhausted 同一
+                # 收窄口径。
+                if ticket_round_failed:
+                    if allowed is not None:
+                        allowed = allowed - ticket_round_failed
                 eligible2 = eligible if allowed is None else (eligible & allowed)
+                if ticket_round_failed:
+                    eligible2 = eligible2 - ticket_round_failed
                 target, _ = _select_main_force(conn, scope_combo, now, eligible=eligible2)
                 if target is None and allowed is not None:
                     for k in allowed:
@@ -2749,6 +2992,8 @@ def claim_due(store_path=None, *, task_id, now=None, scope=None,
                             target = k
                             break
                 if target is None and scope_combo is not None \
+                        and scope_combo not in ticket_round_failed \
+                        and (scope_allowlist is None or scope_combo in scope_allowlist) \
                         and scope_combo in MAIN_FORCE_KEYS \
                         and scope_combo != CODEBUDDY_GLM_POOL_KEY \
                         and not _main_force_limit_active(conn, scope_combo) \
@@ -2765,6 +3010,8 @@ def claim_due(store_path=None, *, task_id, now=None, scope=None,
                     # 一个；两 Flash 都满才保持 pending，绝不改派 Luna 或 retired DeepSeek。
                     for k in sorted(OVERFLOW_KEYS,
                                     key=lambda pk: (_count_active(conn, pk), pk)):
+                        if k in ticket_round_failed:
+                            continue
                         cap = capacity_for(k)
                         if cap is not None and _count_active(conn, k) < cap:
                             target = k
@@ -2775,85 +3022,103 @@ def claim_due(store_path=None, *, task_id, now=None, scope=None,
                     # 被明确限额钉住的具体 combo 也在此保持 pending（sent=false /
                     # model_unavailable 语义）：绝不偷偷换成别的模型，等用户明确额度
                     # 恢复/重置解除标记后才有该 combo 的空位。
-                    scope_combo_limited = (scope_combo is not None
-                                           and _main_force_limit_active(conn, scope_combo))
-                    scope_combo_window_closed = (scope_combo is not None
-                                                 and _max_window_blocks(scope_combo, now))
-                    conn.execute('ROLLBACK')
-                    return {'claimed': False, 'task_id': task_id, 'state': row['state'],
-                            'sent': False,
-                            'model_unavailable': bool(scope_combo_limited
-                                                       or scope_combo_window_closed),
-                            'main_force_window_closed': bool(scope_combo_window_closed),
-                            'reasons': ['no domestic slot satisfies the original scope '
-                                        f'constraint (executor={scope_executor!r}, '
-                                        f'combo={scope_combo!r}'
-                                        + ('; the pinned combo is explicitly quota-limited '
-                                           'so it is never silently swapped to another '
-                                           'model (model_unavailable)'
-                                           if scope_combo_limited else '')
-                                        + ('; the pinned Qoder Max pool is only '
-                                           'a main force during Beijing time 22:00 '
-                                           '(inclusive) to 08:00 (exclusive) and is outside '
-                                           'that window now, so it is never silently '
-                                           'swapped to another model'
-                                           if scope_combo_window_closed else '')
-                                        + '); the ticket stays pending '
-                                        '— a slot for another candidate never satisfies it '
-                                        'and domestic is never Luna']}
-                dup = _active_task(conn, task_id)
-                if dup is not None:
+                    # 唯一例外：合法任务级 Luna 预授权 + 本任务受信任候选**全部**在
+                    # round_failed_candidates 里本轮真实失败过（失败型耗尽，不是"只是
+                    # 满"）且客观核验通过时，不在此处返回，落入下方 Luna 裁决——299 秒
+                    # 仍是 not_due，300 秒到期才允许按原单接续 Luna（单赢家）。
+                    failure_exhausted = False
+                    if (ticket_preauth is not None and ticket_round_failed
+                            and not scope_combo_conflict
+                            and not _task_authorized_candidates(parsed_ticket_scope,
+                                                                 zcode_blocked)):
+                        fx_exhausted, fx_free, _fx_details = (
+                            _preauth_candidates_exhausted(
+                                conn, parsed_ticket_scope, now,
+                                quota_store=quota_store, quota_routes=quota_routes))
+                        failure_exhausted = bool(fx_exhausted and fx_free is None)
+                    if failure_exhausted:
+                        pass
+                    else:
+                        scope_combo_limited = (scope_combo is not None
+                                               and _main_force_limit_active(conn, scope_combo))
+                        scope_combo_window_closed = (scope_combo is not None
+                                                     and _max_window_blocks(scope_combo, now))
+                        conn.execute('ROLLBACK')
+                        return {'claimed': False, 'task_id': task_id, 'state': row['state'],
+                                'sent': False,
+                                'model_unavailable': bool(scope_combo_limited
+                                                           or scope_combo_window_closed),
+                                'main_force_window_closed': bool(scope_combo_window_closed),
+                                'reasons': ['no domestic slot satisfies the original scope '
+                                            f'constraint (executor={scope_executor!r}, '
+                                            f'combo={scope_combo!r}'
+                                            + ('; the pinned combo is explicitly quota-limited '
+                                               'so it is never silently swapped to another '
+                                               'model (model_unavailable)'
+                                               if scope_combo_limited else '')
+                                            + ('; the pinned Qoder Max pool is only '
+                                               'a main force during Beijing time 22:00 '
+                                               '(inclusive) to 08:00 (exclusive) and is outside '
+                                               'that window now, so it is never silently '
+                                               'swapped to another model'
+                                               if scope_combo_window_closed else '')
+                                            + '); the ticket stays pending '
+                                            '— a slot for another candidate never satisfies it '
+                                            'and domestic is never Luna']}
+                if target is not None:
+                    dup = _active_task(conn, task_id)
+                    if dup is not None:
+                        conn.execute("UPDATE luna_tickets SET state='cancelled', "
+                                     'updated_at_utc=? WHERE task_id=?',
+                                     (_iso(now), task_id))
+                        conn.execute('COMMIT')
+                        return {'claimed': False, 'task_id': task_id, 'state': 'cancelled',
+                                'reasons': [f'task {task_id!r} already has an in-flight '
+                                            'domestic attempt; aid ticket cancelled']}
+                    tr, tm = target.split(':', 1)
+                    # Z4：国内回收同样过真实 workspace 单写入守卫（别的 task 在途则拒，
+                    # 票据保持 pending 等下次裁决，绝不改派 Luna/Flash 绕过）。
+                    busy_ws = _workspace_conflict(
+                        conn, parsed_ticket_scope.get('workspace')
+                        if parsed_ticket_scope else None, own_task_id=task_id)
+                    if busy_ws is not None:
+                        conn.execute('ROLLBACK')
+                        return {'claimed': False, 'task_id': task_id,
+                                'state': row['state'],
+                                'reasons': [f'workspace {busy_ws["workspace"]!r} already '
+                                            f'has an in-flight attempt from a different '
+                                            f'task (token={busy_ws["token"]}, '
+                                            f'task={busy_ws["task_id"]!r}); the domestic '
+                                            'reclaim was refused and the ticket stays '
+                                            'pending — never rerouted around the guard']}
+                    # Z2：国内回收必须写回票据原 scope 的真实绑定字段（stage/chat/
+                    # prompt_sha256/workspace），返回的 token 才能被原入口按原 scope 消费。
+                    tok = _insert_claim(conn, task_id=task_id,
+                                        stage=parsed_ticket_scope.get('stage')
+                                        if parsed_ticket_scope else None,
+                                        chat_id=parsed_ticket_scope.get('chat_id')
+                                        if parsed_ticket_scope else None,
+                                        prompt_sha256=parsed_ticket_scope.get('prompt_sha256')
+                                        if parsed_ticket_scope else None,
+                                        workspace=_norm_workspace(
+                                            parsed_ticket_scope.get('workspace'))
+                                        if parsed_ticket_scope else None,
+                                        runtime=tr, model=tm, pk=target, token=None,
+                                        now=now, origin='claim-due-domestic-reclaim')
+                    if target in MAIN_FORCE_KEYS:
+                        _bump_rotation(conn, target, now)
                     conn.execute("UPDATE luna_tickets SET state='cancelled', "
-                                 'updated_at_utc=? WHERE task_id=?',
-                                 (_iso(now), task_id))
+                                 "reply_note='domestic_slot_freed', updated_at_utc=? "
+                                 "WHERE task_id=?", (_iso(now), task_id))
                     conn.execute('COMMIT')
-                    return {'claimed': False, 'task_id': task_id, 'state': 'cancelled',
-                            'reasons': [f'task {task_id!r} already has an in-flight '
-                                        'domestic attempt; aid ticket cancelled']}
-                tr, tm = target.split(':', 1)
-                # Z4：国内回收同样过真实 workspace 单写入守卫（别的 task 在途则拒，
-                # 票据保持 pending 等下次裁决，绝不改派 Luna/Flash 绕过）。
-                busy_ws = _workspace_conflict(
-                    conn, parsed_ticket_scope.get('workspace')
-                    if parsed_ticket_scope else None, own_task_id=task_id)
-                if busy_ws is not None:
-                    conn.execute('ROLLBACK')
-                    return {'claimed': False, 'task_id': task_id,
-                            'state': row['state'],
-                            'reasons': [f'workspace {busy_ws["workspace"]!r} already '
-                                        f'has an in-flight attempt from a different '
-                                        f'task (token={busy_ws["token"]}, '
-                                        f'task={busy_ws["task_id"]!r}); the domestic '
-                                        'reclaim was refused and the ticket stays '
-                                        'pending — never rerouted around the guard']}
-                # Z2：国内回收必须写回票据原 scope 的真实绑定字段（stage/chat/
-                # prompt_sha256/workspace），返回的 token 才能被原入口按原 scope 消费。
-                tok = _insert_claim(conn, task_id=task_id,
-                                    stage=parsed_ticket_scope.get('stage')
-                                    if parsed_ticket_scope else None,
-                                    chat_id=parsed_ticket_scope.get('chat_id')
-                                    if parsed_ticket_scope else None,
-                                    prompt_sha256=parsed_ticket_scope.get('prompt_sha256')
-                                    if parsed_ticket_scope else None,
-                                    workspace=_norm_workspace(
-                                        parsed_ticket_scope.get('workspace'))
-                                    if parsed_ticket_scope else None,
-                                    runtime=tr, model=tm, pk=target, token=None, now=now,
-                                    origin='claim-due-domestic-reclaim')
-                if target in MAIN_FORCE_KEYS:
-                    _bump_rotation(conn, target, now)
-                conn.execute("UPDATE luna_tickets SET state='cancelled', "
-                             "reply_note='domestic_slot_freed', updated_at_utc=? "
-                             "WHERE task_id=?", (_iso(now), task_id))
-                conn.execute('COMMIT')
-                return {'claimed': True, 'mode': 'domestic_reclaim', 'task_id': task_id,
-                        'token': tok, 'pool_key': target,
-                        'selected': {'pool_key': target, 'runtime': tr, 'model': tm},
-                        'scope': parsed_ticket_scope, 'launch_state': None,
-                        'reasons': ['a domestic slot is free again; atomically reserved '
-                                    'for this task (bound to the original ticket scope) '
-                                    'and cancelled the pending aid (no double-dispatch, '
-                                    'no lost slot)']}
+                    return {'claimed': True, 'mode': 'domestic_reclaim', 'task_id': task_id,
+                            'token': tok, 'pool_key': target,
+                            'selected': {'pool_key': target, 'runtime': tr, 'model': tm},
+                            'scope': parsed_ticket_scope, 'launch_state': None,
+                            'reasons': ['a domestic slot is free again; atomically reserved '
+                                        'for this task (bound to the original ticket scope) '
+                                        'and cancelled the pending aid (no double-dispatch, '
+                                        'no lost slot)']}
             # 六仍满：未到期（不重置 deadline）一律拒绝；到期未回复或明确 reply luna
             # 才允许 Luna。
             # BW-AVAILABILITY-20261009-B2：用户明确 reply domestic → 永不 Luna（只能等国内
@@ -2870,32 +3135,79 @@ def claim_due(store_path=None, *, task_id, now=None, scope=None,
             # 绝不因超时自动升级到 Luna（Luna 是不同执行器，从不满足国内 combo 约束）。只有用户
             # 明确 reply luna（已授权接续）才放行；executor/runtime 冲突或未知 model 同样
             # fail-closed 保持 pending，绝不猜池、绝不 Luna。
-            if (scope_combo_conflict
-                    or (scope_combo is not None and scope_combo != LUNA_KEY
-                        and not reply_luna)):
-                conn.execute('ROLLBACK')
-                return {'claimed': False, 'task_id': task_id, 'state': row['state'],
-                        'reasons': ['the original ticket scope pins this task to a domestic '
-                                    f'combo (executor={scope_executor!r}, '
-                                    f'model={scope_model!r}'
-                                    + (f', combo={scope_combo!r}' if scope_combo else '')
-                                    + ('; the combo is ambiguous/unknown so nothing is '
-                                       'guessed (fail-closed)' if scope_combo_conflict else
-                                       '')
-                                    + '); when all eight domestic slots are full it waits for '
-                                    'that combo to free — a wait timeout never escalates a '
-                                    'domestic-combo scope to Luna; only an explicit user '
-                                    'reply luna (an authorized continuation) may proceed']}
-            # 降级票据（<8 满时凭独立 quota/auth/capacity 证据记录）绝不由超时授权 Luna：
-            # 非容量类超时不得替代明确授权，必须用户明确 reply luna 才放行。
+            # 例外（失败型耗尽，不是"只是满"）：合法任务级 Luna 预授权 + 该钉住 combo 本身
+            # 已在 round_failed_candidates 里本轮真实失败 + 客观候选耗尽核验通过时，纯 exact
+            # combo 不再被旧 pinned 分支永久挡死——固定 300 秒无回复按原单接续 Luna（未到期
+            # 仍是 not_due）。该例外不放宽任何其它门：reply domestic/external/cancel、冲突
+            # combo、未知 model、单写入者/活 writer 互斥照旧；候选集合仍由原 scope 收窄，
+            # 绝不因预授权换 executor 绕过。
+            pinned_domestic = (scope_combo is not None and scope_combo != LUNA_KEY
+                               and not reply_luna)
+            if scope_combo_conflict or pinned_domestic:
+                pinned_lifted = False
+                if pinned_domestic and not scope_combo_conflict \
+                        and scope_combo in ticket_round_failed:
+                    p_exhausted, p_free, _p_details = _preauth_candidates_exhausted(
+                        conn, parsed_ticket_scope, now, quota_store=quota_store,
+                        quota_routes=quota_routes)
+                    pinned_lifted = bool(p_exhausted and p_free is None)
+                if not pinned_lifted:
+                    conn.execute('ROLLBACK')
+                    return {'claimed': False, 'task_id': task_id, 'state': row['state'],
+                            'reasons': ['the original ticket scope pins this task to a '
+                                        'domestic '
+                                        f'combo (executor={scope_executor!r}, '
+                                        f'model={scope_model!r}'
+                                        + (f', combo={scope_combo!r}'
+                                           if scope_combo else '')
+                                        + ('; the combo is ambiguous/unknown so nothing is '
+                                           'guessed (fail-closed)'
+                                           if scope_combo_conflict else '')
+                                        + '); when all eight domestic slots are full it '
+                                        'waits for that combo to free — a wait timeout '
+                                        'never escalates a domestic-combo scope to Luna; '
+                                        'only an explicit user reply luna, or a valid '
+                                        'task-level preauthorization over a pinned combo '
+                                        'that genuinely failed this round with the '
+                                        'authorized candidates objectively exhausted, '
+                                        'may proceed']}
+            # 降级票据（<8 满时凭独立 quota/auth/capacity 证据记录）默认绝不由超时授权
+            # Luna：超时不得替代明确授权。唯一例外（任务级预授权，BW-CONTINUE-20261019-S7
+            # 起覆盖 quota/auth/capacity 三类）：降级 + 原单 scope 内合法
+            # luna_preauthorization（authorized=true、固定 300 秒、含用户原话的任务级一次性
+            # 授权）+ **本轮**合格候选真实耗尽时，固定 300 秒无回复可按原单接续 Luna——
+            # 复用原票据与单写入者守卫，绝不新建票据/重置计时。用户授权覆盖全部合格候选
+            # 耗尽（含容量），不再有 capacity 的无条件阻断；候选未耗尽（优先国内）、缺少/
+            # 非法预授权一律 fail-closed 拒绝；capacity 降级无预授权时维持旧拒绝语义。
             if degraded and not reply_luna:
-                conn.execute('ROLLBACK')
-                return {'claimed': False, 'task_id': task_id, 'state': row['state'],
-                        'degradation_reason': row['degradation_reason'],
-                        'reasons': ['this is a degradation ask recorded without eight-full '
-                                    'domestic slots; a wait timeout is never an implicit '
-                                    'authorization — the user must explicitly reply luna '
-                                    'before Luna may be claimed']}
+                if row['degradation_reason'] == 'capacity' and ticket_preauth is None:
+                    conn.execute('ROLLBACK')
+                    return {'claimed': False, 'task_id': task_id, 'state': row['state'],
+                            'degradation_reason': 'capacity',
+                            'reasons': ['this is a capacity degradation ask recorded without '
+                                        'eight-full domestic slots; a wait timeout is never '
+                                        'an implicit authorization — the user must explicitly '
+                                        'reply luna before Luna may be claimed']}
+                exhausted, free_candidate, details = _preauth_candidates_exhausted(
+                    conn, parsed_ticket_scope, now, quota_store=quota_store,
+                    quota_routes=quota_routes)
+                if free_candidate is not None:
+                    conn.execute('ROLLBACK')
+                    return {'claimed': False, 'task_id': task_id, 'state': row['state'],
+                            'degradation_reason': row['degradation_reason'],
+                            'reasons': ['preauthorized Luna continuation refused: the '
+                                        f'authorized domestic candidate {free_candidate} '
+                                        'still has a free slot; prioritize the real domestic '
+                                        'capacity instead of escalating to Luna (the ticket '
+                                        'stays pending)']}
+                if not exhausted:
+                    conn.execute('ROLLBACK')
+                    return {'claimed': False, 'task_id': task_id, 'state': row['state'],
+                            'degradation_reason': row['degradation_reason'],
+                            'reasons': ['preauthorized Luna continuation refused '
+                                        'fail-closed: the task-level exhaustion check must '
+                                        'succeed for the preauthorization to apply']
+                                        + list(details)}
             if row['state'] == 'pending':
                 deadline = _parse(row['deadline_utc'])
                 if deadline is not None and now < deadline:
@@ -2939,14 +3251,26 @@ def claim_due(store_path=None, *, task_id, now=None, scope=None,
                          "launch_state='host_must_call_native', updated_at_utc=? "
                          "WHERE task_id=?", (tok, _iso(now), task_id))
             conn.execute('COMMIT')
+            if (degraded or ticket_preauth is not None) and not reply_luna:
+                luna_reasons = [
+                    'luna_preauthorization (task-scoped) is valid for this '
+                    f'{row["degradation_reason"] if degraded else "non-degraded"} ticket '
+                    'and this round\'s authorized '
+                    'candidates are genuinely exhausted; the fixed 300s ask deadline '
+                    'elapsed with no reply, so Luna continues on the same ticket (single '
+                    'writer per workspace, no new ask, no timer reset). If the native '
+                    'tool started but crashed before writing an agentID, record '
+                    'launch_unknown and do NOT auto-repeat the start.']
+            else:
+                luna_reasons = [
+                    'all eight domestic slots full and the ask deadline elapsed '
+                    'with no reply (or the user explicitly replied luna); '
+                    'the host may now call native Luna. If the native tool '
+                    'started but crashed before writing an agentID, record '
+                    'launch_unknown and do NOT auto-repeat the start.']
             return {'claimed': True, 'mode': 'luna', 'task_id': task_id, 'token': tok,
                     'pool_key': LUNA_KEY, 'launch_state': 'host_must_call_native',
-                    'scope': parsed_ticket_scope,
-                    'reasons': ['all eight domestic slots full and the ask deadline elapsed '
-                                'with no reply (or the user explicitly replied luna); '
-                                'the host may now call native Luna. If the native tool '
-                                'started but crashed before writing an agentID, record '
-                                'launch_unknown and do NOT auto-repeat the start.']}
+                    'scope': parsed_ticket_scope, 'reasons': luna_reasons}
         except Exception:
             conn.execute('ROLLBACK')
             raise

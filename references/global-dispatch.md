@@ -438,7 +438,7 @@ Luna 是**救援**通道，无数量上限，但绝不无条件启动。流程�
   `ask_record` 对**任何已存在票据**直接拒绝并回读 `state`/`deadline_utc`/`reply_choice`（纯 INSERT，
   无 `ON CONFLICT` 重置）；`pending` 不重置计时器。
 - **票据 scope 损坏/缺失 → fail-closed**（`scope_corrupt=True`，绝不据损坏数据启动 Luna 或 reclaim）。
-- **可用性不足的降级决策**：当**国内名额未满总 16（含自定义主力、CN 补充候选、claude 2 槽、CodeBuddy 两模型与两 OpenCode 免费模型各自独立的 1 槽）** 但因 availability 不足以正常派工时，允许一次新的
+- **无任务级预授权时的既有降级决策**（有预授权按下节的新规则）：当**国内名额未满总 16（含自定义主力、CN 补充候选、claude 2 槽、CodeBuddy 两模型与两 OpenCode 免费模型各自独立的 1 槽）** 但因 availability 不足以正常派工时，允许一次新的
   降级 `ask_record`，须带**独立、客观的降级理由** `degradation_reason ∈ {quota, auth, capacity}` +
   `degradation_detail`；`quota` 理由必须由 §3b availability 的客观证据支撑
   （`_zcode_availability_blocked`），无证据则拒绝；`capacity` 理由必须经 `_scope_allowed_candidates`
@@ -446,6 +446,27 @@ Luna 是**救援**通道，无数量上限，但绝不无条件启动。流程�
   降级票据**绕过“总 16 全满”前提**，但
   **非 capacity 的超时绝不可替代显式授权**：只有用户显式回复 `luna` 才 claim Luna；等待超时
   ≠ 授权（`degraded && reply != luna` → 拒绝）。**总 16 全满 + 真实提问 + 300s + 用户授权**的既有规则不变。
+
+### 任务级 300 秒 Luna 预授权与本轮失败候选接续（BW-CONTINUE-20261019-S6）
+
+- **是什么**：票据原 scope 里可携带 `luna_preauthorization`——仅当它是**对本任务用户原话**的
+  明确授权（`authorized=true`、`seconds` 恰为固定 300、非空 `original_quote` + `scope_ref`）才有效；
+  它只授权**这一个任务**这一次超时接续，**不是全局/永久 Luna 授权**，也不免除真实提问与票据。
+- **候选筛选统一口径**（`_task_authorized_candidates`，ask_record / 国内回收 / exhausted 共用）：
+  本任务受信任候选 = scope 的 executor/combo 硬约束交集 ∩ 允许候选，再剔除
+  `round_failed_candidates` 里**本轮真实失败过**的候选；只收窄、绝不扩大授权，未授权有空候选
+  不阻塞本任务，也不能被拿来顶包。缺预授权时全部维持旧行为。
+- **失败后接续动作**：本轮已失败的候选**绝不**被 `domestic_reclaim` 重新认领（否则 299 秒一腾出
+  空位就把刚失败的组合再派一遍）；只有受信任候选全部不可用或满载且
+  客观核验通过时才落入 Luna 裁决——**299 秒仍不 claim（not_due），300 秒到期 Luna 单赢家**；
+  纯 exact combo 被钉住且本轮真实失败时同样可在 300 秒按原单接续，不再被旧 pinned 分支永久挡。
+- **ask_record 核验**：带预授权的 quota/auth 降级询问必须核验客观候选（仍有未失败受信任候选
+  空位时拒绝、优先国内），不是 auth/quota 字符串即可进；capacity 降级同样适用：有明确任务预授权且候选客观耗尽，300 秒无回复可以接续；
+  无预授权时仍须用户明确回复 `luna`。
+- **不覆盖的边界**：用户主动 `cancel`/回复 `domestic`/回复 `external_agent`（包括用户主动暂停、
+  取消、删除任务）绝不因预授权派 Luna；权限拒绝不得借换 executor 绕过；票据 scope 损坏、
+  combo 歧义/未知 model、已 claimed/launch_unknown、同 workspace 活 writer 互斥全部照旧 fail-closed；
+  原始失败记录保留、不伪造恢复、不新建票据或重置计时。
 
 ## 与额度门禁的边界（quota ≠ concurrency）
 

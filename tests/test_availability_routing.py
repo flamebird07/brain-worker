@@ -688,6 +688,178 @@ class LunaStateMachineTests(_TmpBase):
         self.assertFalse(again['recorded'])
         self.assertEqual(again.get('state'), 'cancelled')
 
+    # ---- 任务级 luna_preauthorization + 非容量降级 + 候选耗尽 + 300 秒接续 ----
+    def _pa_scope(self, task_id, ws=None, quote='本任务超时无回复就继续交给 Luna 执行',
+                  failed=None):
+        sc = self._scope(task_id, ws=ws)
+        sc[dp._LUNA_PREAUTH_KEY] = {'authorized': True, 'seconds': 300,
+                                    'original_quote': quote,
+                                    'scope_ref': 'user-reply-asking-ticket'}
+        if failed is not None:
+            sc[dp._LUNA_PREAUTH_KEY]['round_failed_candidates'] = failed
+        return sc
+
+    def test_preauth_auth_degradation_luna_after_deadline_when_exhausted(self):
+        """任务级预授权 + auth 降级 + 合格候选全部真实占满 + 固定 300 秒无回复：
+        到期按**原票据**接续 Luna（复用原 ask 不新建票据、单写入者守卫、计时照旧）。"""
+        self._fill_six()
+        sc = self._pa_scope('pa', quote='超时无回复就继续交给 Luna',
+                            failed=[ZCODE])
+        ask = dp.ask_record(self.dispatch, task_id='pa', scope=sc, ask_message_id='m1',
+                            now=T0, degradation_reason='auth',
+                            degradation_detail='executor auth failed this round',
+                            quota_store=self.quota)
+        self.assertTrue(ask['recorded'], ask)
+        early = dp.claim_due(self.dispatch, task_id='pa',
+                             now=T0 + timedelta(seconds=299), quota_store=self.quota)
+        self.assertFalse(early['claimed'], early)
+        self.assertTrue(early.get('not_due'), early)
+        due = dp.claim_due(self.dispatch, task_id='pa',
+                           now=T0 + timedelta(seconds=301), quota_store=self.quota)
+        self.assertTrue(due['claimed'], due)
+        self.assertEqual(due['mode'], 'luna', due)
+        self.assertEqual(due['pool_key'], dp.LUNA_KEY)
+        self.assertEqual(due['launch_state'], 'host_must_call_native')
+        self.assertEqual(due['scope']['task_id'], 'pa')
+        self.assertTrue(any('luna_preauthorization' in r for r in due['reasons']),
+                        due['reasons'])
+        self.assertTrue(any(' Single' in r or 'single writer' in r
+                            for r in due['reasons']), due['reasons'])
+        self.assertEqual(self._luna_active(), 1)
+
+    def test_preauth_missing_degradation_timeout_refused(self):
+        """auth 降级但原单 scope 没有 luna_preauthorization：超时绝不充当授权（fail-closed）。"""
+        self._fill_six()
+        ask = dp.ask_record(self.dispatch, task_id='pam', scope=self._scope('pam'),
+                            ask_message_id='m1', now=T0, degradation_reason='auth',
+                            degradation_detail='executor auth failed this round',
+                            quota_store=self.quota)
+        self.assertTrue(ask['recorded'], ask)
+        out = dp.claim_due(self.dispatch, task_id='pam',
+                           now=T0 + timedelta(seconds=400), quota_store=self.quota)
+        self.assertFalse(out['claimed'], out)
+        self.assertIn('no valid task-level luna_preauthorization', ' '.join(out['reasons']))
+        self.assertEqual(self._luna_active(), 0)
+
+    def test_preauth_quota_auth_scope_combo_pin_stays_refused(self):
+        """预授权不覆盖票据原国内 combo 硬约束：钉住 combo 的票据依旧只等该组合空位，
+        绝不因预授权或超时被升级到 Luna。"""
+        self._fill_six()
+        pinned = self._pa_scope('pacomb')
+        pinned['executor'] = 'qoder'
+        pinned['model'] = 'Qwen3.8-Flash'
+        ask = dp.ask_record(self.dispatch, task_id='pacomb', scope=pinned,
+                            ask_message_id='m1', now=T0, degradation_reason='auth',
+                            degradation_detail='auth failed this round',
+                            quota_store=self.quota)
+        self.assertTrue(ask['recorded'], ask)
+        out = dp.claim_due(self.dispatch, task_id='pacomb',
+                           now=T0 + timedelta(seconds=400), quota_store=self.quota)
+        self.assertFalse(out['claimed'], out)
+        self.assertTrue(any('pins this task to a domestic combo' in r
+                            for r in out['reasons']), out['reasons'])
+        self.assertEqual(self._luna_active(), 0)
+
+    def test_preauth_capacity_degradation_timeout_luna_when_exhausted(self):
+        """BW-CONTINUE-20261019-S8 收口：capacity 降级携带合法任务级预授权且候选客观
+        耗尽（全部 16 槽在途）时，固定 300 秒无回复按原单接续 Luna——299 秒仍 not_due，
+        301 秒到期单赢家。旧"capacity 一律禁止超时 Luna"的无条件阻断已作废。"""
+        self._fill_six()
+        sc = self._pa_scope('pac')
+        ask = dp.ask_record(self.dispatch, task_id='pac', scope=sc, ask_message_id='m1',
+                            now=T0, degradation_reason='capacity',
+                            degradation_detail='all 16 domestic slots are in-flight',
+                            quota_store=self.quota)
+        self.assertTrue(ask['recorded'], ask)
+        early = dp.claim_due(self.dispatch, task_id='pac',
+                             now=T0 + timedelta(seconds=299), quota_store=self.quota)
+        self.assertFalse(early['claimed'], early)
+        self.assertTrue(early.get('not_due'), early)
+        due = dp.claim_due(self.dispatch, task_id='pac',
+                           now=T0 + timedelta(seconds=301), quota_store=self.quota)
+        self.assertTrue(due['claimed'], due)
+        self.assertEqual(due['mode'], 'luna', due)
+        self.assertEqual(due['pool_key'], dp.LUNA_KEY)
+        self.assertTrue(any('luna_preauthorization' in r for r in due['reasons']),
+                        due['reasons'])
+        self.assertEqual(self._luna_active(), 1)
+
+    def test_capacity_degradation_without_preauth_timeout_never_luna(self):
+        """保留无预授权负例：capacity 降级缺任务级 luna_preauthorization 时超时绝不
+        自动 Luna（fail-closed，必须用户明确 reply luna）。"""
+        self._fill_six()
+        ask = dp.ask_record(self.dispatch, task_id='pacn', scope=self._scope('pacn'),
+                            ask_message_id='m1', now=T0, degradation_reason='capacity',
+                            degradation_detail='all 16 domestic slots are in-flight',
+                            quota_store=self.quota)
+        self.assertTrue(ask['recorded'], ask)
+        out = dp.claim_due(self.dispatch, task_id='pacn',
+                           now=T0 + timedelta(seconds=400), quota_store=self.quota)
+        self.assertFalse(out['claimed'], out)
+        self.assertEqual(out.get('degradation_reason'), 'capacity')
+        self.assertIn('wait timeout is never an implicit authorization',
+                      ' '.join(out['reasons']))
+        self.assertEqual(self._luna_active(), 0)
+
+    def test_preauth_invalid_shapes_refused_at_ask(self):
+        """seconds≠300 与 authorized≠true 的预授权在 ask 落库前即被拒（fail-closed），
+        绝不产生可用票据。"""
+        bad_seconds = self._pa_scope('pbad')
+        bad_seconds[dp._LUNA_PREAUTH_KEY]['seconds'] = 120
+        ask1 = dp.ask_record(self.dispatch, task_id='pbad', scope=bad_seconds,
+                             ask_message_id='m1', now=T0, degradation_reason='auth',
+                             degradation_detail='auth failed this round',
+                             quota_store=self.quota)
+        self.assertFalse(ask1['recorded'], ask1)
+        self.assertIn('seconds must be exactly 300', ' '.join(ask1['reasons']))
+        bad_auth = self._pa_scope('pbau')
+        bad_auth[dp._LUNA_PREAUTH_KEY]['authorized'] = 'yes'
+        ask2 = dp.ask_record(self.dispatch, task_id='pbau', scope=bad_auth,
+                             ask_message_id='m1', now=T0, degradation_reason='auth',
+                             degradation_detail='auth failed this round',
+                             quota_store=self.quota)
+        self.assertFalse(ask2['recorded'], ask2)
+        self.assertIn('authorized must be exactly true', ' '.join(ask2['reasons']))
+        self.assertEqual(self._luna_active(), 0)
+
+    def test_preauth_free_domestic_slot_reclaims_not_luna(self):
+        """有合格国内空位时永远先国内回收（非 Luna），预授权不改变该优先级。"""
+        toks = self._fill_six()
+        sc = self._pa_scope('par')
+        dp.ask_record(self.dispatch, task_id='par', scope=sc, ask_message_id='m1',
+                      now=T0, degradation_reason='auth',
+                      degradation_detail='executor auth failed this round',
+                      quota_store=self.quota)
+        # combos[2] 是 (qoder, Qwen3.8-Max)：释放一个合格主力空位观察回收。
+        self._free_slot(toks[2])
+        out = dp.claim_due(self.dispatch, task_id='par',
+                           now=T0 + timedelta(seconds=400), quota_store=self.quota)
+        self.assertTrue(out['claimed'], out)
+        self.assertEqual(out['mode'], 'domestic_reclaim', out)
+        self.assertEqual(out['pool_key'], QMAX, out)
+        self.assertEqual(self._luna_active(), 0)
+
+    def test_preauth_repeated_ask_never_resets_ticket_or_timer(self):
+        """预授权票据重复询问（即便原话再次记录预授权）绝不重置原票据/计时/scope。"""
+        self._fill_six()
+        sc = self._pa_scope('para')
+        first = dp.ask_record(self.dispatch, task_id='para', scope=sc,
+                              ask_message_id='m1', now=T0, degradation_reason='auth',
+                              degradation_detail='auth failed this round',
+                              quota_store=self.quota)
+        self.assertTrue(first['recorded'], first)
+        again = dp.ask_record(self.dispatch, task_id='para',
+                              scope=self._pa_scope('para', quote='再问一次也继续'),
+                              ask_message_id='m2', now=T0 + timedelta(seconds=100),
+                              degradation_reason='auth',
+                              degradation_detail='auth failed this round',
+                              quota_store=self.quota)
+        self.assertFalse(again['recorded'], again)
+        self.assertTrue(any('already exists' in r for r in again['reasons']),
+                        again['reasons'])
+        st = dp.status(self.dispatch, now=T0)['luna_tickets']
+        self.assertEqual(st[0]['deadline_utc'], first['deadline_utc'])
+
 
 # ============================================================ D. 真实入口接入（合成 stub）
 class ZCodeEntryAvailabilityTests(_TmpBase):
@@ -1638,6 +1810,358 @@ class B5ScopeComboTests(_TmpBase):
         self.assertEqual(dp._scope_allowed_candidates(conflict, zcode_blocked=None), [])
         unknown = {**self._scope('um'), 'executor': 'qoder', 'model': 'GPT-9'}
         self.assertEqual(dp._scope_allowed_candidates(unknown, zcode_blocked=None), [])
+
+
+# ==================================================== 任务级预授权 × 本轮失败候选接续
+class PreauthRoundFailureContinuationTests(_TmpBase):
+    """BW-CONTINUE-20261019-S6：Root 独立反例复现（临时 SQLite、零真实调用）。
+
+    修复前：claim_due 在 299 秒会 domestic_reclaim 重新认领 round_failed_candidates
+    里本轮已真实失败过的 CodeBuddy/Qoder 组合；纯 exact combo 被旧 pinned 分支永久挡死，
+    带预授权也无法在 300 秒接续 Luna。修复后统一 ask_record/国内回收/最终 exhausted 的
+    本任务候选筛选（executor/combo 硬约束交集 + 剔除本轮失败候选，只收窄不扩大授权）：
+    本轮已失败候选不再被回收认领；失败型耗尽（不是"只是满"）时 299 秒仍不 claim，
+    300 秒到期 Luna 单赢家。缺预授权保持旧行为。"""
+
+    ALL_AUTHORIZED = list(dp.MAIN_FORCE_KEYS) + list(dp.OVERFLOW_KEYS)
+
+    def _pa_scope(self, task_id, failed=None, **extra):
+        sc = {**self._scope(task_id), **extra}
+        sc[dp._LUNA_PREAUTH_KEY] = {'authorized': True, 'seconds': 300,
+                                    'original_quote': '本任务超时无回复就继续交给 Luna 执行',
+                                    'scope_ref': 'user-reply-asking-ticket'}
+        if failed is not None:
+            sc[dp._LUNA_PREAUTH_KEY]['round_failed_candidates'] = list(failed)
+        return sc
+
+    def _finish_token(self, token):
+        with contextlib.closing(dp.connect(self.dispatch)) as conn:
+            conn.execute("UPDATE attempts SET state='finished', terminal='finished', "
+                         'ended_at_utc=? WHERE token=?', (qc._iso(T0), token))
+
+    def _task_rows(self, task_id):
+        with contextlib.closing(dp.connect(self.dispatch)) as conn:
+            return [dict(r) for r in conn.execute(
+                'SELECT runtime, pool_key, state FROM attempts WHERE task_id=?',
+                (task_id,)).fetchall()]
+
+    def test_all_candidates_failed_no_reclaim_at_299_luna_single_winner_at_300(self):
+        # 反例 1：全部候选本轮真实失败。腾出失败组合的空位后，299 秒绝不把它们再认领
+        # 一遍（修复前这里返回 domestic_reclaim codebuddy）；300 秒到期仅 Luna 单赢家。
+        toks = self._fill_six()
+        sc = self._pa_scope('rf-all', failed=self.ALL_AUTHORIZED)
+        ask = dp.ask_record(self.dispatch, task_id='rf-all', scope=sc,
+                            ask_message_id='m1', now=T0, degradation_reason='auth',
+                            degradation_detail='all authorized candidates failed this round',
+                            quota_store=self.quota)
+        self.assertTrue(ask['recorded'], ask)
+        # 本轮失败的 CodeBuddy/Qoder 组合腾出空位（模拟真实失败后释放）。
+        self._finish_token('cb-fixture')
+        self._finish_token(toks[7])  # qoder:Qwen3.8-Flash 之一
+        early = dp.claim_due(self.dispatch, task_id='rf-all',
+                             now=T0 + timedelta(seconds=299), quota_store=self.quota)
+        self.assertFalse(early['claimed'], early)
+        self.assertTrue(early.get('not_due'), early)
+        due = dp.claim_due(self.dispatch, task_id='rf-all',
+                          now=T0 + timedelta(seconds=301), quota_store=self.quota)
+        self.assertTrue(due['claimed'], due)
+        self.assertEqual(due['mode'], 'luna', due)
+        self.assertEqual(due['pool_key'], dp.LUNA_KEY)
+        again = dp.claim_due(self.dispatch, task_id='rf-all',
+                            now=T0 + timedelta(seconds=302), quota_store=self.quota)
+        self.assertFalse(again['claimed'])
+        self.assertTrue(again.get('already_claimed'), again)
+        self.assertEqual(self._luna_active(), 1)
+        rows = self._task_rows('rf-all')
+        self.assertEqual([r['pool_key'] for r in rows], [dp.LUNA_KEY], rows)
+
+    def test_exact_qoderflash_failed_not_reclaimed_luna_at_300(self):
+        # 反例 2：scope 精确钉住 qoder:Qwen3.8-Flash 且该 combo 本轮真实失败。
+        # 修复前：299 秒一腾出 Flash 空位就 domestic_reclaim 把刚失败的 Flash 再派一遍；
+        # 修复后：299 不 claim（not_due），300 秒按原单接续 Luna，且不换 executor 绕过。
+        toks = self._fill_six()
+        sc = self._pa_scope('rf-qf', failed=[dp.QFLASH_POOL_KEY],
+                            executor='qoder', model='Qwen3.8-Flash')
+        ask = dp.ask_record(self.dispatch, task_id='rf-qf', scope=sc,
+                            ask_message_id='m1', now=T0, degradation_reason='auth',
+                            degradation_detail='qoder flash failed this round',
+                            quota_store=self.quota)
+        self.assertTrue(ask['recorded'], ask)
+        self._finish_token(toks[6])  # 本轮失败的 Flash 组合腾出空位
+        early = dp.claim_due(self.dispatch, task_id='rf-qf',
+                             now=T0 + timedelta(seconds=299), quota_store=self.quota)
+        self.assertFalse(early['claimed'], early)
+        self.assertTrue(early.get('not_due'), early)
+        due = dp.claim_due(self.dispatch, task_id='rf-qf',
+                          now=T0 + timedelta(seconds=301), quota_store=self.quota)
+        self.assertTrue(due['claimed'], due)
+        self.assertEqual(due['mode'], 'luna', due)
+        self.assertEqual(self._active(QMAX), 1, '不得改派未失败的 Max 绕过 combo 约束')
+        self.assertEqual(self._luna_active(), 1)
+
+    def test_only_authorized_codebuddy_subset_failed_luna_at_300(self):
+        # 反例 3：用户只授权 CodeBuddy 子集（两个精确模型各 1 独立槽），本轮都真实失败。
+        # 修复前：299 秒 CB 空位被 domestic_reclaim 重新认领；修复后失败候选不回收，
+        # 300 秒 Luna 单赢家；其它执行器的空位与本任务无关，绝不据此扩授权。
+        self._fill_six()
+        sc = self._pa_scope('rf-cb', failed=[dp.CODEBUDDY_POOL_KEY,
+                                             dp.CODEBUDDY_GLM_POOL_KEY],
+                            executor='codebuddy')
+        ask = dp.ask_record(self.dispatch, task_id='rf-cb', scope=sc,
+                            ask_message_id='m1', now=T0, degradation_reason='auth',
+                            degradation_detail='both codebuddy combos failed this round',
+                            quota_store=self.quota)
+        self.assertTrue(ask['recorded'], ask)
+        self._finish_token('cb-fixture')
+        self._finish_token('cb-glm-fixture')
+        early = dp.claim_due(self.dispatch, task_id='rf-cb',
+                             now=T0 + timedelta(seconds=299), quota_store=self.quota)
+        self.assertFalse(early['claimed'], early)
+        self.assertTrue(early.get('not_due'), early)
+        due = dp.claim_due(self.dispatch, task_id='rf-cb',
+                          now=T0 + timedelta(seconds=301), quota_store=self.quota)
+        self.assertTrue(due['claimed'], due)
+        self.assertEqual(due['mode'], 'luna', due)
+        self.assertEqual(self._active(dp.CODEBUDDY_POOL_KEY), 0,
+                         '本轮失败的 CodeBuddy 绝不被重新认领')
+
+    def test_pinned_combo_failed_all_eight_full_luna_at_300(self):
+        # 纯 exact combo + 合法任务级预授权 + 该 combo 本轮真实失败、六仍满：
+        # 不再被旧 pinned 分支永久挡死——299 不 claim，300 Luna 接续。
+        self._fill_six()
+        sc = self._pa_scope('rf-pin', failed=[dp.QFLASH_POOL_KEY],
+                            executor='qoder', model='Qwen3.8-Flash')
+        ask = dp.ask_record(self.dispatch, task_id='rf-pin', scope=sc,
+                            ask_message_id='m1', now=T0, degradation_reason='auth',
+                            degradation_detail='pinned flash failed this round',
+                            quota_store=self.quota)
+        self.assertTrue(ask['recorded'], ask)
+        early = dp.claim_due(self.dispatch, task_id='rf-pin',
+                             now=T0 + timedelta(seconds=299), quota_store=self.quota)
+        self.assertFalse(early['claimed'], early)
+        self.assertTrue(early.get('not_due'), early)
+        due = dp.claim_due(self.dispatch, task_id='rf-pin',
+                          now=T0 + timedelta(seconds=301), quota_store=self.quota)
+        self.assertTrue(due['claimed'], due)
+        self.assertEqual(due['mode'], 'luna', due)
+
+    def test_pinned_combo_just_full_without_failure_still_waits(self):
+        # "只是满"不是"失败耗尽"：预授权没有 round_failed_candidates 时 pinned combo
+        # 依旧只等该组合空位，绝不因超时升级到 Luna（保留旧 fail-closed 语义）。
+        self._fill_six()
+        sc = self._pa_scope('rf-full')
+        sc['executor'] = 'qoder'
+        sc['model'] = 'Qwen3.8-Flash'
+        ask = dp.ask_record(self.dispatch, task_id='rf-full', scope=sc,
+                            ask_message_id='m1', now=T0, degradation_reason='auth',
+                            degradation_detail='auth failed this round',
+                            quota_store=self.quota)
+        self.assertTrue(ask['recorded'], ask)
+        out = dp.claim_due(self.dispatch, task_id='rf-full',
+                          now=T0 + timedelta(seconds=400), quota_store=self.quota)
+        self.assertFalse(out['claimed'], out)
+        self.assertTrue(any('pins this task to a domestic combo' in r
+                            for r in out['reasons']), out['reasons'])
+        self.assertEqual(self._luna_active(), 0)
+
+    def test_unfailed_authorized_free_slot_still_prioritizes_domestic_reclaim(self):
+        # 本轮失败候选不阻塞未失败受信任候选的正常国内回收：有预授权、Flash 失败过，
+        # 但 Max（未失败、已授权）有空位时永远先回收 Max，绝不落 Luna。
+        toks = self._fill_six()
+        sc = self._pa_scope('rf-mix', failed=[dp.QFLASH_POOL_KEY], executor='qoder')
+        ask = dp.ask_record(self.dispatch, task_id='rf-mix', scope=sc,
+                            ask_message_id='m1', now=T0, degradation_reason='auth',
+                            degradation_detail='flash failed this round',
+                            quota_store=self.quota)
+        self.assertTrue(ask['recorded'], ask)
+        self._finish_token(toks[6])   # 失败 Flash 的空位不参与回收
+        self._finish_token(toks[2])   # 未失败 Max 腾出真实空位
+        out = dp.claim_due(self.dispatch, task_id='rf-mix',
+                          now=T0 + timedelta(seconds=299), quota_store=self.quota)
+        self.assertTrue(out['claimed'], out)
+        self.assertEqual(out['mode'], 'domestic_reclaim', out)
+        self.assertEqual(out['pool_key'], QMAX, out)
+        self.assertEqual(self._luna_active(), 0)
+
+    def test_user_cancel_or_domestic_reply_blocks_preauth_luna(self):
+        # 用户主动 cancel/选 domestic：即便带合法预授权且候选本轮失败耗尽，也绝不派 Luna；
+        # 用户动作不是"无回复超时"，预授权接续不覆盖明确回复。
+        # cancel 的现有兼容落库形态是 state=replied + reply_choice=cancel（reply() 统一
+        # 写 replied，state=cancelled 只属于 cancel_pending/回收取消路径）。
+        toks = self._fill_six()
+        sc1 = self._pa_scope('rf-can', failed=self.ALL_AUTHORIZED)
+        dp.ask_record(self.dispatch, task_id='rf-can', scope=sc1, ask_message_id='m1',
+                      now=T0, degradation_reason='auth',
+                      degradation_detail='failed this round', quota_store=self.quota)
+        self._finish_token('cb-fixture')
+        dp.reply(self.dispatch, task_id='rf-can', choice='cancel', now=T0)
+        out1 = dp.claim_due(self.dispatch, task_id='rf-can',
+                            now=T0 + timedelta(seconds=400), quota_store=self.quota)
+        self.assertFalse(out1['claimed'], out1)
+        self.assertEqual(out1.get('state'), 'replied', out1)
+        self.assertEqual(out1.get('reply_choice'), 'cancel', out1)
+        self.assertEqual(self._luna_active(), 0)
+
+        sc2 = self._pa_scope('rf-dom', failed=[dp.QFLASH_POOL_KEY],
+                             executor='qoder', model='Qwen3.8-Flash')
+        dp.ask_record(self.dispatch, task_id='rf-dom', scope=sc2, ask_message_id='m1',
+                      now=T0, degradation_reason='auth',
+                      degradation_detail='pinned flash failed', quota_store=self.quota)
+        dp.reply(self.dispatch, task_id='rf-dom', choice='domestic', now=T0)
+        out2 = dp.claim_due(self.dispatch, task_id='rf-dom',
+                            now=T0 + timedelta(seconds=400), quota_store=self.quota)
+        self.assertFalse(out2['claimed'], out2)
+        self.assertIn('never escalates to Luna', ' '.join(out2['reasons']))
+        self.assertEqual(self._luna_active(), 0)
+
+    def test_ask_record_with_preauth_requires_objective_candidates(self):
+        # ask_record 对有预授权的降级任务核验**客观候选**：候选明明有空位时，
+        # auth 字符串 + detail 不再"即可进"；缺预授权时保持旧行为（照常可记录）。
+        sc = self._pa_scope('ask-pa')
+        ask = dp.ask_record(self.dispatch, task_id='ask-pa', scope=sc,
+                            ask_message_id='m1', now=T0, degradation_reason='auth',
+                            degradation_detail='auth failed this round',
+                            quota_store=self.quota)
+        self.assertFalse(ask['recorded'], ask)
+        self.assertTrue(any('still has a real free slot' in r for r in ask['reasons']),
+                        ask['reasons'])
+        legacy = dp.ask_record(self.dispatch, task_id='ask-legacy',
+                               scope=self._scope('ask-legacy'), ask_message_id='m1',
+                               now=T0, degradation_reason='auth',
+                               degradation_detail='auth failed this round',
+                               quota_store=self.quota)
+        self.assertTrue(legacy['recorded'], legacy)
+
+    def test_ask_record_capacity_preauth_failed_slot_does_not_block(self):
+        # 有预授权且受信任候选本轮全部失败过时，失败候选腾出的空位绝不反向阻塞
+        # capacity 降级询问的记录（候选筛选与回收/exhausted 统一口径）。
+        toks = self._fill_six()
+        self._finish_token('cb-fixture')
+        sc = self._pa_scope('ask-cap', failed=self.ALL_AUTHORIZED)
+        ask = dp.ask_record(self.dispatch, task_id='ask-cap', scope=sc,
+                            ask_message_id='m1', now=T0, degradation_reason='capacity',
+                            degradation_detail='authorized candidates all failed this '
+                                               'round with slots already released',
+                            quota_store=self.quota)
+        self.assertTrue(ask['recorded'], ask)
+        # 对照：无预授权时同一空位仍按旧口径阻塞 capacity 降级（不许凭空宣称耗尽）。
+        ctrl = dp.ask_record(self.dispatch, task_id='ask-ctrl',
+                             scope={**self._scope('ask-ctrl'), 'executor': 'codebuddy'},
+                             ask_message_id='m1', now=T0, degradation_reason='capacity',
+                             degradation_detail='codebuddy pools look full',
+                             quota_store=self.quota)
+        self.assertFalse(ctrl['recorded'], ctrl)
+        self.assertIn('still has a free slot', ' '.join(ctrl['reasons']))
+
+    # ---- BW-CONTINUE-20261019-S8 收口：allowed_candidates 单候选正/负例 + quota 耗尽正例 ----
+    def test_allowed_candidates_single_full_exhausted_luna_at_301(self):
+        # 单候选正例：allowed_candidates 只授权 qoder:Qwen3.8-Max 且该候选客观全满时，
+        # auth 降级 + 预授权经耗尽核验可记录；299 秒仍 not_due，301 秒按原单 Luna 单赢家。
+        self._fill_six()
+        sc = self._pa_scope('ac-one', allowed_candidates=[QMAX])
+        ask = dp.ask_record(self.dispatch, task_id='ac-one', scope=sc,
+                            ask_message_id='m1', now=T0, degradation_reason='auth',
+                            degradation_detail='the only authorized candidate is full',
+                            quota_store=self.quota)
+        self.assertTrue(ask['recorded'], ask)
+        early = dp.claim_due(self.dispatch, task_id='ac-one',
+                             now=T0 + timedelta(seconds=299), quota_store=self.quota)
+        self.assertFalse(early['claimed'], early)
+        self.assertTrue(early.get('not_due'), early)
+        due = dp.claim_due(self.dispatch, task_id='ac-one',
+                           now=T0 + timedelta(seconds=301), quota_store=self.quota)
+        self.assertTrue(due['claimed'], due)
+        self.assertEqual(due['mode'], 'luna', due)
+        self.assertEqual(due['pool_key'], dp.LUNA_KEY)
+        again = dp.claim_due(self.dispatch, task_id='ac-one',
+                             now=T0 + timedelta(seconds=302), quota_store=self.quota)
+        self.assertFalse(again['claimed'])
+        self.assertTrue(again.get('already_claimed'), again)
+        self.assertEqual(self._luna_active(), 1)
+
+    def test_allowed_candidates_single_free_slot_reclaims_not_luna(self):
+        # 单候选正例（未耗尽侧）：授权候选里出现真实空位时永远先国内回收该候选，
+        # 绝不落 Luna；回收也只收窄在名单内，不借其它执行器空位改派。
+        toks = self._fill_six()
+        sc = self._pa_scope('ac-free', allowed_candidates=[QMAX])
+        ask = dp.ask_record(self.dispatch, task_id='ac-free', scope=sc,
+                            ask_message_id='m1', now=T0, degradation_reason='auth',
+                            degradation_detail='the only authorized candidate is full',
+                            quota_store=self.quota)
+        self.assertTrue(ask['recorded'], ask)
+        self._finish_token(toks[2])  # qoder:Qwen3.8-Max 腾出真实空位
+        out = dp.claim_due(self.dispatch, task_id='ac-free',
+                           now=T0 + timedelta(seconds=299), quota_store=self.quota)
+        self.assertTrue(out['claimed'], out)
+        self.assertEqual(out['mode'], 'domestic_reclaim', out)
+        self.assertEqual(out['pool_key'], QMAX, out)
+        self.assertEqual(self._luna_active(), 0)
+
+    def test_allowed_candidates_empty_unknown_or_malformed_refused_at_ask(self):
+        # 负例：空列表、非列表、未知池、Luna 键、空串项一律在 ask_record 即诚实拒绝，
+        # 绝不猜候选、绝不把空/未知授权当作耗尽；票据不存在，无任何 Luna 副作用。
+        self._fill_six()
+        for i, bad in enumerate(([], 'not-a-list', ['bogus:model'], [dp.LUNA_KEY],
+                                 [''], ['qoder:Qwen3.8-Max', ''])):
+            with self.subTest(bad=bad):
+                tid = f'ac-bad{i}'
+                sc = self._pa_scope(tid, allowed_candidates=bad)
+                ask = dp.ask_record(self.dispatch, task_id=tid, scope=sc,
+                                    ask_message_id='m1', now=T0,
+                                    degradation_reason='auth',
+                                    degradation_detail='auth failed this round',
+                                    quota_store=self.quota)
+                self.assertFalse(ask['recorded'], ask)
+                self.assertTrue(any('allowed_candidates is present but empty' in r
+                                    for r in ask['reasons']), ask['reasons'])
+                out = dp.claim_due(self.dispatch, task_id=tid,
+                                   now=T0 + timedelta(seconds=400),
+                                   quota_store=self.quota)
+                self.assertFalse(out['claimed'], out)
+        self.assertEqual(self._luna_active(), 0)
+
+    def test_allowed_candidates_conflict_with_pinned_combo_refused(self):
+        # 负例（冲突集合）：scope 钉死 qoder:Qwen3.8-Flash 而 allowed_candidates 只含
+        # QMAX，交集为空——fail-closed 拒绝记录，绝不臆造耗尽、绝不 Luna。
+        self._fill_six()
+        sc = self._pa_scope('ac-conf', failed=[dp.QFLASH_POOL_KEY],
+                            executor='qoder', model='Qwen3.8-Flash',
+                            allowed_candidates=[QMAX])
+        ask = dp.ask_record(self.dispatch, task_id='ac-conf', scope=sc,
+                            ask_message_id='m1', now=T0, degradation_reason='auth',
+                            degradation_detail='pinned flash failed; allowlist conflicts',
+                            quota_store=self.quota)
+        self.assertFalse(ask['recorded'], ask)
+        self.assertTrue(any('no eligible domestic candidate' in r
+                            for r in ask['reasons']), ask['reasons'])
+        out = dp.claim_due(self.dispatch, task_id='ac-conf',
+                           now=T0 + timedelta(seconds=400), quota_store=self.quota)
+        self.assertFalse(out['claimed'], out)
+        self.assertEqual(self._luna_active(), 0)
+
+    def test_quota_preauth_all_authorized_failed_luna_at_301(self):
+        # quota 原因候选耗尽正例：合法预授权 + round_failed_candidates 覆盖全部授权
+        # 候选且全部真实占满时，quota 降级经客观耗尽核验可记录；299 秒仍 not_due，
+        # 301 秒到期按原单接续 Luna（quota 不再强制某个 ZCode 历史阻断标记）。
+        self._fill_six()
+        sc = self._pa_scope('q-ex', failed=self.ALL_AUTHORIZED)
+        ask = dp.ask_record(self.dispatch, task_id='q-ex', scope=sc,
+                            ask_message_id='m1', now=T0, degradation_reason='quota',
+                            degradation_detail='every authorized candidate hit real '
+                                               'quota limits and failed this round',
+                            quota_store=self.quota)
+        self.assertTrue(ask['recorded'], ask)
+        early = dp.claim_due(self.dispatch, task_id='q-ex',
+                             now=T0 + timedelta(seconds=299), quota_store=self.quota)
+        self.assertFalse(early['claimed'], early)
+        self.assertTrue(early.get('not_due'), early)
+        due = dp.claim_due(self.dispatch, task_id='q-ex',
+                           now=T0 + timedelta(seconds=301), quota_store=self.quota)
+        self.assertTrue(due['claimed'], due)
+        self.assertEqual(due['mode'], 'luna', due)
+        self.assertEqual(due['pool_key'], dp.LUNA_KEY)
+        self.assertEqual(self._luna_active(), 1)
+
 
 
 if __name__ == '__main__':

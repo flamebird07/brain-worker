@@ -167,6 +167,20 @@ Qoder/ZCode/CodeBuddy 精确模型入口在**建输出目录、Popen 之前**必
 
 - **CN 既可经显式 `executor='qodercn'` 独立 claim，也作为 `AUTO` 的补充候选**：`AUTO` 仍在原合格主力间做 best-effort 1:1、溢出 Flash 居中，只有**原合格主力与国际 Flash 都不可用或已满**时才把 CN 当**最后的国内补充候选**——此时 `AUTO` 返回 `routing_required` 选 CN（调用入口已是 CN 则直接允许 claim），**原 6 满 + CN 空绝不报整池 full，只有原 8 全满才物理 full**（BW-QODER-CN-20261010-A4；不再有“AUTO 永不被选中 CN”的限制）。明确指定 `Qoder`/`ZCode`/`CN` 的任务约束不互换、不扩大（`_scope_allowed_candidates` 对这三类执行器各自只回收自身候选）。CN 与国际可同时经各自真实入口、在**不同 workspace** 并行；同一真实 workspace 仍单写入（守卫与 runtime 无关）；跨 runtime 绝不消费旧 claim（`consume_for_entry` 的 runtime 漂移即 `claim_invalid`）。子进程真实结束立即释放 CN 名额，unknown 不被抢占。默认入口仍通过准确 runtime/model 选中的真正执行器提交，绝不伪装 Qwen 或改未授权模型，不新增评分/轮换状态或额度逻辑。
 - **Luna 阈值随总 8 更新（历史阶段；已被后续阶段再升为总 13，当前口径见上文）**：仍沿用既有 300 秒真实提问/用户回复/`claim-due` 竞争裁决状态机，只把"全满"前提从 6 改为 8（`_domestic_active` 计入 CN），**不扩 Luna 授权**、不改既有降级票据规则；回复 `domestic` 任何时刻都绝不启动 Luna。BW-MAX-WINDOW-20261010-S2 加入 CN 自定义主力后国内合计再升为 10（Luna“全满”前提即 `_domestic_active ≥ DOMESTIC_TOTAL_CAPACITY=10`），机制不变，详见上文“六池真实分配”§。
+- **任务级 300 秒 Luna 预授权与本轮失败候选接续（BW-CONTINUE-20261019-S6）**：票据原 scope 可携带
+  `luna_preauthorization`——只接受对本任务用户**原话**的明确授权（`authorized=true`、固定 300 秒、
+  非空 `original_quote`/`scope_ref`），可选 `round_failed_candidates` 只列本轮真实失败过的候选；
+  **不是全局/永久 Luna 授权**。ask_record 降级核验、`claim_due` 国内回收与最终 exhausted 共用同一
+  候选筛选（executor/combo 硬约束交集 − 本轮失败候选，只收窄不扩大授权）：本轮已失败的候选不再被
+  `domestic_reclaim` 重新认领，受信任候选全部不可用或满载且客观核验通过时 299 秒仍
+  不 claim、300 秒到期按原单接续 Luna（单赢家）；纯 exact combo 失败后同样可接续，不再被 pinned
+  分支永久挡。用户 `cancel`/`domestic`/`external_agent` 回复、主动暂停/取消/删除任务绝不因此派 Luna，
+  权限拒绝不得换 executor 绕过，原始失败保留、不假恢复。scope 片段示例：
+  `{"task_id":"T","stage":"S","chat_id":"C","workspace":"W","prompt_sha256":"<64hex>",`
+  `"executor":"qoder","model":"Qwen3.8-Flash","luna_preauthorization":{"authorized":true,`
+  `"seconds":300,"original_quote":"超时无回复就继续交给 Luna 执行","scope_ref":"msg-1",`
+  `"round_failed_candidates":["qoder:Qwen3.8-Flash"]}}`。机制详见
+  [references/global-dispatch.md](references/global-dispatch.md) 对应小节。
 - **ZCode 跳过直接复用既有 availability**：本轮**不改** `quota_control.py`/`zcode_direct.py`、不查剩余额度/账单、不新增历史导入/冷却/恢复探针/额度系统、不发任何 ZCode 请求。CN 池与主脑侧读取的正是主脑已写入并回读确认的既有 `hard_hold`（真实 429/1310）；`dispatch_pool` 经既有 `_zcode_availability_blocked` 只读回核，**Z 限额时 AUTO 自动跳过 Z**（改道可用主力/溢出，显式 `executor='zcode'` 得 `zcode_unavailable`），满足"只知是否限额、不读额度"。真实剩余额度不在本轮范围。
 
 详见 [references/qodercn-direct.md](references/qodercn-direct.md)。本节只登记已落实的最小改动；真实 CN 小读/写验收、安装版/仓库版与 GitHub/Obsidian 同步由主脑独立执行，不在本阶段。BW-CN-PERMISSION-STOP-20261015T155930Z-S1 补充：CN 正式入口（仅 `--runtime qodercn` 分支）在 Popen 前静态拒绝裸/整工具通配 Edit/Write/NotebookEdit/Bash allow 规则（要求逐文件 `Edit(...)` 与 `Bash(原样命令)`，tools-only 回退同检、显式空 allow 与 deny 合法），并经官方 `--session-id` 增量监视本会话原生 jsonl——真实审批拒绝（结构化 `toolDenialKind=permission-rule` 或 tool_result 固定文案）即经本次 Popen 对象终止并等待真实退出，最小拒绝证据落 `permission-stop.json`、原始会话文件不改、终态不明确保 unknown 占位、绝不落 quota 标记；监视降级只记事实、不宣称零延迟。国际入口 argv/通信不变；静态门只证明规则形状，真实放行由主脑独立验收（详见 qodercn-direct.md 新节）。BW-CN-PERMISSION-STOP-20261015T155930Z-S3 修正收口：监视按现场路径 `projects/<workspace-key>/<精确sessionId>.jsonl` 精确定位该一个文件，结构化拒绝按**事件顶层** `toolDenialKind` 优先、固定拒绝文案只在工具结果**起始处**直接构成时命中（allow 可选 `Error:` 前缀；输出中间引用同一句不误停），CN 所有已知终态都随 `summary.cn_watch_facts` 留本轮监控事实（是否找到/观察到会话、degraded、错误与读取进度；无拒绝的正常结束也可回读、未找到文件如实 `session_observed=false`）；新路径已过离线回归与主脑原件回放但**尚未最终现场验收**。

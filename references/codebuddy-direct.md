@@ -104,6 +104,14 @@ node <cli/bin/codebuddy> -p --verbose --output-format stream-json --model <ID> \
   回退规则，避免“看似限权实则全放”。
 - `--allowed-tools` / `--disallowed-tools` 为 variadic：一次 flag 后跟全部规则
   （list，不拼字符串）；每条规则原样传入，不按逗号拆分，非字符串/空/仅空白拒绝。
+- **顶层逗号拼接工具名预检（BW-CONTINUE-20261019-S6，`validate_tool_rule_shape`）**：把多个裸
+  工具名用**顶层逗号**塞进单个规则值（如 `--allowed-tools "Read,Write,Edit"`）在容量认领与
+  Popen 之前如实拒绝（`precheck_failed`，零占位、零子进程、零输出目录），入口绝不自动拆分；
+  正确写法是逐项重复 flag：`--allowed-tools Read --allowed-tools Write`。括号内的逗号不是顶层
+  逗号、维持合法（如 `Bash(npm,run,build)`、`Edit(path,with,commas)`），规则仍逐字传给 CLI；
+  非工具名的逗号拼接值也不拆分、不改写。`--tools` 的单一 comma-joined 白名单口径完全不受
+  该预检影响。离线正反例见 `tests/test_codebuddy_direct.py`（ToolRuleShapePreflightTests）与
+  `tests/test_codebuddy_live.py`（认领/Popen 前零调用）。
 - 无显式 allow 时按 `--tools` 逐项回退为允许规则；显式列表（含空列表）完全替代回退。
 - `--permission-mode` 固定 `dontAsk`；永不启用 bypass 或 auto-review 代理；不开
   子 Agent 或联网工具，tools 白名单保证这些不可见。
