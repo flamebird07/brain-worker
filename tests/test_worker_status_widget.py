@@ -121,23 +121,26 @@ class TestModuleDiscipline(_WidgetBase):
 
     def test_row_defs_match_authoritative_priority_and_totals(self):
         order = [pk for pk, _, _ in wsw.ROW_DEFS]
-        # BW-OPENCODE-20261019-S3：两个 OpenCode 免费模型各独立 1 槽，排在 ZCode 之后、
-        # 条件补位 CodeBuddy GLM 之前（AUTO 层序 tier 4 < 条件 GLM tier 5）。
+        # BW-OPENCODE-20261019-S3 + BW-ZCODE-RETIRE-20261020：ZCode 已退役，不再显示可派行；
+        # 两个 OpenCode 免费模型各独立 1 槽，排在 Claude 之后、条件补位 CodeBuddy GLM 之前
+        # （AUTO 层序 tier 4 < 条件 GLM tier 5），其后是两地区 Flash。
         self.assertEqual(order[:9], [
             dp.CODEBUDDY_POOL_KEY, dp.CN_CUSTOM_MAX_POOL_KEY, dp.CN_MAX_POOL_KEY,
-            dp.QMAX_POOL_KEY, dp.CLAUDE_POOL_KEY, dp.ZCODE_POOL_KEY,
+            dp.QMAX_POOL_KEY, dp.CLAUDE_POOL_KEY,
             dp.OPENCODE_DEEPSEEK_POOL_KEY, dp.OPENCODE_GLM_POOL_KEY,
-            dp.CODEBUDDY_GLM_POOL_KEY])
-        self.assertEqual(set(order[9:11]), {dp.QFLASH_POOL_KEY, dp.CN_FLASH_POOL_KEY})
-        self.assertEqual(order[-1], dp.LUNA_KEY)
+            dp.CODEBUDDY_GLM_POOL_KEY, dp.QFLASH_POOL_KEY])
+        self.assertEqual(set(order[9:11]), {dp.CN_FLASH_POOL_KEY, dp.LUNA_KEY})
+        self.assertEqual(order[-1], dp.LUNA_KEY)  # 模块顶部追加的历史 Luna 兼容行
         # 退休池绝不显示成可派行。
         self.assertNotIn('qodercn:DeepSeek-Flash', order)
+        self.assertNotIn(dp.ZCODE_POOL_KEY, order)  # BW-ZCODE-RETIRE-20261020
         self.assertFalse(any(pk.startswith('workbuddy') for pk in order))
-        # BW-WORKER-WIDGET-20261018-S3 + BW-OPENCODE-20261019-S3 当前权威：两 CodeBuddy
-        # 模型与两 OpenCode 免费模型各独立 1 槽 → 物理总 16。
-        self.assertEqual(dp.DOMESTIC_TOTAL_CAPACITY, 16)
+        # BW-WORKER-WIDGET-20261018-S3 + BW-OPENCODE-20261019-S3 + BW-ZCODE-RETIRE-20261020
+        # 当前权威：两 CodeBuddy 模型与两 OpenCode 免费模型各独立 1 槽，ZCode 两槽退役
+        # → 物理总 14。
+        self.assertEqual(dp.DOMESTIC_TOTAL_CAPACITY, 14)
         self.assertEqual((sum(dp.MAIN_FORCE_CAPACITY.values())
-                          + sum(dp.OVERFLOW_CAPACITY.values())), 16)
+                          + sum(dp.OVERFLOW_CAPACITY.values())), 14)
         self.assertEqual(dp.MAIN_FORCE_CAPACITY[dp.CODEBUDDY_GLM_POOL_KEY], 1)
         self.assertEqual(dp.MAIN_FORCE_CAPACITY[dp.OPENCODE_DEEPSEEK_POOL_KEY], 1)
         self.assertEqual(dp.MAIN_FORCE_CAPACITY[dp.OPENCODE_GLM_POOL_KEY], 1)
@@ -149,8 +152,9 @@ class TestModuleDiscipline(_WidgetBase):
         # BW-HOVER-REPAIR-20261019-S7：CodeBuddy 使用国际账号，两个模型行可见名称
         # 必须完整以「CodeBuddy 国际／」开头；旧的「CodeBuddy／...」可见标签不再出现。
         # 仅改用户可见名称：pool key、runtime/model 名、两独立槽与优先级不变。
+        # BW-ZCODE-RETIRE-20261020 引擎复核后标签大小写为 Deepseek（对齐模型名），如实断言。
         self.assertEqual(labels[dp.CODEBUDDY_POOL_KEY],
-                         'CodeBuddy 国际／DeepSeek-V4.1-Flash')
+                         'CodeBuddy 国际／Deepseek-V4.1-Flash')
         self.assertEqual(labels[dp.CODEBUDDY_GLM_POOL_KEY],
                          'CodeBuddy 国际／GLM-5.3-Flash')
         for pk, label, _lbl_note in wsw.ROW_DEFS:
@@ -195,8 +199,8 @@ class TestSnapshotStates(_WidgetBase):
         snap = self._snap()
         self.assertTrue(snap['ok'])
         self.assertEqual(snap['domestic_active'], 0)
-        self.assertEqual(snap['domestic_total_capacity'], 16)
-        self.assertEqual(len(snap['rows']), 12)
+        self.assertEqual(snap['domestic_total_capacity'], 14)  # BW-ZCODE-RETIRE-20261020
+        self.assertEqual(len(snap['rows']), len(wsw.ROW_DEFS))
         for row in snap['rows']:
             self.assertEqual(row['state'], 'idle', row['pool_key'])
             self.assertEqual(row['state_label'], '空闲')
@@ -206,12 +210,13 @@ class TestSnapshotStates(_WidgetBase):
         probe = _probe({4321: {'pid': 4321, 'state': 'alive', 'created': '111'},
                         4322: {'pid': 4322, 'state': 'alive', 'created': '222'}})
         with closing(self._conn()) as conn:
-            self._insert(conn, 'z1', dp.ZCODE_POOL_KEY, 'running', child_pid=4321,
+            # BW-ZCODE-RETIRE-20261020：原 zcode 行改用现役 claude 池（容量 2，本行占 1）。
+            self._insert(conn, 'z1', dp.CLAUDE_POOL_KEY, 'running', child_pid=4321,
                          child_created='111', started=T0 - timedelta(seconds=90))
             self._insert(conn, 'f1', dp.QFLASH_POOL_KEY, 'running', child_pid=4322,
                          child_created='222', started=T0 - timedelta(seconds=5))
         snap = self._snap(probe=probe)
-        z = self._row(snap, dp.ZCODE_POOL_KEY)
+        z = self._row(snap, dp.CLAUDE_POOL_KEY)
         self.assertEqual(z['state'], 'running')
         self.assertEqual(z['state_label'], '运行中')
         self.assertEqual((z['active'], z['capacity']), (1, 2))
@@ -233,11 +238,14 @@ class TestSnapshotStates(_WidgetBase):
     def test_running_dominates_reserved_in_same_pool(self):
         probe = _probe({4321: {'pid': 4321, 'state': 'alive', 'created': '111'}})
         with closing(self._conn()) as conn:
-            self._insert(conn, 'z1', dp.ZCODE_POOL_KEY, 'running', child_pid=4321,
-                         child_created='111', started=T0)
-            self._insert(conn, 'z2', dp.ZCODE_POOL_KEY, 'reserved', reserved=T0)
+            # BW-ZCODE-RETIRE-20261020：原 zcode 混池改用现役 OpenCode deepseek（直插 DB，
+            # 不受派工容量限制，混池展示语义不变）。
+            self._insert(conn, 'z1', dp.OPENCODE_DEEPSEEK_POOL_KEY, 'running',
+                         child_pid=4321, child_created='111', started=T0)
+            self._insert(conn, 'z2', dp.OPENCODE_DEEPSEEK_POOL_KEY, 'reserved',
+                         reserved=T0)
         snap = self._snap(probe=probe)
-        z = self._row(snap, dp.ZCODE_POOL_KEY)
+        z = self._row(snap, dp.OPENCODE_DEEPSEEK_POOL_KEY)
         self.assertEqual(z['state'], 'running')
         self.assertEqual(z['active'], 2)
         self.assertEqual({a['state'] for a in z['attempts']}, {'running', 'reserved'})
@@ -256,7 +264,7 @@ class TestSnapshotStates(_WidgetBase):
         self.assertEqual(glm['own_active'], 0)
         self.assertEqual(glm['state'], 'idle')
         self.assertEqual(snap['domestic_active'], 1)
-        self.assertEqual(snap['domestic_total_capacity'], 16)
+        self.assertEqual(snap['domestic_total_capacity'], 14)  # BW-ZCODE-RETIRE-20261020
         # 两模型可同时各 1 在途 → 总占用 2，绝不按共享槽压成 1。
         with closing(self._conn()) as conn:
             self._insert(conn, 'g1', dp.CODEBUDDY_GLM_POOL_KEY, 'reserved',
@@ -276,7 +284,8 @@ class TestSnapshotStates(_WidgetBase):
             self._insert(conn, 'c1', dp.CLAUDE_POOL_KEY, 'running', child_pid=5150,
                          child_created='222', started=T0 - timedelta(seconds=60))
             # running 且 PID 活但创建身份不匹配（PID 复用嫌疑）：主行待核。
-            self._insert(conn, 'z1', dp.ZCODE_POOL_KEY, 'running', child_pid=6001,
+            # BW-ZCODE-RETIRE-20261020：原 zcode 行改用现役 CN Flash 池。
+            self._insert(conn, 'z1', dp.CN_FLASH_POOL_KEY, 'running', child_pid=6001,
                          child_created='333', started=T0 - timedelta(seconds=60))
             # running 却未绑定任何子进程：没有匹配活 PID → 主行待核。
             self._insert(conn, 'f1', dp.QFLASH_POOL_KEY, 'running',
@@ -296,7 +305,7 @@ class TestSnapshotStates(_WidgetBase):
         self.assertEqual(c['attempts'][0]['state'], 'running')
         self.assertEqual(c['attempts'][0]['display_state'], 'unknown')
         self.assertEqual(c['attempts'][0]['pid_check'], 'dead')
-        z = self._row(snap, dp.ZCODE_POOL_KEY)
+        z = self._row(snap, dp.CN_FLASH_POOL_KEY)
         self.assertEqual(z['state'], 'unknown')
         self.assertEqual(z['attempts'][0]['pid_check'], 'alive_unmatched')
         f = self._row(snap, dp.QFLASH_POOL_KEY)
@@ -322,12 +331,13 @@ class TestSnapshotStates(_WidgetBase):
         # 绝不被同池另一个 running 掩盖），DB 占位计数不变（2/2）。
         probe = _probe({4321: {'pid': 4321, 'state': 'alive', 'created': '111'}})
         with closing(self._conn()) as conn:
-            self._insert(conn, 'z1', dp.ZCODE_POOL_KEY, 'running', child_pid=4321,
+            # BW-ZCODE-RETIRE-20261020：原 zcode 混池改用现役 Qoder 国际 Flash（容量 2）。
+            self._insert(conn, 'z1', dp.QFLASH_POOL_KEY, 'running', child_pid=4321,
                          child_created='111', started=T0)
-            self._insert(conn, 'z2', dp.ZCODE_POOL_KEY, 'running', child_pid=5150,
+            self._insert(conn, 'z2', dp.QFLASH_POOL_KEY, 'running', child_pid=5150,
                          child_created='222', started=T0)
         snap = self._snap(probe=probe)
-        z = self._row(snap, dp.ZCODE_POOL_KEY)
+        z = self._row(snap, dp.QFLASH_POOL_KEY)
         self.assertEqual(z['state'], 'unknown')
         self.assertEqual(z['state_label'], '待核实')
         self.assertEqual(z['active'], 2)
@@ -369,7 +379,7 @@ class TestSnapshotStates(_WidgetBase):
         self.assertEqual(luna['attempts'][0]['pid_check'], 'native')
         self.assertEqual(snap['luna_active'], 1)
         self.assertEqual(snap['domestic_active'], 0)
-        self.assertEqual(snap['domestic_total_capacity'], 16)
+        self.assertEqual(snap['domestic_total_capacity'], 14)  # BW-ZCODE-RETIRE-20261020
 
     def test_retired_pools_not_shown_but_real_in_flight_counted(self):
         with closing(self._conn()) as conn:
@@ -388,15 +398,17 @@ class TestLastResultAndLimits(_WidgetBase):
     def test_success_missing_or_false_never_fakes_passed(self):
         with closing(self._conn()) as conn:
             # finished 但 success 缺失 = 未知，不一概绿灯。
-            self._insert(conn, 'z1', dp.ZCODE_POOL_KEY, 'finished',
+            # BW-ZCODE-RETIRE-20261020：原 zcode 行改用现役 CodeBuddy GLM 池（该池仅此一行）。
+            self._insert(conn, 'z1', dp.CODEBUDDY_GLM_POOL_KEY, 'finished',
                          started=T0, ended=T0, terminal='finished', success=None)
             self._insert(conn, 'f1', dp.QFLASH_POOL_KEY, 'finished',
                          started=T0, ended=T0, terminal='finished', success=0)
             self._insert(conn, 'c1', dp.CLAUDE_POOL_KEY, 'finished',
                          started=T0, ended=T0, terminal='finished', success=1)
         snap = self._snap()
-        self.assertEqual(self._row(snap, dp.ZCODE_POOL_KEY)['last_result'], 'unknown')
-        self.assertEqual(self._row(snap, dp.ZCODE_POOL_KEY)['last_result_label'],
+        self.assertEqual(self._row(snap, dp.CODEBUDDY_GLM_POOL_KEY)['last_result'],
+                         'unknown')
+        self.assertEqual(self._row(snap, dp.CODEBUDDY_GLM_POOL_KEY)['last_result_label'],
                          '上轮调用待核')
         self.assertEqual(self._row(snap, dp.QFLASH_POOL_KEY)['last_result'], 'failed')
         self.assertEqual(self._row(snap, dp.CLAUDE_POOL_KEY)['last_result'], 'passed')
@@ -676,9 +688,11 @@ class TestQuota30Window(_WidgetBase):
 
 
 class TestWindowLimitPools(_WidgetBase):
-    """BW-LIMIT30-20261019-S3：zcode:GLM-5.3 与 claude:deepseek-flash 与 CodeBuddy
-    deepseek 同口径——按绑定 attempt 的真实 ended_at_utc 计 0<=age<1800 显示；空闲显示
-    “上轮限额”，真实运行中只显示“运行中”，恰好 1800 秒撤下提示且不声称恢复。"""
+    """BW-LIMIT30-20261019-S3：claude:deepseek-flash 与 CodeBuddy deepseek 同口径——按
+    绑定 attempt 的真实 ended_at_utc 计 0<=age<1800 显示；空闲显示“上轮限额”，真实运行中
+    只显示“运行中”，恰好 1800 秒撤下提示且不声称恢复。
+    BW-ZCODE-RETIRE-20261020：zcode:GLM-5.3 已退役，不再出现在可派行，原 zcode 窗口用例
+    改用现役 CodeBuddy deepseek 池（同属窗口池，口径一致）。"""
 
     def _mark(self, pk, *, ended=T0, token=None):
         token = token or f'{pk}-old'
@@ -690,8 +704,10 @@ class TestWindowLimitPools(_WidgetBase):
                          terminal='finished', success=0)
         return token
 
-    def test_zcode_and_claude_boundary_1799_shows_1800_hides(self):
-        for pk in (dp.ZCODE_POOL_KEY, dp.CLAUDE_POOL_KEY):
+    def test_claude_boundary_1799_shows_1800_hides(self):
+        # BW-ZCODE-RETIRE-20261020：退役 zcode 不显示行，边界用例保留 claude，另补
+        # 现役 CodeBuddy deepseek 同口径验证。
+        for pk in (dp.CLAUDE_POOL_KEY, dp.CODEBUDDY_POOL_KEY):
             with self.subTest(pool=pk):
                 self._mark(pk)
                 row = self._row(self._snap(now=T0 + timedelta(seconds=1799)), pk)
@@ -703,7 +719,8 @@ class TestWindowLimitPools(_WidgetBase):
 
     def test_running_hides_limit_for_new_pools(self):
         created = '2026-10-08T15:00:00+00:00'
-        for i, pk in enumerate((dp.ZCODE_POOL_KEY, dp.CLAUDE_POOL_KEY)):
+        # BW-ZCODE-RETIRE-20261020：只测现役窗口池 claude（zcode 已退役无展示行）。
+        for i, pk in enumerate((dp.CLAUDE_POOL_KEY,)):
             with self.subTest(pool=pk):
                 pid = 5000 + i
                 self._mark(pk)
@@ -718,11 +735,15 @@ class TestWindowLimitPools(_WidgetBase):
                 self.assertEqual(row['main_state_label'], '运行中')
                 self.assertNotIn(('limit', '限额'), wsw.row_badges(row))
                 self.assertNotIn('上轮限额：', wsw.detail_text(row))
+                # 退役 zcode 绝不显示成可派行（含限额标记也不复活）。
+                self.assertNotIn(dp.ZCODE_POOL_KEY,
+                                 [r['pool_key'] for r in self._snap()['rows']])
 
     def test_expired_window_does_not_claim_recovery(self):
-        self._mark(dp.ZCODE_POOL_KEY)
+        # BW-ZCODE-RETIRE-20261020：原 zcode 窗口池改用现役 CodeBuddy deepseek（同口径）。
+        self._mark(dp.CODEBUDDY_POOL_KEY)
         row = self._row(self._snap(now=T0 + timedelta(seconds=1801)),
-                        dp.ZCODE_POOL_KEY)
+                        dp.CODEBUDDY_POOL_KEY)
         self.assertFalse(row['prev_limited'])
         self.assertEqual(row['main_state_label'], '空闲')
         text = wsw.detail_text(row)
@@ -807,13 +828,14 @@ class TestGuiHelpers(_WidgetBase):
 
     def test_detail_text_contains_full_task_id_and_no_secrets(self):
         with closing(self._conn()) as conn:
-            self._insert(conn, 'z1', dp.ZCODE_POOL_KEY, 'running',
+            # BW-ZCODE-RETIRE-20261020：原 zcode 行改用现役 claude 池（该池仅此一行）。
+            self._insert(conn, 'z1', dp.CLAUDE_POOL_KEY, 'running',
                          task_id='BW-FULL-TASK-ID-20261018-0001', stage='S3',
                          child_pid=4321, child_created='111',
                          started=T0 - timedelta(seconds=75))
         snap = self._snap(probe=_probe({4321: {'pid': 4321, 'state': 'alive',
                                               'created': '111'}}))
-        text = wsw.detail_text(self._row(snap, dp.ZCODE_POOL_KEY))
+        text = wsw.detail_text(self._row(snap, dp.CLAUDE_POOL_KEY))
         self.assertIn('BW-FULL-TASK-ID-20261018-0001', text)
         self.assertIn('S3', text)
         self.assertIn('1分15秒', text)
@@ -829,7 +851,10 @@ class TestGuiHelpers(_WidgetBase):
     def test_detail_text_window_only_for_the_three_window_pools(self):
         """BW-LIMIT30-20261019-S3：只有 zcode:GLM-5.3 / claude:deepseek-flash /
         codebuddy:deepseek-v4.1-flash 三个精确池详情说“近 30 分钟/超过 30 分钟撤下”；
-        其它池保留“标记绑定最新 attempt、历史非实时额度”说明，绝不冒称 30 分钟。"""
+        其它池保留“标记绑定最新 attempt、历史非实时额度”说明，绝不冒称 30 分钟。
+        BW-ZCODE-RETIRE-20261020：zcode 已退役不再有展示行，常量 WINDOW_LIMIT_POOLS
+        仍含其精确池键（历史诊断保留）；展示层循环只覆盖现役两池，并断言退役 zcode
+        不出现在任何行。"""
         # 非窗口池（Qoder 国际 Max）按原有 token 规则落标且仍绑定最新 attempt → prev_limited。
         with closing(self._conn()) as conn:
             conn.execute('INSERT INTO main_force_limits(pool_key, limited, task_id, '
@@ -844,8 +869,9 @@ class TestGuiHelpers(_WidgetBase):
         self.assertNotIn('30 分钟', qtext)      # 其它池绝不冒称半小时窗口
         self.assertNotIn('30分钟', qtext)
         self.assertIn('最新 attempt', qtext)    # 保留原“绑定最新 attempt、历史非实时额度”语义
-        # 三个精确窗口池：ZCode / Claude / CodeBuddy deepseek 均保留 30 分钟说明。
-        for pk in (dp.CODEBUDDY_POOL_KEY, dp.ZCODE_POOL_KEY, dp.CLAUDE_POOL_KEY):
+        # 现役两个窗口池：Claude / CodeBuddy deepseek 均保留 30 分钟说明；
+        # BW-ZCODE-RETIRE-20261020：退役 zcode 不再有任何展示行。
+        for pk in (dp.CODEBUDDY_POOL_KEY, dp.CLAUDE_POOL_KEY):
             with self.subTest(pool=pk):
                 with closing(self._conn()) as conn:
                     conn.execute('DELETE FROM main_force_limits WHERE pool_key=?', (pk,))
@@ -860,6 +886,8 @@ class TestGuiHelpers(_WidgetBase):
                 text = wsw.detail_text(row)
                 self.assertIn('30 分钟', text)
                 self.assertIn('不代表实时余额', text)
+        snap = self._snap(now=T0 + timedelta(seconds=30))
+        self.assertNotIn(dp.ZCODE_POOL_KEY, [r['pool_key'] for r in snap['rows']])
 
 
 class TestCompactViewHelpers(unittest.TestCase):
@@ -1600,7 +1628,8 @@ class LunaDisabledWidgetTests(unittest.TestCase):
 
     def test_luna_row_removed(self):
         self.assertNotIn(dp.LUNA_KEY, [row[0] for row in wsw.ROW_DEFS])
-        self.assertEqual(len(wsw.ROW_DEFS), 11)
+        # BW-ZCODE-RETIRE-20261020：ZCode 行同样退役 → 可派展示行为 10。
+        self.assertEqual(len(wsw.ROW_DEFS), 10)
 
 
 if __name__ == '__main__':

@@ -14,7 +14,11 @@
 
 ### 桌面入口统一与入口运行时资格门（2026-10-20，BW-UNIFIED-DESKTOP-ENTRY-20261020）
 
+**BW-ZCODE-RETIRE-20261020（用户明确指令，当前权威）**：`zcode:GLM-5.3` 按既有退役机制全局退出（`LEGACY_RETIRED_POOL_KEYS`、容量 0、移出层序与浮窗），任何宿主/入口不再派发；国内配置合计 16→**14** 槽，层序变为 CodeBuddy deepseek(0) > 三 Qoder Max(1) > claude(2) > 两 OpenCode 免费模型(4) > CodeBuddy GLM(5) > 两区 Flash(6)；宿主排除集随之收缩（退役键不得再列，G1 强制）。
+
 ZCode 与 Qoder 桌面端共用**同一份**宿主无关入口 `desktop-skill/SKILL.md`：`scripts/install_desktop_skill.py install` 渲染一次并把字节相同的内容装进两个宿主目录（`~/.zcode/skills/brain-worker` 与 `~/.qoder-cn/skills/brain-worker`），三道守卫强制同源——排除集池 key 必须仍是引擎可派发键（G1，`install`/`check` 双拒）、Luna 禁用规则与主 Skill 同源（G2）、两宿主安装内容字节一致（G3）。适配器只承载各宿主自己不可派发的精确组合与运行时识别信号（识别失败 fail-closed 取并集），优先级/时段/容量/池 key 清单一律只在共享代码。`scripts/entry_runtime_probe.py` 对六个执行器运行时做三态（present/missing/unknown）只读探测，复用各入口自己的配置加载器；`stage_selection` 回执新增 `entry_runtime_status`/`entry_runtime_missing` 逐候选可见性，并把**确凿缺失**（入口配置存在而其指向的运行时文件不存在）的候选以 `entry_runtime_missing` 过滤原因挡在资格门外；未配置的引擎副本（无私有入口配置，如裸 CI 环境）与依赖环境的解析失败一律 unknown、绝不挡门，探针自身异常整体降级 unknown（fail-open），绝不影响授权集合回显。
+
+主脑队列纪律（BW-HOST-QUEUE-20261020，三宿主一致）：插话入队不打断、todo 唯一进度真相、不空转交还、长操作后台、互不冲突才并行（同工作区单写入者，同仓并行用 worktree）。详见 canonical 主 Skill「脑的队列与停顿纪律」节。
 
 ### 持久额度冷却与路由门禁（2026-10-08，BW-QUOTA-20261008-S1）
 

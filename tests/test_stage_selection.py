@@ -44,7 +44,8 @@ T_DAY = datetime(2026, 10, 8, 2, 0, 0, tzinfo=timezone.utc)     # 北京 10:00�
 ALL_MAINS = list(dp.MAIN_FORCE_KEYS)
 ALL_FLASH = list(dp.OVERFLOW_KEYS)
 # BW-CODEBUDDY-MAIN-S3：本文件大量用例验证的是 CodeBuddy 恢复前的旧层序
-# （三 Qoder Max > claude > zcode）。这些用例把授权候选明确收窄为”不含 CodeBuddy”的
+# （三 Qoder Max > claude）。BW-ZCODE-RETIRE-20261020：ZCode 已全局退役、不再属于
+# MAIN_FORCE_KEYS，本列表自动不含它。这些用例把授权候选明确收窄为”不含 CodeBuddy”的
 # 旧集合，从而原样验证旧层序而不放宽任何断言；CodeBuddy 作为新最高层由独立
 # tests/test_codebuddy_reactivation.py 验证（含自动/显式入口与容量）。
 LEGACY_MAINS = [k for k in ALL_MAINS if k not in (dp.CODEBUDDY_POOL_KEY, dp.CODEBUDDY_GLM_POOL_KEY)]
@@ -158,10 +159,12 @@ class AuthorizationTests(_Base):
             conn.execute('PRAGMA journal_mode=DELETE')
         r = self.plan(self.auth('auto', 'T', 's2', allowed), now=T_DAY)
         self.assertIsNone(r['refused'], r)
-        self.assertEqual(r['selected_priority'], 3, r)
-        self.assertEqual(r['selected']['pool_key'], dp.ZCODE_POOL_KEY, r)
+        # BW-ZCODE-RETIRE-20261020：ZCode 退役后白天最高可选层是 tier=4 的 OpenCode。
+        self.assertEqual(r['selected_priority'], 4, r)
+        self.assertEqual(r['selected']['pool_key'], dp.OPENCODE_DEEPSEEK_POOL_KEY, r)
         eligible = {x['pool_key']: x for x in r['eligible_candidates']}
-        self.assertEqual(eligible[dp.ZCODE_POOL_KEY]['priority'], 3)
+        self.assertEqual(eligible[dp.OPENCODE_DEEPSEEK_POOL_KEY]['priority'], 4)
+        self.assertNotIn(dp.ZCODE_POOL_KEY, eligible)  # 退役池绝不复活为候选
         excluded = {x['pool_key']: x for x in r['excluded_candidates_with_reason']}
         self.assertEqual(excluded[dp.CODEBUDDY_POOL_KEY]['reason'], 'main_force_limited')
         for pk in (dp.QMAX_POOL_KEY, dp.CN_MAX_POOL_KEY,
@@ -182,7 +185,9 @@ class AuthorizationTests(_Base):
                 'INSERT INTO main_force_limits(pool_key, limited, recorded_at_utc) '
                 'VALUES(?,1,?)', (dp.CLAUDE_POOL_KEY, dp._iso(failed_at)))
             conn.execute('PRAGMA journal_mode=DELETE')
-        auth = self.auth('auto', 'T', 's2', [dp.CLAUDE_POOL_KEY, dp.ZCODE_POOL_KEY],
+        # BW-ZCODE-RETIRE-20261020：原第二候选 zcode 已退役，改用同场景的 QMAX 之外的
+        # 空授权集不改变本例语义——只保留 claude，验证到期后 claude 重新可选与新轮开启。
+        auth = self.auth('auto', 'T', 's2', [dp.CLAUDE_POOL_KEY],
                          round_failed_candidates=[dp.CLAUDE_POOL_KEY],
                          dispatch_round={'id': 7,
                                          'started_at_utc': dp._iso(failed_at)})
@@ -212,7 +217,9 @@ class AuthorizationTests(_Base):
     def test_recent_limits_and_day_windows_select_opencode_before_flash(self):
         self.build_store()
         with closing(dp.connect(self.store)) as conn:
-            for pk in (dp.CODEBUDDY_POOL_KEY, dp.ZCODE_POOL_KEY):
+            # BW-ZCODE-RETIRE-20261020：zcode 已退役、不再是可过滤候选，本例只保留
+            # CodeBuddy 的真实限额标记验证（白天层序 CodeBuddy 受限 → OpenCode 先于 Flash）。
+            for pk in (dp.CODEBUDDY_POOL_KEY,):
                 conn.execute(
                     'INSERT INTO main_force_limits(pool_key, limited, recorded_at_utc) '
                     'VALUES(?,1,?)', (pk, dp._iso(T_DAY)))
@@ -221,8 +228,7 @@ class AuthorizationTests(_Base):
         self.assertIsNone(r['refused'], r)
         self.assertEqual(r['candidate_filters'][dp.CODEBUDDY_POOL_KEY],
                          'main_force_limited')
-        self.assertEqual(r['candidate_filters'][dp.ZCODE_POOL_KEY],
-                         'main_force_limited')
+        self.assertNotIn(dp.ZCODE_POOL_KEY, r['candidate_filters'])  # 退役池不再逐候选出现
         self.assertEqual(r['selected']['pool_key'], dp.OPENCODE_DEEPSEEK_POOL_KEY, r)
         self.assertNotIn(r['selected']['pool_key'], dp.OVERFLOW_KEYS)
 
@@ -241,7 +247,10 @@ class AuthorizationTests(_Base):
         self.assertEqual(r['selected_reason'], 'executor_region_main', r)
         self.assertTrue(r['selected']['pool_key'].startswith('qodercn:'), r)
         # 别区/别执行器绝不显示为 eligible，如实 not_authorized
-        self.assertEqual(r['candidate_filters'][dp.ZCODE_POOL_KEY], 'not_authorized')
+        # BW-ZCODE-RETIRE-20261020：zcode 已退役、不再逐候选枚举，改用仍在池内的
+        # 别执行器候选 OpenCode 验证同一"不跨执行器"口径。
+        self.assertEqual(r['candidate_filters'][dp.OPENCODE_DEEPSEEK_POOL_KEY],
+                         'not_authorized')
         self.assertEqual(r['candidate_filters']['qoder:Qwen3.8-Max'], 'not_authorized')
 
     def test_executor_falls_to_own_flash_never_cross(self):
@@ -285,7 +294,9 @@ class AuthorizationTests(_Base):
         self.assertEqual(r['selected_reason'], 'executor_region_main', r)
         self.assertIn(r['selected']['pool_key'], dp.OPENCODE_POOL_KEYS, r)
         self.assertEqual(r['candidate_filters']['qoder:Qwen3.8-Max'], 'not_authorized')
-        self.assertEqual(r['candidate_filters'][dp.ZCODE_POOL_KEY], 'not_authorized')
+        # BW-ZCODE-RETIRE-20261020：zcode 退役不再枚举，改验 claude 仍如实不跨执行器。
+        self.assertEqual(r['candidate_filters'][dp.CLAUDE_POOL_KEY], 'not_authorized')
+        self.assertNotIn(dp.ZCODE_POOL_KEY, r['candidate_filters'])
 
     def test_executor_opencode_full_refuses_never_crosses(self):
         self.build_store()
@@ -301,19 +312,23 @@ class AuthorizationTests(_Base):
 
 
 class WindowAndLimitTests(_Base):
-    def test_day_drops_gated_max_and_claude_keeps_zcode(self):
+    def test_day_drops_gated_max_and_claude_selects_opencode(self):
+        # BW-ZCODE-RETIRE-20261020：原断言白天落 ZCode；退役后同窗口最高可选层是
+        # tier=4 的 OpenCode，时段门断言原样保留。
         self.build_store()
         r = self.plan(self.auth('auto', 'T', 's2', LEGACY_MAINS + ALL_FLASH), now=T_DAY)
-        self.assertEqual(r['selected']['pool_key'], dp.ZCODE_POOL_KEY, r)
+        self.assertEqual(r['selected']['pool_key'], dp.OPENCODE_DEEPSEEK_POOL_KEY, r)
         self.assertEqual(r['candidate_filters']['qoder:Qwen3.8-Max'], 'window_closed')
         self.assertEqual(r['candidate_filters'][dp.CLAUDE_POOL_KEY], 'window_closed')
+        self.assertNotIn(dp.ZCODE_POOL_KEY, r['candidate_filters'])
 
     def test_night_admits_gated_max_and_keeps_fairness(self):
         self.build_store()
         r = self.plan(self.auth('auto', 'T', 's2', ALL_MAINS + ALL_FLASH), now=T_NIGHT)
         self.assertEqual(r['candidate_filters']['qoder:Qwen3.8-Max'], 'eligible')
         self.assertEqual(r['candidate_filters'][dp.CLAUDE_POOL_KEY], 'eligible')
-        self.assertEqual(r['candidate_filters'][dp.ZCODE_POOL_KEY], 'eligible')
+        # BW-ZCODE-RETIRE-20261020：退役池彻底退出逐候选枚举（夜间亦然）。
+        self.assertNotIn(dp.ZCODE_POOL_KEY, r['candidate_filters'])
 
     def test_explicit_limit_no_longer_blocks_new_round(self):
         """BW-SIMPLE-PRIORITY-RETRY-S3 新用户政策：历史明确限额不再挡一个正常新轮次的
@@ -327,12 +342,17 @@ class WindowAndLimitTests(_Base):
 
     def test_capacity_full_filter_and_fallback(self):
         self.build_store()
-        self.reserve('a', 'zcode', 'GLM-5.3', executor='zcode')
-        self.reserve('b', 'zcode', 'GLM-5.3', executor='zcode')
+        # BW-ZCODE-RETIRE-20261020：原用 ZCode×2 制造 capacity_full；退役后改用
+        # claude（capacity=2，夜间窗口开）验证同一"满→如实 capacity_full、回退更高优先层"。
+        self.reserve('a', 'claude', 'deepseek-flash', executor='claude')
+        self.reserve('b', 'claude', 'deepseek-flash', executor='claude')
         r = self.plan(self.auth('auto', 'T', 's2', LEGACY_MAINS + ALL_FLASH), now=T_NIGHT)
-        self.assertEqual(r['candidate_filters'][dp.ZCODE_POOL_KEY], 'capacity_full')
-        # BW-CUSTOM-MAX-RESUME-20261018-S1：ZCode 满后落 Max 层，自定义 Max 现为该层首个。
-        self.assertEqual(r['selected']['pool_key'], dp.CN_CUSTOM_MAX_POOL_KEY, r)
+        self.assertEqual(r['candidate_filters'][dp.CLAUDE_POOL_KEY], 'capacity_full')
+        self.assertNotIn(dp.ZCODE_POOL_KEY, r['candidate_filters'])
+        # 满层回退：最高优先层（三 Max）有空位即被选中，绝不下探 Flash。
+        self.assertIn(r['selected']['pool_key'],
+                      [dp.QMAX_POOL_KEY, dp.CN_MAX_POOL_KEY,
+                       dp.CN_CUSTOM_MAX_POOL_KEY], r)
 
 
 class NightAutoCustomMaxRegression(_Base):
@@ -363,7 +383,7 @@ class NightAutoCustomMaxRegression(_Base):
 
     def test_auto_narrow_cn_scope_stays_cn_others_not_authorized(self):
         """合法用户把 AUTO 范围收窄到只 CN：选择仍在 CN 内，其余区/池如实 not_authorized
-        ——这只表示不在本轮输入里，绝不伪造“用户撤权”，也绝不偷偷扩权到 qoder/claude/zcode。"""
+        ——这只表示不在本轮输入里，绝不伪造"用户撤权"，也绝不偷偷扩权到 qoder/claude。"""
         self.build_store()
         cn_scope = CN_MAINS + [CN_FLASH]
         r = self.plan(self.auth('auto', 'T', 's2', cn_scope), now=T_NIGHT)
@@ -372,7 +392,11 @@ class NightAutoCustomMaxRegression(_Base):
         self.assertTrue(r['selected']['pool_key'].startswith('qodercn:'), r)
         self.assertEqual(r['candidate_filters']['qoder:Qwen3.8-Max'], 'not_authorized')
         self.assertEqual(r['candidate_filters'][dp.CLAUDE_POOL_KEY], 'not_authorized')
-        self.assertEqual(r['candidate_filters'][dp.ZCODE_POOL_KEY], 'not_authorized')
+        # BW-ZCODE-RETIRE-20261020：zcode 退役不再逐候选枚举，用仍在池内的别区
+        # OpenCode 验证同一 not_authorized 口径；退役池本身绝不出现在候选视图。
+        self.assertEqual(r['candidate_filters'][dp.OPENCODE_DEEPSEEK_POOL_KEY],
+                         'not_authorized')
+        self.assertNotIn(dp.ZCODE_POOL_KEY, r['candidate_filters'])
 
     def test_only_flash_input_marks_mains_not_authorized_without_fake_revocation(self):
         """错误输入只给 Flash 时，主力的 not_authorized 只反映未列入输入（不是撤权）；
@@ -397,20 +421,22 @@ class PreviousAndConflictTests(_Base):
 
     def test_task_in_flight_blocks_new_decision(self):
         self.build_store()
-        self.reserve('T', 'zcode', 'GLM-5.3', executor='zcode')
+        # BW-ZCODE-RETIRE-20261020：在途守卫用例改用现役组合（qoder Max），语义不变。
+        self.reserve('T', 'qoder', 'Qwen3.8-Max', executor='qoder')
         r = self.plan(self.auth('auto', 'T', 's2', ALL_MAINS + ALL_FLASH))
         self.assertEqual(r['refused'], 'task_in_flight')
 
     def test_workspace_conflict_rejects_whole_item(self):
         self.build_store()
         shared = self._ws('shared')
-        self.reserve('a', 'zcode', 'GLM-5.3', ws=shared, executor='zcode')
+        self.reserve('a', 'qoder', 'Qwen3.8-Max', ws=shared, executor='qoder')
         r = self.plan(self.auth('auto', 'T', 's2', ALL_MAINS + ALL_FLASH), ws=shared)
         self.assertEqual(r['refused'], 'workspace_conflict')
 
     def test_scope_drift_rejected(self):
         self.build_store()
-        auth = self.auth('auto', 'T', 's2', [dp.ZCODE_POOL_KEY],
+        # BW-ZCODE-RETIRE-20261020：授权候选换成现役池，scope 漂移仍优先如实拒绝。
+        auth = self.auth('auto', 'T', 's2', [dp.QMAX_POOL_KEY],
                          scope={'task_id': 'OTHER', 'stage': 's2'})
         r = self.plan(auth)
         self.assertEqual(r['refused'], 'scope_conflict')
@@ -592,11 +618,12 @@ class ContextAndReadOnlyTests(_Base):
 
     def test_wal_writer_latest_active_must_be_read(self):
         # 临时 WAL 库 + 打开的 writer 保留最新 active；规划只读打开必须读到它。
+        # BW-ZCODE-RETIRE-20261020：在途占位改用现役 qoder Max 组合，WAL 可见性语义不变。
         writer = dp.connect(self.store)
         try:
             dp._rotation_row(writer)
-            r = dp.reserve(self.store, task_id='Q', runtime='zcode', model='GLM-5.3',
-                           workspace=self._ws('Q'), prompt_sha256='p', executor='zcode',
+            r = dp.reserve(self.store, task_id='Q', runtime='qoder', model='Qwen3.8-Max',
+                           workspace=self._ws('Q'), prompt_sha256='p', executor='qoder',
                            now=T_NIGHT, _preclaim=False)
             self.assertTrue(r.get('reserved') or r.get('allowed'), r)
             self.assertTrue(Path(self.store + '-wal').exists())
@@ -615,8 +642,9 @@ class ContextAndReadOnlyTests(_Base):
         if shm.exists():
             shm.unlink()
         Path(str(p) + '-wal').write_bytes(b'')
+        # BW-ZCODE-RETIRE-20261020：授权候选换成现役池，让用例真正走到快照读取路径。
         r = ss.plan_stage_selection(
-            self.auth('auto', 'T', 's2', [dp.ZCODE_POOL_KEY]), store_path=str(p),
+            self.auth('auto', 'T', 's2', [dp.QMAX_POOL_KEY]), store_path=str(p),
             task_id='T', stage='s2', workspace=self._ws('T'), now=T_NIGHT)
         self.assertEqual(r['refused'], 'store_snapshot_unavailable', r)
         self.assertFalse(shm.exists())
@@ -629,8 +657,9 @@ class ContextAndReadOnlyTests(_Base):
         conn.close()
         ws = self._ws('T')
         before = sorted(fp.name for fp in self.base.iterdir())
+        # BW-ZCODE-RETIRE-20261020：现役候选，确保拒绝原因如实是 store 缺 schema。
         r = ss.plan_stage_selection(
-            self.auth('auto', 'T', 's2', [dp.ZCODE_POOL_KEY]), store_path=str(p),
+            self.auth('auto', 'T', 's2', [dp.QMAX_POOL_KEY]), store_path=str(p),
             task_id='T', stage='s2', workspace=ws, now=T_NIGHT)
         self.assertEqual(r['refused'], 'store_refused', r)
         self.assertEqual(before, sorted(fp.name for fp in self.base.iterdir()))
@@ -648,15 +677,18 @@ class ContextAndReadOnlyTests(_Base):
 
     def test_missing_store_refused_and_not_created(self):
         missing = self.base / 'nope.sqlite3'
+        # BW-ZCODE-RETIRE-20261020：现役候选，拒绝原因如实是缺库，不被授权校验抢跑。
         r = ss.plan_stage_selection(
-            self.auth('auto', 'T', 's2', [dp.ZCODE_POOL_KEY]), store_path=str(missing),
+            self.auth('auto', 'T', 's2', [dp.QMAX_POOL_KEY]), store_path=str(missing),
             task_id='T', stage='s2', workspace=self._ws('T'), now=T_NIGHT)
         self.assertEqual(r['refused'], 'store_refused')
         self.assertFalse(missing.exists())
 
     def test_cli_exit_codes(self):
         self.build_store()
-        auth = self.auth('auto', 'T', 's2', [dp.ZCODE_POOL_KEY])
+        # BW-ZCODE-RETIRE-20261020：CLI 用真实时钟，原来借 ZCode 无时段门保证恒可选；
+        # 退役后改用同样无时段门的现役 OpenCode DeepSeek 槽，退出码语义不变。
+        auth = self.auth('auto', 'T', 's2', [dp.OPENCODE_DEEPSEEK_POOL_KEY])
         ws = self._ws('T')
         buf = io.StringIO()
         with contextlib.redirect_stdout(buf):
@@ -665,7 +697,7 @@ class ContextAndReadOnlyTests(_Base):
                             '--authorization-json', json.dumps(auth)])
         self.assertEqual(code, 0)
         self.assertEqual(json.loads(buf.getvalue())['selected']['pool_key'],
-                         dp.ZCODE_POOL_KEY)
+                         dp.OPENCODE_DEEPSEEK_POOL_KEY)
         buf = io.StringIO()
         missing = str(self.base / 'gone.sqlite3')
         with contextlib.redirect_stdout(buf):
@@ -691,8 +723,9 @@ class PermissionGrantsTests(_Base):
         self.assertEqual(ec.CAPABILITY['qoder']['fine_grained'], True)
 
     def test_day_fine_grants_skip_z_for_authorized_compatible_flash(self):
-        """白天 Z 健康且有全部空位，但任务需精确 Edit/Bash：Z 被能力过滤，
-        选兼容的已授权 Flash，绝不启动 Z 计划。"""
+        """白天精确 Edit/Bash 需求：能力不兼容的候选（OpenCode 等）被过滤，选兼容的
+        已授权 Flash。BW-ZCODE-RETIRE-20261020：ZCode 已退役、不再逐候选枚举，本例
+        同时锁定退役池绝不复活为候选，也绝不启动 Z 计划。"""
         self.build_store()
         r = self.plan(self.auth('auto', 'T', 's2', LEGACY_MAINS + ALL_FLASH),
                       now=T_DAY, permission_grants=self.FINE)
@@ -700,87 +733,100 @@ class PermissionGrantsTests(_Base):
         self.assertEqual(r['permission_requirements'],
                          {'fine_grained': True, 'read_dirs': False})
         self.assertEqual(r['selected']['pool_key'], 'qoder:Qwen3.8-Flash', r)
-        self.assertEqual(r['candidate_filters'][dp.ZCODE_POOL_KEY],
+        # 精确需求下无逐文件能力的现役候选如实 permission_incompatible。
+        self.assertEqual(r['candidate_filters'][dp.OPENCODE_DEEPSEEK_POOL_KEY],
                          'permission_incompatible')
+        self.assertNotIn(dp.ZCODE_POOL_KEY, r['candidate_filters'])
         self.assertEqual(r['candidate_filters']['qodercn:Qwen3.8-Flash'], 'eligible')
         self.assertNotEqual(r['selected']['runtime'], 'zcode')
         self._assert_capability_table_untouched()
 
     def test_day_same_window_without_exact_rules_z_still_eligible(self):
-        """同一白天窗口、不要求精确规则（未传 grants）：Z 仍可选（旧兼容行为）。"""
+        """同一白天窗口、不要求精确规则（未传 grants）：BW-ZCODE-RETIRE-20261020 后
+        ZCode 已退役退出候选，最高可选层变为 tier=4 的 OpenCode（旧兼容行为：无需求
+        时不做能力过滤）。"""
         self.build_store()
         r = self.plan(self.auth('auto', 'T', 's2', LEGACY_MAINS + ALL_FLASH), now=T_DAY)
-        self.assertEqual(r['selected']['pool_key'], dp.ZCODE_POOL_KEY, r)
-        self.assertEqual(r['candidate_filters'][dp.ZCODE_POOL_KEY], 'eligible')
+        self.assertEqual(r['selected']['pool_key'], dp.OPENCODE_DEEPSEEK_POOL_KEY, r)
+        self.assertNotIn(dp.ZCODE_POOL_KEY, r['candidate_filters'])
         self.assertEqual(r['permission_requirements'],
                          {'fine_grained': False, 'read_dirs': False})
 
     def test_fixed_z_with_exact_requirement_refused_not_swapped(self):
-        """fixed 明确 ZCode 但任务要求精确 grants：诚实拒绝，不偷偷换执行器。"""
+        """fixed 明确 ZCode：BW-ZCODE-RETIRE-20261020 起退役池根本不被授权——诚实拒绝
+        （unauthorized_candidate），绝不偷偷换执行器、也绝不复活候选。"""
         self.build_store()
         auth = self.auth('fixed', 'T', 's2', [dp.ZCODE_POOL_KEY],
                          runtime='zcode', model='GLM-5.3')
         r = self.plan(auth, permission_grants=self.FINE)
-        self.assertEqual(r['refused'], 'fixed_candidate_unavailable', r)
-        self.assertEqual(r['refused_detail'], 'permission_incompatible', r)
+        self.assertEqual(r['refused'], 'unauthorized_candidate', r)
+        self.assertEqual(r['refused_detail'], "'zcode:GLM-5.3'", r)
         self.assertIsNone(r['selected'])
 
     def test_read_dirs_requirement_is_independent_capability_filter(self):
         """外部 read_dirs 需求走独立能力过滤：只剔除无 read_dirs 能力的候选，
-        与 fine_grained 需求分别可辨（codebuddy 类不在池内，此处 Z 两能力皆无）。"""
+        与 fine_grained 需求分别可辨（codebuddy 类无 read_dirs；BW-ZCODE-RETIRE-20261020：
+        ZCode 已退役不再枚举，用无 read_dirs 能力的 CodeBuddy 验证同一口径）。"""
         self.build_store()
         r = self.plan(self.auth('auto', 'T', 's2', ALL_MAINS + ALL_FLASH), now=T_DAY,
                       permission_grants={'edits': [], 'bash': [],
                                          'read_dirs': ['D:/refs']})
         self.assertEqual(r['permission_requirements'],
                          {'fine_grained': False, 'read_dirs': True})
-        self.assertEqual(r['candidate_filters'][dp.ZCODE_POOL_KEY],
+        self.assertEqual(r['candidate_filters'][dp.CODEBUDDY_POOL_KEY],
                          'permission_incompatible')
+        self.assertNotIn(dp.ZCODE_POOL_KEY, r['candidate_filters'])
         self.assertEqual(r['selected']['pool_key'], 'qoder:Qwen3.8-Flash', r)
         self._assert_capability_table_untouched()
 
     def test_missing_qoder_authorization_never_expands_via_permission_filter(self):
         """能力过滤只作用于授权集合内候选：缺 Qoder 授权时精确需求绝不把候选扩到
-        Qoder，非授权池仍如实 not_authorized，需求兼容也不构成授权。"""
+        Qoder，非授权池仍如实 not_authorized，需求兼容也不构成授权。
+        BW-ZCODE-RETIRE-20261020：原第二候选 zcode 已退役，换成现役但能力不兼容的
+        OpenCode 验证同一"过滤不扩权"语义。"""
         self.build_store()
-        auth = self.auth('auto', 'T', 's2', [CN_FLASH, dp.ZCODE_POOL_KEY])
+        auth = self.auth('auto', 'T', 's2', [CN_FLASH, dp.OPENCODE_DEEPSEEK_POOL_KEY])
         r = self.plan(auth, permission_grants=self.FINE)
         self.assertEqual(r['refused'], None, r)
         self.assertEqual(r['selected']['pool_key'], CN_FLASH, r)
         self.assertEqual(r['candidate_filters']['qoder:Qwen3.8-Flash'], 'not_authorized')
-        self.assertEqual(r['candidate_filters'][dp.ZCODE_POOL_KEY],
+        self.assertEqual(r['candidate_filters'][dp.OPENCODE_DEEPSEEK_POOL_KEY],
                          'permission_incompatible')
+        self.assertNotIn(dp.ZCODE_POOL_KEY, r['candidate_filters'])
 
     def test_permission_incompatible_and_availability_now_orthogonal(self):
         """BW-SIMPLE-PRIORITY-RETRY-S3：历史 availability 阻断不再作为普通新轮的过滤
-        原因——Z 被 blocked 时若无精确权限需求，本轮仍 eligible（真实尝试失败才落诊断、
-        CAS 结算不变）；只有真正的权限能力冲突才记 permission_incompatible。两口径互不
-        冒充：zcode_blocked 仅作 receipt 只读诊断，绝不假装 healthy 或清除 hold。"""
+        原因——只作 receipt 只读诊断（zcode_blocked），绝不假装 healthy 或清除 hold；
+        只有真正的权限能力冲突才记 permission_incompatible。BW-ZCODE-RETIRE-20261020：
+        ZCode 退役后不再进候选枚举，两口径互不冒充的验证改由现役候选承担。"""
         self.build_store()
         with _patch_zcode(False):
-            # 混合 Edit+Bash：无法进受控文件 profile（bash 必须为空），能力冲突前置。
+            # 混合 Edit+Bash：无逐文件能力的现役候选（OpenCode）如实 permission_incompatible。
             r = self.plan(self.auth('auto', 'T', 's2', ALL_MAINS + ALL_FLASH),
                           permission_grants=self.FINE)
             self.assertEqual(r['zcode_blocked'], True)
-            self.assertEqual(r['candidate_filters'][dp.ZCODE_POOL_KEY],
+            self.assertEqual(r['candidate_filters'][dp.OPENCODE_DEEPSEEK_POOL_KEY],
                              'permission_incompatible', r)
+            self.assertNotIn(dp.ZCODE_POOL_KEY, r['candidate_filters'])
         with _patch_zcode(False):
-            # 无精确权限需求：旧的 availability 阻断不再挡新轮，Z 仍 eligible。
+            # 无精确权限需求：旧的 availability 阻断只回显诊断，不产生任何过滤原因。
             r = self.plan(self.auth('auto', 'T', 's2', ALL_MAINS + ALL_FLASH))
             self.assertEqual(r['zcode_blocked'], True)
-            self.assertEqual(r['candidate_filters'][dp.ZCODE_POOL_KEY], 'eligible', r)
+            self.assertNotIn(dp.ZCODE_POOL_KEY, r['candidate_filters'])
             self.assertNotIn('zcode_unavailable', set(r['candidate_filters'].values()))
+            self.assertNotEqual(r['selected'], None, r)
 
     def test_workspace_inflight_guards_and_readonly_hash_kept_with_grants(self):
         """权限过滤不替代既有守卫：同任务在途/工作区冲突照旧整项拒绝；
-        带 grants 的规划仍只读，读写前后快照哈希不变。"""
+        带 grants 的规划仍只读，读写前后快照哈希不变。
+        BW-ZCODE-RETIRE-20261020：在途占位改用现役 qoder Max 组合，守卫语义不变。"""
         self.build_store()
         shared = self._ws('shared')
-        self.reserve('a', 'zcode', 'GLM-5.3', ws=shared, executor='zcode')
+        self.reserve('a', 'qoder', 'Qwen3.8-Max', ws=shared, executor='qoder')
         r = self.plan(self.auth('auto', 'T', 's2', ALL_MAINS + ALL_FLASH),
                       ws=shared, permission_grants=self.FINE)
         self.assertEqual(r['refused'], 'workspace_conflict')
-        self.reserve('T', 'zcode', 'GLM-5.3', executor='zcode')
+        self.reserve('T', 'qodercn', 'Qwen3.8-Flash', executor='qodercn')
         before = self._digest()
         r = self.plan(self.auth('auto', 'T', 's2', ALL_MAINS + ALL_FLASH),
                       task='T', permission_grants=self.FINE)
@@ -830,16 +876,19 @@ class PermissionGrantsTests(_Base):
                                                  runtime='zcode', model='GLM-5.3')),
                             '--permission-grants-json', json.dumps(self.FINE)])
         self.assertEqual(code, 2)
+        # BW-ZCODE-RETIRE-20261020：fixed 点名已退役 ZCode → 授权校验即诚实拒绝
+        # unauthorized_candidate（退役早于 fixed_candidate_unavailable 判定），仍退出码 2。
         self.assertEqual(json.loads(buf.getvalue())['refused'],
-                         'fixed_candidate_unavailable')
+                         'unauthorized_candidate')
 
     def test_temp_fallback_same_stage_and_parent_reselect_apply_current_need(self):
         """临时降级不丢失当前阶段权限需求：同阶段指定 Flash 与旧 scope 到期经父授权
-        重选，都按**本轮** grants 应用能力过滤（Z 标 permission_incompatible），绝不从
-        旧 session 继承需求、也不因临时/父授权绕过过滤。"""
+        重选，都按**本轮** grants 应用能力过滤，绝不从旧 session 继承需求、也不因临时/
+        父授权绕过过滤。BW-ZCODE-RETIRE-20261020：ZCode 退役不再枚举，逐候选冲突验证
+        改由无逐文件能力的现役 OpenCode 承担，并锁定退役池绝不复活。"""
         self.build_store()
         # 同阶段：指定已授权且能力兼容的 CN Flash（runtime qodercn fine_grained=True）
-        # → 正常 temporary_fallback_selected；Z 在候选集合中如实标 permission_incompatible。
+        # → 正常 temporary_fallback_selected；OpenCode 在候选集合中如实标 permission_incompatible。
         auth = self.auth('temporary_fallback', 'T', 's1', ALL_MAINS + ALL_FLASH,
                          fallback_scope={'task_id': 'T', 'stage': 's1'},
                          runtime='qodercn', model='Qwen3.8-Flash')
@@ -850,10 +899,11 @@ class PermissionGrantsTests(_Base):
         self.assertEqual(r['refused'], None, r)
         self.assertEqual(r['selected_reason'], 'temporary_fallback_selected', r)
         self.assertEqual(r['selected']['pool_key'], CN_FLASH, r)
-        self.assertEqual(r['candidate_filters'][dp.ZCODE_POOL_KEY],
+        self.assertEqual(r['candidate_filters'][dp.OPENCODE_DEEPSEEK_POOL_KEY],
                          'permission_incompatible')
-        # 到期经父授权重选：应用**当前**需求 → 白天三 Max/Claude 窗闭、Z 权限不兼容，
-        # 选择落兼容的已授权 Flash；旧 s1 的需求绝不反向继承或改写本轮需求。
+        self.assertNotIn(dp.ZCODE_POOL_KEY, r['candidate_filters'])
+        # 到期经父授权重选：应用**当前**需求 → 白天三 Max/Claude 窗闭、无逐文件能力候选
+        # 权限不兼容，选择落兼容的已授权 Flash；旧 s1 的需求绝不反向继承或改写本轮需求。
         # 父授权明确保留旧候选集（不含 CodeBuddy）：CodeBuddy 全天可派且为最高层，若纳入
         # 父候选会先于 Flash 被选中，这与本例“临时 fallback 到期重裁决按当前权限需求过滤”
         # 的旧语义无关；CodeBuddy 的自动/显式入口由 test_codebuddy_reactivation.py 独立验证。
@@ -871,47 +921,52 @@ class PermissionGrantsTests(_Base):
         self.assertEqual(r['selection_mode'], 'auto')
         self.assertEqual(r['permission_requirements'],
                          {'fine_grained': True, 'read_dirs': False})
-        self.assertEqual(r['candidate_filters'][dp.ZCODE_POOL_KEY],
+        self.assertEqual(r['candidate_filters'][dp.OPENCODE_DEEPSEEK_POOL_KEY],
                          'permission_incompatible')
+        self.assertNotIn(dp.ZCODE_POOL_KEY, r['candidate_filters'])
         self.assertEqual(r['selected']['pool_key'], 'qoder:Qwen3.8-Flash', r)
 
-    def test_edits_only_grants_make_zcode_eligible_via_controlled_file_profile(self):
-        """仅需精确文件 Edit（无 Bash、无 read_dirs）时，ZCode 经**受控文件 profile** 变为可选，
-        回执标明 controlled_file_profile_required=True；绝不修改 CAPABILITY 的 fine_grained=False，
-        也绝不因此把混合 Bash 任务放行。"""
+    def test_edits_only_grants_never_resurrect_retired_zcode(self):
+        """仅需精确文件 Edit（无 Bash、无 read_dirs）：BW-ZCODE-RETIRE-20261020 起
+        ZCode 已退役，受控文件 profile 绝不使其复活为候选；回执仍按 grants 结构标
+        controlled_file_profile_required=True，且绝不修改 CAPABILITY 的能力表。"""
         self.build_store()
         r = self.plan(self.auth('auto', 'T', 's2', ALL_MAINS + ALL_FLASH), now=T_DAY,
                       permission_grants={'edits': ['Edit(C:/a.py)'], 'bash': [],
                                          'read_dirs': []})
         self.assertEqual(r['refused'], None, r)
-        self.assertEqual(r['candidate_filters'][dp.ZCODE_POOL_KEY], 'eligible', r)
+        self.assertNotIn(dp.ZCODE_POOL_KEY, r['candidate_filters'])
+        self.assertNotIn(dp.ZCODE_POOL_KEY,
+                         [x['pool_key'] for x in r['eligible_candidates']])
         self.assertEqual(r['permission_requirements'],
                          {'fine_grained': True, 'read_dirs': False})
         self.assertTrue(r['controlled_file_profile_required'], r)
         self._assert_capability_table_untouched()
 
-    def test_fixed_z_edits_only_selects_zcode_not_swapped(self):
-        """fixed 明确 ZCode 且本轮仅需精确 Edit：受控文件 profile 使其可选，正常选中 ZCode，
-        绝不因能力表 fine_grained=False 而偷偷换执行器。"""
+    def test_fixed_z_edits_only_refused_never_swapped(self):
+        """fixed 明确 ZCode 且本轮仅需精确 Edit：BW-ZCODE-RETIRE-20261020 起退役池
+        不被授权——诚实拒绝 unauthorized_candidate，绝不偷偷换执行器、绝不复活候选。"""
         self.build_store()
         auth = self.auth('fixed', 'T', 's2', [dp.ZCODE_POOL_KEY],
                          runtime='zcode', model='GLM-5.3')
         r = self.plan(auth, permission_grants={'edits': ['Edit(C:/a.py)'], 'bash': [],
                                                'read_dirs': []})
-        self.assertEqual(r['refused'], None, r)
-        self.assertEqual(r['selected']['pool_key'], dp.ZCODE_POOL_KEY, r)
-        self.assertTrue(r['controlled_file_profile_required'], r)
+        self.assertEqual(r['refused'], 'unauthorized_candidate', r)
+        self.assertEqual(r['refused_detail'], "'zcode:GLM-5.3'", r)
+        self.assertIsNone(r['selected'])
 
     def test_mixed_edit_bash_task_remains_permission_incompatible(self):
         """混合 Edit+Bash 整段任务继续 permission_incompatible：受控文件 profile 只覆盖纯精确
         Edit，Bash 需求一律不成立，回执不标 controlled_file_profile_required。硬 Edit+Bash 不支持
-        ZCode 直接承接，但可选能承接同一硬合同的已授权兼容执行器一轮完成；仅确有依赖且经任务
-        授权时采用纯 Edit profile 与必要独立测试，不强制/机械拆分。"""
+        无逐文件能力的执行器直接承接，但可选能承接同一硬合同的已授权兼容执行器一轮完成；仅确有依赖且经任务
+        授权时采用纯 Edit profile 与必要独立测试，不强制/机械拆分。
+        BW-ZCODE-RETIRE-20261020：验证对象由 ZCode 换成现役无逐文件能力的 OpenCode。"""
         self.build_store()
         r = self.plan(self.auth('auto', 'T', 's2', ALL_MAINS + ALL_FLASH), now=T_DAY,
                       permission_grants=self.FINE)
-        self.assertEqual(r['candidate_filters'][dp.ZCODE_POOL_KEY],
+        self.assertEqual(r['candidate_filters'][dp.OPENCODE_DEEPSEEK_POOL_KEY],
                          'permission_incompatible', r)
+        self.assertNotIn(dp.ZCODE_POOL_KEY, r['candidate_filters'])
         self.assertFalse(r['controlled_file_profile_required'], r)
 
 
@@ -926,16 +981,17 @@ class TaskScopeTests(_Base):
              'read_dirs': ['references/']}
     FINE = PermissionGrantsTests.FINE
 
-    def test_ordinary_scope_selects_zcode_when_only_route_open(self):
-        """白天三 Max 窗关、Claude 明确 limited、Z 可用有槽，同 5 文件/1 测试只是
-        task_scope（无硬 grants）：选 ZCode，requirements 全 false，Z eligible。"""
+    def test_ordinary_scope_selects_opencode_when_only_route_open(self):
+        """白天三 Max 窗关、Claude 明确 limited，同 5 文件/1 测试只是 task_scope
+        （无硬 grants）：requirements 全 false、不做能力过滤。BW-ZCODE-RETIRE-20261020：
+        原唯一通路 ZCode 已退役，最高可选层变为 tier=4 的 OpenCode。"""
         self.build_store()
         self.set_limit(dp.CLAUDE_POOL_KEY)
         r = self.plan(self.auth('auto', 'T', 's2', LEGACY_MAINS + ALL_FLASH), now=T_DAY,
                       task_scope=self.SCOPE)
         self.assertEqual(r['refused'], None, r)
-        self.assertEqual(r['selected']['pool_key'], dp.ZCODE_POOL_KEY, r)
-        self.assertEqual(r['candidate_filters'][dp.ZCODE_POOL_KEY], 'eligible')
+        self.assertEqual(r['selected']['pool_key'], dp.OPENCODE_DEEPSEEK_POOL_KEY, r)
+        self.assertNotIn(dp.ZCODE_POOL_KEY, r['candidate_filters'])
         self.assertEqual(r['permission_requirements'],
                          {'fine_grained': False, 'read_dirs': False})
         self.assertFalse(r['controlled_file_profile_required'])
@@ -943,24 +999,27 @@ class TaskScopeTests(_Base):
         self.assertEqual(r['permission_incompatibility_details'], {})
 
     def test_same_scope_plus_hard_grants_keeps_contract_and_inputs_untouched(self):
-        """同样 scope 再传明确 hard Edit+Bash：Z 仍 permission_incompatible，hard 合同
-        完整生效、不被 task_scope 覆盖；回执保留 task_scope；调用方原 scope/grants
-        对象不被突变。"""
+        """同样 scope 再传明确 hard Edit+Bash：无逐文件能力的现役候选（OpenCode）仍
+        permission_incompatible，hard 合同完整生效、不被 task_scope 覆盖；回执保留
+        task_scope；调用方原 scope/grants 对象不被突变。BW-ZCODE-RETIRE-20261020：
+        ZCode 退役不再枚举，冲突明细验证对象换成 OpenCode，并锁定退役池零出现。"""
         self.build_store()
         scope = dict(self.SCOPE)
         grants = dict(self.FINE)
         r = self.plan(self.auth('auto', 'T', 's2', ALL_MAINS + ALL_FLASH), now=T_DAY,
                       permission_grants=grants, task_scope=scope)
-        self.assertEqual(r['candidate_filters'][dp.ZCODE_POOL_KEY],
+        self.assertEqual(r['candidate_filters'][dp.OPENCODE_DEEPSEEK_POOL_KEY],
                          'permission_incompatible', r)
+        self.assertNotIn(dp.ZCODE_POOL_KEY, r['candidate_filters'])
         self.assertEqual(r['permission_requirements'],
                          {'fine_grained': True, 'read_dirs': False})
         self.assertEqual(r['task_scope'], self.SCOPE)
         self.assertEqual(scope, self.SCOPE)   # 原输入不突变
         self.assertEqual(grants, self.FINE)
-        details = r['permission_incompatibility_details'][dp.ZCODE_POOL_KEY]
+        details = r['permission_incompatibility_details'][dp.OPENCODE_DEEPSEEK_POOL_KEY]
         self.assertIn('per-file edits/verbatim Bash grants', details['unsupported'])
         self.assertIn('ordinary_task_tools', details['note'])
+        self.assertNotIn(dp.ZCODE_POOL_KEY, r['permission_incompatibility_details'])
         self._assert_readonly_with_scope()
 
     def _assert_readonly_with_scope(self):
@@ -970,26 +1029,30 @@ class TaskScopeTests(_Base):
         self.assertEqual(before, self._digest())
 
     def test_legacy_grants_only_unchanged_and_no_scope(self):
-        """legacy 仅 permission_grants 混合需求：照旧拒 Z，回执 task_scope=None、
-        明细仍给冲突说明（未传新输入完全兼容旧行为）。"""
+        """legacy 仅 permission_grants 混合需求：回执 task_scope=None、明细仍给冲突
+        说明（未传新输入完全兼容旧行为）。BW-ZCODE-RETIRE-20261020：退役 ZCode 零出现，
+        拒无逐文件能力候选的语义由 OpenCode 承担。"""
         self.build_store()
         r = self.plan(self.auth('auto', 'T', 's2', ALL_MAINS + ALL_FLASH), now=T_DAY,
                       permission_grants=self.FINE)
-        self.assertEqual(r['candidate_filters'][dp.ZCODE_POOL_KEY],
+        self.assertEqual(r['candidate_filters'][dp.OPENCODE_DEEPSEEK_POOL_KEY],
                          'permission_incompatible', r)
+        self.assertNotIn(dp.ZCODE_POOL_KEY, r['candidate_filters'])
+        self.assertNotIn(dp.ZCODE_POOL_KEY, r['permission_incompatibility_details'])
         self.assertIsNone(r['task_scope'])
-        self.assertIn(dp.ZCODE_POOL_KEY, r['permission_incompatibility_details'])
+        self.assertIn(dp.OPENCODE_DEEPSEEK_POOL_KEY,
+                      r['permission_incompatibility_details'])
 
     def test_pure_hard_edits_keep_controlled_profile_consistency(self):
         """纯 hard Edit：仍 required controlled profile 与正式 preflight 同口径；
-        ZCode 走受控文件 profile 故 eligible（无 incompatibility 明细）；两个 OpenCode
-        免费模型不支持逐文件硬授权，如实出现在明细里（绝不因"整池空诊断"而放过）。"""
+        两个 OpenCode 免费模型不支持逐文件硬授权，如实出现在明细里（绝不因"整池空诊断"
+        而放过）。BW-ZCODE-RETIRE-20261020：ZCode 已退役，不再复活为 eligible 候选。"""
         self.build_store()
         r = self.plan(self.auth('auto', 'T', 's2', ALL_MAINS + ALL_FLASH), now=T_DAY,
                       permission_grants={'edits': ['Edit(source/f1.cjs)'], 'bash': [],
                                          'read_dirs': []},
                       task_scope={'edits': ['source/f1.cjs'], 'bash': [], 'read_dirs': []})
-        self.assertEqual(r['candidate_filters'][dp.ZCODE_POOL_KEY], 'eligible', r)
+        self.assertNotIn(dp.ZCODE_POOL_KEY, r['candidate_filters'], r)
         self.assertTrue(r['controlled_file_profile_required'], r)
         details = r['permission_incompatibility_details']
         self.assertNotIn(dp.ZCODE_POOL_KEY, details, details)
@@ -997,29 +1060,31 @@ class TaskScopeTests(_Base):
         self.assertIn(dp.OPENCODE_GLM_POOL_KEY, details, details)
 
     def test_scope_never_bypasses_existing_guards(self):
-        """fixed 不换执行器、缺 Z 授权、availability 阻断、在途、工作区冲突都不被
-        task_scope 绕过，原因照旧可辨。"""
+        """fixed 不换执行器、缺授权、availability 阻断、在途、工作区冲突都不被
+        task_scope 绕过，原因照旧可辨。BW-ZCODE-RETIRE-20261020：fixed 点名退役
+        ZCode 现在是授权层诚实拒绝（unauthorized_candidate）；在途/工作区守卫改用现役
+        组合占位；退役池在候选视图/明细中零出现。"""
         self.build_store()
         auth = self.auth('fixed', 'T', 's2', [dp.ZCODE_POOL_KEY],
                          runtime='zcode', model='GLM-5.3')
         r = self.plan(auth, permission_grants=self.FINE, task_scope=self.SCOPE)
-        self.assertEqual(r['refused'], 'fixed_candidate_unavailable', r)
+        self.assertEqual(r['refused'], 'unauthorized_candidate', r)
+        self.assertEqual(r['refused_detail'], "'zcode:GLM-5.3'", r)
         r = self.plan(self.auth('auto', 'T', 's2', [CN_FLASH]), now=T_DAY,
                       task_scope=self.SCOPE)
-        self.assertEqual(r['candidate_filters'][dp.ZCODE_POOL_KEY], 'not_authorized')
+        self.assertNotIn(dp.ZCODE_POOL_KEY, r['candidate_filters'])
         with _patch_zcode(False):
-            # BW-SIMPLE-PRIORITY-RETRY-S3：历史 availability 阻断不再挡普通新轮，
-            # task_scope/重试都不改变这点——Z 本轮仍 eligible（诊断 zcode_blocked 保留）。
+            # 历史 availability 阻断只作只读诊断回显，不产生候选过滤、也不复活退役池。
             r = self.plan(self.auth('auto', 'T', 's2', ALL_MAINS + ALL_FLASH),
                           now=T_DAY, task_scope=self.SCOPE)
             self.assertEqual(r['zcode_blocked'], True)
-            self.assertEqual(r['candidate_filters'][dp.ZCODE_POOL_KEY], 'eligible', r)
-        self.reserve('T', 'zcode', 'GLM-5.3', executor='zcode')
+            self.assertNotIn(dp.ZCODE_POOL_KEY, r['candidate_filters'], r)
+        self.reserve('T', 'qoder', 'Qwen3.8-Max', executor='qoder')
         r = self.plan(self.auth('auto', 'T', 's2', ALL_MAINS + ALL_FLASH),
                       task_scope=self.SCOPE)
         self.assertEqual(r['refused'], 'task_in_flight')
         shared = self._ws('shared')
-        self.reserve('a', 'zcode', 'GLM-5.3', ws=shared, executor='zcode')
+        self.reserve('a', 'qodercn', 'Qwen3.8-Flash', ws=shared, executor='qodercn')
         r = self.plan(self.auth('auto', 'T2', 's2', ALL_MAINS + ALL_FLASH), task='T2',
                       ws=shared, task_scope=self.SCOPE)
         self.assertEqual(r['refused'], 'workspace_conflict')
@@ -1038,10 +1103,12 @@ class TaskScopeTests(_Base):
 
     def test_cli_task_scope_and_malformed_refused(self):
         """CLI 新输入 --task-scope-json 原样进回执；畸形 scope（非对象/未知键/非列表/
-        空或带空白项）→ invalid_task_scope 拒绝、退出 2。"""
+        空或带空白项）→ invalid_task_scope 拒绝、退出 2。
+        BW-ZCODE-RETIRE-20261020：CLI 用真实时钟，正例候选由退役 ZCode 换成同样无
+        时段门的现役 OpenCode DeepSeek。"""
         self.build_store()
         ws = self._ws('T')
-        auth = self.auth('auto', 'T', 's2', [dp.ZCODE_POOL_KEY])
+        auth = self.auth('auto', 'T', 's2', [dp.OPENCODE_DEEPSEEK_POOL_KEY])
         buf = io.StringIO()
         with contextlib.redirect_stdout(buf):
             code = ss.main(['--store', self.store, '--task-id', 'T', '--stage', 's2',
@@ -1050,7 +1117,7 @@ class TaskScopeTests(_Base):
                             '--task-scope-json', json.dumps(self.SCOPE)])
         self.assertEqual(code, 0)
         out = json.loads(buf.getvalue())
-        self.assertEqual(out['selected']['pool_key'], dp.ZCODE_POOL_KEY)
+        self.assertEqual(out['selected']['pool_key'], dp.OPENCODE_DEEPSEEK_POOL_KEY)
         self.assertEqual(out['task_scope'], self.SCOPE)
         for bad in ([1], {'edits': 'x'}, {'edits': ['']}, {'edits': [' ']},
                     {'scope': []}):

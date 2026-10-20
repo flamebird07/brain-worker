@@ -1238,18 +1238,26 @@ class PrepLeakTests(unittest.TestCase):
         self.assertFalse(self.out.joinpath('request.json').exists())  # 未写请求、未派发
 
     def test_zcode_mkdir_generic_oserror_releases(self):
+        # BW-ZCODE-RETIRE-20261020：zcode 池全局退役——入口在权威原子门即诚实拒绝
+        # （rc=2、refused_before_dispatch），gate→Popen 间的 mkdir 失败注入点已不可达；
+        # 退役后的确定性更强：零 Popen、sent=false、零锁残留（从未产生 claim，
+        # 无需 start_failed 结算）。
         patchers = [mock.patch.object(Path, 'mkdir', autospec=True,
                                       side_effect=self._out_only_mkdir(
                                           PermissionError('no perm')))]
         rc, out_text = self._run(self._zd_argv(), zd.main, patchers)
-        self.assertEqual(rc, 3, out_text)
+        self.assertEqual(rc, 2, out_text)
+        self.assertIn('refused_before_dispatch', out_text)
         self._assert_cleaned(out_text)
 
     def test_zcode_payload_permissionerror_releases(self):
+        # BW-ZCODE-RETIRE-20261020：同上——退役池在门前即拒，payload 组合失败点不可达；
+        # 诚实拒绝同样零 Popen、零 request.json、零锁残留。
         patchers = [mock.patch.object(zd.pc, 'compose_task_payload',
                                       side_effect=PermissionError('disk'))]
         rc, out_text = self._run(self._zd_argv(), zd.main, patchers)
-        self.assertEqual(rc, 3, out_text)
+        self.assertEqual(rc, 2, out_text)
+        self.assertIn('refused_before_dispatch', out_text)
         self._assert_cleaned(out_text)
         self.assertFalse(self.out.joinpath('request.json').exists())
 
@@ -1262,7 +1270,9 @@ class ZCodeEntryReplayTests(unittest.TestCase):
     stderr_error_frame。新政策：ZCode 取消自动额度冷却，入口对 429/1308 只失败退出、
     如实记录原始数字码 1308 与错误载体，不再落本组冷却、第二次独立新 output 仍可派工，
     一次 main 恰好一次 mock 进程（不自动重试）；original_error_ref 直指本次 stdout 失败
-    信封、SHA 对原始字节核验，空/仅 warning 的 stderr 绝不冒充原错误，缺报告如实保留。"""
+    信封、SHA 对原始字节核验，空/仅 warning 的 stderr 绝不冒充原错误，缺报告如实保留。
+    BW-ZCODE-RETIRE-20261020：zcode 池全局退役后入口在权威原子门即 rc=2 诚实拒绝、
+    零 Popen、零 summary，回放注入点不可达——本组用例固化退役拒绝口径。"""
 
     REAL_STDERR_FRAME = ('ProviderBusinessError: [1308][已达到 5 小时的使用上限。'
                          '您的限额将在 2026-10-08 15:17:30 重置。]\n'
@@ -1337,12 +1347,10 @@ class ZCodeEntryReplayTests(unittest.TestCase):
         return code, summary, buf.getvalue()
 
     def test_entry_reports_1308_without_auto_cooldown_records_availability_hold(self):
-        # BW-AVAILABILITY-20261009-B2 新政策：ZCode 取消自动额度冷却（旧 cooldowns 表仍不落），
-        # 但真实受信任 429/1308 硬上限（"已达到…使用上限"命中窄硬上限消息语义，优先于 wrapper
-        # 派生的 rate_limit 标签；reset 文本无时区 → 不猜窗口）落进**独立持久 availability 状态**
-        # 为无限期 hard_hold。完整入口回放 429/1308 → 失败退出、原始数字码 1308、错误载体 SHA
-        # 仍真、不落本组冷却；随后独立新 output 被 availability 门挡住（sent=false、退出 2、零
-        # Popen、零输出目录），一次 main 恰好一次 mock 进程、不自动重试。
+        # BW-ZCODE-RETIRE-20261020：zcode 池已全局退役——完整入口在权威原子门即诚实拒绝
+        # （rc=2、零 Popen、零 summary），429/1308 回放与 availability 落标在派工面不可再
+        # 触发；本用例转为固化退役口径：绝不派发、绝不自动重试、旧 cooldowns 表不落、
+        # 入口也不写 availability（历史 hold/诊断数据仅保留读取，见 availability 回归）。
         counter = {'n': 0}
         env = {'carrier': 'zcode-sdk', 'ok': False, 'preflight_ok': True,
                'errors': ['ProviderBusinessError: [1308][已达到 5 小时的使用上限。'
@@ -1350,64 +1358,21 @@ class ZCodeEntryReplayTests(unittest.TestCase):
                'errors_info': None, 'event_count': 0}
         stdout_bytes = json.dumps(env, ensure_ascii=False).encode('utf-8')
         out1 = self.tmp / 'out-1308'
-        code, summary, _ = self._run(out1, stdout_bytes, self.REAL_STDERR_FRAME, 5, counter)
-        self.assertEqual(code, 3, summary)
-        self.assertFalse(summary['protocol_success'])
-        self.assertEqual(counter['n'], 1)  # 恰好一次 Popen（不自动重试）
-        # 入口明确标识 ZCode 自动额度冷却禁用，且失败但不谎称额度/恢复/免费。
-        self.assertTrue(summary['quota_auto_cooldown_disabled'])
-        self.assertFalse(summary['free_quota_verified'])
-        # 取消自动冷却：入口对 ZCode 不再落本组冷却（unknown-shared 不出现）。
-        self.assertNotIn(qc.UNKNOWN_SHARED_GROUP, qc.get_status(self.store)['cooldowns'])
-        outcome = summary['quota_outcome']
-        self.assertTrue(outcome['auto_cooldown_disabled'])
-        self.assertFalse(outcome.get('recorded'))
-        # 独立持久 availability：真实 1308 硬上限落 hard_hold（无限期，无窗口猜测）。
-        recorded = summary['zcode_availability_recorded']
-        self.assertTrue(recorded['recorded'], recorded)
-        self.assertEqual(recorded['state'], 'hard_hold')
-        self.assertTrue(recorded['hard_quota'])
-        self.assertEqual(recorded['provider_code'], 1308)
-        self.assertIsNone(recorded['blocked_until_utc'])
-        # 原始数字码 1308（内层），外层 wrapper 码区分保留；无时区 reset→unverified 不猜。
-        ref = summary['quota_wrapper_reference']
-        self.assertEqual(ref['provider_code'], 1308)
-        self.assertEqual(ref['wrapper_code'], 'PROVIDER_BUSINESS_ERROR')
-        self.assertTrue(str(ref['reset_timezone']).startswith('unverified'))
-        # 原始错误引用直指本次 stdout 失败信封，SHA 对原始字节核验，绝不指向 report-state。
-        oer = summary['original_error_reference']
-        self.assertEqual(os.path.realpath(oer['path']),
-                         os.path.realpath(str(out1 / 'stdout.json')))
-        self.assertEqual(oer['sha256'], hashlib.sha256(stdout_bytes).hexdigest())
-        self.assertNotIn('report-state', oer['path'])
-        # SDK ProviderBusinessError 的本次 stderr 原 ref/SHA 一并保留。
-        self.assertEqual(os.path.realpath(oer['sdk_stderr_frame']['path']),
-                         os.path.realpath(str(out1 / 'stderr.log')))
-        self.assertEqual(oer['sdk_stderr_frame']['sha256'],
-                         hashlib.sha256(self.REAL_STDERR_FRAME).hexdigest())
-        # 缺原始报告如实保留：无 response.md → 不宣称 bound，不补写报告。
-        self.assertFalse(summary['report_bound'])
-        self.assertFalse((out1 / 'response.md').exists())
-        # 第二次独立新 output：BW-SIMPLE-PRIORITY-RETRY-S4 用户政策——普通新一轮不再据历史
-        # availability 挡真实尝试。qc.zcode_availability_gate(purpose='dispatch') 允许通过、
-        # dp.consume_for_entry 消费成功，正式入口第二次仍会真实调用 Popen（每轮从最高优先级
-        # 真实候选起，失败换下一个）。真实失败仍落 availability 诊断（epoch CAS 结算），绝
-        # 不假装 healthy、不清旧 hold；本用例仍要求旧 cooldowns 表不落、unknown-shared 不出现。
-        out2 = self.tmp / 'out-1308-again'
-        code2, summary2, stdout2 = self._run(out2, stdout_bytes, self.REAL_STDERR_FRAME,
-                                             5, counter)
-        self.assertEqual(counter['n'], 2)  # 新轮真实尝试，不再被历史 hold 前置挡
-        self.assertEqual(code2, 3, summary2)  # 真实失败退出（非门前拒 2）
-        self.assertNotIn('zcode_availability_rejected', stdout2)
-        # 独立 availability 诊断：第二次真实 429 再次落 hard_hold（epoch 前进、CAS 结算）。
-        rec2 = summary2['zcode_availability_recorded']
-        self.assertTrue(rec2['recorded'], rec2)
-        self.assertEqual(rec2['state'], 'hard_hold')
+        code, summary, stdout_text = self._run(out1, stdout_bytes,
+                                               self.REAL_STDERR_FRAME, 5, counter)
+        self.assertEqual(code, 2, stdout_text)
+        self.assertIsNone(summary)  # 门前拒绝，绝不落 summary
+        self.assertEqual(counter['n'], 0)  # 零 Popen、零派发
+        refusal = json.loads(stdout_text)
+        self.assertTrue(refusal['refused_before_dispatch'], refusal)
+        self.assertFalse(refusal['sent'], refusal)
+        self.assertIn(refusal['reason'], ('unknown_pool', 'retired_pool'), refusal)
         self.assertNotIn(qc.UNKNOWN_SHARED_GROUP, qc.get_status(self.store)['cooldowns'])
 
     def test_structured_stdout_429_empty_stderr_binds_stdout_envelope(self):
-        # 缺陷 2 对照：结构化 429 只在 stdout.json、stderr 为空 → 原错误 ref 直接指本次
-        # stdout 失败信封且 SHA 一致（绝不因 stderr 空漏记，也绝不绑空/缺失 stderr）。
+        # 缺陷 2 对照（BW-ZCODE-RETIRE-20261020 更新口径）：zcode 池已全局退役——结构化
+        # 429 回放在派工面不可再触发，入口在权威原子门即诚实拒绝：rc=2、零 Popen、
+        # 零 summary/stdout.json（绝不派发即绝不产生任何错误载体绑定）。
         counter = {'n': 0}
         env = {'carrier': 'zcode-sdk', 'ok': False, 'preflight_ok': True,
                'errors': ['quota exceeded'],
@@ -1417,31 +1382,27 @@ class ZCodeEntryReplayTests(unittest.TestCase):
                'event_count': 0}
         stdout_bytes = json.dumps(env, ensure_ascii=False).encode('utf-8')
         out = self.tmp / 'out-structured'
-        code, summary, _ = self._run(out, stdout_bytes, b'', 5, counter)
-        self.assertEqual(code, 3)
-        oer = summary['original_error_reference']
-        self.assertEqual(os.path.realpath(oer['path']),
-                         os.path.realpath(str(out / 'stdout.json')))
-        self.assertEqual(oer['sha256'], hashlib.sha256(stdout_bytes).hexdigest())
-        self.assertNotIn('sdk_stderr_frame', oer)  # 空 stderr 无真实帧 → 不冒充
+        code, summary, stdout_text = self._run(out, stdout_bytes, b'', 5, counter)
+        self.assertEqual(code, 2, stdout_text)
+        self.assertEqual(counter['n'], 0)
+        self.assertIsNone(summary)
+        self.assertFalse((out / 'stdout.json').exists())
 
     def test_warning_only_stderr_does_not_masquerade_as_original_error(self):
-        # 缺陷 2 对照：stderr 仅 warning（无白名单错误帧）不得冒充原错误；本次 stdout
-        # 失败信封才是原错误载体。
+        # 缺陷 2 对照（BW-ZCODE-RETIRE-20261020 更新口径）：退役池在门前即拒——warning
+        # stderr 冒充原错误的注入路径同样不可达：rc=2、零 Popen、零输出证据文件。
         counter = {'n': 0}
         env = {'carrier': 'zcode-sdk', 'ok': False, 'preflight_ok': True,
                'errors': ['ProviderBusinessError: [1308][已达到 5 小时的使用上限]'],
                'errors_info': None, 'event_count': 0}
         stdout_bytes = json.dumps(env, ensure_ascii=False).encode('utf-8')
         out = self.tmp / 'out-warning'
-        code, summary, _ = self._run(out, stdout_bytes, b'WARNING: noisy but not an error\n',
-                                     5, counter)
-        self.assertEqual(code, 3)
-        oer = summary['original_error_reference']
-        self.assertEqual(os.path.realpath(oer['path']),  # 绝不指 warning stderr
-                         os.path.realpath(str(out / 'stdout.json')))
-        self.assertEqual(oer['sha256'], hashlib.sha256(stdout_bytes).hexdigest())
-        self.assertNotIn('sdk_stderr_frame', oer)
+        code, summary, stdout_text = self._run(out, stdout_bytes,
+                                               b'WARNING: noisy but not an error\n', 5, counter)
+        self.assertEqual(code, 2, stdout_text)
+        self.assertEqual(counter['n'], 0)
+        self.assertIsNone(summary)
+        self.assertFalse((out / 'stderr.log').exists())
 
 
 class CBReceiptIdentityTests(unittest.TestCase):

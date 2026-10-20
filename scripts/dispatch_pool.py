@@ -190,15 +190,17 @@ except ImportError:  # isolated revision tree / standalone tests
 # 官方 API 离峰窗，也不套 Max 北京夜间窗）。
 # BW-WORKER-WIDGET-20261018-S3（用户 2026-10-18 最新明确）：codebuddy:deepseek-v4.1-flash
 # 与 codebuddy:glm-5.3-flash **不共享名额，各自独立 1 槽**（旧「同一物理 1 槽」口径作废）。
-# 当前 AUTO 层序：CodeBuddy deepseek(0) > 三 Qoder Max(1) > claude(2) > ZCode(3) >
+# 当前 AUTO 层序：CodeBuddy deepseek(0) > 三 Qoder Max(1) > claude(2) >
 # 两 OpenCode 免费模型(4，同级、各自独立 1 槽、无时段门/无限额条件) >
 # CodeBuddy GLM(5，额度独立的低层补位；BW-LIMIT30-20261019-S3 起不再要求当轮 DeepSeek
 # 限额证据，缺省候选即含) > 两地区 Flash 兜底。
-# claude 仍 2 槽。物理调度总数 DOMESTIC_TOTAL_CAPACITY = 12(主力，含两个 CodeBuddy 各 1
-# 与两 OpenCode 各 1) + 4(两地区 Flash) = 16（由 MAIN_FORCE+OVERFLOW 求和自动得出）。
+# BW-ZCODE-RETIRE-20261020（用户明确指令）：zcode:GLM-5.3 从正常池**全局退役**——任何
+# 宿主/AUTO/executor/显式 combo 都不再派发该池，浮窗不再显示其行；真实在途仍按 retired
+# 机制自然排干（计入 retired_active）。
+# claude 仍 2 槽。物理调度总数 DOMESTIC_TOTAL_CAPACITY = 10(主力，含两个 CodeBuddy 各 1
+# 与两 OpenCode 各 1) + 4(两地区 Flash) = 14（由 MAIN_FORCE+OVERFLOW 求和自动得出）。
 # WorkBuddy 仍 human-relay、CodeBuddy 其它旧模型（新旧 GLM 之外的组合）仍不恢复。
 MAIN_FORCE_POOLS = (('codebuddy', 'deepseek-v4.1-flash'),
-                    ('zcode', 'GLM-5.3'),
                     ('qoder', 'Qwen3.8-Max'),
                     ('qodercn', 'Qwen3.8-Max'),
                     ('qodercn', 'Qwen-3.8-Max'),
@@ -208,7 +210,6 @@ MAIN_FORCE_POOLS = (('codebuddy', 'deepseek-v4.1-flash'),
                     ('codebuddy', 'glm-5.3-flash'))
 MAIN_FORCE_CAPACITY = {'codebuddy:deepseek-v4.1-flash': 1,
                        'codebuddy:glm-5.3-flash': 1,
-                       'zcode:GLM-5.3': 2,
                        'qoder:Qwen3.8-Max': 1,
                        'qodercn:Qwen3.8-Max': 1,
                        'qodercn:Qwen-3.8-Max': 2,
@@ -227,7 +228,6 @@ POOL_PRIORITY = {
     'qoder:Qwen3.8-Max': 1,
     'qodercn:Qwen3.8-Max': 1,
     'claude:deepseek-flash': 2,
-    'zcode:GLM-5.3': 3,
     'opencode:deepseek-v4.1-flash-free': 4,
     'opencode:glm-5.3-flash-free': 4,
     'codebuddy:glm-5.3-flash': 5,
@@ -237,12 +237,13 @@ POOL_PRIORITY = {
 # BW-POOL-SPLIT-20261010-S2：CN DeepSeek-Flash 从正常池退出，但保留池名与 0 容量条目，
 # 让已有真实在途 attempt 仍能通过 `_count_active` 与 `finish/reconcile` 到达自然终态
 # 释放；不再有任何新 claim 落到该池（AUTO/executor=qodercn/显式 combo 均拒绝）。
-LEGACY_RETIRED_POOL_KEYS = ('qodercn:DeepSeek-Flash',)
+# BW-ZCODE-RETIRE-20261020（用户明确指令）：zcode:GLM-5.3 同机制全局退役。
+LEGACY_RETIRED_POOL_KEYS = ('qodercn:DeepSeek-Flash', 'zcode:GLM-5.3')
 LUNA_RUNTIME = 'luna'
 LUNA_MODEL = 'native'
 LUNA_ASK_TIMEOUT_SECONDS = 300
 DOMESTIC_TOTAL_CAPACITY = (sum(MAIN_FORCE_CAPACITY.values())
-                           + sum(OVERFLOW_CAPACITY.values()))  # 12 (两个 CodeBuddy+两 OpenCode) + 4 = 16
+                           + sum(OVERFLOW_CAPACITY.values()))  # 10 (两个 CodeBuddy+两 OpenCode) + 4 = 14
 
 # pool_key -> capacity（None 表示无上限，仅 Luna；0 表示已退出正常池但保留历史真实在途）。
 CAPACITY = {}
@@ -1113,6 +1114,9 @@ def main_force_limits(store_path=None, *, now=None) -> dict:
 
 
 # ------------------------------------------------------------------ 统一国内策略
+# BW-ZCODE-RETIRE-20261020（用户明确指令）：zcode:GLM-5.3 已按 LEGACY_RETIRED_POOL_KEYS
+# 机制全局退役——不进候选/浮窗/新 claim；本常量仅供历史诊断引用（availability/quota
+# 旧证据读取与在途排干），绝不据此派发。
 ZCODE_POOL_KEY = 'zcode:GLM-5.3'
 
 
@@ -1227,11 +1231,12 @@ def _scope_allowed_candidates(scope, zcode_blocked, codebuddy_glm_allowed=False)
     if conflict:
         return []
     if combo is not None:
-        if combo == ZCODE_POOL_KEY and zcode_blocked:
-            return []
+        # BW-ZCODE-RETIRE-20261020：zcode:GLM-5.3 组合已在 _scope_combo_from_scope 按
+        # LEGACY_RETIRED fail-closed，此处只可能剩现役组合。
         return [combo]
     if executor == 'zcode':
-        return [] if zcode_blocked else [ZCODE_POOL_KEY]
+        # 已全局退役：显式 executor=zcode 无任何受信任候选，诚实空集（绝不改派别池）。
+        return []
     if executor == 'qoder':
         return [QMAX_POOL_KEY, QFLASH_POOL_KEY]
     if executor == CN_RUNTIME:
@@ -1247,11 +1252,10 @@ def _scope_allowed_candidates(scope, zcode_blocked, codebuddy_glm_allowed=False)
         # 显式 OpenCode 入口：只列两个精确免费模型，同级、无时段门/额度前提，绝不跨到
         # CodeBuddy/其它池，也绝不自动付费回退。
         return list(OPENCODE_POOL_KEYS)
-    mains = [k for k in MAIN_FORCE_KEYS
-             if not (k == ZCODE_POOL_KEY and zcode_blocked)]
-    # 默认/auto 受信任候选：三主力在前、两地区 Flash 同级兜底在后；已 retired 的 CN
-    # DeepSeek-Flash 不在候选集合中，任何 AUTO 派工绝不新落该池。
-    return mains + list(OVERFLOW_KEYS)
+    # 默认/auto 受信任候选：现役主力在前、两地区 Flash 同级兜底在后；已退役的 CN
+    # DeepSeek-Flash 与 zcode:GLM-5.3（BW-ZCODE-RETIRE-20261020）不在候选集合中，
+    # 任何 AUTO 派工绝不新落退役池。
+    return list(MAIN_FORCE_KEYS) + list(OVERFLOW_KEYS)
 
 
 def _select_main_force(conn, requested_pk, now, eligible=None):
@@ -1526,19 +1530,10 @@ def _domestic_policy(conn, requested_pk, now, executor='auto', eligible=None,
     if executor == 'zcode':
         if requested_pk != ZCODE_POOL_KEY:
             return 'executor_conflict', None
-        # BW-SIMPLE-PRIORITY-RETRY-S4 用户政策：普通新一轮即便调用方/mock 传入历史
-        # availability blocked，也**不因此拒绝**——直接尝试真实 ZCode 池（受容量/工作区/
-        # 去重/unknown 在途照常约束，绝不抢占别人的在途名额）。真实失败才落 availability
-        # 诊断、成功仍 epoch/attempt CAS 结算，不假装 healthy。显式 recovery probe 的
-        # 生命周期/陈旧成功保护由 quota_control 入口与结算独立保证，不在此前置拦截。
-        # BW-LIMIT30-20261019-S3：若最近一次真实结构化 429 距其 ended_at_utc 不足 1800 秒，
-        # 直接 ZCode 入口必须零 Popen 拒绝；恰好 1800 秒及更久自动恢复现有优先级可选。
-        if _quota_limit_window_active(conn, requested_pk, now):
-            return 'main_force_limited', None
-        cap = capacity_for(requested_pk)
-        if cap is not None and _count_active(conn, requested_pk) < cap:
-            return 'claim', requested_pk
-        return 'full', None
+        # BW-ZCODE-RETIRE-20261020（用户明确指令）：zcode:GLM-5.3 已全局退役
+        # （LEGACY_RETIRED_POOL_KEYS，capacity=0），任何宿主/入口的新 claim 一律拒绝；
+        # 历史在途仍经 finish/reconcile 自然排干，ZCode availability/quota 诊断口径保留。
+        return 'retired_pool', None
 
     # executor == 'codebuddy' 但请求的不是精确恢复组合：绝不落回 AUTO 选择/别的池。
     if executor == CODEBUDDY_RUNTIME:
@@ -3041,7 +3036,9 @@ def claim_due(store_path=None, *, task_id, now=None, scope=None,
                 elif scope_executor == 'qoder':
                     allowed = {QMAX_POOL_KEY, QFLASH_POOL_KEY}
                 elif scope_executor == 'zcode':
-                    allowed = {ZCODE_POOL_KEY}
+                    # BW-ZCODE-RETIRE-20261020：zcode:GLM-5.3 已全局退役，原 scope 绑定
+                    # ZCode 的票据不再有任何可回收候选——保持 pending，绝不改派别池、不 Luna。
+                    allowed = set()
                 elif scope_executor == CN_RUNTIME:
                     # CN-bound ticket reclaims only the CN Max (built-in + custom)/Flash pools,
                     # never international/ZCode, never Luna; retired DeepSeek-Flash is not a
@@ -3052,8 +3049,9 @@ def claim_due(store_path=None, *, task_id, now=None, scope=None,
                     # 名单内候选参与本任务回收。
                     allowed = (set(scope_allowlist) if allowed is None
                                else allowed & scope_allowlist)
-                if allowed is not None and ZCODE_POOL_KEY in allowed and zcode_blocked:
-                    # 原 scope 只要 ZCode，但 ZCode 当前不可用：不回收、不 Luna，保持 pending。
+                if allowed is not None and ZCODE_POOL_KEY in allowed:
+                    # 原 scope/名单只要 ZCode：该池已全局退役（或按旧证据不可用）——
+                    # 不回收、不 Luna，保持 pending 等待人工处理，绝不改派其它执行器。
                     conn.execute('ROLLBACK')
                     return {'claimed': False, 'task_id': task_id, 'state': row['state'],
                             'reasons': ['the original scope pins this task to ZCode but '

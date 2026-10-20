@@ -631,27 +631,19 @@ class TaskToolRouteEntryTests(unittest.TestCase):
         return proc, summary, req, submits, out
 
     def test_edit_bash_without_contract_uses_task_tool_route(self):
+        # BW-ZCODE-RETIRE-20261020：zcode 池全局退役——普通（无 command_contract）编辑
+        # 任务在权威原子门即诚实拒绝：rc=2、refused_before_dispatch、零 submit、
+        # 零 request.json（task_tool_authorization 决策随派发不可达）、绝不改派别池。
         proc, summary, req, submits, out = self._run(
             't-normal', extra=['--mode', 'edit', '--tools', 'Read,Glob,Grep,Edit,Write,Bash'])
-        self.assertEqual(proc.returncode, 0, proc.stdout + proc.stderr)
-        self.assertTrue(out.is_dir())
-        self.assertIs(req['task_tool_authorization'], True)
-        self.assertNotIn('command_contract', req)
-        self.assertNotIn('file_scope_contract', req)
-        self.assertEqual(submits, 1)
-        self.assertIs(summary['protocol_success'], True)
-        # present 是派工前 Python 决策；broker_ready/started 等执行载体回声不在离线断言范围。
-        self.assertIs(summary['task_tool_authorization_present'], True)
-        # 实际发送载荷携带本轮 runtime 与请求模型身份（不读旧提示词推断）。
-        sent = (out / 'sent-task-payload.bin').read_text(encoding='utf-8')
-        self.assertIn('runtime=zcode；请求模型=GLM-5.3', sent)
-        self.assertEqual(req['executor_identity']['runtime'], 'zcode')
-        self.assertEqual(req['executor_identity']['request_model'], 'GLM-5.3')
-        # 环境值绝不落进任何证据文件。
-        for p in out.iterdir():
-            if p.is_file():
-                self.assertNotIn('sh-SECRET-S2',
-                                 p.read_text(encoding='utf-8', errors='ignore'))
+        self.assertEqual(proc.returncode, 2, proc.stdout + proc.stderr)
+        refusal = json.loads(proc.stdout)
+        self.assertTrue(refusal['refused_before_dispatch'], refusal)
+        self.assertFalse(refusal['sent'], refusal)
+        self.assertIn(refusal['reason'], ('unknown_pool', 'retired_pool'), refusal)
+        self.assertEqual(submits, 0)
+        self.assertIsNone(req)
+        self.assertIsNone(summary)
 
     def test_plan_bash_still_refused_read_only(self):
         proc, summary, req, submits, out = self._run(
@@ -673,6 +665,9 @@ class TaskToolRouteEntryTests(unittest.TestCase):
         self.assertIn('forbids Bash', proc.stdout)
 
     def test_edit_bash_with_command_contract_keeps_strict_route(self):
+        # BW-ZCODE-RETIRE-20261020：严格路径（带 command_contract）同样先在权威原子门
+        # 诚实拒绝——rc=2、零 submit、零 request.json；退役前"绝不设 task_tool_authorization"
+        # 的严格语义随派发面整体不可达，此处固化"带任何契约都不改派、只诚实拒"。
         cc = self.root / 'cc.json'
         cc.write_text(json.dumps({'privacy_free': False, 'commands': [
             {'command': 'ls', 'cwd': str(self.work)}]}, ensure_ascii=False),
@@ -680,8 +675,10 @@ class TaskToolRouteEntryTests(unittest.TestCase):
         proc, summary, req, submits, out = self._run(
             't-strict', extra=['--mode', 'edit', '--tools', 'Read,Bash',
                                '--command-contract', str(cc)])
-        # 严格路径：带 command_contract，绝不设 task_tool_authorization。
-        self.assertEqual(proc.returncode, 0, proc.stdout + proc.stderr)
-        self.assertIn('command_contract', req)
-        self.assertNotIn('task_tool_authorization', req)
-        self.assertIs(summary['task_tool_authorization_present'], False)
+        self.assertEqual(proc.returncode, 2, proc.stdout + proc.stderr)
+        refusal = json.loads(proc.stdout)
+        self.assertTrue(refusal['refused_before_dispatch'], refusal)
+        self.assertIn(refusal['reason'], ('unknown_pool', 'retired_pool'), refusal)
+        self.assertEqual(submits, 0)
+        self.assertIsNone(req)
+        self.assertIsNone(summary)

@@ -169,7 +169,8 @@ class TestCodebuddyPoolPriority(_PoolBase):
     def test_codebuddy_has_one_independent_slot(self):
         self.assertEqual(dp.capacity_for(CB), 1)
         self.assertIn(CB, dp.MAIN_FORCE_KEYS)
-        self.assertEqual(dp.DOMESTIC_TOTAL_CAPACITY, 16)
+        # BW-ZCODE-RETIRE-20261020：zcode 2 槽退役，权威总容量 16→14。
+        self.assertEqual(dp.DOMESTIC_TOTAL_CAPACITY, 14)
 
     def test_auto_prefers_codebuddy_over_all_max_when_free(self):
         out = self.reserve('t1', 'qoder', 'Qwen3.8-Max', 'auto')
@@ -178,8 +179,10 @@ class TestCodebuddyPoolPriority(_PoolBase):
 
     def test_after_codebuddy_occupied_auto_lands_max(self):
         # 占用 CodeBuddy 唯一名额（本轮真实失败/在用）→ AUTO 落最高层的下一档三 Qoder Max。
+        # BW-ZCODE-RETIRE-20261020：原 zcode 请求组合已退役（会先撞 unknown_pool），
+        # 改用现役国际 Flash 请求组合验证同一 AUTO 层序。
         self.reserve('occ', 'codebuddy', CB_MODEL, 'codebuddy')
-        out = self.reserve('t2', 'zcode', 'GLM-5.3', 'auto')
+        out = self.reserve('t2', 'qoder', 'Qwen3.8-Flash', 'auto')
         self.assertIn(out['selected']['pool_key'], MAXES)
 
     def test_round_failed_codebuddy_falls_to_next_qualified(self):

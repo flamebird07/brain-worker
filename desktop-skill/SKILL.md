@@ -33,8 +33,8 @@ ZCode 桌面端与 Qoder 桌面端共用的**同一份**入口，安装到两个
 
 | 宿主 | 识别信号（环境变量存在即命中） | 本宿主不可派发的精确组合 |
 |---|---|---|
-| Qoder 桌面 | `QODER_CONFIG_DIR` 或 `QODERCN_CONFIG_DIR` 或 `QODER_PRODUCT_ID` | `qoder:Qwen3.8-Max`、`qodercn:Qwen-3.8-Max`、`qodercn:Qwen3.8-Max`、`zcode:GLM-5.3` |
-| ZCode 桌面 | `ZCODE_SKILL_DIR` 或 `ZCODE_DESKTOP_CONTEXT_PROMPT_ENABLED` 或 `ZCODE_APP_VERSION` | `zcode:GLM-5.3` |
+| Qoder 桌面 | `QODER_CONFIG_DIR` 或 `QODERCN_CONFIG_DIR` 或 `QODER_PRODUCT_ID` | `qoder:Qwen3.8-Max`、`qodercn:Qwen-3.8-Max`、`qodercn:Qwen3.8-Max` |
+| ZCode 桌面 | `ZCODE_SKILL_DIR` 或 `ZCODE_DESKTOP_CONTEXT_PROMPT_ENABLED` 或 `ZCODE_APP_VERSION` | 无（`zcode:GLM-5.3` 已由引擎全局退役，任何宿主均不派发） |
 
 **无法确定宿主时必须 fail-closed：排除上表全部组合的并集**，并在回执中说明宿主未识别。绝不默认放行、绝不猜测宿主、绝不因为识别失败而放宽候选。
 
@@ -62,6 +62,7 @@ ZCode 桌面端与 Qoder 桌面端共用的**同一份**入口，安装到两个
 3. 只保存真实证据：request、进程终态、原始 stdout/stderr、报告、工具事件和产物回读。模型自述、退出码 0、格式合格或测试数量都不能单独证明工程完成。
 4. 首次权限拒绝即停止当前受影响调用并保存证据；在已有授权范围内修正配置或重新裁决，不把内部错误升级成整个用户任务暂停。
 5. 独立核对实际改动、必要测试和业务结果。状态询问、故障报告和阶段复盘不能取代原目标；用户任务未完成时继续处理已有授权且可行的部分。
+6. 用户中途插话入队不打断：派发后本会话空闲时处理插话并把结论固化到 todo 队列；队列有可做项不空转停顿；互不冲突的队列任务按容量并行派工（编辑区重叠或同工作区则串行，同仓并行用各自 git worktree）。
 
 桌面入口只负责调用既有引擎，不修改真实共享池来制造空位，不清历史错误，不查询余额，不复制或输出任何凭据。
 

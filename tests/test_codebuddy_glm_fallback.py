@@ -525,13 +525,13 @@ class TestIndependentModelSlots(_Base):
             self.assertEqual(dp._count_active(conn, GLM), 1)
 
     def test_total_physical_capacity_16_and_status_independent_counts(self):
-        # BW-OPENCODE-20261019 起物理总 16：两 OpenCode 免费模型各独立 1 槽、独立计数。
-        self.assertEqual(dp.DOMESTIC_TOTAL_CAPACITY, 16)
+        # BW-ZCODE-RETIRE-20261020 起物理总 14（原 16 去掉 zcode 2 槽）：
+        # 两 OpenCode 免费模型各独立 1 槽、独立计数。
+        self.assertEqual(dp.DOMESTIC_TOTAL_CAPACITY, 14)
         self.assertEqual(dp.CAPACITY[GLM], 1)
         self.assertEqual(dp.MAIN_FORCE_CAPACITY[GLM], 1)
         self.seed(CB, 1)
         self.seed(GLM, 1)
-        self.seed(ZCODE, 2)
         self.seed(QMAX, 1)
         self.seed(CN_MAX, 1)
         self.seed(CN_CUSTOM_MAX, 2)
@@ -541,8 +541,8 @@ class TestIndependentModelSlots(_Base):
         self.seed(QFLASH, 2)
         self.seed(CN_FLASH, 2)
         st = dp.status(self.store, now=T_NIGHT)
-        self.assertEqual(st['domestic']['capacity'], 16)
-        self.assertEqual(st['domestic']['active'], 16)
+        self.assertEqual(st['domestic']['capacity'], 14)
+        self.assertEqual(st['domestic']['active'], 14)
         self.assertEqual(st['pools'][CB]['active'], 1)
         self.assertEqual(st['pools'][CB]['free'], 0)
         self.assertEqual(st['pools'][GLM]['active'], 1)
@@ -550,7 +550,7 @@ class TestIndependentModelSlots(_Base):
         self.assertNotIn('shared_active', st['pools'][GLM])
         self.assertNotIn('shared_group', st['pools'][GLM])
         self.assertNotIn('shared_capacity', st['pools'][CB])
-        self.assertEqual(sum(p['active'] for p in st['pools'].values()), 16)
+        self.assertEqual(sum(p['active'] for p in st['pools'].values()), 14)
         for model in (GLM_MODEL, CB_MODEL):
             out = dp.reserve(self.store, task_id=f'full-{model}',
                              runtime='codebuddy',

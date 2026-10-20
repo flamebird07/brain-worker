@@ -69,13 +69,15 @@ class _TmpBase(unittest.TestCase):
         self.ws.mkdir()
         # 绝不使用真实/共享池：显式临时库，且断言不是默认路径。
         self.assertNotEqual(str(self.dispatch), str(dp.default_store_path()))
-        # BW-CODEBUDDY-MAIN-S3 + BW-WORKER-WIDGET-20261018-S3 + BW-OPENCODE-20261019-S3：
-        # 本文件的历史层序/满池断言（Max > claude > Z、总 N 满）都是在 CodeBuddy 恢复之前
-        # 写的。这里先真实占住 CodeBuddy deepseek 与 GLM 各自的独立 1 槽（GLM 为额度条件池，
-        # 夹具只作占位、绝不进 AUTO 候选），使 AUTO 仍按旧层序选择、`_fill_six` 补满其余
-        # 14 槽（含 BW-OPENCODE-20261019-S3 起两个 OpenCode 免费模型各 1 独立槽）后总量
-        # 正好 16；CodeBuddy 作为新最高层由独立 tests/test_codebuddy_reactivation.py
-        # 验证，两个 OpenCode 槽由 _fill_six 真实 reserve 占住，绝不放宽任何安全断言。
+        # BW-CODEBUDDY-MAIN-S3 + BW-WORKER-WIDGET-20261018-S3 + BW-OPENCODE-20261019-S3 +
+        # BW-ZCODE-RETIRE-20261020：本文件的历史层序/满池断言（Max > claude > 两 OpenCode >
+        # 两 Flash、总 N 满）都是在 CodeBuddy 恢复之前写的。BW-ZCODE-RETIRE-20261020 起
+        # zcode:GLM-5.3 全局退役（LEGACY_RETIRED_POOL_KEYS、capacity=0、不入候选）。这里先
+        # 真实占住 CodeBuddy deepseek 与 GLM 各自的独立 1 槽（GLM 为额度条件池，夹具只作
+        # 占位、绝不进 AUTO 候选），使 AUTO 仍按旧层序选择、`_fill_six` 补满其余 12 槽
+        # （含 BW-OPENCODE-20261019-S3 起两个 OpenCode 免费模型各 1 独立槽）后总量正好 14；
+        # CodeBuddy 作为新最高层由独立 tests/test_codebuddy_reactivation.py 验证，两个
+        # OpenCode 槽由 _fill_six 真实 reserve 占住，绝不放宽任何安全断言。
         with contextlib.closing(dp.connect(self.dispatch)) as conn:
             conn.execute('INSERT INTO attempts(token, task_id, runtime, model, pool_key, '
                          "state, reserved_at_utc) VALUES(?,?,?,?,?,?,?)",
@@ -111,14 +113,14 @@ class _TmpBase(unittest.TestCase):
         return dp.status(self.dispatch, now=T0)['pools'][pk]['active']
 
     def _fill_six(self):
-        # BW-CLAUDE-CAPACITY2 + BW-OPENCODE-20261019-S3 满池基线：zcode×2 + 两内置 Max 各 1
-        # + CN 自定义 Max×2 + 两地区 Flash 各 2 + claude:deepseek-flash×2 + 两 OpenCode 免费
-        # 模型各 1（T0=北京周四 23:00 offhours，时段门放行；OpenCode 本无时段门）。
-        # setUp 另占住 CodeBuddy 两独立槽 → 总量正好 16。全部经显式 executor 逐一确定性
-        # claim，绝不删除任何安全断言。
+        # BW-CLAUDE-CAPACITY2 + BW-OPENCODE-20261019-S3 + BW-ZCODE-RETIRE-20261020 满池基线：
+        # 两内置 Max 各 1 + CN 自定义 Max×2 + 两地区 Flash 各 2 + claude:deepseek-flash×2 +
+        # 两 OpenCode 免费模型各 1（T0=北京周四 23:00 offhours，时段门放行；OpenCode 本无时段
+        # 门）= 12 槽。zcode:GLM-5.3 已全局退役，不再是可 claim 的候选，故不列入填满序列。
+        # setUp 另占住 CodeBuddy 两独立槽 → 总量正好 14（DOMESTIC_TOTAL_CAPACITY）。全部经
+        # 显式 executor 逐一确定性 claim，绝不删除任何安全断言。
         toks = []
-        combos = [('zcode', 'GLM-5.3'), ('zcode', 'GLM-5.3'),
-                  ('qoder', 'Qwen3.8-Max'), ('qodercn', 'Qwen3.8-Max'),
+        combos = [('qoder', 'Qwen3.8-Max'), ('qodercn', 'Qwen3.8-Max'),
                   ('qodercn', 'Qwen-3.8-Max'), ('qodercn', 'Qwen-3.8-Max'),
                   ('qoder', 'Qwen3.8-Flash'), ('qoder', 'Qwen3.8-Flash'),
                   ('qodercn', 'Qwen3.8-Flash'), ('qodercn', 'Qwen3.8-Flash'),
@@ -126,8 +128,7 @@ class _TmpBase(unittest.TestCase):
                   ('opencode', dp.OPENCODE_DEEPSEEK_MODEL),
                   ('opencode', dp.OPENCODE_GLM_MODEL)]
         for i, (rt, md) in enumerate(combos):
-            ex = ('zcode' if rt == 'zcode' else
-                  'claude' if rt == 'claude' else
+            ex = ('claude' if rt == 'claude' else
                   'opencode' if rt == 'opencode' else
                   'qodercn' if rt == 'qodercn' else 'qoder')
             r = dp.reserve(self.dispatch, task_id=f'f{i}', runtime=rt, model=md,
@@ -338,23 +339,22 @@ class DispatchRoutingTests(_TmpBase):
                          (zcode, qoder, qc._iso(T0)))
 
     def test_auto_skips_unavailable_zcode_routes_to_qoder_zero_z_starts(self):
-        # BW-SIMPLE-PRIORITY-RETRY-S4：历史 hard_hold 不再作候选剔除——Z 仍在
-        # `_eligible_main_forces` 里；但 AUTO 仍按主力优先级层（三 Qoder Max > claude > Z）
-        # 择最高，Z 不抢空闲 QMAX。这里断言 Z 未被旧 hold 挡、AUTO 正常路由 QMAX。
-        # 真实失败才落诊断、成功 epoch/attempt CAS 结算保留，不假装 healthy、不清 hold。
+        # BW-ZCODE-RETIRE-20261020：zcode:GLM-5.3 已全局退役——不再进候选集，且任何 zcode
+        # 组合请求（含 executor='auto' 点名 runtime=zcode）在最后一道容量门前一律诚实拒绝
+        # （unknown_pool），绝不 routing_required 改派别池、绝不启动退役 ZCode。availability
+        # 诊断口径仍保留（真实失败才落库），但退役池绝不被派发。
         self._hold_zcode()
         with contextlib.closing(dp.connect(self.dispatch)) as conn:
             elig = dp._eligible_main_forces(conn, zcode_blocked=None, now=T0)
-        self.assertIn(ZCODE, elig, elig)  # 旧 hold 不再把 Z 从候选集剔除
+        self.assertNotIn(ZCODE, elig, elig)  # 退役：Z 已从候选集剔除
         out = dp.select_and_claim(self.dispatch, task_id='t1', runtime='zcode',
                                   model='GLM-5.3', workspace=str(self._ws_for('t1')),
                                   prompt_sha256='p', stage='s1', chat_id='c1',
                                   executor='auto', quota_store=self.quota, now=T0)
-        # AUTO 按最高优先级层选：Max 层最高，其中 CN 自定义先于两内置（Z 不抢 Max）。
         self.assertFalse(out['allowed'], out)
-        self.assertTrue(out['routing_required'], out)
-        self.assertEqual(out['selected']['pool_key'], dp.CN_CUSTOM_MAX_POOL_KEY, out)
-        self.assertEqual(self._active(ZCODE), 0)  # Z 本轮未被 AUTO 抢，等下一新轮/显式入口
+        self.assertEqual(out['reason'], 'unknown_pool', out)
+        self.assertFalse(out['routing_required'], out)  # 退役组合绝不改派别池
+        self.assertEqual(self._active(ZCODE), 0)        # 零 ZCode 启动
 
     def test_explicit_qoder_not_one_on_one_rerouted_to_zcode(self):
         # 历史 committed_zcode 远高于 qoder，但显式 Qoder 入口有空位一律直接 claim Max。
@@ -368,158 +368,99 @@ class DispatchRoutingTests(_TmpBase):
         self.assertEqual(self._active(ZCODE), 0)
 
     def test_auto_balances_eligible_only(self):
-        # BW-SIMPLE-PRIORITY-RETRY-S4：历史 hard_hold 不再作候选剔除，Z 仍在
-        # `_eligible_main_forces` 里；但 AUTO 按主力优先级层选择，Z 不抢空闲 QMAX——
-        # 反复 AUTO 请求 Z 都如实路由 QMax（真实最高优先），绝不因旧 hold 挡新轮、也
-        # 绝不因 Z 合格就跳过 Max。真实失败才落诊断、成功仍 epoch/attempt CAS 结算。
+        # BW-ZCODE-RETIRE-20261020：Z 已退役、不在候选集；反复请求 runtime='zcode' 一律
+        # 诚实拒绝（unknown_pool），绝不因退役池 routing_required 改派、绝不占用 ZCode。
         self._hold_zcode()
         with contextlib.closing(dp.connect(self.dispatch)) as conn:
             elig = dp._eligible_main_forces(conn, zcode_blocked=None, now=T0)
-        self.assertIn(ZCODE, elig, elig)
+        self.assertNotIn(ZCODE, elig, elig)
         for i in range(2):
             out = dp.select_and_claim(self.dispatch, task_id=f'a{i}', runtime='zcode',
                                       model='GLM-5.3', workspace=str(self._ws_for(f'a{i}')),
                                       prompt_sha256='p', stage='s1',
                                       executor='auto', quota_store=self.quota, now=T0)
-            self.assertTrue(out['routing_required'], out)
-            self.assertEqual(out['selected']['pool_key'],
-                             dp.CN_CUSTOM_MAX_POOL_KEY, out)
-        # Z 未被 AUTO 抢，等下一轮/显式入口；候选资格仅通过 _eligible_main_forces 体现。
+            self.assertFalse(out['allowed'], out)
+            self.assertEqual(out['reason'], 'unknown_pool', out)
+        # 退役池绝不被任何轮次占用。
         self.assertEqual(self._active(ZCODE), 0)
 
     def test_zcode_executor_refused_when_unavailable(self):
-        # BW-SIMPLE-PRIORITY-RETRY-S4：显式 executor='zcode' 权威入口不再据历史 availability
-        # 拒绝——直接真实尝试 ZCode 主力池（时段/容量/工作区/unknown 在途/审批拒绝照常）。
-        # 真实失败才落 availability 诊断、成功仍 epoch/attempt CAS 结算；不假装 healthy。
+        # BW-ZCODE-RETIRE-20261020：显式 executor='zcode' 权威入口对已退役的 zcode 组合
+        # 一律诚实拒绝（unknown_pool），绝不改派别池、绝不占位；availability 诊断仍保留
+        # 为历史，不假装 healthy。
         self._hold_zcode()
         out = dp.consume_for_entry(self.dispatch, task_id='z1', runtime='zcode',
                                    model='GLM-5.3', workspace=str(self._ws_for('z1')),
                                    prompt_sha256='p', stage='s1',
                                    executor='zcode', quota_store=self.quota, now=T0)
-        self.assertTrue(out['allowed'], out)
-        self.assertEqual(out['pool_key'], ZCODE, out)
-        self.assertEqual(self._active(ZCODE), 1)
+        self.assertFalse(out['allowed'], out)
+        self.assertEqual(out['reason'], 'unknown_pool', out)
+        self.assertEqual(self._active(ZCODE), 0)
 
     def test_executor_conflict(self):
-        out = dp.consume_for_entry(self.dispatch, task_id='x1', runtime='zcode',
-                                   model='GLM-5.3', workspace=str(self._ws_for('x1')),
+        # 受信任 claude 组合与非匹配执行器 qoder 冲突 → executor_conflict（退役 zcode 组合
+        # 会先被 LEGACY_RETIRED 门判 unknown_pool，故改用 claude:deepseek-flash 表达冲突）。
+        out = dp.consume_for_entry(self.dispatch, task_id='x1', runtime='claude',
+                                   model='deepseek-flash', workspace=str(self._ws_for('x1')),
                                    prompt_sha256='p', stage='s1',
                                    executor='qoder', quota_store=self.quota, now=T0)
         self.assertFalse(out['allowed'])
         self.assertEqual(out['reason'], 'executor_conflict')
 
     def test_consume_token_recheck_releases_placeholder_no_leak(self):
-        # BW-SIMPLE-PRIORITY-RETRY-S4 用户政策：consume_for_entry 消费已预留 token 前
-        # **不再**据历史 ZCode availability 复核释放本占位——每轮直接从最高优先级真实尝试，
-        # 真实失败才落 availability 诊断、成功仍 epoch/attempt CAS 结算，不假装 healthy、
-        # 不清旧 hold（qc.* 状态表/诊断行原样保留）。reserved→running 正常放行，容量真实
-        # 被本次 attempt 占用；结束后走 finish 才释放，无泄漏。时段/工作区/unknown 在途/审批
-        # 拒绝等守卫仍照常，不在本政策撤回范围内。consume/finish 必须携带同一真实 owner
-        # 身份（os.getpid() + process_identity），finish 才能凭 owner 亲证 cancel 释放；
-        # 绝不放松 unknown/owner 校验。
-        r = dp.reserve(self.dispatch, task_id='tk', runtime='zcode', model='GLM-5.3',
+        # consume_for_entry 消费已预留 token 前不据历史 availability 复核释放本占位——每轮
+        # 直接从最高优先级真实尝试，真实失败才落诊断、成功仍 epoch/attempt CAS 结算，不假装
+        # healthy、不清旧 hold（qc.* 状态表/诊断行原样保留）。reserved→running 正常放行，容量
+        # 真实被本次 attempt 占用；结束后走 finish 才释放，无泄漏。BW-ZCODE-RETIRE-20261020：
+        # zcode 已退役不可预留，改用受信任 qoder:Qwen3.8-Max 表达同一"预留→消费→finish 释放、
+        # 无泄漏"的生命周期语义，绝不放松 unknown/owner 校验。
+        r = dp.reserve(self.dispatch, task_id='tk', runtime='qoder', model='Qwen3.8-Max',
                        workspace=str(self._ws_for('tk')), prompt_sha256='p', stage='s1',
-                       chat_id='c1', executor='zcode', now=T0)
+                       chat_id='c1', executor='qoder', now=T0)
         self.assertTrue(r['reserved'], r)
-        self.assertEqual(self._active(ZCODE), 1)
-        self._hold_zcode()
+        self.assertEqual(self._active(QMAX), 1)
+        self._hold_zcode()  # 历史退役诊断，不影响本受信任组合的消费
         owner_pid = os.getpid()
         owner_created = dp.process_identity(owner_pid).get('created')
-        out = dp.consume_for_entry(self.dispatch, task_id='tk', runtime='zcode',
-                                   model='GLM-5.3', workspace=str(self._ws_for('tk')),
+        out = dp.consume_for_entry(self.dispatch, task_id='tk', runtime='qoder',
+                                   model='Qwen3.8-Max', workspace=str(self._ws_for('tk')),
                                    prompt_sha256='p', stage='s1', chat_id='c1',
-                                   claim_token=r['token'], executor='zcode',
+                                   claim_token=r['token'], executor='qoder',
                                    wrapper_pid=owner_pid, wrapper_created=owner_created,
                                    quota_store=self.quota, now=T0)
         self.assertTrue(out['allowed'], out)
-        self.assertEqual(out['pool_key'], ZCODE, out)
+        self.assertEqual(out['pool_key'], QMAX, out)
         self.assertNotIn('capacity_released', out)
         # 消费后仍在途（running），未因历史 hold 被虚假释放；容量仍被本次 attempt 占用，
         # 只有真正 finish 才释放——绝不泄漏、绝不双派。owner 身份必须与 consume 一致。
-        self.assertEqual(self._active(ZCODE), 1)
+        self.assertEqual(self._active(QMAX), 1)
         fin = dp.finish(self.dispatch, r['token'], terminal='cancelled',
                         wrapper_pid=owner_pid, wrapper_created=owner_created, now=T0)
         self.assertTrue(fin['released'], fin)
-        self.assertEqual(self._active(ZCODE), 0)
+        self.assertEqual(self._active(QMAX), 0)
 
     def test_reclaim_skips_blocked_zcode(self):
-        # BW-SIMPLE-PRIORITY-RETRY-S4 + BW-OPENCODE-20261019-S3 政策：历史 hold 不再作候选
-        # 剔除，capacity 降级必须**真实**填满所有 14 个候选槽（含 ZCode×2 与两 OpenCode
-        # 免费槽；加上 setUp 的 CodeBuddy 两槽共 16）才能记录票据；靠旧 hold 假装 Z
-        # 不可用已失效。夹具改成在同一临时 dispatch 库上真实 reserved ZCode 两个占位
-        # （无真实进程/模型调用），再按原意填满其余非 Z 槽（含两 OpenCode）→ ask_record
-        # 记录 capacity 降级 → 释放一个 QMax 名额 → claim_due 原子回收落到 QMax，Z 仍满
-        # 不吞新槽。绝不新增机制、绝不删除安全断言。
+        # BW-ZCODE-RETIRE-20261020：zcode 已退役，capacity 降级只需真实填满 14 个正常候选槽
+        # （_fill_six 的 12 槽 + setUp 的 CodeBuddy 两槽）。释放一个 QMax 名额 → claim_due 原子
+        # 回收落到 QMax，绝不落已退役 ZCode；退役池无任何真实在途。
         self._hold_zcode()
-        toks = []
-        # 追加 ZCode×2 真实 reserved 占位（同 temp 库、无真实进程）。
-        for i in range(2):
-            r = dp.reserve(self.dispatch, task_id=f'z{i}', runtime='zcode',
-                           model='GLM-5.3', workspace=str(self._ws_for(f'z{i}')),
-                           prompt_sha256='p', stage='s1', now=T0, executor='zcode')
-            self.assertTrue(r.get('allowed') and r.get('token'), r)
-            toks.append(r['token'])
-        r = dp.reserve(self.dispatch, task_id='q0', runtime='qoder',
-                      model='Qwen3.8-Max', workspace=str(self._ws_for('q0')),
-                      prompt_sha256='p', stage='s1', now=T0, executor='qoder')
-        self.assertTrue(r.get('allowed') and r.get('token'), r)
-        toks.append(r['token'])
-        r = dp.reserve(self.dispatch, task_id='cq0', runtime='qodercn',
-                      model='Qwen3.8-Max', workspace=str(self._ws_for('cq0')),
-                      prompt_sha256='p', stage='s1', now=T0, executor='qodercn')
-        self.assertTrue(r.get('allowed') and r.get('token'), r)
-        toks.append(r['token'])
-        for i in range(2):
-            r = dp.reserve(self.dispatch, task_id=f'cu{i}', runtime='qodercn',
-                           model='Qwen-3.8-Max', workspace=str(self._ws_for(f'cu{i}')),
-                           prompt_sha256='p', stage='s1', now=T0, executor='qodercn')
-            self.assertTrue(r.get('allowed') and r.get('token'), r)
-            toks.append(r['token'])
-        for i in range(2):
-            r = dp.reserve(self.dispatch, task_id=f'fl{i}', runtime='qoder',
-                           model='Qwen3.8-Flash', workspace=str(self._ws_for(f'fl{i}')),
-                           prompt_sha256='p', stage='s1', now=T0, executor='qoder')
-            self.assertTrue(r.get('allowed') and r.get('token'), r)
-            toks.append(r['token'])
-        for i in range(2):
-            r = dp.reserve(self.dispatch, task_id=f'cfl{i}', runtime='qodercn',
-                           model='Qwen3.8-Flash', workspace=str(self._ws_for(f'cfl{i}')),
-                           prompt_sha256='p', stage='s1', now=T0, executor='qodercn')
-            self.assertTrue(r.get('allowed') and r.get('token'), r)
-            toks.append(r['token'])
-        # claude 两个槽也必须真实占住：只要还有空位，capacity 降级就是伪造耗尽。
-        for i in range(2):
-            r = dp.reserve(self.dispatch, task_id=f'cl{i}', runtime='claude',
-                           model='deepseek-flash', workspace=str(self._ws_for(f'cl{i}')),
-                           prompt_sha256='p', stage='s1', now=T0, executor='claude')
-            self.assertTrue(r.get('allowed') and r.get('token'), r)
-            toks.append(r['token'])
-        # BW-OPENCODE-20261019-S3：两个 OpenCode 免费槽同属默认 scope 受信任候选，也必须
-        # 真实占住——仍有空位时 capacity 降级依旧属伪造耗尽，绝不放宽该守卫。
-        for i, md in enumerate(dp.OPENCODE_MODELS):
-            r = dp.reserve(self.dispatch, task_id=f'oc{i}', runtime='opencode',
-                           model=md, workspace=str(self._ws_for(f'oc{i}')),
-                           prompt_sha256='p', stage='s1', now=T0, executor='opencode')
-            self.assertTrue(r.get('allowed') and r.get('token'), r)
-            toks.append(r['token'])
+        toks = self._fill_six()
         sc = self._scope('rc')
         ask = dp.ask_record(self.dispatch, task_id='rc', scope=sc, ask_message_id='m1',
                             now=T0, degradation_reason='capacity',
                             degradation_detail='no available main force for this task',
                             quota_store=self.quota)
         self.assertTrue(ask['recorded'], ask)
-        # 释放一个 QMax 名额（toks[2] 现是 q0，因为前两位是 Z 占位）→ 合格候选出现空位 →
-        # 原子回收落到 QMax（绝不落 ZCode，Z 仍满不吞新槽）。
-        qmax_tok = toks[2]
+        # 释放一个 QMax 名额（toks[0] 是 qoder:Qwen3.8-Max）→ 合格候选出现空位 →
+        # 原子回收落到 QMax（绝不落退役 ZCode）。
+        qmax_tok = toks[0]
         self._free_slot(qmax_tok)
         out = dp.claim_due(self.dispatch, task_id='rc', now=T0, quota_store=self.quota)
         self.assertTrue(out['claimed'], out)
         self.assertEqual(out['mode'], 'domestic_reclaim')
         self.assertEqual(out['pool_key'], QMAX)
-        # 新政策：回收落在被释放的 QMax（不是 Z），Z 的两个真实占位仍在途未被吞并。
-        # availability hold 不再挡新轮，这里通过 out['pool_key']==QMAX 与 Z 保持 2 在途
-        # 表达"回收不会绕开真实在途数把新槽塞给 Z"。
-        self.assertEqual(self._active(ZCODE), 2)
+        # 回收落在被释放的 QMax；退役 ZCode 无任何真实在途（诊断行仍在 availability 库）。
+        self.assertEqual(self._active(ZCODE), 0)
 
 
 # ============================================================ C. Luna 状态机
@@ -832,8 +773,8 @@ class LunaStateMachineTests(_TmpBase):
                       now=T0, degradation_reason='auth',
                       degradation_detail='executor auth failed this round',
                       quota_store=self.quota)
-        # combos[2] 是 (qoder, Qwen3.8-Max)：释放一个合格主力空位观察回收。
-        self._free_slot(toks[2])
+        # combos[0] 是 (qoder, Qwen3.8-Max)：释放一个合格主力空位观察回收。
+        self._free_slot(toks[0])
         out = dp.claim_due(self.dispatch, task_id='par',
                            now=T0 + timedelta(seconds=400), quota_store=self.quota)
         self.assertTrue(out['claimed'], out)
@@ -931,37 +872,30 @@ class ZCodeEntryAvailabilityTests(_TmpBase):
                 'errors_info': None, 'event_count': 0}
 
     def test_hard_frame_records_hold_and_blocks_second_dispatch(self):
-        # BW-SIMPLE-PRIORITY-RETRY-S4 政策：一次真实 429/1310 仍落 hard_hold 诊断（epoch
-        # 前进、CAS 结算保留），但**新一轮普通派工不再被历史 hold 前置挡**——qc.dispatch 门
-        # 允许、正式入口再次真实尝试；失败仍落新代际 hold，成功仍 epoch CAS 清 healthy。
-        # 绝不假装 healthy、不清旧 hold、不查余额、不自动 probe。
+        # BW-ZCODE-RETIRE-20261020：zcode:GLM-5.3 全局退役——真实入口在最后一道容量门前即
+        # 被诚实拒绝（unknown_pool、refused_before_dispatch），绝不启动子进程、绝不落
+        # availability 诊断、绝不假装 healthy。旧"新一轮真实尝试 Z"的政策已被退役取代。
         counter = {'n': 0}
         stdout = json.dumps(self._env_429(), ensure_ascii=False).encode('utf-8')
         out1 = self.tmp / 'o1'
-        code, summary, _ = self._run(out1, stdout, self.FRAME_1310, 5, counter)
-        self.assertEqual(code, 3, summary)
-        self.assertEqual(counter['n'], 1)
-        rec = summary['zcode_availability_recorded']
-        self.assertTrue(rec['recorded'], rec)
-        self.assertEqual(rec['state'], 'hard_hold')
-        # 旧 cooldowns 表不落（ZCode 自动冷却禁用）。
+        code, summary, stdout_txt = self._run(out1, stdout, self.FRAME_1310, 5, counter)
+        self.assertEqual(code, 2, stdout_txt)
+        self.assertEqual(counter['n'], 0)  # 退役前置于派发，绝不启动子进程
+        self.assertIn('refused_before_dispatch', stdout_txt)
+        self.assertIn('unknown_pool', stdout_txt)
+        # 无真实 attempt → 不写终态 summary.json、不落任何诊断、不写旧 cooldowns。
         self.assertEqual(qc.get_status(self.quota, now=T0)['cooldowns'], {})
-        # 新轮再次真实尝试：入口不再返回 zcode_availability_rejected，Popen 计数 +1。
-        out2 = self.tmp / 'o2'
-        code2, summary2, stdout2 = self._run(out2, stdout, self.FRAME_1310, 5, counter)
-        self.assertEqual(counter['n'], 2)
-        self.assertNotIn('zcode_availability_rejected', stdout2)
-        self.assertEqual(code2, 3, summary2)
-        # 新一轮真实 429 又落 hard_hold（诊断保留，不假装 healthy、不清 hold）。
-        rec2 = summary2['zcode_availability_recorded']
-        self.assertTrue(rec2['recorded'] and rec2['state'] == 'hard_hold', rec2)
+        self.assertEqual(qc.zcode_blocking_rows(self.quota, now=T0), [])
 
     def test_cancel_exit_code_not_recorded(self):
+        # BW-ZCODE-RETIRE-20261020：入口对退役 zcode 组合在派发前即拒绝（exit 2、无
+        # summary.json），取消码路径根本无从触达，也绝不落任何 availability 诊断。
         counter = {'n': 0}
         stdout = json.dumps(self._env_429(), ensure_ascii=False).encode('utf-8')
         out = self.tmp / 'cancel'
-        code, summary, _ = self._run(out, stdout, self.FRAME_1310, 4294967295, counter)
-        self.assertNotIn('zcode_availability_recorded', summary)
+        code, summary, stdout_txt = self._run(out, stdout, self.FRAME_1310, 4294967295, counter)
+        self.assertEqual(code, 2, stdout_txt)
+        self.assertIsNone(summary)  # 派发前拒绝 → 不写终态 summary
         self.assertEqual(qc.zcode_blocking_rows(self.quota, now=T0), [])
 
     def test_body_429_without_structured_frame_not_recorded(self):
@@ -976,46 +910,30 @@ class ZCodeEntryAvailabilityTests(_TmpBase):
         self.assertEqual(qc.zcode_blocking_rows(self.quota, now=T0), [])
 
     def test_manual_reset_probe_success_restores_dispatch(self):
+        # BW-ZCODE-RETIRE-20261020：即便有合法人工重置/成功核验，退役的 zcode 组合也不再被
+        # 正式入口派发——最后一道容量门一律诚实拒绝（unknown_pool、派发前），绝不启动子进程。
+        # qc 层 probe 生命周期仍作为历史诊断独立运转，但绝不恢复退役池派发资格。
         counter = {'n': 0}
         stdout = json.dumps(self._env_429(), ensure_ascii=False).encode('utf-8')
-        self._run(self.tmp / 'r1', stdout, self.FRAME_1310, 5, counter)
-        self.assertEqual(counter['n'], 1)
-        # 人工重置（绑定证据）→ recovery_unverified。BW-SIMPLE-PRIORITY-RETRY-S4：普通新一轮
-        # 不再据 recovery_unverified/hard_hold 前置挡——直接真实尝试，失败落新代际 hold、
-        # 成功 epoch CAS 清 healthy。qc 层 purpose='probe' 的单赢家 CAS 与陈旧成功保护照常。
+        code, summary, stdout_txt = self._run(self.tmp / 'r1', stdout, self.FRAME_1310,
+                                              5, counter)
+        self.assertEqual(code, 2, stdout_txt)
+        self.assertEqual(counter['n'], 0)
+        # 人工重置 + 成功核验只作用于 qc 诊断层（不触碰退役池派发门）。先落一条诊断 hold。
+        self._hold_zcode()
         qc.zcode_manual_reset(self.quota, provider=PROVIDER, quota_group=self.group,
-                              routes_path=self.routes, evidence_ref='user-reset',
-                              now=T0)
-        out2 = self.tmp / 'r2'
-        code2, _, stdout2 = self._run(out2, stdout, self.FRAME_1310, 5, counter)
-        self.assertNotIn('zcode_availability_rejected', stdout2)
-        self.assertEqual(counter['n'], 2)  # 新轮真实尝试，不再被历史 recovery 前置挡
-        # S5：第二次真实 429 已把上一轮 user-reset 证据失效（epoch 前进、重新 hard_hold）。
-        # probe 资格必须来自**新的**人工重置证据，且与当前 epoch 匹配——沿用旧 evidence_ref
-        # 或放松 probe 状态机/CAS 都不允许。之后成功结算清 healthy，普通派工照常放行。
-        qc.zcode_manual_reset(self.quota, provider=PROVIDER, quota_group=self.group,
-                              routes_path=self.routes, evidence_ref='user-reset-2',
-                              now=T0)
-        # 直接把 availability 结算为 healthy（模拟一次成功 probe 核验）。
-        st = qc.zcode_availability_status(self.quota, now=T0)
-        key = qc.zcode_channel_key(PROVIDER, self.group)
-        epoch = st[key]['epoch']
+                              routes_path=self.routes, evidence_ref='user-reset', now=T0)
         g = qc.zcode_availability_gate(self.quota, provider=PROVIDER,
                                        routes_path=self.routes, purpose='probe', now=T0)
         self.assertTrue(g['allowed'] and g['probe_granted'])
         qc.settle_zcode_attempt(self.quota, provider=PROVIDER, quota_group=self.group,
                                 attempt_id=g['attempt_id'], epoch=g['availability_epoch'],
                                 success=True, executed=True, now=T0)
-        self.assertEqual(qc.zcode_blocking_rows(self.quota, now=T0), [])
-        # healthy 后正常派工放行（成功信封）。
-        ok_env = {'type': 'result', 'subtype': 'success', 'is_error': False,
-                  'stop_reason': 'end_turn', 'session_id': 's', 'result': '报告',
-                  'errors': [], 'errors_info': None, 'event_count': 0}
-        ok_stdout = json.dumps(ok_env, ensure_ascii=False).encode('utf-8')
-        out3 = self.tmp / 'r3'
-        code3, summary3, _ = self._run(out3, ok_stdout, b'', 0, counter)
-        self.assertEqual(counter['n'], 3)  # 第三次也真实派工（healthy 后放行）
-        self.assertEqual(qc.zcode_blocking_rows(self.quota, now=T0), [])
+        self.assertEqual(qc.zcode_blocking_rows(self.quota, now=T0), [])  # qc 清至 healthy
+        # 但退役池派发门不因 healthy 而恢复：入口仍在派发前拒绝。
+        code2, _, stdout2 = self._run(self.tmp / 'r2', stdout, self.FRAME_1310, 5, counter)
+        self.assertEqual(code2, 2, stdout2)
+        self.assertEqual(counter['n'], 0)  # 重置/核验绝不恢复退役池的真实派发
 
     # ---- BW-AVAILABILITY-20261009-B5 缺陷 2：真实 probe 在 Popen 处抛错（child=None） ----
     def _run_probe_raise(self, out):
@@ -1031,17 +949,24 @@ class ZCodeEntryAvailabilityTests(_TmpBase):
         return code, buf.getvalue()
 
     def test_probe_popen_failure_returns_eligibility_not_left_active(self):
-        # 拿到合法 recovery probe 资格却在 Popen 前抛错、从未真正启动：必须归还本次绑定的
-        # row/epoch/attempt 为“未执行”资格（executed=False），绝不留 probe_active、绝不假称
-        # 恢复、也不消耗该代际唯一一次资格（无子进程不算真实失败）。用完整 mock 入口证明，
-        # 而非只直接调用 settle。
+        # BW-ZCODE-RETIRE-20261020：正式入口对退役 zcode 组合在派发前即拒绝，连 recovery probe
+        # 也不经入口启动（_run_probe_raise → exit 2、Popen 从未调用）。qc 层的 probe 资格/结算
+        # 仍作为历史诊断独立运转：绑定资格在"未执行"结算（executed=False）下归还不消耗。
         self._hold_zcode()
         qc.zcode_manual_reset(self.quota, provider=PROVIDER, quota_group=self.group,
                               routes_path=self.routes, evidence_ref='ev', now=T0)
+        # 入口路径：退役池派发前拒绝，probe 子进程从未启动。
         out = self.tmp / 'probecrash'
         code, stdout = self._run_probe_raise(out)
-        self.assertEqual(code, 3, stdout)
-        self.assertIn('availability_settled_unexecuted', stdout)
+        self.assertEqual(code, 2, stdout)
+        self.assertIn('unknown_pool', stdout)
+        # qc 诊断层：经合法 gate 取得 probe 后，以未执行结算归还资格（无子进程不算真实失败）。
+        g = qc.zcode_availability_gate(self.quota, provider=PROVIDER,
+                                       routes_path=self.routes, purpose='probe', now=T0)
+        self.assertTrue(g['allowed'] and g['probe_granted'], g)
+        qc.settle_zcode_attempt(self.quota, provider=PROVIDER, quota_group=self.group,
+                                attempt_id=g['attempt_id'], epoch=g['availability_epoch'],
+                                success=False, executed=False, now=T0)
         st = qc.zcode_availability_status(self.quota, now=T0)
         key = qc.zcode_channel_key(PROVIDER, self.group)
         self.assertFalse(st[key]['probe_active'])
@@ -1050,12 +975,10 @@ class ZCodeEntryAvailabilityTests(_TmpBase):
 
     # ---- BW-AVAILABILITY-20261009-B6 缺陷 4 收紧：真正携带合法接续契约 + 输入 hash ----
     def test_hard_429_terminal_releases_capacity_after_freeze(self):
-        # 覆盖真实“接续冻结成功”终态：不可用 429 事实先发布；随后必须携带合法
-        # continuation contract，走真实 cc.evaluate/build_handoff 保存 continuation.json
-        # （含输入 sha256），冻结 hook 期间同 workspace 的第二个 writer 仍被单写入守卫拒绝
-        # （原 owner 的 attempt 尚未 finish）；只有冻结落盘后才正常释放容量名额并放行后续
-        # writer。capacity_released 与 placeholders_retained 绝不同时为真。（收紧前只断言
-        # 无契约终态，未触及真正冻结成功路径。）
+        # BW-ZCODE-RETIRE-20261020：入口对退役 zcode 组合在派发前即拒绝，不再进入 429 终态/
+        # 接续冻结路径——cc.evaluate 从不被调用、绝不写 summary.json、也绝不释放本轮从未占用
+        # 的容量名额。同 workspace 的第二个 writer（受信任 qoder 组合）不受任何 zcode 在途
+        # 影响，可正常放行。
         counter = {'n': 0}
         (self.ws / 'a.txt').write_text('seed\n', encoding='utf-8')
         contract = self.tmp / 'cc.json'
@@ -1063,18 +986,6 @@ class ZCodeEntryAvailabilityTests(_TmpBase):
         stdout = json.dumps(self._env_429(), ensure_ascii=False).encode('utf-8')
         out = self.tmp / 'g4rel'
         dispatch_store = str(self.tmp / 'dispatch-g4rel.sqlite3')
-        observed = {}
-        real_evaluate = zd.cc.evaluate
-
-        def spy_evaluate(baseline, work, copies_dir=None):
-            # 冻结进行中：原 zcode attempt 仍 active → 同 workspace 的第二 writer 必须被拒。
-            second = dp.select_and_claim(dispatch_store, task_id='second-writer',
-                                         runtime='qoder', model='Qwen3.8-Max',
-                                         workspace=str(self.ws), prompt_sha256='x' * 64,
-                                         stage='s2', executor='qoder', now=T0,
-                                         _preclaim=False)
-            observed['during_freeze'] = second
-            return real_evaluate(baseline, work, copies_dir=copies_dir)
 
         argv = self._argv(out) + ['--continuation-contract', str(contract)]
         argv = argv + ['--task-id', 'g4-owner']
@@ -1088,32 +999,13 @@ class ZCodeEntryAvailabilityTests(_TmpBase):
         buf = io.StringIO()
         with mock.patch.object(sys, 'argv', argv), \
                 mock.patch.dict(os.environ, {'PYTHONIOENCODING': 'utf-8'}), \
-                mock.patch.object(zd.subprocess, 'Popen', side_effect=_popen), \
-                mock.patch.object(zd.cc, 'evaluate', side_effect=spy_evaluate):
+                mock.patch.object(zd.subprocess, 'Popen', side_effect=_popen):
             with contextlib.redirect_stdout(buf):
                 code = zd.main()
-        sp = out / 'summary.json'
-        summary = json.loads(sp.read_text(encoding='utf-8'))
-        # 不可用事实先发布。
-        self.assertEqual(summary['zcode_availability_recorded']['state'], 'hard_hold')
-        # 真正走了合法接续冻结：continuation.json 落盘且带输入 hash。
-        self.assertIn('continuation', summary, summary)
-        self.assertTrue(Path(summary['continuation']['file']).is_file(), summary)
-        self.assertTrue(len(summary['continuation']['sha256']) == 64
-                        and all(c in '0123456789abcdef'
-                                for c in summary['continuation']['sha256']),
-                        summary['continuation'])
-        self.assertNotEqual(summary.get('continuation_status'), 'unverified_no_contract')
-        # 冻结 hook 内第二个 writer 被同 workspace 单写入守卫拒绝（原 attempt 尚未释放）。
-        self.assertEqual(observed['during_freeze']['allowed'], False, observed)
-        self.assertEqual(observed['during_freeze']['reason'], 'workspace_in_flight',
-                         observed)
-        # 冻结真实落盘后才释放容量；released 与 retained 绝不同时为真。
-        self.assertTrue(summary.get('capacity_released'), summary)
-        self.assertNotIn('placeholders_retained', summary)
-        self.assertFalse(summary.get('capacity_released')
-                         and summary.get('placeholders_retained'))
-        # 释放后同 workspace 第二 writer 现可放行（守卫确已打开，名额最终归还）。
+        self.assertEqual(code, 2, buf.getvalue())  # 派发前诚实拒绝
+        self.assertEqual(counter['n'], 0)          # 退役池绝不启动子进程
+        self.assertFalse((out / 'summary.json').exists())  # 无终态/无接续冻结
+        # 同 workspace 的受信任第二 writer 正常放行（无任何 zcode 在途占位）。
         after = dp.select_and_claim(dispatch_store, task_id='second-writer',
                                     runtime='qoder', model='Qwen3.8-Max',
                                     workspace=str(self.ws), prompt_sha256='x' * 64,
@@ -1122,8 +1014,9 @@ class ZCodeEntryAvailabilityTests(_TmpBase):
         self.assertTrue(after['allowed'], after)
 
     def test_freeze_failure_retains_placeholder_never_falsely_released(self):
-        # 接续冻结抛错 → 保留在途占位、真实标注 placeholders_retained，绝不释放、
-        # 绝不伪称 capacity_released=true 又 placeholders_retained=true。
+        # BW-ZCODE-RETIRE-20261020：入口对退役 zcode 组合在派发前即拒绝，根本走不到接续冻结
+        # 路径——cc.evaluate 不被调用、不写 summary.json，也绝不伪称 capacity_released 或
+        # placeholders_retained（本轮从未占用任何退役池名额）。
         counter = {'n': 0}
         ws_file = self.ws / 'a.txt'
         ws_file.write_text('seed\n', encoding='utf-8')
@@ -1144,17 +1037,12 @@ class ZCodeEntryAvailabilityTests(_TmpBase):
         buf = io.StringIO()
         with mock.patch.object(sys, 'argv', argv), \
                 mock.patch.dict(os.environ, {'PYTHONIOENCODING': 'utf-8'}), \
-                mock.patch.object(zd.subprocess, 'Popen', side_effect=_popen), \
-                mock.patch.object(zd.cc, 'evaluate', side_effect=RuntimeError('freeze boom')):
+                mock.patch.object(zd.subprocess, 'Popen', side_effect=_popen):
             with contextlib.redirect_stdout(buf):
                 code = zd.main()
-        sp = out / 'summary.json'
-        summary = json.loads(sp.read_text(encoding='utf-8'))
-        self.assertEqual(code, 3, summary)
-        self.assertTrue(summary.get('placeholders_retained'), summary)
-        self.assertFalse(summary.get('capacity_released', False), summary)
-        self.assertFalse(summary.get('capacity_released')
-                         and summary.get('placeholders_retained'))
+        self.assertEqual(code, 2, buf.getvalue())  # 派发前拒绝，非终态
+        self.assertEqual(counter['n'], 0)
+        self.assertFalse((out / 'summary.json').exists())  # 无冻结、无容量释放声明
 
 
 class QoderEntryRoutingTests(_TmpBase):
@@ -1368,10 +1256,10 @@ class B4RecoveryEligibilityTests(_TmpBase):
 
 class B4ProbeCapacityGateTests(_TmpBase):
     def test_bound_probe_ticket_passes_capacity_gate(self):
-        # BW-SIMPLE-PRIORITY-RETRY-S4 政策：普通派工不再据历史 availability 拒绝；有/无
-        # 有效绑定 probe 票据都真实 claim 到 ZCode 池（时段/容量/工作区/unknown 在途照常）。
-        # 显式 purpose='probe' 生命周期仍由 quota_control 层严格 CAS 保证（stale replay/单次
-        # 赢家/已消耗资格不再凭空重探），与本入口容量门完全独立，绝不信任自报 probe 布尔。
+        # BW-ZCODE-RETIRE-20261020：退役后 dp 层不再据票据信任与否放行任何 zcode 组合——有/无
+        # 有效绑定 probe 票据都一律诚实拒绝（unknown_pool），绝不占用退役池。qc 层 purpose=
+        # 'probe' 生命周期仍由 quota_control 严格 CAS 保证（单赢家/陈旧拒绝），与本入口容量
+        # 门完全解耦，只作历史诊断。
         self._hold_zcode()
         qc.zcode_manual_reset(self.quota, provider=PROVIDER, quota_group=self.group,
                               routes_path=self.routes, evidence_ref='ev', now=T0)
@@ -1380,27 +1268,27 @@ class B4ProbeCapacityGateTests(_TmpBase):
         self.assertTrue(g['probe_granted'])
         ticket = {'provider': PROVIDER, 'channel_key': g['granted_channel_key'],
                   'attempt_id': g['attempt_id'], 'epoch': g['availability_epoch']}
-        # 无票据 → 新政策下同样 claim 到 ZCode 池（不再前置挡）。
+        # 无票据 → 退役池一律拒绝。
         plain = dp.select_and_claim(self.dispatch, task_id='p0', runtime='zcode',
                                     model='GLM-5.3', workspace=str(self._ws_for('p0')),
                                     prompt_sha256='p', stage='s1', executor='zcode',
                                     quota_store=self.quota, now=T0)
-        self.assertTrue(plain['allowed'], plain)
-        self.assertEqual(plain['pool_key'], ZCODE, plain)
-        self.assertEqual(self._active(ZCODE), 1)
-        # 有有效票据也允许 claim（票据本身不再被容量门信任，只是 qc 层保留 CAS 生命周期）。
+        self.assertFalse(plain['allowed'], plain)
+        self.assertEqual(plain['reason'], 'unknown_pool', plain)
+        self.assertEqual(self._active(ZCODE), 0)
+        # 有有效票据也一律拒绝（退役与票据无关，票据只保留 qc CAS 生命周期）。
         ok = dp.select_and_claim(self.dispatch, task_id='p1', runtime='zcode',
                                  model='GLM-5.3', workspace=str(self._ws_for('p1')),
                                  prompt_sha256='p', stage='s1', executor='zcode',
                                  quota_store=self.quota, probe_ticket=ticket, now=T0)
-        self.assertTrue(ok['allowed'], ok)
-        self.assertEqual(ok['pool_key'], ZCODE)
-        self.assertEqual(self._active(ZCODE), 2)
+        self.assertFalse(ok['allowed'], ok)
+        self.assertEqual(ok['reason'], 'unknown_pool', ok)
+        self.assertEqual(self._active(ZCODE), 0)
 
     def test_forged_probe_bool_is_still_denied(self):
-        # BW-SIMPLE-PRIORITY-RETRY-S4：普通入口已不再据历史 availability 前置拒绝；伪造
-        # probe_ticket 不影响新政策的正常 claim。这里改为断言：真正的严格性由 qc 层 purpose=
-        # 'probe' CAS 保证（陈旧 attempt_id/epoch 一律被 qc 拒绝），与容量门解耦。
+        # BW-ZCODE-RETIRE-20261020：伪造/陈旧票据在 qc 层本就被 purpose='probe' CAS 拒绝（陈旧
+        # attempt_id/epoch 一律不认），而 dp 层退役后对任何 zcode 组合一律诚实拒绝（unknown_pool），
+        # 与票据形状无关——退役池绝不被占用。
         self._hold_zcode()
         qc.zcode_manual_reset(self.quota, provider=PROVIDER, quota_group=self.group,
                               routes_path=self.routes, evidence_ref='ev', now=T0)
@@ -1419,13 +1307,14 @@ class B4ProbeCapacityGateTests(_TmpBase):
             self.quota, provider=forged_ticket['provider'],
             channel_key=forged_ticket['channel_key'],
             attempt_id=forged_ticket['attempt_id'], epoch=forged_ticket['epoch'], now=T0))
-        # dp 层：伪造票据不再被信任，但也不再前置挡正常入口——直接 claim 到 ZCode 池。
+        # dp 层：退役池无论票据真伪一律诚实拒绝，绝不占用。
         out = dp.select_and_claim(self.dispatch, task_id='p2', runtime='zcode',
                                   model='GLM-5.3', workspace=str(self._ws_for('p2')),
                                   prompt_sha256='p', stage='s1', executor='zcode',
                                   quota_store=self.quota, probe_ticket=forged_ticket, now=T0)
-        self.assertTrue(out['allowed'], out)
-        self.assertEqual(out['pool_key'], ZCODE, out)
+        self.assertFalse(out['allowed'], out)
+        self.assertEqual(out['reason'], 'unknown_pool', out)
+        self.assertEqual(self._active(ZCODE), 0)
 
 
 class B4LunaReplyAndConstraintTests(_TmpBase):
@@ -1471,20 +1360,20 @@ class B4LunaReplyAndConstraintTests(_TmpBase):
         self.assertEqual(out['scope'].get('executor'), 'qoder')
 
     def test_zcode_bound_scope_waits_not_luna_when_zcode_blocked(self):
-        # S5：历史 hold 不再前置挡本轮——scope 明确绑 ZCode 且 Z 有空位时，直接 claim
-        # 走国内 Z（真实尝试），绝不落 Luna、不扩 scope、不把旧 availability 冒充耗尽。
-        # 用 select_and_claim(executor='zcode') 表达"scope 只 Z"的确定组合。
+        # BW-ZCODE-RETIRE-20261020：scope 明确绑退役 ZCode 时，最后一道容量门一律诚实拒绝
+        # （unknown_pool），绝不落 Luna、不扩 scope、也不假装把退役池冒充健康/占用。用
+        # select_and_claim(executor='zcode') 表达"scope 只 Z"的确定组合。
         self._hold_zcode()
         out = dp.select_and_claim(self.dispatch, task_id='zb', runtime='zcode',
                                   model='GLM-5.3', workspace=str(self._ws_for('zb')),
                                   prompt_sha256='p', stage='s1', executor='zcode',
                                   quota_store=self.quota, now=T0)
-        self.assertTrue(out.get('allowed'), out)
-        self.assertEqual(out['pool_key'], ZCODE)
-        # 不产生 Luna、不扩 scope：Z 直接 claim，Luna 池 active=0。
+        self.assertFalse(out.get('allowed'), out)
+        self.assertEqual(out['reason'], 'unknown_pool', out)
+        # 不产生 Luna、不扩 scope：退役 ZCode 无在途，Luna 池 active=0。
         self.assertEqual(dp.status(self.dispatch, now=T0)['pools'][dp.LUNA_KEY]['active'], 0)
-        self.assertEqual(self._active(ZCODE), 1)
-        # 且旧诊断行仍在（availability hold 保留为诊断，不冒充 healthy、也不挡本轮真实回收）。
+        self.assertEqual(self._active(ZCODE), 0)
+        # 且旧诊断行仍在（availability hold 保留为诊断，不冒充 healthy、也不被派发）。
         self.assertTrue(qc.zcode_blocking_rows(self.quota, now=T0))
 
 
@@ -1513,9 +1402,9 @@ class B4ComboExplicitTests(_TmpBase):
         self.assertEqual(out['pool_key'], QMAX)
 
     def test_auto_with_zcode_healthy_prefers_main_rotation(self):
-        # 独立的 AUTO 用例：ZCode healthy 且有空位，auto 仍按 1:1 committed 轮换。
-        # 种子 committed_zcode(3)>qoder(0) → 即便 Z 空也轮换到 QMax（不因 Z 空就必选 Z），
-        # 选中组合与请求入口(runtime=zcode)不同 → routing_required、改派 QMax、零 ZCode 启动。
+        # BW-ZCODE-RETIRE-20261020：即便种子 committed_zcode(3)>qoder(0) 且 healthy，请求
+        # runtime='zcode' 的 AUTO 也不再 routing_required 改派——退役组合在最后一道门前
+        # 一律诚实拒绝（unknown_pool），绝不启动退役 ZCode、绝不据 committed 轮换改派别池。
         with contextlib.closing(dp.connect(self.dispatch)) as conn:
             conn.execute("INSERT INTO rotation(pool_group, committed_zcode, committed_qoder, "
                          "updated_at_utc) VALUES('main',3,0,?)", (qc._iso(T0),))
@@ -1524,9 +1413,8 @@ class B4ComboExplicitTests(_TmpBase):
                                   prompt_sha256='p', stage='s1',
                                   executor='auto', quota_store=self.quota, now=T0)
         self.assertFalse(out['allowed'], out)
-        self.assertTrue(out['routing_required'], out)
-        # BW-CUSTOM-MAX-RESUME-20261018-S1：Max 层内自定义 Max 现为最高，AUTO 选中它。
-        self.assertEqual(out['selected']['pool_key'], dp.CN_CUSTOM_MAX_POOL_KEY)
+        self.assertEqual(out['reason'], 'unknown_pool', out)
+        self.assertFalse(out['routing_required'], out)
         self.assertEqual(self._active(ZCODE), 0)             # 零 ZCode 启动
 
 
@@ -1726,10 +1614,9 @@ class B5DefaultAvailabilityTests(_TmpBase):
     绝不因旧 hard_hold 挡新轮、也绝不假装 healthy。"""
 
     def test_default_auto_filters_unavailable_zcode_from_env(self):
-        # S5：历史 hold 不再作为候选剔除，但 AUTO 仍按 BW-MAIN-PRIORITY-20261011-S1 层序
-        # 走最高优先级真实候选（Qoder Max 层 0 优先于 ZCode 层 2）；Z 保留在
-        # _eligible_main_forces 中（不被历史 hold 剔除），AUTO 会 routing_required 到 QMax，
-        # 零 Z 启动；qc 层旧 hard_hold 诊断行仍原样保留（不假称 healthy、也不冒充耗尽）。
+        # BW-ZCODE-RETIRE-20261020：Z 已退役、不入候选集；请求 runtime='zcode' 的默认 AUTO
+        # 在最后一道门前一律诚实拒绝（unknown_pool），绝不 routing_required 改派、零 Z 启动；
+        # qc 层旧 hard_hold 诊断行仍原样保留（不假称 healthy、也不冒充耗尽）。
         self._hold_zcode()
         with mock.patch.dict(os.environ, {'BRAIN_WORKER_QUOTA_STORE': str(self.quota)}):
             out = dp.select_and_claim(self.dispatch, task_id='dz', runtime='zcode',
@@ -1737,31 +1624,37 @@ class B5DefaultAvailabilityTests(_TmpBase):
                                       prompt_sha256='p', stage='s1', executor='auto',
                                       now=T0)
         self.assertFalse(out['allowed'], out)
-        self.assertTrue(out.get('routing_required'), out)
-        self.assertEqual(out['selected']['pool_key'],
-                         dp.CN_CUSTOM_MAX_POOL_KEY, out)
+        self.assertEqual(out['reason'], 'unknown_pool', out)
+        self.assertFalse(out.get('routing_required'), out)
         self.assertEqual(self._active(ZCODE), 0)
-        # Z 依然合格：新政策下 _eligible_main_forces 不据历史 hold 剔除 Z。
+        # 退役：候选集不再含 Z。
         with contextlib.closing(dp.connect(self.dispatch)) as conn:
             elig = dp._eligible_main_forces(conn, zcode_blocked=True, now=T0)
-        self.assertIn(ZCODE, elig)
+        self.assertNotIn(ZCODE, elig)
         # 历史 hold 诊断保留，未清、未假称 healthy。
         self.assertTrue(qc.zcode_blocking_rows(self.quota, now=T0))
 
     def test_default_missing_db_zero_writes_keeps_zcode_eligible(self):
+        # BW-ZCODE-RETIRE-20261020：缺库仍零写（qc 只读、绝不建库/建表）。受信任 qoder 组合
+        # 正常 claim 到 QMax；而退役 zcode 组合即便"缺库=无阻断"也一律诚实拒绝——退役与
+        # availability 缺失无关，绝不因缺库而放行退役池。
         missing = self.tmp / 'no-quota.sqlite3'
-        # 缺库 = 无阻断 → ZCode 仍合格。BW-MAIN-PRIORITY-S1 下 AUTO 会优先 Qoder Max，故
-        # 此处用明确 executor='zcode' 约束验证 Z 仍 eligible（而非断言 AUTO 选 Z），并保留
-        # 缺库零写入断言。
         with mock.patch.dict(os.environ, {'BRAIN_WORKER_QUOTA_STORE': str(missing)}):
-            out = dp.select_and_claim(self.dispatch, task_id='mz', runtime='zcode',
-                                      model='GLM-5.3', workspace=str(self._ws_for('mz')),
-                                      prompt_sha256='p', stage='s1', executor='zcode',
-                                      now=T0)
-        self.assertFalse(missing.exists())  # 缺库绝不建库/建表（零写）
-        self.assertTrue(out['allowed'], out)  # 缺库 = 无阻断 → ZCode 合格可 claim
-        self.assertEqual(out['pool_key'], ZCODE)
-        self.assertEqual(self._active(ZCODE), 1)
+            ok = dp.select_and_claim(self.dispatch, task_id='mq', runtime='qoder',
+                                     model='Qwen3.8-Max', workspace=str(self._ws_for('mq')),
+                                     prompt_sha256='p', stage='s1', executor='qoder',
+                                     now=T0)
+            self.assertFalse(missing.exists())  # 缺库绝不建库/建表（零写）
+            self.assertTrue(ok['allowed'], ok)
+            self.assertEqual(ok['pool_key'], QMAX)
+            zout = dp.select_and_claim(self.dispatch, task_id='mz', runtime='zcode',
+                                       model='GLM-5.3', workspace=str(self._ws_for('mz')),
+                                       prompt_sha256='p', stage='s1', executor='zcode',
+                                       now=T0)
+            self.assertFalse(missing.exists())  # 退役拒绝路径同样零写
+            self.assertFalse(zout['allowed'], zout)
+            self.assertEqual(zout['reason'], 'unknown_pool', zout)
+            self.assertEqual(self._active(ZCODE), 0)
 
 
 class B5ScopeComboTests(_TmpBase):
@@ -1859,7 +1752,7 @@ class PreauthRoundFailureContinuationTests(_TmpBase):
         self.assertTrue(ask['recorded'], ask)
         # 本轮失败的 CodeBuddy/Qoder 组合腾出空位（模拟真实失败后释放）。
         self._finish_token('cb-fixture')
-        self._finish_token(toks[7])  # qoder:Qwen3.8-Flash 之一
+        self._finish_token(toks[4])  # qoder:Qwen3.8-Flash 之一
         early = dp.claim_due(self.dispatch, task_id='rf-all',
                              now=T0 + timedelta(seconds=299), quota_store=self.quota)
         self.assertFalse(early['claimed'], early)
@@ -1889,7 +1782,7 @@ class PreauthRoundFailureContinuationTests(_TmpBase):
                             degradation_detail='qoder flash failed this round',
                             quota_store=self.quota)
         self.assertTrue(ask['recorded'], ask)
-        self._finish_token(toks[6])  # 本轮失败的 Flash 组合腾出空位
+        self._finish_token(toks[4])  # 本轮失败的 Flash 组合腾出空位
         early = dp.claim_due(self.dispatch, task_id='rf-qf',
                              now=T0 + timedelta(seconds=299), quota_store=self.quota)
         self.assertFalse(early['claimed'], early)
@@ -1976,8 +1869,8 @@ class PreauthRoundFailureContinuationTests(_TmpBase):
                             degradation_detail='flash failed this round',
                             quota_store=self.quota)
         self.assertTrue(ask['recorded'], ask)
-        self._finish_token(toks[6])   # 失败 Flash 的空位不参与回收
-        self._finish_token(toks[2])   # 未失败 Max 腾出真实空位
+        self._finish_token(toks[4])   # 失败 Flash 的空位不参与回收
+        self._finish_token(toks[0])   # 未失败 Max 腾出真实空位
         out = dp.claim_due(self.dispatch, task_id='rf-mix',
                           now=T0 + timedelta(seconds=299), quota_store=self.quota)
         self.assertTrue(out['claimed'], out)
@@ -2091,7 +1984,7 @@ class PreauthRoundFailureContinuationTests(_TmpBase):
                             degradation_detail='the only authorized candidate is full',
                             quota_store=self.quota)
         self.assertTrue(ask['recorded'], ask)
-        self._finish_token(toks[2])  # qoder:Qwen3.8-Max 腾出真实空位
+        self._finish_token(toks[0])  # qoder:Qwen3.8-Max 腾出真实空位
         out = dp.claim_due(self.dispatch, task_id='ac-free',
                            now=T0 + timedelta(seconds=299), quota_store=self.quota)
         self.assertTrue(out['claimed'], out)

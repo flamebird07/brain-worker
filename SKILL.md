@@ -1,9 +1,13 @@
 ---
 name: brain-worker
-description: 主脑负责规划与独立验收，工程执行交已授权外部 Agent。支持 CodeBuddy 两模型、Qoder 国际与 CN、ZCode、Claude/deepseek-flash、OpenCode 两个指定 free 模型；Luna 已删除并强制禁用。当前配置总16槽；精确模型、优先级、时段、30分钟限额展示/重派规则、权限边界与收尾要求以正文和 references 为准。
+description: 主脑负责规划与独立验收，工程执行交已授权外部 Agent。支持 CodeBuddy 两模型、Qoder 国际与 CN、Claude/deepseek-flash、OpenCode 两个指定 free 模型；ZCode 已全局退役；Luna 已删除并强制禁用。当前配置总14槽；精确模型、优先级、时段、30分钟限额展示/重派规则、权限边界与收尾要求以正文和 references 为准。
 ---
 
-桌面端接入（BW-UNIFIED-DESKTOP-ENTRY-20261020，覆盖并取代 BW-ZCODE-DESKTOP-SKILL-20261019 的「每宿主一份适配器」口径）：ZCode 与 Qoder 桌面端各自原生扫描用户级 `~/.zcode/skills/<name>/SKILL.md` 与 `~/.qoder-cn/skills/<name>/SKILL.md`，Skill 工具单文件上限为 100,000 bytes；本主 Skill 已超过该上限，禁止直接复制后让桌面端读取截断内容。仓库 `desktop-skill/SKILL.md` 是**唯一**的宿主无关精简入口，`scripts/install_desktop_skill.py install` 渲染一次并把**字节相同**的内容装进两个宿主目录，同时写入无凭据的 `engine.json`；实际调度继续复用安装版 brain-worker 引擎和共享池。桌面适配器只承载各宿主自己不可派发的精确组合（Qoder 排除 `qoder:Qwen3.8-Max`、`qodercn:Qwen-3.8-Max`、`qodercn:Qwen3.8-Max`、`zcode:GLM-5.3`；ZCode 排除 `zcode:GLM-5.3`；宿主无法识别时 fail-closed 取并集），优先级顺序、主力时段门、各池容量数字、池 key 清单与额度门禁一律留在共享代码里，改一次三个宿主同时生效，禁止在适配器里抄写这些字面量。`tests/test_desktop_skill.py` 以三道守卫强制同源：G1 排除集里的每个 pool key 必须仍是引擎真实可派发键（改名或退役即失败，`install` 与 `check` 都会拒绝）、G2 Luna 禁用规则必须与本文同源、G3 两宿主安装内容必须字节一致且任一侧漂移都能被 `check` 检出；另有结构性守卫禁止适配器复述引擎态字面量。旧的 `zcode-skill/`、`qoder-skill/` 与对应按宿主安装脚本已删除。桌面会话默认作为主脑宿主，构造授权候选时施加上表排除集，防止递归自派；用户明确要求当前桌面会话自己执行时直接在当前会话工作，不冒充外部派工、不占共享名额。新会话用 `/brain-worker` 调用；Luna 禁用、每轮派工显示、原始证据、独立验收与适用收尾要求保持不变。
+桌面端接入（BW-UNIFIED-DESKTOP-ENTRY-20261020，覆盖并取代 BW-ZCODE-DESKTOP-SKILL-20261019 的「每宿主一份适配器」口径）：ZCode 与 Qoder 桌面端各自原生扫描用户级 `~/.zcode/skills/<name>/SKILL.md` 与 `~/.qoder-cn/skills/<name>/SKILL.md`，Skill 工具单文件上限为 100,000 bytes；本主 Skill 已超过该上限，禁止直接复制后让桌面端读取截断内容。仓库 `desktop-skill/SKILL.md` 是**唯一**的宿主无关精简入口，`scripts/install_desktop_skill.py install` 渲染一次并把**字节相同**的内容装进两个宿主目录，同时写入无凭据的 `engine.json`；实际调度继续复用安装版 brain-worker 引擎和共享池。桌面适配器只承载各宿主自己不可派发的精确组合（Qoder 排除 `qoder:Qwen3.8-Max`、`qodercn:Qwen-3.8-Max`、`qodercn:Qwen3.8-Max`；ZCode 无排除——`zcode:GLM-5.3` 已由引擎全局退役，任何宿主都不再派发、也不得在排除集列出已退役键；宿主无法识别时 fail-closed 取并集），优先级顺序、主力时段门、各池容量数字、池 key 清单与额度门禁一律留在共享代码里，改一次三个宿主同时生效，禁止在适配器里抄写这些字面量。`tests/test_desktop_skill.py` 以三道守卫强制同源：G1 排除集里的每个 pool key 必须仍是引擎真实可派发键（改名或退役即失败，`install` 与 `check` 都会拒绝）、G2 Luna 禁用规则必须与本文同源、G3 两宿主安装内容必须字节一致且任一侧漂移都能被 `check` 检出；另有结构性守卫禁止适配器复述引擎态字面量。旧的 `zcode-skill/`、`qoder-skill/` 与对应按宿主安装脚本已删除。桌面会话默认作为主脑宿主，构造授权候选时施加上表排除集，防止递归自派；用户明确要求当前桌面会话自己执行时直接在当前会话工作，不冒充外部派工、不占共享名额。新会话用 `/brain-worker` 调用；Luna 禁用、每轮派工显示、原始证据、独立验收与适用收尾要求保持不变。
+
+ZCode 全局退役（BW-ZCODE-RETIRE-20261020，用户明确指令，**当前权威、覆盖正文所有旧层序/总数/排除集叙述**）：`zcode:GLM-5.3` 按既有退役机制（与 `qodercn:DeepSeek-Flash` 同款）从正常候选池全局退出——`LEGACY_RETIRED_POOL_KEYS` 登记、容量条目置 0、`MAIN_FORCE_POOLS`/`POOL_PRIORITY` 移除，任何宿主/AUTO/`executor=zcode`/显式组合都不再派发（诚实拒绝，绝不改派别池），浮窗不再显示其行（真实在途只计入 `retired_active` 自然排干）。当前 AUTO 层序：CodeBuddy `deepseek-v4.1-flash`（0）> 三 Qoder Max（1）> `claude:deepseek-flash`（2）> 两 OpenCode 免费模型（4）> CodeBuddy `glm-5.3-flash`（5）> 两区 Flash（6）；国内配置合计 **14** 槽。ZCode availability/quota 诊断口径与 `ZCODE_POOL_KEY` 常量仅作历史证据读取保留，绝不据此派发。正文下方涉及 ZCode 的层序、总数 16、宿主排除 `zcode:GLM-5.3` 的旧段落一律视为被本段覆盖的历史档案。
+
+脑的队列与停顿纪律（BW-HOST-QUEUE-20261020，用户明确要求，三宿主一致）：用户中途插话一律**入队**——不打断、不取消、不重启任何正在运行的派发或工作，当前主线照常推进；主脑在等待 worker 返回的空闲时段处理队列，给出结论并把结论固化为 todo 项/技能条款/记忆，而不是换轨。**todo list 是唯一进度真相**：队列还有可做项时绝不空转交还回合，只有两种情况允许停——后台任务在跑且其完成通知会自动续队列，或真正阻塞在只有用户能给的输入上。长操作（回归、派发、安装）一律后台执行。**并行派工**：队列内容多且互不冲突（不同池、不同工作区/编辑区）时按引擎容量同时派多个牛马并行处理；编辑区重叠或同一工作区的任务必须串行（引擎同工作区单写入者），需要并行的同仓任务用各自 git worktree 从干净基线派发、验收后合并。
 
 CN 自定义 Max 恢复声明（BW-CUSTOM-MAX-RESUME-20261018-S1）：用户已于 2026-10-18 明确解除暂停，`qodercn:Qwen-3.8-Max`（Qoder CN自定义、带连字符）精确组合恢复正式授权，主脑新阶段授权集合恢复精确 `qodercn:Qwen-3.8-Max`，自定义仍 2 槽。历史事实保留：2026-10-15 至恢复前该组合曾按 BW-CUSTOM-MAX-PAUSE-20261015 暂停新派工，当时按授权可新派上限为 11；该暂停只是授权候选软排除，不存在需要清理的真实 DB 暂停锁，本次不清真实池/历史限额/在途。恢复不等于认证或额度现场已验证：不查询余额、不探测模型、不把既有在途强杀或抢占。AUTO 层序为 CodeBuddy `deepseek-v4.1-flash` > CN 自定义 Max > 两内置 Max（同级按真实在途数平衡）> claude > ZCode > 两 OpenCode 免费模型 `deepseek-v4.1-flash-free`/`glm-5.3-flash-free`（同层=4，BW-OPENCODE-20261019-S3）> CodeBuddy `glm-5.3-flash`（层=5，低层补位、额度独立，不再要求当轮 DeepSeek 限额证据——BW-LIMIT30-20261019-S3 覆盖旧证据门口径）> 两区 Flash。容量当前权威口径（BW-OPENCODE-20261019-S3，2026-10-19）：两个 OpenCode 免费模型**各独立 1 槽、无时段门、无 CodeBuddy 当轮额度前提、无付费回退**，配置总 16 槽、授权可新派上限 16（基线 BW-WORKER-WIDGET-20261018-S3：GLM 与 deepseek **不共享名额、各自独立物理 1 槽**，配置总 14——旧「共用同一物理 1 槽、总 13」口径作废，仅属历史；原 14 槽一项未减）。三 Max 仍受北京时间 22:00（含）至 08:00（不含）时段门。内置`qodercn:Qwen3.8-Max`、国际Max、两区Flash、CodeBuddy 两模型及其他既有规则不变。
 
@@ -971,7 +975,6 @@ AGENT_CAPABILITY_RECORD_END
   "allowed_candidates": [
     "codebuddy:deepseek-v4.1-flash",
     "codebuddy:glm-5.3-flash",
-    "zcode:GLM-5.3",
     "qoder:Qwen3.8-Flash",
     "qodercn:Qwen3.8-Flash"
   ],

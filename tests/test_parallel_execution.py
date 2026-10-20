@@ -5,12 +5,12 @@
 Windows CRLF 让 Qoder/ZCode 的 read_text→encode 哈希与 read_bytes 计划绑定不符）：
 
 - 一 CodeBuddy 结构化 429/6004（errors_info status=429, code=6004，含 reset 提示）；
-- 一 ZCode events.jsonl 真实 permission_resolved/tool_call_result 形状缺 Bash 权限
-  客户端（协议仍成功、summary 无拒绝记录，仍从原始 events 提取 permission_client_missing，
-  正常 model_request 正文含 429/缺 client 也不误报）；
+- 一 ZCode 退役诚实拒绝（BW-ZCODE-RETIRE-20261020：zcode:GLM-5.3 全局退役，入口经权威
+  原子门 rc=2、refused_before_dispatch、零派发、不进 barrier、绝不改派别池）；
 - 两 Qoder 成功完整绑定报告（九节、阶段 token、路径一致、session 非空、回读哈希一致），
   仅这两个成功任务写各自独立 workspace 的同名 output.py；失败任务零代码产出；
-- 文件 barrier 证明四子进程真实重叠而非串行（max(started) <= min(finished)）；
+- 文件 barrier 证明三并发子进程真实重叠而非串行（max(started) <= min(finished)，
+  退役拒绝腿不进 barrier）；
 - 失败的两个任务不阻塞其余：两 Qoder 任务照常完成并绑定；
 - authorized fallback：CodeBuddy 429 先落失败 summary+hash，再以另一入口接管，证明接管
   发生时另两任务仍在途且其 prompt/request 哈希一字未改；
@@ -342,7 +342,7 @@ class ParallelRehearsalTests(unittest.TestCase):
                 '--prompt-file', str(prompt), '--output-dir', str(out), '--stage', stage,
                 '--model', 'CB-PARR-429', '--tools', 'Read', '--config', str(cfg)]
 
-    def _zcode_cmd(self, ws, prompt, out, stage, plan, model, claim):
+    def _zcode_cmd(self, ws, prompt, out, stage, plan, model, claim=None):
         fixture = {}
         for key, name in (('bootstrap', 'boot.js'), ('tsx_loader', 'loader.mjs'),
                           ('builtin_provider_config', 'builtin.json'),
@@ -354,11 +354,15 @@ class ParallelRehearsalTests(unittest.TestCase):
         cfg.write_text(json.dumps({
             'node': sys.executable, 'runner': str(self.stub_dir / 'zcode_stub.py'),
             'node_args': [], 'environment': {}, **fixture}), encoding='utf-8')
-        return [sys.executable, str(ZCODE_ENTRY), '--workspace', str(ws),
-                '--prompt-file', str(prompt), '--output-dir', str(out), '--stage', stage,
-                '--model', model, '--tools', 'Read', '--config', str(cfg),
-                '--dispatch-plan', str(plan), '--dispatch-store', str(self.dispatch_store),
-                '--dispatch-claim', claim]
+        cmd = [sys.executable, str(ZCODE_ENTRY), '--workspace', str(ws),
+               '--prompt-file', str(prompt), '--output-dir', str(out), '--stage', stage,
+               '--model', model, '--tools', 'Read', '--config', str(cfg),
+               '--dispatch-plan', str(plan), '--dispatch-store', str(self.dispatch_store)]
+        # BW-ZCODE-RETIRE-20261020：退役池不可能再 reserve 出 claim token；claim=None
+        # 时不带 --dispatch-claim，让入口走自身权威原子门并诚实拒绝（零派发）。
+        if claim is not None:
+            cmd += ['--dispatch-claim', claim]
+        return cmd
 
     def test_four_task_parallel_rehearsal(self):
         specs = []
@@ -369,19 +373,18 @@ class ParallelRehearsalTests(unittest.TestCase):
                           prompt, ['Read'])
         specs.append(('cb429', self._codebuddy_cmd(ws, prompt, ws / 'out',
                                                    'BW-PARR-CB429', plan),
-                      self._base_env('cb429', ws), ws, 'BW-PARR-CB429'))
-        # 2) ZCode 缺 Bash 权限客户端（协议仍成功）
+                      self._base_env('cb429', ws, barrier_total=3), ws, 'BW-PARR-CB429'))
+        # 2) ZCode 退役诚实拒绝腿（BW-ZCODE-RETIRE-20261020）：池已全局退役、不可能再
+        #    reserve 出 token，入口经自身权威原子门必须 rc=2 零派发、绝不改派别池、
+        #    绝不进 barrier；其余三腿仍并行成功。
         ws = self._mk_workspace('zcperm')
         prompt = self._write('prompt-zcperm.txt', 'ZCode 并行演练任务，原样汇报。\n')
         plan = self._plan('T-ZC', 'BW-PARR-ZCPERM', 'zcode', 'GLM-5.3', ws,
                           prompt, ['Read'])
-        zc_claim = self._reserve('T-ZC', 'zcode', 'GLM-5.3', ws, prompt, 'BW-PARR-ZCPERM')
-        report = self._write('report-zcperm.txt',
-                             build_bound_report('BW-PARR-ZCPERM', str(ws)))
         specs.append(('zcperm', self._zcode_cmd(ws, prompt, ws / 'out',
-                                                'BW-PARR-ZCPERM', plan, 'GLM-5.3',
-                                                zc_claim),
-                      self._base_env('zcperm', ws, report), ws, 'BW-PARR-ZCPERM'))
+                                                'BW-PARR-ZCPERM', plan, 'GLM-5.3'),
+                      self._base_env('zcperm', ws, barrier_total=3), ws,
+                      'BW-PARR-ZCPERM'))
         # 3 & 4) 两个 Qoder 成功完整绑定报告（独立 workspace，同名 output.py）。
         #    BW-POOL-SPLIT-20261010-S3：国际 Qwen3.8-Max 只有 1 槽，第二个 qoder 并行任务
         #    走同级国际 Qwen3.8-Flash 兜底（executor='qoder'，同区不跨执行器），二者共存。
@@ -397,7 +400,7 @@ class ParallelRehearsalTests(unittest.TestCase):
                                  build_bound_report(stage, str(ws)))
             specs.append((tag, self._qoder_cmd(ws, prompt, ws / 'out', stage, plan,
                                                qmodel, claim),
-                          self._base_env(tag, ws, report), ws, stage))
+                          self._base_env(tag, ws, report, barrier_total=3), ws, stage))
 
         # 并发启动四适配器子进程（真实重叠由 barrier 门控完成证明）。
         procs = {tag: subprocess.Popen(cmd, env=env, cwd=str(ws),
@@ -423,16 +426,16 @@ class ParallelRehearsalTests(unittest.TestCase):
                             'stdout': out.decode('utf-8', 'replace'),
                             'stderr': err.decode('utf-8', 'replace')}
 
-        # ---- barrier 证明重叠而非串行 ----
+        # ---- barrier 证明重叠而非串行（三腿并发；ZCode 退役腿不进 barrier） ----
         started = sorted(float(p.read_text()) for p in self.barrier.glob('started-*'))
         finished = sorted(float(p.read_text()) for p in self.barrier.glob('finished-*'))
-        self.assertEqual(len(started), 4, f'started={started}')
-        self.assertEqual(len(finished), 4, f'finished={finished}')
+        self.assertEqual(len(started), 3, f'started={started}')
+        self.assertEqual(len(finished), 3, f'finished={finished}')
         self.assertLessEqual(max(started), min(finished),
                              'tasks did not truly overlap (serial execution detected)')
 
         # ---- 路径隔离：两个 Qoder 成功任务同名 output.py 在独立 workspace 互不覆盖；
-        #      失败任务（CodeBuddy 429 / ZCode 缺客户端）零代码产出，不得提前写 output ----
+        #      失败/拒绝任务（CodeBuddy 429 / ZCode 退役拒绝）零代码产出，不得提前写 output ----
         qoder_outputs = set()
         for tag in ('qa', 'qb'):
             f = results[tag]['ws'] / 'output.py'
@@ -465,15 +468,19 @@ class ParallelRehearsalTests(unittest.TestCase):
         self.assertIn('重置', sb['diagnostics']['reset_hint'] or '')
         self.assertFalse(sb['report_bound'])
 
-        # ---- ZCode events 缺 Bash 客户端（真实 permission_resolved 形状，summary
-        #      无拒绝记录仍被提取；正常 model_request 正文不被误报） ----
+        # ---- ZCode 退役诚实拒绝（BW-ZCODE-RETIRE-20261020）：入口 rc=2、
+        #      refused_before_dispatch、绝不进 barrier、零 summary/零派发 ----
         rzc = results['zcperm']
-        sz = json.loads((rzc['out'] / 'summary.json').read_text(encoding='utf-8'))
-        self.assertIn('permission_client_missing', sz['diagnostics']['failure_types'])
-        # 已知缺客户端来源不得泛化为模型执行失败。
-        self.assertNotIn('model_execution_failure', sz['diagnostics']['failure_types'])
-        raw_events = (rzc['out'] / 'events.jsonl').read_text(encoding='utf-8')
-        self.assertIn('model_request', raw_events)  # 含带 429 文案的正常请求正文
+        self.assertEqual(rzc['rc'], 2, rzc['stdout'] + rzc['stderr'])
+        refusal = json.loads(rzc['stdout'])
+        self.assertTrue(refusal['refused_before_dispatch'], refusal)
+        self.assertFalse(refusal['sent'], refusal)
+        self.assertEqual(refusal['pool_key'], 'zcode:GLM-5.3')
+        self.assertIn(refusal['reason'], ('unknown_pool', 'retired_pool'), refusal)
+        self.assertFalse((self.barrier / 'started-zcperm').exists(),
+                         'retired zcode entry must never reach the barrier')
+        self.assertFalse((rzc['out'] / 'summary.json').exists(),
+                         'refused-before-dispatch must produce zero summary')
 
         # 若主脑给出 BRAIN_WORKER_EXERCISE_EVIDENCE_DIR，把全部 request/summary/process/
         # stdout/stderr/失败证据复制过去，便于真实回读；默认 temp 即可，不提交进业务仓。
@@ -529,17 +536,12 @@ class ParallelRehearsalTests(unittest.TestCase):
 
         # 2) 起两个 Qoder 成功任务（barrier_total=3），此刻它们仍卡在 barrier 内。
         #    BW-POOL-SPLIT-20261010-S3：国际 Qwen3.8-Max 只有 1 槽，故 ia 占主力 Max、
-        #    ib 走同级国际 Flash；两个 zcode 幻影预留把 zcode 池也填到上限（只占容量、
-        #    从不 launch），确保接管任务的 Flash 名额不被 AUTO 改派，绝不突破任一池上限。
-        self._reserve('T-PHZ0', 'zcode', 'GLM-5.3', self._mk_workspace('phz0'),
-                      self._write('prompt-phz0.txt', 'phantom zcode 0\n'), 'BW-FB-PHZ0')
+        #    ib 走同级国际 Flash。BW-ZCODE-RETIRE-20261020：zcode 池已全局退役
+        #    （capacity=0、不在候选），旧"两个 zcode 幻影预留填顶"已无必要且不可能
+        #    再 reserve——各腿本就显式 claim，绝不突破任一池上限。
         inflight = {}
         for tag, stage, qmodel in (('ia', 'BW-FB-IA', 'Qwen3.8-Max'),
                                    ('ib', 'BW-FB-IB', 'Qwen3.8-Flash')):
-            if tag == 'ib':
-                self._reserve('T-PHZ1', 'zcode', 'GLM-5.3', self._mk_workspace('phz1'),
-                              self._write('prompt-phz1.txt', 'phantom zcode 1\n'),
-                              'BW-FB-PHZ1')
             wsi = self._mk_workspace(tag)
             pi = self._write(f'prompt-{tag}.txt', f'Qoder {tag} 在途任务。\n')
             pl = self._plan('T-' + tag.upper(), stage, 'qoder', qmodel, wsi,

@@ -13,8 +13,8 @@
 4. launch_unknown 拒结算且不重派；
 5. 国内旧 finish 安全边界不变（reserved 无 child：start_failed 允许、finished
    拒绝 no_child_terminal_unverified），且 Luna attempt 不能再走国内 finish；
-6. Z6-A 夹具顺序服从生产 1:1 轮转（Z,Max,Z,Max,Flash,Flash，各独立 workspace，
-   逐一核验 allowed/token/pool_key，六满 + 轮转 2:2）；
+6. Z6-A 夹具顺序服从生产轮转（BW-ZCODE-RETIRE-20261020：现役组合逐一显式 claim，
+   各独立 workspace，逐一核验 allowed/token/pool_key 直至全满）；
 7. Z6-B 回执 sha256 严格 64 位 ASCII 十六进制（大小写规范化）、string content 按
    UTF-8 原文哈希（不加 JSON 引号）、content 与 sha256 同给必须一致；
 8. Z6-C 重复结算只有同终态+同原回执哈希才算合法幂等（不覆盖旧证据），错误
@@ -55,22 +55,21 @@ class NativeLifecycleTests(unittest.TestCase):
     def tearDown(self):
         self._tmp.cleanup()
 
-    # ---------- 夹具：六满 → ask → 到期 claim Luna → 登记 agent_id ----------
-    # Z6-A：请求顺序必须服从生产 1:1 轮转——Z,Z,Max,Max 会从第二笔起被
-    # routing_required 拒绝（fixture 不能反向松生产轮转）；合法顺序 Z,Max,Z,Max,
-    # Flash,Flash，每次独立 workspace 并逐一核验 allowed/token/pool_key。
+    # ---------- 夹具：现役全满 → ask → 到期 claim Luna → 登记 agent_id ----------
+    # Z6-A（BW-ZCODE-RETIRE-20261020 起改为现役组合逐一显式 claim）：请求顺序服从
+    # 生产轮转，各独立 workspace，逐一核验 allowed/token/pool_key 直至全满。
     def _fill_domestic(self):
         # BW-CODEBUDDY-MAIN-S3 + BW-WORKER-WIDGET-20261018-S3 + BW-OPENCODE-20261019-S3
-        # 十六满：codebuddy deepseek×1 + codebuddy GLM×1（各自独立 1 槽，GLM 需显式当轮
-        # 额度条件授权）+ zcode×2 + 两内置 Max 各 1 + CN 自定义 Max×2 + 两地区 Flash 各 2
-        # + claude:deepseek-flash×2 + 两个 OpenCode 免费模型各 1 独立槽（T0=北京周四 23:00，
-        # 主力时段内且 claude offhours，OpenCode 无时段门，真实 API 直接 claim）。
+        # + BW-ZCODE-RETIRE-20261020 十四满：codebuddy deepseek×1 + codebuddy GLM×1（各自
+        # 独立 1 槽，GLM 需显式当轮额度条件授权）+ 两内置 Max 各 1 + CN 自定义 Max×2 +
+        # 两地区 Flash 各 2 + claude:deepseek-flash×2 + 两个 OpenCode 免费模型各 1 独立槽
+        # （T0=北京周四 23:00，主力时段内且 claude offhours，OpenCode 无时段门，真实 API
+        # 直接 claim；ZCode 已退役——组合在授权门即 unknown_pool，从填满夹具移除）。
         # 全部经显式 executor 逐一确定性 claim（CN 池只能 executor='qodercn'，claude 只能
         # executor='claude'，codebuddy 两模型只能 executor='codebuddy'，OpenCode 经
         # executor='opencode'，AUTO 轮换不保证落某特定主力），每次核验 allowed/token/pool_key。
         plan = [('codebuddy', 'deepseek-v4.1-flash', 'codebuddy'),
                 ('codebuddy', 'glm-5.3-flash', 'codebuddy'),
-                ('zcode', 'GLM-5.3', 'zcode'), ('zcode', 'GLM-5.3', 'zcode'),
                 ('qoder', 'Qwen3.8-Max', 'qoder'),
                 ('qodercn', 'Qwen3.8-Max', 'qodercn'),
                 ('qodercn', 'Qwen-3.8-Max', 'qodercn'),
@@ -95,9 +94,9 @@ class NativeLifecycleTests(unittest.TestCase):
         st = dp.status(self.store, now=T0)
         self.assertEqual(st['domestic']['active'], dp.DOMESTIC_TOTAL_CAPACITY,
                          st['domestic'])
-        # 2 个 zcode 记 committed_zcode；Qoder 主力组（两内置 Max + 自定义 Max 合计）记
-        # committed_qoder。
-        self.assertEqual(st['rotation']['committed_zcode'], 2, st['rotation'])
+        # Qoder 主力组（两内置 Max + 自定义 Max 合计）记 committed_qoder=4；
+        # BW-ZCODE-RETIRE-20261020：退役池不可能再提交，committed_zcode 恒为 0。
+        self.assertEqual(st['rotation']['committed_zcode'], 0, st['rotation'])
         self.assertEqual(st['rotation']['committed_qoder'], 4, st['rotation'])
         return tokens
 
@@ -147,22 +146,23 @@ class NativeLifecycleTests(unittest.TestCase):
         with dp.closing(dp.connect(self.store)) as conn:
             conflict = dp._workspace_conflict(conn, 'ws-luna')
         self.assertIsNone(conflict, conflict)
-        # task 已释放：腾一个 zcode 名额后，同 task 可重新 claim（不被旧 attempt 挡）。
-        # 本例验的是原生结算后的生命周期释放，不是 AUTO 优先级，故释放 zcode 行并以显式
-        # executor='zcode' 重新 claim 同一组合（AUTO 新 reserve 会被 CodeBuddy 空位改派）。
-        dp.finish(self.store, self._zcode_token(), terminal='cancelled',
+        # task 已释放：腾一个现役 qoder Max 名额后，同 task 可重新 claim（不被旧 attempt 挡）。
+        # 本例验的是原生结算后的生命周期释放，不是 AUTO 优先级；BW-ZCODE-RETIRE-20261020：
+        # zcode 组合在授权门即 unknown_pool，夹具改用释放 qoder:Qwen3.8-Max 行并以显式
+        # executor='qoder' 重新 claim 同一组合（该池容量 1，释放后必空；AUTO 会被改派）。
+        dp.finish(self.store, self._qmax_token(), terminal='cancelled',
                   now=T0 + timedelta(seconds=901))
-        out2 = dp.reserve(self.store, task_id='task-luna', runtime='zcode',
-                          model='GLM-5.3', workspace='ws-luna',
-                          prompt_sha256='f' * 64, executor='zcode',
+        out2 = dp.reserve(self.store, task_id='task-luna', runtime='qoder',
+                          model='Qwen3.8-Max', workspace='ws-luna',
+                          prompt_sha256='f' * 64, executor='qoder',
                           now=T0 + timedelta(seconds=902))
         self.assertTrue(out2.get('token'), out2)
 
-    def _zcode_token(self):
+    def _qmax_token(self):
         with dp.closing(dp.connect(self.store)) as conn:
             row = conn.execute(
                 "SELECT token FROM attempts WHERE origin='reserve' "
-                "AND pool_key='zcode:GLM-5.3' AND state IN ('reserved','running') "
+                "AND pool_key='qoder:Qwen3.8-Max' AND state IN ('reserved','running') "
                 "ORDER BY rowid LIMIT 1").fetchone()
         self.assertIsNotNone(row)
         return row['token']
@@ -316,13 +316,14 @@ class NativeLifecycleTests(unittest.TestCase):
         dp.settle_native(self.store, task_id='task-luna', token=luna_tok,
                          agent_id='agent-real-1', terminal='finished',
                          receipt=RECEIPT, now=T0 + timedelta(seconds=900))
-        # 腾一个 zcode 名额后建一个真实国内 attempt（显式 executor='zcode' 保留原组合，
-        # 不因 CodeBuddy 空位被 AUTO 改派）。
-        dp.finish(self.store, self._zcode_token(), terminal='cancelled',
+        # 腾一个现役 qoder Max 名额后建一个真实国内 attempt（显式 executor='qoder' 保留
+        # 原组合；BW-ZCODE-RETIRE-20261020：zcode 已退役不可能再 reserve，该池容量 1，
+        # 释放后必空，不因 CodeBuddy 空位被 AUTO 改派）。
+        dp.finish(self.store, self._qmax_token(), terminal='cancelled',
                   now=T0 + timedelta(seconds=901))
-        out = dp.reserve(self.store, task_id='dom-n', runtime='zcode',
-                         model='GLM-5.3', workspace='ws-n', prompt_sha256='a' * 64,
-                         executor='zcode', now=T0 + timedelta(seconds=902))
+        out = dp.reserve(self.store, task_id='dom-n', runtime='qoder',
+                         model='Qwen3.8-Max', workspace='ws-n', prompt_sha256='a' * 64,
+                         executor='qoder', now=T0 + timedelta(seconds=902))
         self.assertTrue(out.get('token'), out)
         dom_tok = out['token']
         later = T0 + timedelta(seconds=903)
@@ -407,11 +408,13 @@ class NativeLifecycleTests(unittest.TestCase):
 
     # ---------- 5. 国内旧 finish 边界不变；Luna 不能走国内 finish ----------
     def test_domestic_finish_boundary_unchanged(self):
-        # 准备用显式 executor='zcode' 固定组合，绕过 AUTO 跨层改派（BW-MAIN-PRIORITY-S1）；
+        # 准备用显式 executor='qoder' 固定现役组合，绕过 AUTO 跨层改派
+        # （BW-MAIN-PRIORITY-S1 + BW-ZCODE-RETIRE-20261020：原借退役 zcode 组合已失效）；
         # 国内旧 finish 边界断言原样保留。
-        out = dp.reserve(self.store, task_id='dom-x', runtime='zcode',
-                         model='GLM-5.3', workspace='ws-x', prompt_sha256='a' * 64,
-                         executor='zcode', now=T0)
+        out = dp.reserve(self.store, task_id='dom-x', runtime='qoder',
+                         model='Qwen3.8-Max', workspace='ws-x', prompt_sha256='a' * 64,
+                         executor='qoder', now=T0)
+        self.assertTrue(out.get('allowed') and out.get('token'), out)
         tok = out['token']
         fin = dp.finish(self.store, tok, terminal='finished', now=T0)
         self.assertFalse(fin['released'], fin)  # 无 child 证据仍拒绝

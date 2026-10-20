@@ -1,12 +1,12 @@
 """BW-CLAUDE-DEEPSEEK-S3 / BW-CLAUDE-CAPACITY2 离线回归：claude:deepseek-flash AUTO 可选主力槽。
 
-覆盖：物理 DOMESTIC_TOTAL_CAPACITY=16（含 CodeBuddy 最高层 1 槽、GLM 独立 1 槽与两
-OpenCode 免费槽各 1，BW-OPENCODE-20261019 现行口径）；claude 在 MAIN_FORCE_KEYS 且容量 2（第 2 个请求可认领、
+覆盖：物理 DOMESTIC_TOTAL_CAPACITY=14（BW-ZCODE-RETIRE-20261020：zcode 2 槽退役，含 CodeBuddy
+最高层 1 槽、GLM 独立 1 槽与两 OpenCode 免费槽各 1）；claude 在 MAIN_FORCE_KEYS 且容量 2（第 2 个请求可认领、
 第 3 个满且绝不回退别模型；完成释放后可再用；同 workspace 仍拒绝；reserved/running/unknown 均
 正确占位）；AUTO 在其它主力占满时可选中 claude（无需用户显式点名）；claude 在途计入国内总在途
 聚合、但绝不污染 committed_qoder；显式 executor='claude' 点名；时段门（工作日高峰拒 / 周末 /
-2026 假日 / 夜间放行）；跨高峰 reserve→consume 只释放本 token；明确限额落标/释放；总 16 守卫
-包含历史迁移占位且绝不派第 17 个。全部显式临时 sqlite store，绝不读写真实 ~/.brain-worker。
+2026 假日 / 夜间放行）；跨高峰 reserve→consume 只释放本 token；明确限额落标/释放；总 14 守卫
+包含历史迁移占位且绝不派第 15 个。全部显式临时 sqlite store，绝不读写真实 ~/.brain-worker。
 零网络/零模型。
 """
 import hashlib
@@ -60,13 +60,12 @@ class _ClaudeBase(unittest.TestCase):
                           now=now, executor=executor, _preclaim=False)
 
     def occupy_non_claude_mains(self, now=OFFPEAK_NIGHT):
-        """占满 9 个非 claude 主力槽（codebuddy deepseek 1 + zcode 2 + qoder Max 1 +
-        cn Max 1 + cn 自定义 Max 2 + 两 OpenCode 免费槽各 1，BW-OPENCODE-20261019），
+        """占满 7 个非 claude 现役主力槽（codebuddy deepseek 1 + qoder Max 1 +
+        cn Max 1 + cn 自定义 Max 2 + 两 OpenCode 免费槽各 1；BW-ZCODE-RETIRE-20261020：
+        原 zcode 2 槽已全局退役、不再占位），
         使 AUTO 在 claude 仍空闲时按层序（claude tier2 高于 OpenCode tier4 之上）落到 claude。"""
         self.assertTrue(self._reserve('cb', 'codebuddy', 'deepseek-v4.1-flash',
                                       'codebuddy', now).get('allowed'))
-        for i in range(2):
-            self.assertTrue(self._reserve(f'z{i}', 'zcode', 'GLM-5.3', 'zcode', now).get('allowed'))
         self.assertTrue(self._reserve('qm', 'qoder', 'Qwen3.8-Max', 'qoder', now).get('allowed'))
         self.assertTrue(self._reserve('cnm', 'qodercn', 'Qwen3.8-Max', 'qodercn', now).get('allowed'))
         for i in range(2):
@@ -87,9 +86,9 @@ class CapacityAndRouting(_ClaudeBase):
         self.assertIn(CLAUDE, dp.MAIN_FORCE_KEYS)
 
     def test_physical_domestic_total_is_sixteen(self):
-        # BW-OPENCODE-20261019 当前权威总数：12 主力（含两 CodeBuddy 各独立 1 槽与两
-        # OpenCode 免费模型各独立 1 槽）+ 4 Flash = 16（旧 14 口径作废）。
-        self.assertEqual(dp.DOMESTIC_TOTAL_CAPACITY, 16)
+        # BW-ZCODE-RETIRE-20261020 当前权威总数：8 主力（含两 CodeBuddy 各独立 1 槽与两
+        # OpenCode 免费模型各独立 1 槽，zcode 2 槽已退役）+ 4 Flash = 14（旧 16 口径作废）。
+        self.assertEqual(dp.DOMESTIC_TOTAL_CAPACITY, 14)
         self.assertEqual(dp.DOMESTIC_TOTAL_CAPACITY,
                          sum(dp.MAIN_FORCE_CAPACITY.values())
                          + sum(dp.OVERFLOW_CAPACITY.values()))
@@ -160,8 +159,8 @@ class CapacityAndRouting(_ClaudeBase):
         self.assertEqual(r4['reason'], 'capacity_full', r4)
 
     def test_auto_selects_claude_when_other_mains_full(self):
-        # 另一主力的 AUTO 请求（未点名 claude）：其余 9 个主力槽（含 CodeBuddy 与两
-        # OpenCode）占满、
+        # 另一主力的 AUTO 请求（未点名 claude）：其余 7 个现役主力槽（含 CodeBuddy 与两
+        # OpenCode，BW-ZCODE-RETIRE-20261020 起无 zcode 占位）占满、
         # claude 空闲 → 选中 claude
         self.occupy_non_claude_mains()
         r = dp.select_and_claim(self.store, task_id='auto', runtime='qoder',
@@ -205,11 +204,11 @@ class CapacityAndRouting(_ClaudeBase):
         self.assertEqual(r['reason'], 'main_force_window_closed')
 
     def test_total_guard_blocks_claude_with_migration_debt(self):
-        # BW-CODEBUDDY-MAIN-S3 + BW-WORKER-WIDGET-20261018-S3 + BW-OPENCODE-20261019：
-        # 真实国内在途已达总 16（9 个非 claude 主力含 CodeBuddy deepseek 与两 OpenCode
-        # 免费槽 + GLM 独立 1 槽在途 + 4 个 Flash + 1 个 claude 在途 + 1 条 retired 池
-        # 超额迁移在途），claude 自身按容量看似仍空（1/2），但总守卫对 claude 同样生效，
-        # 绝不派第 17 个。显式点名也如实拒绝。
+        # BW-CODEBUDDY-MAIN-S3 + BW-WORKER-WIDGET-20261018-S3 + BW-ZCODE-RETIRE-20261020：
+        # 真实国内在途已达总 14（7 个现役非 claude 主力含 CodeBuddy deepseek 与两 OpenCode
+        # 免费槽，zcode 已退役不占位 + GLM 独立 1 槽在途 + 4 个 Flash + 1 个 claude 在途 +
+        # 1 条 retired 池超额迁移在途），claude 自身按容量看似仍空（1/2），但总守卫对
+        # claude 同样生效，绝不派第 15 个。显式点名也如实拒绝。
         self.occupy_non_claude_mains()
         for i in range(2):
             self.assertTrue(self._reserve(f'of{i}', 'qoder', 'Qwen3.8-Flash',
@@ -229,7 +228,7 @@ class CapacityAndRouting(_ClaudeBase):
                           'qodercn:DeepSeek-Flash', 'running',
                           dp._iso(OFFPEAK_NIGHT)))
         st = dp.status(self.store, now=OFFPEAK_NIGHT)
-        self.assertEqual(st['domestic']['active'], 16, st['domestic'])
+        self.assertEqual(st['domestic']['active'], 14, st['domestic'])
         self.assertEqual(st['pools'][CLAUDE]['active'], 1, st['pools'][CLAUDE])
         r = self.claim_claude('late', executor='claude')
         self.assertFalse(r.get('allowed'), r)

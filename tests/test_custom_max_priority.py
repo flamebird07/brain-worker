@@ -1,14 +1,15 @@
 """BW-CUSTOM-MAX-RESUME-20261018-S1 离线回归：CN 自定义 Max 在 Max 层内优先。
 
 只用临时 SQLite（每用例独立 store）+ mock ZCode availability / process_identity，
-零真实模型 / 零凭据 / 零真实池 / 零网络。断言：
-- AUTO 顺序 CodeBuddy > CN 自定义 Max > 两内置 Max（同级在途平衡）> Claude > ZCode；
+零真实模型 / 零凭据 / 零真实池 / 零网络。断言（BW-ZCODE-RETIRE-20261020 起 zcode 已全局
+退役，请求组合/占位改用现役池）：
+- AUTO 顺序 CodeBuddy > CN 自定义 Max > 两内置 Max（同级在途平衡）> Claude > 两 OpenCode；
 - 夜间自定义即使已有 1 在途、两内置 0 在途，仍先选自定义直到其 2 槽满；
 - 自定义 2 槽满 → 两内置（真实在途平衡/stable tie 保持）；
 - 全部 Max 满 → Claude；白天三 Max 全部剔除；
 - 显式指定内置 Max 的固定选择不被新优先级改写；
 - stage_selection 规划与正式原子入口 select_and_claim 同序；
-- 当前权威总容量 16（BW-OPENCODE-20261019 起两 CodeBuddy + 两 OpenCode 免费模型各独立 1 槽）、
+- 当前权威总容量 14（BW-ZCODE-RETIRE-20261020 起 zcode 2 槽退役，原 16 口径作废）、
   同 workspace 单写与 unknown 在途保护保留。
 """
 import sys
@@ -33,7 +34,8 @@ QMAX = 'qoder:Qwen3.8-Max'
 CN_MAX = 'qodercn:Qwen3.8-Max'
 CN_CUSTOM_MAX = 'qodercn:Qwen-3.8-Max'
 CLAUDE = 'claude:deepseek-flash'
-ZCODE = 'zcode:GLM-5.3'
+ZCODE = 'zcode:GLM-5.3'  # BW-ZCODE-RETIRE-20261020：已全局退役，仅用于拒绝/层序断言
+OPENCODE_DS = 'opencode:deepseek-v4.1-flash-free'
 QFLASH = 'qoder:Qwen3.8-Flash'
 CN_FLASH = 'qodercn:Qwen3.8-Flash'
 MAXES = (QMAX, CN_MAX, CN_CUSTOM_MAX)
@@ -103,7 +105,9 @@ class _Base(unittest.TestCase):
                           workspace=ws or self.ws(tid), prompt_sha256=SHA, stage='s',
                           now=now, executor=executor, _preclaim=False)
 
-    def claim_auto(self, tid, runtime='zcode', model='GLM-5.3', now=NIGHT):
+    def claim_auto(self, tid, runtime='qoder', model='Qwen3.8-Flash', now=NIGHT):
+        # BW-ZCODE-RETIRE-20261020：原默认请求组合 zcode:GLM-5.3 已退役（会先撞
+        # unknown_pool），改用现役国际 Flash 请求组合验证 AUTO 层序。
         return dp.select_and_claim(self.store, task_id=tid, runtime=runtime, model=model,
                                    workspace=self.ws(tid), prompt_sha256=SHA, stage='s',
                                    now=now, executor='auto', _preclaim=False)
@@ -154,8 +158,10 @@ class CustomMaxPriorityTests(_Base):
             elig = dp._eligible_main_forces(conn, False, DAY)
         for pk in MAXES:
             self.assertNotIn(pk, elig)
-        # 白天 Max 全剔除；claude 高峰门关 → 落 ZCode，且绝不静默改派 Max。
-        self.assertEqual(self.select(ZCODE, DAY)[0], ZCODE)
+        # BW-ZCODE-RETIRE-20261020：zcode 已全局退役、不在候选；白天 Max 全剔除、
+        # claude 高峰门关 → 落现役下一层两 OpenCode 免费槽，且绝不静默改派 Max。
+        self.assertNotIn(ZCODE, elig)
+        self.assertIn(self.select(ZCODE, DAY)[0], dp.OPENCODE_POOL_KEYS)
 
     def test_explicit_builtin_selection_not_rewritten(self):
         r = self.reserve('qm', 'qoder', 'Qwen3.8-Max', executor='qoder')
@@ -177,17 +183,21 @@ class SameOrderAndGuardsTests(_Base):
         self.assertEqual(out['selected']['pool_key'], CN_CUSTOM_MAX, out)
 
     def test_capacity_16_current_authority(self):
-        # BW-OPENCODE-20261019 起两 OpenCode 免费模型各独立 1 槽，权威总容量 14→16。
-        self.assertEqual(dp.DOMESTIC_TOTAL_CAPACITY, 16)
+        # BW-ZCODE-RETIRE-20261020：zcode 2 槽退役，权威总容量 16→14（旧 16 口径作废）。
+        self.assertEqual(dp.DOMESTIC_TOTAL_CAPACITY, 14)
         self.assertEqual(dp.capacity_for(CN_CUSTOM_MAX), 2)
         self.assertEqual(sum(dp.MAIN_FORCE_CAPACITY.values())
-                         + sum(dp.OVERFLOW_CAPACITY.values()), 16)
+                         + sum(dp.OVERFLOW_CAPACITY.values()), 14)
 
     def test_workspace_single_write_guard_unchanged(self):
+        # BW-ZCODE-RETIRE-20261020：原 zcode executor 入口已退役（retired_pool 拒绝），
+        # 单写守卫改用现役 codebuddy executor，验证同 workspace 在途互斥语义不变。
         shared = self.ws('shared')
-        r1 = self.reserve('w1', 'zcode', 'GLM-5.3', executor='zcode', ws=shared)
+        r1 = self.reserve('w1', 'codebuddy', 'deepseek-v4.1-flash',
+                          executor='codebuddy', ws=shared)
         self.assertTrue(r1.get('allowed'), r1)
-        r2 = self.reserve('w2', 'zcode', 'GLM-5.3', executor='zcode', ws=shared)
+        r2 = self.reserve('w2', 'codebuddy', 'deepseek-v4.1-flash',
+                          executor='codebuddy', ws=shared)
         self.assertFalse(r2.get('allowed'), r2)
         self.assertEqual(r2['reason'], 'workspace_in_flight')
 

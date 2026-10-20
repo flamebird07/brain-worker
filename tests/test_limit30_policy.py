@@ -10,9 +10,11 @@
 - S4 缺口 2 回归：main_force_limits 携带**非法时间**（历史损坏数据）时
   `_quota_limit_window_active` 绝不 ValueError 崩溃；未知证据原样保留，不伪造恢复
   （不谎称窗口有效，也不删标记）；
-- 跨连接/跨 workspace 共享同一临时库：另一"进程"新派发同样在窗口内被拒；
-- AUTO / 显式入口 / 预留 consume 三口径一致拒绝，且 consume 拒绝只释放本 token
-  自己的 reserved（start_failed），不抢占、不泄漏；
+- 跨连接/跨 workspace 共享同一临时库：另一"进程"新派发同样在窗口内被拒
+  （BW-ZCODE-RETIRE-20261020：zcode 退役后该窗口语义由现役 claude 池验证，
+  退役组合的 AUTO/显式 claim 一律 unknown_pool 诚实拒绝，先进闸后窗口）；
+- 预留 consume 在窗口内一致拒绝且只释放本 token 自己的 reserved（start_failed），
+  不抢占、不泄漏（同样改用 claude 池验证）；
 - CodeBuddy GLM 与 DeepSeek 额度独立：窗口政策不波及两 CodeBuddy 池；无当轮
   DeepSeek 证据 GLM 仍可 reserve/consume，两槽互不占用；
 - 浮窗展示纯函数：限额窗口内空闲显示"上轮限额"、真实运行中只显示"运行中"（运行
@@ -198,30 +200,40 @@ class TestQuotaLimitWindow(_PoolBase):
     """1799 拒 / 1800 放行；到期不删证据、不声称恢复、不泄漏锁、跨连接一致。"""
 
     def test_1799_rejects_and_1800_allows_per_pool(self):
-        for pk, runtime, model, tag in ((ZC, 'zcode', 'GLM-5.3', 'zc'),
-                                        (CL, 'claude', 'deepseek-flash', 'cl')):
-            with self.subTest(pool=pk):
-                # task/文件/目录名一律不带 ':'（Windows 路径安全）。
-                tok = f'bound-{tag}'
-                self.insert_attempt(tok, f'b-{tag}', pk, 'running', ended=T0)
-                self.mark(pk, f'b-{tag}', tok)
-                denied = self.claim(f'new-{tag}', runtime, model, runtime,
-                                    T0 + timedelta(seconds=1799))
-                self.assertFalse(denied.get('allowed'), denied)
-                self.assertEqual(denied['reason'], 'main_force_limited', denied)
-                allowed = self.claim(f'exp-{tag}', runtime, model, runtime,
-                                     T0 + timedelta(seconds=1800))
-                self.assertTrue(allowed.get('allowed'), allowed)
-                self.assertEqual(allowed['pool_key'], pk)
-                # 到期只是**只读**放行：原标记 limited=1、绑定证据、错误原件都还在。
-                snaps = dp.status(self.store, now=T0 + timedelta(seconds=1801))
-                self.assertTrue(snaps['pools'][pk]['limited'], snaps['pools'][pk])
-                lim = snaps['main_force_limits'][pk]
-                self.assertEqual(int(lim['limited']), 1)
-                self.assertTrue(Path(lim['evidence_path']).is_file())
-                self.assertEqual(lim['evidence_sha256'],
-                                 hashlib.sha256(
-                                     Path(lim['evidence_path']).read_bytes()).hexdigest())
+        # BW-ZCODE-RETIRE-20261020：zcode 已全局退役——其新 claim 不再进入窗口判定，
+        # 任何时刻一律 unknown_pool 诚实拒绝（历史 429 标记仅作诊断保留）；
+        # 1799/1800 窗口的拒绝与只读放行改由现役 claude 池完整验证。
+        ztok = 'bound-zc'
+        self.insert_attempt(ztok, 'b-zc', ZC, 'running', ended=T0)
+        self.mark(ZC, 'b-zc', ztok)
+        for seconds in (1799, 1800):
+            with self.subTest(pool=ZC, seconds=seconds):
+                r = self.claim(f'new-zc{seconds}', 'zcode', 'GLM-5.3', 'zcode',
+                               T0 + timedelta(seconds=seconds))
+                self.assertFalse(r.get('allowed'), r)
+                self.assertEqual(r['reason'], 'unknown_pool', r)
+        pk, runtime, model, tag = CL, 'claude', 'deepseek-flash', 'cl'
+        # task/文件/目录名一律不带 ':'（Windows 路径安全）。
+        tok = f'bound-{tag}'
+        self.insert_attempt(tok, f'b-{tag}', pk, 'running', ended=T0)
+        self.mark(pk, f'b-{tag}', tok)
+        denied = self.claim(f'new-{tag}', runtime, model, runtime,
+                            T0 + timedelta(seconds=1799))
+        self.assertFalse(denied.get('allowed'), denied)
+        self.assertEqual(denied['reason'], 'main_force_limited', denied)
+        allowed = self.claim(f'exp-{tag}', runtime, model, runtime,
+                             T0 + timedelta(seconds=1800))
+        self.assertTrue(allowed.get('allowed'), allowed)
+        self.assertEqual(allowed['pool_key'], pk)
+        # 到期只是**只读**放行：原标记 limited=1、绑定证据、错误原件都还在。
+        snaps = dp.status(self.store, now=T0 + timedelta(seconds=1801))
+        self.assertTrue(snaps['pools'][pk]['limited'], snaps['pools'][pk])
+        lim = snaps['main_force_limits'][pk]
+        self.assertEqual(int(lim['limited']), 1)
+        self.assertTrue(Path(lim['evidence_path']).is_file())
+        self.assertEqual(lim['evidence_sha256'],
+                         hashlib.sha256(
+                             Path(lim['evidence_path']).read_bytes()).hexdigest())
 
     def test_two_pools_independent(self):
         tok = 'bound-z'
@@ -234,10 +246,12 @@ class TestQuotaLimitWindow(_PoolBase):
 
     def test_other_process_other_workspace_same_store_also_refused(self):
         # 已在运行的另一进程（独立连接）绑定的真实失败，跨连接/跨 workspace 同样拒新派。
+        # BW-ZCODE-RETIRE-20261020：zcode 退役后 claim 一律 unknown_pool、测不到窗口，
+        # 该跨连接窗口语义改用现役 claude 池验证。
         tok = 'proc2-bound'
-        self.insert_attempt(tok, 'proc2-task', ZC, 'running', ended=T0)
-        self.mark(ZC, 'proc2-task', tok)
-        r = self.claim('proc3-task', 'zcode', 'GLM-5.3', 'zcode',
+        self.insert_attempt(tok, 'proc2-task', CL, 'running', ended=T0)
+        self.mark(CL, 'proc2-task', tok)
+        r = self.claim('proc3-task', 'claude', 'deepseek-flash', 'claude',
                        T0 + timedelta(seconds=60))
         self.assertFalse(r.get('allowed'), r)
         self.assertEqual(r['reason'], 'main_force_limited', r)
@@ -255,49 +269,50 @@ class TestQuotaLimitWindow(_PoolBase):
     def test_consume_releases_only_own_reserved_and_lock_not_leaked(self):
         # 预留 consume 在窗口内一致拒绝；本 token 的 reserved 真实释放为 start_failed
         # （终态释放不泄漏锁——后续新事务立即可成功），其它在途不受影响。
+        # BW-ZCODE-RETIRE-20261020：zcode 退役后无法再 reserve/consume（claim 一律
+        # unknown_pool），窗口内 consume 释放语义改用现役 claude 池验证；预留取北京
+        # 22:00 离峰锚点避开 claude 高峰门；不泄漏锁的后续新事务改用 CodeBuddy
+        # deepseek 池（额度独立、不受 claude 标记连坐、无时段门）。
+        anchor = datetime(2026, 10, 19, 14, 0, 0, tzinfo=timezone.utc)  # 北京 22:00 离峰
         bound = 'lock-bound'
-        self.insert_attempt(bound, 'lock-b', ZC, 'running', ended=T0)
-        self.mark(ZC, 'lock-b', bound)
-        mine = self.claim('lock-mine', 'zcode', 'GLM-5.3', 'zcode',
-                          T0 - timedelta(seconds=3600))
+        self.insert_attempt(bound, 'lock-b', CL, 'running', ended=anchor)
+        self.mark(CL, 'lock-b', bound, now=anchor)
+        mine = self.claim('lock-mine', 'claude', 'deepseek-flash', 'claude',
+                          anchor - timedelta(seconds=3600))
         self.assertTrue(mine.get('allowed'), mine)
-        out = dp.consume_for_entry(self.store, task_id='lock-mine', runtime='zcode',
-                                   model='GLM-5.3', workspace=self.ws('lock-mine'),
+        out = dp.consume_for_entry(self.store, task_id='lock-mine', runtime='claude',
+                                   model='deepseek-flash', workspace=self.ws('lock-mine'),
                                    prompt_sha256=SHA64, stage='s',
                                    claim_token=mine['token'],
-                                   now=T0 + timedelta(seconds=10))
+                                   now=anchor + timedelta(seconds=10))
         self.assertFalse(out.get('allowed'), out)
         self.assertEqual(out['reason'], 'main_force_limited', out)
         self.assertTrue(out.get('capacity_released'), out)
         self.assertEqual(self.state_of(mine['token']), 'start_failed')
         self.assertEqual(self.state_of(bound), 'running')
-        # 不泄漏锁：紧随其后的普通预留（Claude 池）在同一库上立即成功。
-        nxt = self.claim('lock-next', 'claude', 'deepseek-flash', 'claude',
-                        T0 + timedelta(seconds=11))
+        # 不泄漏锁：紧随其后的普通预留（CodeBuddy deepseek 池）在同一库上立即成功。
+        nxt = self.claim('lock-next', 'codebuddy', 'deepseek-v4.1-flash', 'codebuddy',
+                         anchor + timedelta(seconds=11))
         self.assertTrue(nxt.get('allowed'), nxt)
 
     def test_auto_explicit_consume_consistent(self):
-        # 三口径一致：窗口内 AUTO 不选中 ZCode、显式入口拒绝、预留 consume 拒绝。
+        # BW-ZCODE-RETIRE-20261020：zcode 全局退役后三口径收敛为"诚实拒绝"——LEGACY_RETIRED
+        # 闸先于限额窗口判定：AUTO 请求退役组合一律 unknown_pool 拒绝、绝不选中退役池，
+        # 显式入口同样 unknown_pool（历史 429 标记仅作诊断保留，不再是派发依据）。
         bound = 'tri-bound'
         self.insert_attempt(bound, 'tri-b', ZC, 'running', ended=T0)
         self.mark(ZC, 'tri-b', bound)
-        # 占满比 ZCode 更高的层（CodeBuddy deepseek 1 + GLM 1 + 三 Max 4 + Claude 2），
-        # 使 AUTO 在无窗口时会落到 ZCode；有窗口必须跳过。
-        for i, (pk, task) in enumerate(((CB, 'cb'), (GLM, 'gl'), (CL, 'cl'),
-                                        (CL, 'cl2'))):
-            self.insert_attempt(f'fill{i}', task, pk, 'running', ended=T0)
-        with closing(dp.connect(self.store)) as conn:
-            self.assertFalse(dp._quota_limit_window_active(conn, CL, T0 + timedelta(seconds=60)))
         now = T0 + timedelta(seconds=60)
         r = dp.select_and_claim(self.store, task_id='tri-auto', runtime='zcode',
                                 model='GLM-5.3', workspace=self.ws('tri-auto'),
                                 prompt_sha256=SHA64, now=now, executor='auto',
                                 _preclaim=False)
-        chosen = (r.get('selected') or {}).get('pool_key') or r.get('pool_key')
-        self.assertNotEqual(chosen, ZC, r)
+        self.assertFalse(r.get('allowed'), r)
+        self.assertEqual(r['reason'], 'unknown_pool', r)
+        self.assertNotEqual((r.get('selected') or {}).get('pool_key'), ZC, r)
         exp = self.claim('tri-exp', 'zcode', 'GLM-5.3', 'zcode', now)
         self.assertFalse(exp.get('allowed'), exp)
-        self.assertEqual(exp['reason'], 'main_force_limited', exp)
+        self.assertEqual(exp['reason'], 'unknown_pool', exp)
 
     def test_illegal_time_never_crashes_and_evidence_kept(self):
         # S4 缺口 2 回归：历史损坏时间串不得 ValueError 崩溃；未知证据保留、不伪造恢复。

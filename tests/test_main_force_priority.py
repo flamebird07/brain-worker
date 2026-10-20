@@ -7,7 +7,8 @@
 - Max 全不可用时，Claude 允许窗且有空位优先于 Z；Claude 满/限额/峰值才 Z；
 - 同层内保持现有在途平衡与 tie 方式；rotation 历史计数照旧保留；
 - 全部主力无可用槽才 Flash；只允许 Z / 固定 Flash 时不强制 Max；CN 约束不跨区；
-- 16 总槽（BW-OPENCODE-20261019 起两 CodeBuddy + 两 OpenCode 免费模型各独立 1 槽；
+- 14 总槽（BW-OPENCODE-20261019 起两 CodeBuddy + 两 OpenCode 免费模型各独立 1 槽；
+  BW-ZCODE-RETIRE-20261020：ZCode 两槽全局退役，原 Z 承接层由 OpenCode tier 4 接替；
   CodeBuddy 最高层名额由 build_store 预占以保留旧层序断言）、unknown 在途、
   workspace 冲突、北京 22/08 边界与 DeepSeek 独立时间门不变；
 - stage_selection 复用单一权威 `_select_main_force`，同一新优先级。
@@ -33,7 +34,10 @@ QMAX = 'qoder:Qwen3.8-Max'
 CN_MAX = 'qodercn:Qwen3.8-Max'
 CN_CUSTOM_MAX = 'qodercn:Qwen-3.8-Max'
 CLAUDE = 'claude:deepseek-flash'
-ZCODE = 'zcode:GLM-5.3'
+ZCODE = 'zcode:GLM-5.3'  # BW-ZCODE-RETIRE-20261020：已退役，不再出现在任何候选/选择结果
+OC_DS = dp.OPENCODE_DEEPSEEK_POOL_KEY
+OC_GLM = dp.OPENCODE_GLM_POOL_KEY
+OPENCODES = (OC_DS, OC_GLM)
 QFLASH = 'qoder:Qwen3.8-Flash'
 CN_FLASH = 'qodercn:Qwen3.8-Flash'
 RETIRED_DS = 'qodercn:DeepSeek-Flash'
@@ -179,8 +183,9 @@ class NightMaxPriorityTests(_Base):
         self.assertEqual(target, CLAUDE)
 
     def test_zcode_only_when_claude_full_or_limited_or_peak(self):
+        # BW-ZCODE-RETIRE-20261020：zcode 已退役，claude 满后按层序落到 OpenCode tier 4。
         self.seed(CLAUDE, 2)                      # claude 容量 2 → 满
-        self.assertEqual(self.select(ZCODE, GAP)[0], ZCODE)
+        self.assertIn(self.select(ZCODE, GAP)[0], OPENCODES)
 
     def test_claude_history_limit_no_longer_yields_to_zcode(self):
         # BW-SIMPLE-PRIORITY-RETRY-S3：历史明确限额不再挡普通新轮——claude 带限额标记
@@ -189,14 +194,16 @@ class NightMaxPriorityTests(_Base):
         self.assertEqual(self.select(ZCODE, GAP)[0], CLAUDE)
 
     def test_zcode_when_claude_peak_window_closed(self):
-        # PEAK：Max 窗外 + claude 高峰门关 → 只剩 Z（ZCode 全天，不受时段门）
-        self.assertEqual(self.select(ZCODE, PEAK)[0], ZCODE)
+        # PEAK：Max 窗外 + claude 高峰门关 → Z 已退役（BW-ZCODE-RETIRE-20261020），
+        # 按层序只剩 OpenCode tier 4（CodeBuddy deepseek 夹具已占、GLM tier 5 更低）。
+        self.assertEqual(self.select(ZCODE, PEAK)[0], OC_DS)
 
     def test_history_zcode_hold_no_longer_makes_auto_full(self):
-        # BW-SIMPLE-PRIORITY-RETRY-S3：旧 availability 阻断不再把 Z 从候选剔除；PEAK 下
-        # 三 Max 窗外、claude 高峰关，但 Z 全天可派 → AUTO 新轮直接落 Z，绝不再 main_force_full。
+        # BW-SIMPLE-PRIORITY-RETRY-S3：旧 availability 阻断不再改变候选集合；PEAK 下
+        # 三 Max 窗外、claude 高峰关，Z 已退役不再可派（BW-ZCODE-RETIRE-20261020）→
+        # AUTO 新轮按层序直接落 OpenCode，绝不再 main_force_full。
         target, reason = self.select(QMAX, PEAK, zcode_blocked=True)
-        self.assertEqual(target, ZCODE)
+        self.assertEqual(target, OC_DS)
         self.assertEqual(reason, 'main_force_selected')
 
 
@@ -240,7 +247,10 @@ class WindowAndGateTests(_Base):
             elig = dp._eligible_main_forces(conn, False, DAY_08)
         for pk in MAXES:
             self.assertNotIn(pk, elig)
-        self.assertIn(ZCODE, elig)
+        # BW-ZCODE-RETIRE-20261020：Z 原"全天可派"随退役消失——退役池绝不在候选；
+        # 白天无时段门的现役层（OpenCode）承接。
+        self.assertNotIn(ZCODE, elig)
+        self.assertIn(OC_DS, elig)
 
     def test_claude_independent_offpeak_gate_unchanged(self):
         with closing(dp.connect(self.store)) as conn:
@@ -258,8 +268,8 @@ class WindowAndGateTests(_Base):
 
 class HighLevelDispatchTests(_Base):
     def occupy_all_mains(self):
-        for i in range(2):
-            self.assertTrue(self.reserve(f'z{i}', 'zcode', 'GLM-5.3', 'zcode').get('allowed'))
+        # BW-ZCODE-RETIRE-20261020：zcode 两槽退役（组合即 unknown_pool），原 z0/z1
+        # 占位从满主力夹具移除，其余层占满方式不变。
         self.assertTrue(self.reserve('qm', 'qoder', 'Qwen3.8-Max', 'qoder').get('allowed'))
         self.assertTrue(self.reserve('cm', 'qodercn', 'Qwen3.8-Max', 'qodercn').get('allowed'))
         for i in range(2):
@@ -286,13 +296,16 @@ class HighLevelDispatchTests(_Base):
         self.assertIn(r['selected']['pool_key'], ALL_FLASH)
 
     def test_explicit_zcode_scope_not_forced_to_max(self):
-        # 夜间 Max 全空，只允许 Z 的显式点名仍直接落 Z，绝不强制改派 Max。
+        # BW-ZCODE-RETIRE-20261020：显式点名退役 zcode 组合不再"直接落 Z"，也不再强制
+        # 改派 Max——诚实拒绝（unknown_pool，不偷换组合、不给 token）。
         r = dp.select_and_claim(self.store, task_id='zonly', runtime='zcode',
                                 model='GLM-5.3', workspace=self.ws('zonly'),
                                 prompt_sha256=SHA, stage='s', now=NIGHT,
                                 executor='zcode', _preclaim=False)
-        self.assertTrue(r.get('allowed'), r)
-        self.assertEqual(r['pool_key'], ZCODE)
+        self.assertFalse(r.get('allowed'), r)
+        self.assertFalse(r.get('token'), r)
+        self.assertEqual(r['reason'], 'unknown_pool', r)
+        self.assertFalse(r['routing_required'], r)  # 拒绝不是改派
 
     def test_cn_executor_never_crosses_region(self):
         cands = dp._scope_allowed_candidates({'executor': 'qodercn'}, False)
@@ -309,21 +322,26 @@ class HighLevelDispatchTests(_Base):
         self.assertIn(target, MAXES)
 
     def test_workspace_conflict_guard_unchanged(self):
+        # BW-ZCODE-RETIRE-20261020：原 zcode 组合（cap 2 可两行同 ws 验证）改用现役
+        # claude（同 cap 2），workspace 单写守卫语义原样。
         shared = self.ws('shared')
-        r1 = self.reserve('wa', 'zcode', 'GLM-5.3', 'zcode', ws=shared)
+        r1 = self.reserve('wa', 'claude', 'deepseek-flash', 'claude', ws=shared)
         self.assertTrue(r1.get('allowed'), r1)
-        r2 = self.reserve('wb', 'zcode', 'GLM-5.3', 'zcode', ws=shared)
+        r2 = self.reserve('wb', 'claude', 'deepseek-flash', 'claude', ws=shared)
         self.assertFalse(r2.get('allowed'), r2)
         self.assertEqual(r2['reason'], 'workspace_in_flight')
 
     def test_total_capacity_and_slots(self):
-        # BW-OPENCODE-20261019 当前权威总数 16：两 CodeBuddy + 两 OpenCode 免费模型各独立 1 槽。
-        self.assertEqual(dp.DOMESTIC_TOTAL_CAPACITY, 16)
+        # BW-OPENCODE-20261019 + BW-ZCODE-RETIRE-20261020 当前权威总数 14：两 CodeBuddy +
+        # 两 OpenCode 免费模型各独立 1 槽；ZCode 两槽全局退役（CAPACITY 记 0）。
+        self.assertEqual(dp.DOMESTIC_TOTAL_CAPACITY, 14)
         self.assertEqual(dp.capacity_for(CODEBUDDY), 1)
         self.assertEqual(dp.capacity_for('codebuddy:glm-5.3-flash'), 1)
         self.assertEqual(dp.capacity_for(dp.OPENCODE_DEEPSEEK_POOL_KEY), 1)
         self.assertEqual(dp.capacity_for(dp.OPENCODE_GLM_POOL_KEY), 1)
-        self.assertEqual(dp.capacity_for(ZCODE), 2)
+        self.assertEqual(dp.capacity_for(ZCODE), 0)
+        self.assertNotIn(ZCODE, dp.MAIN_FORCE_KEYS)
+        self.assertNotIn(ZCODE, dp.POOL_PRIORITY)
         self.assertEqual(dp.capacity_for(QMAX), 1)
         self.assertEqual(dp.capacity_for(CN_MAX), 1)
         self.assertEqual(dp.capacity_for(CN_CUSTOM_MAX), 2)
@@ -357,10 +375,13 @@ class StageSelectionPriorityTests(_Base):
         self.assertEqual(r['selected']['pool_key'], CLAUDE)
 
     def test_stage_selection_zcode_when_claude_peak_closed(self):
+        # BW-ZCODE-RETIRE-20261020：PEAK 下 Max 窗外 + claude 高峰关、CB deepseek 夹具
+        # 已占 → 按层序落 OpenCode tier 4（退役 Z 绝不再被选中）。
         auth = self.auth('auto', 'T', 's2', ALL_MAINS + ALL_FLASH)
         r = self.plan(auth, now=PEAK)
         self.assertEqual(r['refused'], None, r)
-        self.assertEqual(r['selected']['pool_key'], ZCODE)
+        self.assertEqual(r['selected']['pool_key'], OC_DS)
+        self.assertNotIn(ZCODE, r['candidate_filters'])
 
     def test_stage_selection_fixed_flash_not_forced_to_max(self):
         auth = self.auth('fixed', 'T', 's2', [QFLASH], runtime='qoder',

@@ -54,17 +54,16 @@ except Exception:  # noqa: BLE001 - 缺模块时 Claude 时段外退回纯「时
     offpeak = None
 
 # ------------------------------------------------------------------ 展示常量
-# 11 个可派组合按现有主力优先级显示（BW-OPENCODE-20261019 层序）。
+# 10 个可派组合按现有主力优先级显示（BW-OPENCODE-20261019 层序）。
 # BW-LUNA-DISABLED-20261019：Luna 已从牛马删除，绝不显示可派行；旧记录只按退休历史审计。
-# 退休池（qodercn:DeepSeek-Flash、WorkBuddy 等）不显示成可派，
-# 但其真实在途仍计入总占用（见 retired_active）。
+# 退休池（qodercn:DeepSeek-Flash、zcode:GLM-5.3[WB-ZCODE-RETIRE-20261020 用户明确指令]、
+# WorkBuddy 等）不显示成可派，但其真实在途仍计入总占用（见 retired_active）。
 ROW_DEFS = (
-    (dp.CODEBUDDY_POOL_KEY, 'CodeBuddy 国际／DeepSeek-V4.1-Flash', '主力 · 最高优先 · 无时段门'),
+    (dp.CODEBUDDY_POOL_KEY, 'CodeBuddy 国际／Deepseek-V4.1-Flash', '主力 · 最高优先 · 无时段门'),
     (dp.CN_CUSTOM_MAX_POOL_KEY, 'Qoder CN／token plan／Qwen-3.8-Max', '主力 Max · 夜间窗'),
     (dp.CN_MAX_POOL_KEY, 'Qoder CN／Qwen3.8-Max', '主力 Max · 夜间窗'),
     (dp.QMAX_POOL_KEY, 'Qoder 国际／Qwen3.8-Max', '主力 Max · 国际内置 · 夜间窗'),
     (dp.CLAUDE_POOL_KEY, 'Claude Code／deepseek-flash', '主力 · 空闲时段门'),
-    (dp.ZCODE_POOL_KEY, 'ZCode／GLM-5.3', '主力 · 全天'),
     (dp.OPENCODE_DEEPSEEK_POOL_KEY, 'OpenCode／deepseek-v4.1-flash-free',
      '主力 · 独立 1 槽 · 无时段门'),
     (dp.OPENCODE_GLM_POOL_KEY, 'OpenCode／glm-5.3-flash-free',

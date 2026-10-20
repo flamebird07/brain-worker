@@ -167,17 +167,22 @@ class GuardOnePoolKeyRealityTests(DesktopSkillTestBase):
             for candidate in installer.HOST_EXCLUDED[host]:
                 self.assertIn(candidate, union)
 
-    def test_qoder_excludes_the_zcode_worker_to_prevent_cross_host_recursion(self):
-        self.assertIn("zcode:GLM-5.3", installer.HOST_EXCLUDED["qoder"])
+    def test_retired_zcode_worker_is_not_relisted_by_any_host(self):
+        # BW-ZCODE-RETIRE-20261020：zcode:GLM-5.3 已由引擎全局退役，宿主排除集不再
+        # （G1 也禁止）列出已退役键；Qoder 宿主的递归防护由引擎退役本身兜底，
+        # 排除集只保留各自真实占用的 Qwen Max 通道。
+        for host in installer.HOSTS:
+            self.assertNotIn("zcode:GLM-5.3", installer.HOST_EXCLUDED[host])
+        self.assertIn("qoder:Qwen3.8-Max", installer.HOST_EXCLUDED["qoder"])
 
     def test_rejects_exclusion_naming_a_renamed_pool_key(self):
         with self.assertRaisesRegex(ValueError, "renamed or retired"):
             installer.validate_host_exclusions({"zcode": ("zcode:GLM-9.9",)})
 
     def test_rejects_exclusion_naming_a_retired_pool_key(self):
-        retired = dp.LEGACY_RETIRED_POOL_KEYS[0]
-        with self.assertRaisesRegex(ValueError, "renamed or retired"):
-            installer.validate_host_exclusions({"zcode": (retired,)})
+        for retired in dp.LEGACY_RETIRED_POOL_KEYS:
+            with self.assertRaisesRegex(ValueError, "renamed or retired"):
+                installer.validate_host_exclusions({"zcode": (retired,)})
 
     def test_rejects_exclusion_naming_luna(self):
         with self.assertRaisesRegex(ValueError, "renamed or retired"):

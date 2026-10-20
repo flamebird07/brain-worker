@@ -33,13 +33,15 @@ LEGACY_MANAGED_BY = ("brain-worker-zcode-adapter", "brain-worker-qoder-adapter")
 HOSTS = ("zcode", "qoder")
 
 HOST_EXCLUDED = {
+    # BW-ZCODE-RETIRE-20261020：zcode:GLM-5.3 已由引擎全局退役（LEGACY_RETIRED_POOL_KEYS），
+    # 任何宿主都不再需要（G1 也禁止）在排除集里列出已退役键；两宿主排除集只剩各自
+    # 真实占用的 Qwen Max 通道。
     "qoder": (
         "qoder:Qwen3.8-Max",
         "qodercn:Qwen-3.8-Max",
         "qodercn:Qwen3.8-Max",
-        "zcode:GLM-5.3",
     ),
-    "zcode": ("zcode:GLM-5.3",),
+    "zcode": (),
 }
 # Fail-closed set applied when the host cannot be identified at runtime.
 HOST_EXCLUDED_UNION = tuple(

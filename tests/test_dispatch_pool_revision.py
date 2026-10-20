@@ -79,11 +79,12 @@ class TempStoreMixin:
         # 显式确保没有意外读到默认库/env 覆盖。
         self.saved_env = os.environ.pop('BRAIN_WORKER_DISPATCH_STORE', None)
         # BW-CODEBUDDY-MAIN-S3 + BW-WORKER-WIDGET-20261018-S3 + BW-OPENCODE-20261019-S3：
-        # 本文件的历史层序（Max > claude > Z）与"填满即满"夹具写于 CodeBuddy 恢复之前。
-        # 先真实占住 CodeBuddy deepseek 与 GLM 各自的独立 1 槽（GLM 为额度条件池，夹具
-        # 只作占位），使旧层序断言原样成立，且 fill_domestic 补 14 槽（BW-OPENCODE-20261019-S3
-        # 起含两个 OpenCode 免费模型各 1 独立槽）后总量正好 16（不靠虚拟同一路径、
-        # 不放宽任何断言）。
+        # 本文件的历史层序（Max > claude）与"填满即满"夹具写于 CodeBuddy 恢复之前。
+        # BW-ZCODE-RETIRE-20261020：ZCode 退役、在途只按 retired_active 记账，不再计入
+        # 国内容量基线。先真实占住 CodeBuddy deepseek 与 GLM 各自的独立 1 槽（GLM 为额度
+        # 条件池，夹具只作占位），使旧层序断言原样成立，且 fill_domestic 补 12 个现役槽
+        # （三 Max + claude×2 + 两地区 Flash 各 2 + 两个 OpenCode 免费槽）后总量正好 14
+        # = DOMESTIC_TOTAL_CAPACITY（不靠虚拟同一路径、不放宽任何断言）。
         with closing(dp.connect(self.store)) as conn:
             conn.execute('INSERT INTO attempts(token, task_id, runtime, model, pool_key, '
                          "state, reserved_at_utc) VALUES(?,?,?,?,?,?,?)",
@@ -114,13 +115,14 @@ class TempStoreMixin:
                 (token, task_id, runtime, model, pool, state, child_pid, child_created,
                  wrapper_pid, wrapper_created))
 
-    def fill_domestic(self, prefix='seed', n=14):
-        # BW-CLAUDE-CAPACITY2 + BW-OPENCODE-20261019-S3：真实主力 + 两地区 Flash 共 14 槽：
-        # zcode×2 + 两内置 Max 各 1 + CN 自定义 Max×2 + claude:deepseek-flash×2（容量由 1
-        # 增至 2）+ 两地区 Flash 各 2 + 两个 OpenCode 免费模型各 1 独立槽（CN DeepSeek-Flash
-        # 已 retired，不再作为在途基线）。配合 setUp 的 CodeBuddy 两占位共 16，恰为
+    def fill_domestic(self, prefix='seed', n=12):
+        # BW-CLAUDE-CAPACITY2 + BW-OPENCODE-20261019-S3 + BW-ZCODE-RETIRE-20261020：
+        # 真实现役主力 + 两地区 Flash 共 12 槽：两内置 Max 各 1 + CN 自定义 Max×2 +
+        # claude:deepseek-flash×2 + 两地区 Flash 各 2 + 两个 OpenCode 免费模型各 1 独立槽
+        # （ZCode 已退役——退役池在途只按 retired_active 记账，绝不再计入国内容量基线，
+        # 故从填满夹具中移除）。配合 setUp 的 CodeBuddy 两占位共 14，恰为
         # DOMESTIC_TOTAL_CAPACITY。绝不删除任何安全断言。
-        pools = ['zcode:GLM-5.3'] * 2 + ['qoder:Qwen3.8-Max'] \
+        pools = ['qoder:Qwen3.8-Max'] \
             + ['qodercn:Qwen3.8-Max'] + ['qodercn:Qwen-3.8-Max'] * 2 \
             + ['claude:deepseek-flash'] * 2 \
             + ['qoder:Qwen3.8-Flash'] * 2 + ['qodercn:Qwen3.8-Flash'] * 2 \
@@ -164,14 +166,13 @@ class TestUnifiedPolicy(TempStoreMixin, unittest.TestCase):
         self.assertEqual(out['reason'], 'luna_disabled')
 
     def test_fill_all_slots_then_one_more_rejected(self):
-        # BW-CLAUDE-CAPACITY2 + BW-OPENCODE-20261019-S3：主力 + 两地区 Flash + 两 OpenCode
-        # 免费槽共 14 槽（claude×2、opencode 各 1）：经显式 executor 逐槽确定性 claim（各池
-        # 不超自身容量），每次 assert allowed；配合 setUp 的 CodeBuddy 两占位填满 16 后任何
-        # AUTO 国内组合才 capacity_full 且 domestic_full。Z4：不同 task 用独立 workspace
+        # BW-CLAUDE-CAPACITY2 + BW-OPENCODE-20261019-S3 + BW-ZCODE-RETIRE-20261020：
+        # 现役主力 + 两地区 Flash + 两 OpenCode 免费槽共 12 槽（claude×2、opencode 各 1；
+        # ZCode 已退役不可 claim，从填满序列移除）：经显式 executor 逐槽确定性 claim（各池
+        # 不超自身容量），每次 assert allowed；配合 setUp 的 CodeBuddy 两占位填满 14 后任何
+        # AUTO 现役国内组合才 capacity_full 且 domestic_full。Z4：不同 task 用独立 workspace
         # 目录（真实单写入守卫）。
-        fill = [('t0', 'zcode', 'GLM-5.3', 'zcode'),
-                ('t1', 'zcode', 'GLM-5.3', 'zcode'),
-                ('t2', 'qoder', 'Qwen3.8-Max', 'qoder'),
+        fill = [('t2', 'qoder', 'Qwen3.8-Max', 'qoder'),
                 ('t3', 'qodercn', 'Qwen3.8-Max', 'qodercn'),
                 ('t3a', 'qodercn', 'Qwen-3.8-Max', 'qodercn'),
                 ('t3b', 'qodercn', 'Qwen-3.8-Max', 'qodercn'),
@@ -190,20 +191,27 @@ class TestUnifiedPolicy(TempStoreMixin, unittest.TestCase):
             self.assertTrue(out['allowed'], out)
         self.assertEqual(dp.status(self.store, now=T0)['domestic']['active'],
                          dp.DOMESTIC_TOTAL_CAPACITY)
-        # 全部槽已满 → 再一个 AUTO 国内组合 capacity_full 且 domestic_full。
-        out = dp.select_and_claim(self.store, task_id='t9', runtime='zcode',
-                                  model='GLM-5.3', workspace='C:/w/t9',
+        # 全部槽已满 → 再一个 AUTO 现役国内组合 capacity_full 且 domestic_full；
+        # 点名退役 ZCode 则更早一步在授权门如实 unknown_pool，绝不冒充"容量满"。
+        out = dp.select_and_claim(self.store, task_id='t9', runtime='qoder',
+                                  model='Qwen3.8-Max', workspace='C:/w/t9',
                                   prompt_sha256='9' * 64, now=T0, _preclaim=False)
         self.assertFalse(out['allowed'], out)
         self.assertEqual(out['reason'], 'capacity_full')
         self.assertTrue(out['domestic_full'])
+        retired = dp.select_and_claim(self.store, task_id='t10', runtime='zcode',
+                                      model='GLM-5.3', workspace='C:/w/t10',
+                                      prompt_sha256='a' * 64, now=T0, _preclaim=False)
+        self.assertFalse(retired['allowed'], retired)
+        self.assertEqual(retired['reason'], 'unknown_pool')
 
     def test_duplicate_task_rejected(self):
         kw = dict(workspace='C:/w', prompt_sha256='a' * 64, now=T0, _preclaim=False)
-        # 首占用显式 executor='zcode' 固定组合（绕过 AUTO 跨层改派 BW-MAIN-PRIORITY-S1）；
+        # BW-ZCODE-RETIRE-20261020：首占用显式 executor='qoder' 固定现役组合（原借
+        # executor='zcode' 固定组合绕过 AUTO 跨层改派，语义不变）；
         # 同 task 第二次请求仍走 AUTO，验证防重先于路由/容量裁决。
-        self.assertTrue(dp.select_and_claim(self.store, task_id='dup', runtime='zcode',
-                                            model='GLM-5.3', executor='zcode',
+        self.assertTrue(dp.select_and_claim(self.store, task_id='dup', runtime='qoder',
+                                            model='Qwen3.8-Max', executor='qoder',
                                             **kw)['allowed'])
         out = dp.select_and_claim(self.store, task_id='dup', runtime='qoder',
                                   model='Qwen3.8-Max', **kw)
@@ -215,15 +223,17 @@ class TestConsume(TempStoreMixin, unittest.TestCase):
     def _reserve_one(self, task_id='ct'):
         # Z3 修复：consume 现在做严格 stage/chat 绑定校验，reserve 必须带原 stage/chat，
         # 否则合法 consume 会因 None != 's1' 被误判漂移（放松绑定不可取，补齐原字段）。
-        # BW-MAIN-PRIORITY-S1：显式 executor='zcode' 固定组合，绕过 AUTO 跨层改派，作为
-        # consume/bind 生命周期用例的确定性准备（不放松任何绑定/守卫语义）。
-        return dp.reserve(self.store, task_id=task_id, runtime='zcode', model='GLM-5.3',
+        # BW-MAIN-PRIORITY-S1 + BW-ZCODE-RETIRE-20261020：显式 executor='qoder' 固定
+        # 现役组合，绕过 AUTO 跨层改派，作为 consume/bind 生命周期用例的确定性准备
+        # （不放松任何绑定/守卫语义）。
+        return dp.reserve(self.store, task_id=task_id, runtime='qoder',
+                          model='Qwen3.8-Max',
                           workspace='C:/w', prompt_sha256='a' * 64, stage='s1',
-                          chat_id='c1', executor='zcode', now=T0, _preclaim=False)
+                          chat_id='c1', executor='qoder', now=T0, _preclaim=False)
 
     def test_double_consume_single_winner(self):
         tok = self._reserve_one()['token']
-        kw = dict(task_id='ct', runtime='zcode', model='GLM-5.3', workspace='C:/w',
+        kw = dict(task_id='ct', runtime='qoder', model='Qwen3.8-Max', workspace='C:/w',
                   prompt_sha256='a' * 64, stage='s1', chat_id='c1',
                   wrapper_pid=4321, wrapper_created='w-created-1', now=T0)
         first = dp.consume_for_entry(self.store, claim_token=tok, **kw)
@@ -239,7 +249,7 @@ class TestConsume(TempStoreMixin, unittest.TestCase):
     def test_explicit_token_drift_stage_chat_rejected(self):
         tok = self._reserve_one()
         tok = tok['token']
-        base = dict(task_id='ct', runtime='zcode', model='GLM-5.3', workspace='C:/w',
+        base = dict(task_id='ct', runtime='qoder', model='Qwen3.8-Max', workspace='C:/w',
                     prompt_sha256='a' * 64, wrapper_pid=99, now=T0)
         out = dp.consume_for_entry(self.store, claim_token=tok, stage='OTHER', **base)
         self.assertFalse(out['allowed'])
@@ -279,10 +289,11 @@ class TestConsume(TempStoreMixin, unittest.TestCase):
 
 class TestFinish(TempStoreMixin, unittest.TestCase):
     def _with_child(self, child_pid=555, child_created='cc'):
-        # BW-MAIN-PRIORITY-S1：显式 executor='zcode' 固定组合，绕过 AUTO 跨层改派，作为
-        # finish 生命周期用例的确定性准备（不放松任何 child/owner 释放语义）。
-        dp.reserve(self.store, task_id='ft', runtime='zcode', model='GLM-5.3',
-                   workspace='C:/w', prompt_sha256='a' * 64, executor='zcode',
+        # BW-MAIN-PRIORITY-S1 + BW-ZCODE-RETIRE-20261020：显式 executor='qoder' 固定
+        # 现役组合，绕过 AUTO 跨层改派，作为 finish 生命周期用例的确定性准备
+        # （不放松任何 child/owner 释放语义）。
+        dp.reserve(self.store, task_id='ft', runtime='qoder', model='Qwen3.8-Max',
+                   workspace='C:/w', prompt_sha256='a' * 64, executor='qoder',
                    now=T0, _preclaim=False)
         with closing(dp.connect(self.store)) as conn:
             conn.execute("UPDATE attempts SET state='running', child_pid=?, "
@@ -313,8 +324,9 @@ class TestFinish(TempStoreMixin, unittest.TestCase):
         self.assertEqual(self.row('attempts', 'token', tok)['state'], 'unknown')
 
     def test_finish_without_child_only_start_failed_or_cancelled(self):
-        dp.reserve(self.store, task_id='nc', runtime='zcode', model='GLM-5.3',
-                   workspace='C:/w', prompt_sha256='a' * 64, executor='zcode',
+        # BW-ZCODE-RETIRE-20261020：预留组合换成现役 qoder Max（语义不变）。
+        dp.reserve(self.store, task_id='nc', runtime='qoder', model='Qwen3.8-Max',
+                   workspace='C:/w', prompt_sha256='a' * 64, executor='qoder',
                    now=T0, _preclaim=False)
         tok = self.row('attempts', 'task_id', 'nc')['token']
         out = dp.finish(self.store, tok, terminal='finished', now=T0)
@@ -595,59 +607,62 @@ class TestClaimDue(TempStoreMixin, unittest.TestCase):
 
 
 class TestMainForceRotationZ2(TempStoreMixin, unittest.TestCase):
-    """BW-MAIN-PRIORITY-S1：主力分配按优先级层选择（三 Qoder Max > claude > zcode），
-    Z 池有空也绝不让低层抢高层名额；历史 committed 计数照旧记账但不参与跨层排序。"""
+    """BW-MAIN-PRIORITY-S1：主力分配按优先级层选择（三 Qoder Max > claude）。
+    BW-ZCODE-RETIRE-20261020：ZCode 已全局退役——点名 Z 的 AUTO 请求在授权门即
+    unknown_pool 诚实拒绝，绝不改派、绝不复活为候选；层内轮转语义原样保留。"""
 
-    def test_z_request_routes_to_max_tier_and_committed_survives_restart(self):
+    def test_z_request_refused_never_reroutes(self):
         kw = dict(workspace='C:/w', prompt_sha256='a' * 64, now=T0, _preclaim=False)
-        # 空池 AUTO 请求 Z：改派到最高 Max 层，其中 CN 自定义 Max 现为最高优先。
+        # 空池 AUTO 请求 Z：退役组合不进入任何选择/路由路径——直接 unknown_pool，
+        # 绝不假装 routing 到 Max、绝不落库。
         first = dp.select_and_claim(self.store, task_id='r1', runtime='zcode',
                                     model='GLM-5.3', **kw)
         self.assertFalse(first['allowed'], first)
-        self.assertTrue(first['routing_required'], first)
-        self.assertEqual(first['selected']['pool_key'], dp.CN_CUSTOM_MAX_POOL_KEY)
-        # 用显式 executor='zcode' 真实占一个 Z 名额（提交历史 bump committed_zcode）。
-        zres = dp.reserve(self.store, task_id='rz', runtime='zcode', model='GLM-5.3',
-                          workspace='C:/w/rz', prompt_sha256='z' * 64, executor='zcode',
-                          now=T0, _preclaim=False)
-        self.assertTrue(zres['allowed'], zres)
-        # 真实终态释放（reserved 无 wrapper，cancelled 即确认取消）。
-        self.assertTrue(dp.finish(self.store, zres['token'], terminal='cancelled',
-                                  now=T0)['released'])
-        # 释放后再次 AUTO 请求 Z：Z 池现在有空，仍按优先级改派到最高层 Max，绝不直接落 Z。
-        again = dp.select_and_claim(self.store, task_id='r2', runtime='zcode',
-                                    model='GLM-5.3', prompt_sha256='b' * 64,
-                                    workspace='C:/w', now=T0, _preclaim=False)
-        self.assertFalse(again['allowed'])
-        self.assertTrue(again['routing_required'])
-        self.assertEqual(again['selected']['pool_key'], dp.CN_CUSTOM_MAX_POOL_KEY)
-        # “重启”（所有调用本就各自新连接；再显式读一次 status）后历史 committed 计数仍在：
-        # 释放不回收 committed_zcode；AUTO 全程只改派未 claim Qoder，committed_qoder 保持 0。
+        self.assertEqual(first['reason'], 'unknown_pool', first)
+        self.assertFalse(first['routing_required'], first)
+        self.assertIsNone(first.get('token'))
+        # 退役不占任何在途：Z 池 active 恒为 0（status 仍如实列出退役池诊断口径）。
         st = dp.status(self.store, now=T0)
-        self.assertEqual(st['rotation']['committed_zcode'], 1)
-        self.assertEqual(st['rotation']['committed_qoder'], 0)
+        self.assertEqual(st['pools'][dp.ZCODE_POOL_KEY]['active'], 0)
+        # 现役 AUTO 请求仍按最高优先层正常 claim（层序不受退役影响）。
+        live = dp.select_and_claim(self.store, task_id='r2', runtime='qodercn',
+                                   model='Qwen-3.8-Max', prompt_sha256='b' * 64,
+                                   workspace='C:/w', now=T0, _preclaim=False)
+        self.assertTrue(live['allowed'], live)
+        self.assertIn(live['pool_key'], dp.MAIN_FORCE_KEYS, live)
 
-    def test_idle_consecutive_z_max_alternate(self):
+    def test_idle_consecutive_auto_requests_stay_in_max_tier(self):
+        # BW-ZCODE-RETIRE-20261020：原"空闲连续 Z/Max 交替"用例——Z 侧已退役，改为
+        # 验证连续 AUTO 请求始终在最高 Max 层内消化（1:1 轮转如实路由到该层空位池），
+        # 退役池零出现。
         kw = dict(workspace='C:/w', prompt_sha256='a' * 64, now=T0, _preclaim=False)
-        a = dp.select_and_claim(self.store, task_id='a1', runtime='zcode',
-                                model='GLM-5.3', **kw)
-        self.assertEqual(a['pool_key'], 'zcode:GLM-5.3')
+        a = dp.select_and_claim(self.store, task_id='a1', runtime='qoder',
+                                model='Qwen3.8-Max', **kw)
+        self.assertFalse(a['allowed'], a)
+        self.assertTrue(a['routing_required'], a)
+        self.assertIn(a['selected']['pool_key'],
+                      [dp.QMAX_POOL_KEY, dp.CN_MAX_POOL_KEY,
+                       dp.CN_CUSTOM_MAX_POOL_KEY], a)
         b = dp.select_and_claim(self.store, task_id='a2', runtime='zcode',
                                 model='GLM-5.3', prompt_sha256='b' * 64,
                                 workspace='C:/w/a2', now=T0, _preclaim=False)
-        self.assertFalse(b['allowed'])
-        self.assertEqual(b['selected']['pool_key'], dp.CN_CUSTOM_MAX_POOL_KEY)
+        self.assertFalse(b['allowed'], b)
+        self.assertEqual(b['reason'], 'unknown_pool', b)
+        self.assertNotEqual(a['pool_key'], dp.ZCODE_POOL_KEY)
 
 
 class TestOverflowNotSubstitutedZ2(TempStoreMixin, unittest.TestCase):
-    """Z2-2：两主力满时请求 Z/Max 必须 routing_required，绝不偷换成 Flash 落库。"""
+    """Z2-2：全部主力满时请求现役主力必须 routing_required，绝不偷换成 Flash 落库。
+    BW-ZCODE-RETIRE-20261020：ZCode 退役——请求 Z 在授权门即 unknown_pool（更早于路由
+    判定），回落 Flash 的验证改由现役 QMAX 请求承担，"绝不偷换落库"断言原样保留。"""
 
     def _fill_mains(self):
-        # 全部主力填满：zcode×2 + 两内置 Max 各 1 + CN 自定义 Max×2 + claude×2
-        # （BW-CLAUDE-CAPACITY2：claude 容量由 1 增至 2，第 11–12 槽主力，须一并占满才回落到
+        # 全部现役主力填满：两内置 Max 各 1 + CN 自定义 Max×2 + claude×2
+        # （BW-CLAUDE-CAPACITY2：claude 容量由 1 增至 2，须一并占满才回落到
         # Flash）+ 两个 OpenCode 免费模型各 1 独立槽（BW-OPENCODE-20261019-S3：tier 4 主力，
         # 不占满则 AUTO 会如实路由到 OpenCode 而非 Flash，回落断言语义不变、不放宽）。
-        for i, pool in enumerate(['zcode:GLM-5.3'] * 2 + ['qoder:Qwen3.8-Max']
+        # BW-ZCODE-RETIRE-20261020：zcode×2 已从主力基线移除（退役）。
+        for i, pool in enumerate(['qoder:Qwen3.8-Max']
                                  + ['qodercn:Qwen3.8-Max']
                                  + ['qodercn:Qwen-3.8-Max'] * 2
                                  + ['claude:deepseek-flash'] * 2
@@ -657,20 +672,27 @@ class TestOverflowNotSubstitutedZ2(TempStoreMixin, unittest.TestCase):
 
     def test_select_and_claim_main_full_routes_to_flash_no_substitution(self):
         self._fill_mains()
-        out = dp.select_and_claim(self.store, task_id='ov1', runtime='zcode',
-                                  model='GLM-5.3', workspace='C:/w',
+        out = dp.select_and_claim(self.store, task_id='ov1', runtime='qoder',
+                                  model='Qwen3.8-Max', workspace='C:/w',
                                   prompt_sha256='c' * 64, now=T0, _preclaim=False)
         self.assertFalse(out['allowed'])
         self.assertTrue(out['routing_required'])
         self.assertEqual(out['selected']['pool_key'], 'qoder:Qwen3.8-Flash')
-        # 原主力计数绝不超各自容量，且没有任何 zcode runtime 被记到 Flash 池。
-        self.assertEqual(self.active_count('zcode:GLM-5.3'), 2)
+        # 原主力计数绝不超各自容量，且没有任何请求被偷换记到 Flash 池。
+        self.assertEqual(self.active_count(dp.CLAUDE_POOL_KEY), 2)
         self.assertEqual(self.active_count('qoder:Qwen3.8-Max'), 1)
         self.assertEqual(self.active_count('qodercn:Qwen3.8-Max'), 1)
         with closing(dp.connect(self.store)) as conn:
             rows = conn.execute('SELECT runtime, model, pool_key FROM attempts '
                                 "WHERE pool_key='qoder:Qwen3.8-Flash'").fetchall()
         self.assertEqual(rows, [])
+        # 点名退役 ZCode：授权门直接 unknown_pool，绝不进入 Flash 路由。
+        retired = dp.select_and_claim(self.store, task_id='ov1z', runtime='zcode',
+                                      model='GLM-5.3', workspace='C:/w/ov1z',
+                                      prompt_sha256='f' * 64, now=T0, _preclaim=False)
+        self.assertFalse(retired['allowed'], retired)
+        self.assertEqual(retired['reason'], 'unknown_pool', retired)
+        self.assertFalse(retired['routing_required'], retired)
 
     def test_reserve_main_full_routes_to_flash_no_substitution(self):
         self._fill_mains()
@@ -702,13 +724,15 @@ class TestDomesticRescueCancelsTicketZ2(TempStoreMixin, unittest.TestCase):
     """Z2-3：同 task 国内救回须同事务取消旧 pending 票；external_agent/cancel 阻断。"""
 
     def test_domestic_claim_cancels_pending_and_blocks_later_luna(self):
+        # BW-ZCODE-RETIRE-20261020：救回/补位请求由退役 ZCode 换成现役 QMAX，
+        # refill 也换成对应现役槽，"同事务取消旧票 + 到期不得 Luna"语义原样保留。
         self.fill_domestic()
         self.assertTrue(dp.ask_record(self.store, task_id='rt', scope=_scope('rt'),
                                       ask_message_id='msg-1', now=T0)['recorded'])
         self.assertTrue(dp.finish(self.store, 'seed-0', terminal='cancelled',
                                   now=T0 + timedelta(seconds=30))['released'])
-        out = dp.select_and_claim(self.store, task_id='rt', runtime='zcode',
-                                  model='GLM-5.3', workspace='C:/w',
+        out = dp.select_and_claim(self.store, task_id='rt', runtime='qoder',
+                                  model='Qwen3.8-Max', workspace='C:/w',
                                   prompt_sha256='p' * 64, now=T0 + timedelta(seconds=31),
                                   _preclaim=False)
         self.assertTrue(out['allowed'], out)
@@ -717,7 +741,7 @@ class TestDomesticRescueCancelsTicketZ2(TempStoreMixin, unittest.TestCase):
         # 原任务真实终态后，其它 task 把空位填满；原票据到期不得再 Luna。
         self.assertTrue(dp.finish(self.store, out['token'], terminal='cancelled',
                                   now=T0 + timedelta(seconds=60))['released'])
-        self.seed_attempt('refill', 'refill-task', 'zcode:GLM-5.3')
+        self.seed_attempt('refill', 'refill-task', 'qoder:Qwen3.8-Max')
         late = dp.claim_due(self.store, task_id='rt', now=T0 + timedelta(seconds=301),
                             _preclaim=False)
         self.assertFalse(late['claimed'])
@@ -731,7 +755,9 @@ class TestDomesticRescueCancelsTicketZ2(TempStoreMixin, unittest.TestCase):
         self.assertTrue(dp.finish(self.store, 'seed-0', terminal='cancelled',
                                   now=T0 + timedelta(seconds=30))['released'])
         for fn in (dp.select_and_claim, dp.reserve):
-            out = fn(self.store, task_id='ex', runtime='zcode', model='GLM-5.3',
+            # BW-ZCODE-RETIRE-20261020：现役组合，验证 task_answered_external 阻断
+            # 仍先于路由/容量（原借 ZCode 的写法失效，语义不放宽）。
+            out = fn(self.store, task_id='ex', runtime='qoder', model='Qwen3.8-Max',
                      workspace='C:/w', prompt_sha256='p' * 64,
                      now=T0 + timedelta(seconds=31), _preclaim=False)
             self.assertFalse(out['allowed'])
@@ -829,14 +855,16 @@ class TestOwnerIdentityZ2(TempStoreMixin, unittest.TestCase):
     """Z2-6：bind_child/finish 的 owner 身份与 unknown 状态保护。"""
 
     def _owned_attempt(self, wrapper_pid=4321):
-        # BW-MAIN-PRIORITY-S1：显式 executor='zcode' 固定组合，绕过 AUTO 跨层改派，作为
-        # owner 身份用例的确定性准备（不放松任何 owner/unknown 保护语义）。
-        dp.reserve(self.store, task_id='ow', runtime='zcode', model='GLM-5.3',
-                   workspace='C:/w', prompt_sha256='a' * 64, executor='zcode',
+        # BW-MAIN-PRIORITY-S1 + BW-ZCODE-RETIRE-20261020：显式 executor='qodercn' 固定
+        # 现役组合（qmax 容量 1 已由 _with_child 类用例区分，本类用 CN Max），绕过 AUTO
+        # 跨层改派，作为 owner 身份用例的确定性准备（不放松任何 owner/unknown 保护语义）。
+        dp.reserve(self.store, task_id='ow', runtime='qodercn', model='Qwen3.8-Max',
+                   workspace='C:/w', prompt_sha256='a' * 64, executor='qodercn',
                    now=T0, _preclaim=False)
         tok = self.row('attempts', 'task_id', 'ow')['token']
-        dp.consume_for_entry(self.store, claim_token=tok, task_id='ow', runtime='zcode',
-                             model='GLM-5.3', workspace='C:/w', prompt_sha256='a' * 64,
+        dp.consume_for_entry(self.store, claim_token=tok, task_id='ow',
+                             runtime='qodercn', model='Qwen3.8-Max',
+                             workspace='C:/w', prompt_sha256='a' * 64,
                              wrapper_pid=wrapper_pid, wrapper_created='w-owned',
                              now=T0)
         return tok
@@ -889,11 +917,12 @@ class TestWorkspaceGuardZ4(TempStoreMixin, unittest.TestCase):
 
     def test_select_and_reserve_reject_other_task_same_workspace(self):
         kw = dict(prompt_sha256='a' * 64, now=T0, _preclaim=False)
-        # 首占用显式 executor='zcode' 固定组合（绕过 AUTO 跨层改派 BW-MAIN-PRIORITY-S1）；
+        # 首占用显式 executor='qoder' 固定现役组合（BW-ZCODE-RETIRE-20261020：原借
+        # executor='zcode' 固定组合绕过 AUTO 跨层改派 BW-MAIN-PRIORITY-S1，语义不变）；
         # 后续别 task 的 select/reserve 仍走 AUTO，验证单写入守卫先于路由/容量裁决。
-        first = dp.select_and_claim(self.store, task_id='wga', runtime='zcode',
-                                    model='GLM-5.3', workspace='C:/wg/dir',
-                                    executor='zcode', **kw)
+        first = dp.select_and_claim(self.store, task_id='wga', runtime='qoder',
+                                    model='Qwen3.8-Max', workspace='C:/wg/dir',
+                                    executor='qoder', **kw)
         self.assertTrue(first['allowed'], first)
         for fn in (dp.select_and_claim, dp.reserve):
             out = fn(self.store, task_id='wgb', runtime='qoder',
@@ -914,9 +943,11 @@ class TestWorkspaceGuardZ4(TempStoreMixin, unittest.TestCase):
         self.assertTrue(again['allowed'], again)
 
     def test_consume_same_token_allowed_other_task_same_dir_rejected(self):
-        res = dp.reserve(self.store, task_id='wgd', runtime='zcode', model='GLM-5.3',
+        # BW-ZCODE-RETIRE-20261020：预留/consume 组合换成现役 QMAX，守卫语义不变。
+        res = dp.reserve(self.store, task_id='wgd', runtime='qoder',
+                         model='Qwen3.8-Max',
                          workspace='C:/wg/d2', prompt_sha256='b' * 64, stage='s',
-                         chat_id='c', executor='zcode', now=T0, _preclaim=False)
+                         chat_id='c', executor='qoder', now=T0, _preclaim=False)
         self.assertTrue(res['allowed'], res)
         # 直接播种一个别的 task 的在途行占同一真实目录（模拟 adopt/旧库既有写入）。
         with closing(dp.connect(self.store)) as conn:
@@ -928,7 +959,7 @@ class TestWorkspaceGuardZ4(TempStoreMixin, unittest.TestCase):
                  dp._norm_workspace('C:/wg/d2')))
         # 同 task 原 token 消费被守卫拒绝（写入方已是别的 task）。
         out = dp.consume_for_entry(self.store, claim_token=res['token'],
-                                   task_id='wgd', runtime='zcode', model='GLM-5.3',
+                                   task_id='wgd', runtime='qoder', model='Qwen3.8-Max',
                                    workspace='C:/wg/d2', prompt_sha256='b' * 64,
                                    stage='s', chat_id='c', wrapper_pid=11, now=T0)
         self.assertFalse(out['allowed'])
@@ -938,7 +969,7 @@ class TestWorkspaceGuardZ4(TempStoreMixin, unittest.TestCase):
         self.assertTrue(dp.finish(self.store, 'intruder', terminal='cancelled',
                                   now=T0)['released'])
         ok = dp.consume_for_entry(self.store, claim_token=res['token'],
-                                  task_id='wgd', runtime='zcode', model='GLM-5.3',
+                                  task_id='wgd', runtime='qoder', model='Qwen3.8-Max',
                                   workspace='C:/wg/d2', prompt_sha256='b' * 64,
                                   stage='s', chat_id='c', wrapper_pid=11, now=T0)
         self.assertTrue(ok['allowed'], ok)
