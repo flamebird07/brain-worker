@@ -12,6 +12,10 @@
 
 以下为 **2026-10-08 历史决定**（已被上面的当前口径取代，仅存档，不再表述为“当前”）：当时 WorkBuddy 与独立 CodeBuddy CLI 均改为 human-relay only，不再从 Skill/CLI/控制面提交新的直接派发调用；选择它们时只生成完整可复制提示词，由客户人工交给外部 Agent，生成提示词不记成已派发。当时直连派发只保留 Qoder 与 ZCode，默认按可用主力 `zcode:GLM-5.3`/`qoder:Qwen3.8-Max` 的 1:1 轮换、明确 executor+model 组合授权优先，主力不可用时改用溢出 Flash 或已授权接续（不再表述为“ZCode 默认优先、Qoder 唯一模型”）。不再启动 WorkBuddy 的认证或测试。历史能力、原错误与模型信息与测试证据保留，仅作为离线证据回放/档案，不作为重新启用授权。
 
+### 桌面入口统一与入口运行时资格门（2026-10-20，BW-UNIFIED-DESKTOP-ENTRY-20261020）
+
+ZCode 与 Qoder 桌面端共用**同一份**宿主无关入口 `desktop-skill/SKILL.md`：`scripts/install_desktop_skill.py install` 渲染一次并把字节相同的内容装进两个宿主目录（`~/.zcode/skills/brain-worker` 与 `~/.qoder-cn/skills/brain-worker`），三道守卫强制同源——排除集池 key 必须仍是引擎可派发键（G1，`install`/`check` 双拒）、Luna 禁用规则与主 Skill 同源（G2）、两宿主安装内容字节一致（G3）。适配器只承载各宿主自己不可派发的精确组合与运行时识别信号（识别失败 fail-closed 取并集），优先级/时段/容量/池 key 清单一律只在共享代码。`scripts/entry_runtime_probe.py` 对六个执行器运行时做三态（present/missing/unknown）只读探测，复用各入口自己的配置加载器；`stage_selection` 回执新增 `entry_runtime_status`/`entry_runtime_missing` 逐候选可见性，并把**确凿缺失**（入口配置存在而其指向的运行时文件不存在）的候选以 `entry_runtime_missing` 过滤原因挡在资格门外；未配置的引擎副本（无私有入口配置，如裸 CI 环境）与依赖环境的解析失败一律 unknown、绝不挡门，探针自身异常整体降级 unknown（fail-open），绝不影响授权集合回显。
+
 ### 持久额度冷却与路由门禁（2026-10-08，BW-QUOTA-20261008-S1）
 
 > **当前口径（2026-10-17）**：普通调度轮**不因历史标记新增长冷却**——每个新轮从仍合格的最高优先候选真实试一次、失败本轮换下一、下一新轮重来，不查余额、不加持久冷却（见 [global-dispatch](references/global-dispatch.md) 的每轮优先级重试）。历史 ZCode availability 与三 Qoder Max/Claude `main_force_limits` 标记仅作**诊断**，不再把普通 AUTO 候选据历史剔除；真实尝试失败才落库、成功仍 epoch/attempt CAS，普通入口无需 recovery probe。下方 2026-10-08 的持久门禁描述仅作**历史背景/旧接口回放说明**；普通新一轮（包括明确指定 ZCode）不据历史 availability 拒绝，不要求 recovery probe。真实失败仍保留证据，容量、工作区和未知在途保护继续生效。
