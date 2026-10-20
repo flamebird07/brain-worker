@@ -34,6 +34,7 @@ import dispatch_pool as dp  # noqa: E402
 import execution_control as ec  # noqa: E402
 import codebuddy_fallback as cbf  # noqa: E402
 import qoder_permissions as qp  # noqa: E402
+import entry_runtime_probe as erp  # noqa: E402  只读 entry 实存可见性（非资格门）
 
 SELECTION_MODES = ('auto', 'fixed', 'executor', 'temporary_fallback')
 USER_DIRECT_SELECTION_FIELD = 'user_direct_selection'
@@ -268,7 +269,7 @@ def _permission_incompatibility_details(filters, requirements):
 
 def _filter_candidates(conn, allowed, zcode_blocked, now, requirements=None,
                        controlled_file_ok=False, round_failed=None,
-                       codebuddy_glm_allowed=False):
+                       codebuddy_glm_allowed=False, entry_missing=None):
     """逐候选只读过滤，返回 (通过集合, {pk: 拒绝原因})。
     未授权/权限能力/本轮已试/时段/容量 分开记录。
     `permission_incompatible`（能力冲突）与 `not_authorized`（不在授权集合）分别为可辨
@@ -279,6 +280,12 @@ def _filter_candidates(conn, allowed, zcode_blocked, now, requirements=None,
     标记仅作诊断，不再挡新轮真实尝试。`zcode_blocked` 仍作只读诊断回显在 receipt，
     但不再产生 `zcode_unavailable` 过滤原因。时段/容量/权限能力/明确 model 约束/
     workspace/unknown 在途/审批拒绝**照常**，绝不通过重试绕过。
+    BW-UNIFIED-DESKTOP-ENTRY-20261020-R1G（用户 2026-10-20 授权由只读可见性升级）：
+    `entry_missing` 是入口运行时**确凿缺失**（探针三态 missing，物理不存在，如整树被
+    清）的 pool_key 集合，命中者标 `entry_runtime_missing` 直接挡——这与 S3 的“历史
+    可用性/限额不挡新轮”不冲突：那些是**瞬态**状态，缺文件是**物理事实**，重试不会
+    让文件回来。探针 `unknown`（无法判定）绝不挡，探针异常整体降级 unknown 后
+    fail-open，绝不让可见性探针把规划器搞崩。回执仍保留逐候选可见性字段。
     调用方传入本轮已真实尝试失败的 pool_key 列表 `round_failed_candidates`（内存入参，
     不落新库/新表/新服务）时，本轮命中者标 `already_tried_this_round`，同一 runtime:model
     本轮最多一次；下一新轮调用者不传或传空列表即重新从最高优先级开始，绝不永久挡新轮。
@@ -286,6 +293,7 @@ def _filter_candidates(conn, allowed, zcode_blocked, now, requirements=None,
     忽略，绝不因此扩大授权集合。"""
     requirements = requirements or {'fine_grained': False, 'read_dirs': False}
     failed_this_round = set(round_failed or [])
+    entry_missing = set(entry_missing or ())
     filters, passed = {}, []
     for pk in allowed:
         if not _allowed_candidate(pk):
@@ -293,6 +301,9 @@ def _filter_candidates(conn, allowed, zcode_blocked, now, requirements=None,
             continue
         if _permission_incompatible(pk, requirements, controlled_file_ok):
             filters[pk] = 'permission_incompatible'
+            continue
+        if pk in entry_missing:
+            filters[pk] = 'entry_runtime_missing'
             continue
         # BW-LIMIT30-20261019-S3：ZCode/GLM-5.3 与 Claude/deepseek-flash 的最近真实
         # 结构化 429/402 在 1800 秒只读窗口内跳过；恰好 1800 秒及更久按现有优先级重新
@@ -671,10 +682,19 @@ def plan_stage_selection(authorization, *, previous=None, store_path=None, quota
         if isinstance(receipt.get('codebuddy_glm_condition'), dict):
             receipt['codebuddy_glm_condition']['effective_authorized'] = bool(
                 dp.CODEBUDDY_GLM_POOL_KEY in set(eff_allowed))
+        # R1G 硬资格门（用户 2026-10-20 授权）：探针在过滤前执行一次；只有确凿
+        # missing 进入过滤（unknown 绝不挡）；探针自身任何异常整体降级 unknown
+        # （fail-open），绝不让可见性探针把规划器搞崩、也绝不改变授权集合。
+        try:
+            entry_status, entry_missing = erp.probe_entry_runtimes(eff_allowed)
+        except Exception:
+            entry_status = {pk: erp.UNKNOWN for pk in eff_allowed}
+            entry_missing = []
         passed, filters = _filter_candidates(conn, eff_allowed, zcode_blocked, now,
                                              requirements, controlled_file_ok,
                                              round_failed=round_failed,
-                                             codebuddy_glm_allowed=glm_allowed)
+                                             codebuddy_glm_allowed=glm_allowed,
+                                             entry_missing=set(entry_missing))
         receipt['candidate_filters'] = _per_candidate_view(eff_allowed, filters)
         eligible_rows = []
         excluded_rows = []
@@ -703,6 +723,11 @@ def plan_stage_selection(authorization, *, previous=None, store_path=None, quota
         receipt['excluded_candidates_with_reason'] = excluded_rows
         receipt['permission_incompatibility_details'] = _permission_incompatibility_details(
             receipt['candidate_filters'], requirements)
+        # BW-UNIFIED-DESKTOP-ENTRY-20261020 R1→R1G：entry runtime 实存可见性字段保留
+        # （过滤前已算好）；硬门在 _filter_candidates 的 entry_runtime_missing 原因里
+        # 体现，两者同源同一次探测，绝不影响授权集合回显。
+        receipt['entry_runtime_status'] = entry_status
+        receipt['entry_runtime_missing'] = entry_missing
 
         if eff_mode == 'fixed':
             pk = dp.pool_key(str(eff_auth.get('runtime')), str(eff_auth.get('model')))
