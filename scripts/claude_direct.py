@@ -35,6 +35,12 @@
   `tool_result.tool_use_id` 精确配对，**成功回执 ≥1** 才算工程成功（use_count>0 不够），
   缺失回执/全部权限拒绝/孤儿 result 分别记录；正文普通 429 文本与取消退出码 `4294967295`/`-1`
   绝不判限额；普通可恢复错误只作诊断。协议成功、执行证据、报告绑定各自独立。
+- 连接类故障有界重试（BW-CLAUDE-RETRY-FIX）：仅当真实 terminal result 错误载体被分类为
+  `transport_error`（ECONNRESET 等连接建立类）才重试，至多 2 次额外尝试、间隔递增 5s/15s
+  （`transport_retry_delays`/`sleeper` 可测注入）；额度/认证/权限/协议解析类错误分类恒优先、
+  绝不重试；每次尝试留证（时间/次数/错误分类/间隔/该次 usage）；重试耗尽终态如实
+  transport_failure（sent/dispatched=true、绝不冒充未派发或额度失败）；退出未知绝不重试；
+  回执/摘要带 `retry_count`/`retry_attempts` 纯附加字段，usage 只记最终尝试原件、不跨尝试累加。
 - 证据持久化：请求/进程/发送任务/发送契约/raw stdout/stderr 的**脱敏原件**全部落盘；最终改写后
   刷新 `result_sha256` 并重算 `evidence_sha256`，429 限额以**最终 SHA**先 record_main_force_limit
   再释放本占位。离线结果 `business_verified=false`——只证协议与绑定，不证真实业务。
@@ -54,6 +60,7 @@ import re
 import subprocess
 import sys
 import threading
+import time
 from datetime import datetime, timezone
 from pathlib import Path
 
@@ -89,6 +96,11 @@ _CLEARED_CHILD_ENV = ('ANTHROPIC_AUTH_TOKEN', 'ANTHROPIC_API_KEY',
 # 非必需流量与重试/超时：钉死，避免后台轮询/自动重试污染一次性派工。
 _CHILD_FIXED_ENV = {'CLAUDE_CODE_MAX_RETRIES': '0', 'API_TIMEOUT_MS': '60000',
                     'CLAUDE_CODE_DISABLE_NONESSENTIAL_TRAFFIC': '1'}
+
+# BW-CLAUDE-RETRY-FIX：连接建立类故障（classify_result 的 transport_error 分类）有界重试：
+# 至多 2 次额外尝试，间隔递增 5s/15s；离线测试可注入 transport_retry_delays/sleeper。
+# 额度/认证/权限/协议解析错误在分类上恒优先于 transport，绝不进入重试。
+_TRANSPORT_RETRY_DELAYS_SECONDS = (5.0, 15.0)
 
 DEFAULT_CONFIG = _SCRIPTS_DIR / 'claude-entry.local.json'
 EXAMPLE_CONFIG = _SCRIPTS_DIR / 'claude-entry.json.example'
@@ -951,8 +963,12 @@ def summarize_stream(lines) -> dict:
         approval_denial_in_result = (approval_denial_in_result
                                      or _looks_like_approval_denial(
                                          (result_event or {}).get('result')))
+    # 计费口径（BW-CLAUDE-RETRY-FIX）：只如实转录 CLI 终态 result 事件自带的 usage 原件；
+    # 重试时每次尝试各自记录，绝不跨尝试求和/重复计费。
+    usage = (result_event or {}).get('usage')
     return {'events': events, 'result_event': result_event, 'subtype': subtype,
             'is_error': is_error, 'session_id': session_id, 'cli_version': cli_version,
+            'usage': usage if isinstance(usage, dict) else None,
             'tool_use': tool_use, 'tool_result': tool_result,
             'tool_use_count': len(tool_use), 'tool_result_count': len(tool_result),
             'matched_receipt_ids': matched_ids, 'ok_receipt_ids': ok_receipt_ids,
@@ -1262,6 +1278,8 @@ def classify_result(summary: dict, exit_code: int, stderr_text: str,
         'failure_kind': 'transport_error' if transport_error else None,
         'transport_error': transport_error,
         'cli_version': summary.get('cli_version'),
+        # 本次（最终）尝试的 CLI usage 原件；重试不重复计费，见 summarize_stream。
+        'usage': summary.get('usage'),
         # 兼容旧字段名：工程任务必须有至少一条**成功**回执（不是仅 use_count>0）。
         'zero_tool_engineering': bool(zero_receipt_engineering),
         'stderr_present': bool(stderr_text),
@@ -1393,7 +1411,8 @@ def run(cfg: dict, *, workspace: str, prompt_file: Path, out_dir: Path, stage: s
         task_id: str, prompt_sha256: str, claim_token: str | None = None,
         is_engineering_task: bool = True, now=None, popen_factory=subprocess.Popen,
         environ=None, dispatch_store=None, child_prober=None, bind_child_pid=True,
-        plan=None, active_tasks=None, required_tools=None, write_files=None) -> dict:
+        plan=None, active_tasks=None, required_tools=None, write_files=None,
+        transport_retry_delays=None, sleeper=None) -> dict:
     """真实编排：outdir/预检/凭据前置 → 时段+容量门 → Popen → 监控 → 绑定 → 终态释放。
 
     - outdir 必须不存在（存在即 0 Popen 拒绝，绝不覆写旧证据）；
@@ -1524,6 +1543,23 @@ def run(cfg: dict, *, workspace: str, prompt_file: Path, out_dir: Path, stage: s
     child_env = build_subprocess_env(cfg, token, environ)
     secret = child_env.get('ANTHROPIC_API_KEY', '')
 
+    # (3b) 连接类故障有界重试参数（BW-CLAUDE-RETRY-FIX）：默认 5s/15s 至多 2 次额外
+    # 尝试；测试可注入 delays/sleeper。非法配置在占位之前拒绝（0 Popen、零占位泄漏）。
+    if transport_retry_delays is None:
+        retry_delays = list(_TRANSPORT_RETRY_DELAYS_SECONDS)
+    else:
+        try:
+            retry_delays = [float(x) for x in transport_retry_delays]
+            if any(not (x >= 0.0) or x != x or x == float('inf') for x in retry_delays):
+                raise ValueError('delays must be finite non-negative numbers')
+        except Exception as exc:  # noqa: BLE001
+            return {'dispatch_failed': True, 'sent': False, 'dispatched': False,
+                    'reason': 'retry_config_invalid', 'error_class': type(exc).__name__,
+                    'reasons': [f'transport_retry_delays invalid: {exc!r}']}
+    if sleeper is None:
+        sleeper = time.sleep
+    max_transport_retries = len(retry_delays)
+
     # (4) 容量门 + claude 时段门（占位发生在 consume_for_entry 内）。
     gate = dp.consume_for_entry(
         dispatch_store, task_id=task_id, runtime=RUNTIME, model=model,
@@ -1549,6 +1585,8 @@ def run(cfg: dict, *, workspace: str, prompt_file: Path, out_dir: Path, stage: s
     stdin_error = None
     started_at_utc = now
     finished_at_utc = now
+    retry_count = 0
+    retry_attempts = []
     try:
         # 真实开始点：Popen 之前采集；显式注入时钟时用注入值保持离线确定性。
         started_at_utc = now if clock_injected else datetime.now(timezone.utc)
@@ -1559,88 +1597,152 @@ def run(cfg: dict, *, workspace: str, prompt_file: Path, out_dir: Path, stage: s
         started = True
         dp.mark_running(dispatch_store, claim, wrapper_pid=os.getpid(),
                         now=started_at_utc)
-        if bind_child_pid:
-            bound = None
-            if getattr(proc, 'pid', None) is not None:
-                bound = dp.bind_child(dispatch_store, claim, int(proc.pid),
-                                      wrapper_pid=os.getpid(), now=started_at_utc)
-            # bound 必须**明确为 true** 才算已核验：缺字段/false/None 一律未核验，绝不默认。
-            child_verified = bool(isinstance(bound, dict) and bound.get('bound') is True)
-            if not child_verified:
-                # 生产默认绑定未明确成功：绝不把任务写入子进程（不调用 communicate(input=...)）、
-                # 不杀进程、不假 start_failed/未知释放；保留活/未知占位供核查。
+        attempt_index = 0
+        first_bound_pid = None
+        while True:
+            if bind_child_pid:
+                bound = None
+                if getattr(proc, 'pid', None) is not None:
+                    bound = dp.bind_child(dispatch_store, claim, int(proc.pid),
+                                          wrapper_pid=os.getpid(), now=started_at_utc)
+                if attempt_index == 0:
+                    # bound 必须**明确为 true** 才算已核验：缺字段/false/None 一律未核验，绝不默认。
+                    child_verified = bool(isinstance(bound, dict)
+                                          and bound.get('bound') is True)
+                    if child_verified:
+                        first_bound_pid = int(proc.pid)
+                elif not (isinstance(bound, dict) and bound.get('bound') is True):
+                    # BW-CLAUDE-RETRY-FIX：store 绑定是单发语义（child 已绑定绝不覆盖），
+                    # 重试子进程无法重新绑定。仅当既有绑定仍是本 run 首绑的 pid（其间
+                    # 每次尝试都在真实退出已知后才重试）时保留首绑核验继续；任何异常
+                    # 状态保守 unknown，绝不假称已核验。
+                    existing = (bound or {}).get('existing_child') or {}
+                    existing_pid = existing.get('child_pid')
+                    if not (first_bound_pid is not None and existing_pid is not None
+                            and int(existing_pid) == first_bound_pid):
+                        child_verified = False
+                if not child_verified:
+                    # 生产默认绑定未明确成功：绝不把任务写入子进程（不调用 communicate(input=...)）、
+                    # 不杀进程、不假 start_failed/未知释放；保留活/未知占位供核查。
+                    try:
+                        unknown_guard = dp.mark_unknown(dispatch_store, claim,
+                                                        now=started_at_utc)
+                    except Exception as uexc:  # noqa: BLE001
+                        unknown_guard = {'marked': False, 'error': type(uexc).__name__}
+                    unknown_evidence = _write_unknown_evidence(
+                        out_dir, stage=stage, task_id=task_id,
+                        process={'pid': getattr(proc, 'pid', None),
+                                 'wrapper_pid': os.getpid(), 'exit_code': None,
+                                 'exchange_mode': None, 'terminated_by_worker': False,
+                                 'stdin_error': None, 'child_verified': False,
+                                 'bind_required': True, 'started': True,
+                                 'retry_count': retry_count,
+                                 'started_at_utc': _iso_utc(started_at_utc),
+                                 'finished_at_utc': _iso_utc(started_at_utc)},
+                        raw_stdout=stdout_text, raw_stderr=stderr_text,
+                        permission_stop=None, secret=secret)
+                    return {'dispatch_failed': False, 'sent': False, 'dispatched': True,
+                            'launch_unknown': True, 'started': True, 'token': claim,
+                            'child_verified': False, 'bind_required': True,
+                            'unknown_guard': unknown_guard,
+                            'retry_count': retry_count,
+                            'retry_attempts': retry_attempts,
+                            'evidence': unknown_evidence,
+                            'business_verified': False}
+            child_done = False
+            exchange = _exchange_streaming(proc, sent_payload)
+            stdout_text = exchange.get('stdout') or ''
+            stderr_text = exchange.get('stderr') or ''
+            exit_code = exchange.get('exit_code')
+            first_denial = exchange.get('first_denial')
+            stop_requested = bool(exchange.get('stop_requested'))
+            terminate_called = bool(exchange.get('terminate_called'))
+            observed_followup_tool_use = bool(exchange.get('observed_followup_tool_use'))
+            stdout_partial = bool(exchange.get('stdout_partial'))
+            exchange_mode = exchange.get('mode')
+            stdin_error = exchange.get('stdin_error')
+            # 真实结束点：每次尝试的交换返回后采集，绝不沿用派工开始的 now。
+            finished_at_utc = now if clock_injected else datetime.now(timezone.utc)
+            child_done = exit_code is not None  # 真实退出码已知（确知已退出）
+            if permission_stop is None and first_denial is not None:
+                permission_stop = first_denial
+            if not child_done:
+                # 已启动但真实退出未知（含 stop 后 wait 失败/terminate 失败）：保留 unknown，
+                # 不假释放；把已收集 raw stdout/stderr、permission_stop 与进程元数据落盘。
+                # 真实退出未知绝不重试（下一尝试只会制造更多未知子进程）。
                 try:
-                    unknown_guard = dp.mark_unknown(dispatch_store, claim,
-                                                    now=started_at_utc)
+                    unknown_guard = dp.mark_unknown(dispatch_store, claim, now=now)
                 except Exception as uexc:  # noqa: BLE001
                     unknown_guard = {'marked': False, 'error': type(uexc).__name__}
                 unknown_evidence = _write_unknown_evidence(
                     out_dir, stage=stage, task_id=task_id,
                     process={'pid': getattr(proc, 'pid', None),
-                             'wrapper_pid': os.getpid(), 'exit_code': None,
-                             'exchange_mode': None, 'terminated_by_worker': False,
-                             'stdin_error': None, 'child_verified': False,
-                             'bind_required': True, 'started': True,
+                             'wrapper_pid': os.getpid(), 'exit_code': exit_code,
+                             'exchange_mode': exchange_mode,
+                             'stop_requested': bool(stop_requested),
+                             'terminated_by_worker': bool(terminate_called),
+                             'observed_followup_tool_use': bool(observed_followup_tool_use),
+                             'raw_stdout_partial': bool(stdout_partial),
+                             'stdin_error': stdin_error, 'child_verified': child_verified,
+                             'bind_required': bool(bind_child_pid), 'started': True,
+                             'retry_count': retry_count,
                              'started_at_utc': _iso_utc(started_at_utc),
-                             'finished_at_utc': _iso_utc(started_at_utc)},
+                             'finished_at_utc': _iso_utc(finished_at_utc)},
                     raw_stdout=stdout_text, raw_stderr=stderr_text,
-                    permission_stop=None, secret=secret)
+                    permission_stop=permission_stop, secret=secret,
+                    raw_stdout_partial=stdout_partial)
                 return {'dispatch_failed': False, 'sent': False, 'dispatched': True,
                         'launch_unknown': True, 'started': True, 'token': claim,
-                        'child_verified': False, 'bind_required': True,
-                        'unknown_guard': unknown_guard,
+                        'unknown_guard': unknown_guard, 'permission_stop': permission_stop,
+                        'stop_requested': bool(stop_requested),
+                        'terminated_by_worker': bool(terminate_called),
+                        'observed_followup_tool_use': bool(observed_followup_tool_use),
+                        'raw_stdout_partial': bool(stdout_partial),
+                        'stdout_sha256': _sha((stdout_text or '').encode('utf-8')),
+                        'stderr_sha256': _sha((stderr_text or '').encode('utf-8')),
+                        'retry_count': retry_count,
+                        'retry_attempts': retry_attempts,
                         'evidence': unknown_evidence,
                         'business_verified': False}
-        exchange = _exchange_streaming(proc, sent_payload)
-        stdout_text = exchange.get('stdout') or ''
-        stderr_text = exchange.get('stderr') or ''
-        exit_code = exchange.get('exit_code')
-        first_denial = exchange.get('first_denial')
-        stop_requested = bool(exchange.get('stop_requested'))
-        terminate_called = bool(exchange.get('terminate_called'))
-        observed_followup_tool_use = bool(exchange.get('observed_followup_tool_use'))
-        stdout_partial = bool(exchange.get('stdout_partial'))
-        exchange_mode = exchange.get('mode')
-        stdin_error = exchange.get('stdin_error')
-        # 真实结束点：交换返回后采集，绝不沿用派工开始的 now。
-        finished_at_utc = now if clock_injected else datetime.now(timezone.utc)
-        child_done = exit_code is not None  # 真实退出码已知（确知已退出）
-        if permission_stop is None and first_denial is not None:
-            permission_stop = first_denial
-        if not child_done:
-            # 已启动但真实退出未知（含 stop 后 wait 失败/terminate 失败）：保留 unknown，
-            # 不假释放；把已收集 raw stdout/stderr、permission_stop 与进程元数据落盘。
-            try:
-                unknown_guard = dp.mark_unknown(dispatch_store, claim, now=now)
-            except Exception as uexc:  # noqa: BLE001
-                unknown_guard = {'marked': False, 'error': type(uexc).__name__}
-            unknown_evidence = _write_unknown_evidence(
-                out_dir, stage=stage, task_id=task_id,
-                process={'pid': getattr(proc, 'pid', None),
-                         'wrapper_pid': os.getpid(), 'exit_code': exit_code,
-                         'exchange_mode': exchange_mode,
-                         'stop_requested': bool(stop_requested),
-                         'terminated_by_worker': bool(terminate_called),
-                         'observed_followup_tool_use': bool(observed_followup_tool_use),
-                         'raw_stdout_partial': bool(stdout_partial),
-                         'stdin_error': stdin_error, 'child_verified': child_verified,
-                         'bind_required': bool(bind_child_pid), 'started': True,
-                         'started_at_utc': _iso_utc(started_at_utc),
-                         'finished_at_utc': _iso_utc(finished_at_utc)},
-                raw_stdout=stdout_text, raw_stderr=stderr_text,
-                permission_stop=permission_stop, secret=secret,
-                raw_stdout_partial=stdout_partial)
-            return {'dispatch_failed': False, 'sent': False, 'dispatched': True,
-                    'launch_unknown': True, 'started': True, 'token': claim,
-                    'unknown_guard': unknown_guard, 'permission_stop': permission_stop,
-                    'stop_requested': bool(stop_requested),
-                    'terminated_by_worker': bool(terminate_called),
-                    'observed_followup_tool_use': bool(observed_followup_tool_use),
-                    'raw_stdout_partial': bool(stdout_partial),
-                    'stdout_sha256': _sha((stdout_text or '').encode('utf-8')),
-                    'stderr_sha256': _sha((stderr_text or '').encode('utf-8')),
-                    'evidence': unknown_evidence,
-                    'business_verified': False}
+            # BW-CLAUDE-RETRY-FIX：连接类故障的有界重试判定。只有真实 terminal result
+            # 错误载体被 classify_result 判为 transport_error（额度/认证/权限/协议解析
+            # 恒优先于该分类，绝不误判可重试）且本尝试无权限停止时才重试；每次重试
+            # 留证（时间/次数/错误分类/间隔/该次 usage 与 raw stdout 哈希）。
+            attempt_summary = summarize_stream((stdout_text or '').splitlines())
+            if permission_stop:
+                attempt_summary = _mark_permission_stop(attempt_summary, permission_stop)
+            attempt_facts = classify_result(attempt_summary, exit_code, stderr_text or '',
+                                            is_engineering_task=is_engineering_task)
+            transport = attempt_facts.get('transport_error')
+            will_retry = bool(transport is not None and not permission_stop
+                              and retry_count < max_transport_retries)
+            attempt_entry = {
+                'attempt': attempt_index,
+                'finished_at_utc': _iso_utc(finished_at_utc),
+                'child_pid': getattr(proc, 'pid', None),
+                'exit_code': exit_code,
+                'failure_kind': attempt_facts.get('failure_kind'),
+                'transport_error_code': (transport or {}).get('code'),
+                'transport_error_source': (transport or {}).get('source'),
+                'transport_error_message': (transport or {}).get('message'),
+                'usage': attempt_summary.get('usage'),
+                'raw_stdout_sha256': _sha((stdout_text or '').encode('utf-8')),
+                'retried': will_retry,
+            }
+            if will_retry:
+                attempt_entry['retry_delay_seconds'] = retry_delays[retry_count]
+            retry_attempts.append(attempt_entry)
+            if not will_retry:
+                break  # 成功 / 非连接类失败 / 重试耗尽：终态如实，交下方统一流程
+            retry_count += 1
+            attempt_index += 1
+            sleeper(retry_delays[retry_count - 1])
+            # 重试 Popen 抛异常 → child_done=False 由外层 except 保守保留 unknown，
+            # 绝不把上一尝试的传输失败冒充本次尝试终态。
+            child_done = False
+            proc = popen_factory(argv, cwd=str(workspace), stdin=subprocess.PIPE,
+                                 stdout=subprocess.PIPE, stderr=subprocess.PIPE,
+                                 env=child_env, text=True)
     except BaseException as exc:  # noqa: BLE001 - 终态处理必须兜底
         if started:
             # 已启动但真实退出未知（communicate/Popen 之后异常）→ 保留占位为 unknown，
@@ -1659,6 +1761,7 @@ def run(cfg: dict, *, workspace: str, prompt_file: Path, out_dir: Path, stage: s
                              'stdin_error': stdin_error,
                              'child_verified': child_verified,
                              'bind_required': bool(bind_child_pid), 'started': True,
+                             'retry_count': retry_count,
                              'started_at_utc': _iso_utc(started_at_utc),
                              'finished_at_utc': _iso_utc(finished_at_utc),
                              'error_class': type(exc).__name__},
@@ -1668,6 +1771,8 @@ def run(cfg: dict, *, workspace: str, prompt_file: Path, out_dir: Path, stage: s
                         'launch_unknown': True, 'started': True, 'token': claim,
                         'unknown_guard': unknown_guard,
                         'permission_stop': permission_stop,
+                        'retry_count': retry_count,
+                        'retry_attempts': retry_attempts,
                         'evidence': unknown_evidence,
                         'error_class': type(exc).__name__, 'business_verified': False}
             # 极小竞态：communicate 已返回但取 returncode 抛出 → 子进程确知已结束，
@@ -1712,7 +1817,9 @@ def run(cfg: dict, *, workspace: str, prompt_file: Path, out_dir: Path, stage: s
                      observed_followup_tool_use=bool(observed_followup_tool_use),
                      raw_stdout_partial=bool(stdout_partial),
                      exchange_mode=exchange_mode,
-                     stdin_error=stdin_error)
+                     stdin_error=stdin_error,
+                     retry_count=retry_count,
+                     retry_attempts=retry_attempts)
         report_text = ((summary.get('result_event') or {}).get('result')
                        or summary.get('assistant_text') or '')
         ev = write_evidence(Path(out_dir), events=summary.get('events', []), facts=facts,
@@ -1736,6 +1843,10 @@ def run(cfg: dict, *, workspace: str, prompt_file: Path, out_dir: Path, stage: s
                                      'exchange_mode': exchange_mode,
                                      'terminated_by_worker': bool(terminate_called),
                                      'raw_stdout_partial': bool(stdout_partial),
+                                     'transport_retry': {
+                                         'delays_seconds': retry_delays,
+                                         'max_additional_attempts': max_transport_retries,
+                                         'retry_count': retry_count},
                                      'started_at_utc': _iso_utc(started_at_utc),
                                      'finished_at_utc': _iso_utc(finished_at_utc),
                                      'executor_identity': {
@@ -1817,6 +1928,7 @@ def run(cfg: dict, *, workspace: str, prompt_file: Path, out_dir: Path, stage: s
             'stopped': bool(permission_stop),
             'facts': facts, 'binding': binding, 'evidence': ev, 'launched': True,
             'limit_recorded': limit_recorded, 'limit_error': limit_error,
+            'retry_count': retry_count, 'retry_attempts': retry_attempts,
             'started_at_utc': _iso_utc(started_at_utc),
             'finished_at_utc': _iso_utc(finished_at_utc),
             'capacity_release': release, 'passed': passed, 'business_verified': False,

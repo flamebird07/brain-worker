@@ -747,5 +747,279 @@ class LifecycleTests(unittest.TestCase):
         m.assert_not_called()
 
 
+class _SeqPopenFactory:
+    """按尝试次序返回不同 FakePopen 的离线工厂（第 N 次调用返回第 N 个替身，
+    耗尽后重放最后一个）；只记录调用次数，不产生 OS 子进程、不联网。"""
+
+    def __init__(self, fakes):
+        self._fakes = list(fakes)
+        self.calls = 0
+
+    def __call__(self, argv, **kwargs):
+        idx = self.calls
+        self.calls += 1
+        fake = self._fakes[idx] if idx < len(self._fakes) else self._fakes[-1]
+        return fake(argv, **kwargs)
+
+
+def _transport_error_stream(code='ECONNRESET', usage=None, session='s-t'):
+    ev = {'type': 'result', 'subtype': 'success', 'is_error': True,
+          'session_id': session,
+          'result': f'API Error: Unable to connect to API ({code})'}
+    if usage is not None:
+        ev['usage'] = usage
+    return _jsonl([ev])
+
+
+class TransportRetryTests(unittest.TestCase):
+    """BW-CLAUDE-RETRY-FIX：连接类错误有界重试（注入式 popen/sleeper，零网络零凭据文件）。"""
+
+    STAGE = 'BW-CLAUDE-DEEPSEEK-S3'
+
+    def setUp(self):
+        self.tmp = tempfile.TemporaryDirectory()
+        self.base = Path(self.tmp.name)
+        self.store = self.base / 'dispatch.sqlite3'
+        self.ws = self.base / 'ws'
+        self.ws.mkdir()
+        self.prompt = self.base / 'prompt.txt'
+        self.prompt.write_text('do the task', encoding='utf-8')
+        self.out = self.base / 'out'
+        self._p = mock.patch.object(dp, 'process_identity',
+                                    return_value={'state': 'alive', 'created': 'c1'})
+        self._p.start()
+        self.addCleanup(self._p.stop)
+        self.addCleanup(self.tmp.cleanup)
+
+    def cfg(self):
+        return {'executable': str(self.base / 'claude.exe'), 'model': 'deepseek-flash',
+                'permission_mode': 'dontAsk',
+                'tools': ['Read'], 'allowed_tools': ['Read'], 'setting_sources': [],
+                'credential_source': {'mode': 'token_env', 'env': 'ANTHROPIC_API_KEY'}}
+
+    def sha(self):
+        import hashlib
+        return hashlib.sha256(self.prompt.read_bytes()).hexdigest()
+
+    def success_stream(self, usage=None):
+        body = _report_body(self.STAGE, str(self.ws))
+        result = {'type': 'result', 'subtype': 'success', 'is_error': False,
+                  'session_id': 's1', 'result': body}
+        if usage is not None:
+            result['usage'] = usage
+        return _jsonl([
+            {'type': 'assistant', 'message': {'content': [
+                {'type': 'tool_use', 'name': 'Read', 'id': 't1'}]}},
+            {'type': 'user', 'message': {'content': [
+                {'type': 'tool_result', 'tool_use_id': 't1'}]}},
+            result])
+
+    def run_with(self, factory, *, now=OFFPEAK, is_eng=True, task='t1', out=None,
+                 bind_child_pid=False, retry_delays=(0.0, 0.0), sleeps=None):
+        recorded = sleeps if sleeps is not None else []
+        return cd.run(self.cfg(), workspace=str(self.ws), prompt_file=self.prompt,
+                      out_dir=out or self.out, stage=self.STAGE, task_id=task,
+                      prompt_sha256=self.sha(), now=now, popen_factory=factory,
+                      environ={'ANTHROPIC_API_KEY': SECRET}, dispatch_store=self.store,
+                      child_prober=lambda pid: {'state': 'dead', 'created': 'c1'},
+                      is_engineering_task=is_eng, bind_child_pid=bind_child_pid,
+                      required_tools=['Read'] if is_eng else None,
+                      transport_retry_delays=list(retry_delays),
+                      sleeper=recorded.append)
+
+    def _active(self):
+        return dp.status(self.store,
+                         now=OFFPEAK)['pools']['claude:deepseek-flash']['active']
+
+    def test_default_retry_policy_is_bounded_5s_15s(self):
+        self.assertEqual(cd._TRANSPORT_RETRY_DELAYS_SECONDS, (5.0, 15.0))
+
+    def test_connection_error_retries_then_success_no_double_usage(self):
+        # 第 1 次尝试 ECONNRESET（真实退出码 1 已知）→ 有界重试 → 第 2 次成功。
+        sleeps = []
+        first = FakePopen(_transport_error_stream(usage={'input_tokens': 3}),
+                          returncode=1, pid=4242)
+        second = FakePopen(
+            self.success_stream(usage={'input_tokens': 10, 'output_tokens': 4}),
+            pid=5252)
+        factory = _SeqPopenFactory([first, second])
+        out = self.run_with(factory, bind_child_pid=True, retry_delays=(7.0, 9.0),
+                            sleeps=sleeps)
+        self.assertEqual(factory.calls, 2)
+        self.assertEqual(sleeps, [7.0])  # 只用掉第一段递增间隔；注入值原样传递
+        self.assertEqual(out['retry_count'], 1)
+        self.assertTrue(out['sent'], out)
+        self.assertTrue(out['child_verified'], out)
+        self.assertTrue(out['passed'], out)
+        # 计费口径不重复：facts.usage 只记最终成功尝试的原件，绝不跨尝试累加。
+        self.assertEqual(out['facts']['usage'],
+                         {'input_tokens': 10, 'output_tokens': 4})
+        attempts = out['facts']['retry_attempts']
+        self.assertEqual(len(attempts), 2)
+        self.assertEqual(attempts[0]['attempt'], 0)
+        self.assertEqual(attempts[0]['failure_kind'], 'transport_error')
+        self.assertEqual(attempts[0]['transport_error_code'], 'ECONNRESET')
+        self.assertEqual(attempts[0]['transport_error_source'], 'result')
+        self.assertTrue(attempts[0]['retried'])
+        self.assertEqual(attempts[0]['retry_delay_seconds'], 7.0)
+        self.assertEqual(attempts[0]['usage'], {'input_tokens': 3})  # 各次 usage 如实单列
+        self.assertEqual(attempts[0]['exit_code'], 1)
+        self.assertEqual(attempts[0]['finished_at_utc'], OFFPEAK.isoformat())
+        self.assertIsNone(attempts[1]['transport_error_code'])
+        self.assertFalse(attempts[1]['retried'])
+        # 证据回读：result.json 带 retry_count 与各次错误分类（纯附加字段）。
+        res = json.loads(Path(out['evidence']['result_json']).read_text(encoding='utf-8'))
+        self.assertEqual(res['facts']['retry_count'], 1)
+        self.assertEqual(res['facts']['retry_attempts'][0]['transport_error_code'],
+                         'ECONNRESET')
+        self.assertEqual(res['facts']['usage'],
+                         {'input_tokens': 10, 'output_tokens': 4})
+        req = json.loads(Path(out['evidence']['request_path']).read_text(encoding='utf-8'))
+        self.assertEqual(req['transport_retry']['retry_count'], 1)
+        self.assertEqual(req['transport_retry']['delays_seconds'], [7.0, 9.0])
+        # 单次容量 consume / 单次终态释放：重试绝不重复占用容量。
+        self.assertTrue(out['capacity_release'].get('released'), out['capacity_release'])
+        self.assertEqual(self._active(), 0)
+
+    def test_retry_exhausted_terminal_is_honest_transport_failure(self):
+        sleeps = []
+        fakes = [FakePopen(_transport_error_stream(), returncode=1, pid=4242 + i)
+                 for i in range(3)]
+        factory = _SeqPopenFactory(fakes)
+        out = self.run_with(factory, bind_child_pid=True, retry_delays=(0.5, 1.5),
+                            sleeps=sleeps)
+        self.assertEqual(factory.calls, 3)  # 1 次初始 + 至多 2 次额外尝试，绝不再多
+        self.assertEqual(out['retry_count'], 2)
+        self.assertEqual(sleeps, [0.5, 1.5])  # 间隔递增按注入常量执行
+        self.assertTrue(out['sent'])          # 已派发：绝不冒充未派发
+        self.assertTrue(out['dispatched'])
+        self.assertFalse(out.get('launch_unknown', False))
+        self.assertFalse(out['passed'])
+        facts = out['facts']
+        self.assertEqual(facts['failure_kind'], 'transport_error')  # 终态如实 transport 类
+        self.assertEqual(facts['transport_error']['code'], 'ECONNRESET')
+        self.assertFalse(facts['quota_limited'])   # 绝不冒充额度失败
+        self.assertFalse(facts['quota_429'])
+        self.assertFalse(facts['hard_balance_402'])
+        self.assertFalse(facts['protocol_success'])
+        attempts = facts['retry_attempts']
+        self.assertEqual([a['attempt'] for a in attempts], [0, 1, 2])
+        self.assertEqual([a['retried'] for a in attempts], [True, True, False])
+        self.assertEqual([a['transport_error_code'] for a in attempts],
+                         ['ECONNRESET'] * 3)
+        self.assertEqual([a['child_pid'] for a in attempts], [4242, 4243, 4244])
+        # 真实退出已知 → 终态释放照常，容量不泄漏。
+        self.assertTrue(out['capacity_release'].get('released'), out['capacity_release'])
+        self.assertEqual(self._active(), 0)
+        res = json.loads(Path(out['evidence']['result_json']).read_text(encoding='utf-8'))
+        self.assertEqual(res['facts']['retry_count'], 2)
+        self.assertEqual(res['facts']['failure_kind'], 'transport_error')
+
+    def test_quota_429_never_retried(self):
+        stream = _jsonl([
+            {'type': 'result', 'subtype': 'error_during_execution', 'is_error': True,
+             'session_id': 's', 'result_errors': [{'status': 429}],
+             'result': '429 Too Many Requests'}])
+        factory = _SeqPopenFactory([FakePopen(stream, returncode=1)])
+        sleeps = []
+        out = self.run_with(factory, sleeps=sleeps)
+        self.assertEqual(factory.calls, 1)
+        self.assertEqual(out['retry_count'], 0)
+        self.assertEqual(sleeps, [])
+        self.assertTrue(out['facts']['quota_429'])
+        self.assertTrue(out['limit_recorded'], out)
+        self.assertIsNone(out['facts']['failure_kind'])
+
+    def test_auth_401_with_embedded_network_code_never_retried(self):
+        # 认证错误文本夹带 ECONNRESET：认证分类恒优先，绝不误归连接类而重试。
+        stream = _jsonl([
+            {'type': 'result', 'subtype': 'success', 'is_error': True, 'session_id': 's',
+             'result': 'API Error: 401 Unauthorized (previous transport ECONNRESET)'}])
+        factory = _SeqPopenFactory([FakePopen(stream, returncode=1)])
+        sleeps = []
+        out = self.run_with(factory, sleeps=sleeps)
+        self.assertEqual(factory.calls, 1)
+        self.assertEqual(out['retry_count'], 0)
+        self.assertEqual(sleeps, [])
+        self.assertIsNone(out['facts']['failure_kind'])
+        self.assertIsNone(out['facts']['transport_error'])
+        self.assertFalse(out['passed'])
+
+    def test_protocol_parse_error_never_retried(self):
+        factory = _SeqPopenFactory([FakePopen('not json at all\n{"broken": ',
+                                              returncode=1)])
+        sleeps = []
+        out = self.run_with(factory, sleeps=sleeps)
+        self.assertEqual(factory.calls, 1)
+        self.assertEqual(out['retry_count'], 0)
+        self.assertEqual(sleeps, [])
+        self.assertTrue(out['facts']['parse_error'])
+        self.assertFalse(out['facts']['protocol_success'])
+
+    def test_permission_denial_never_retried(self):
+        stream = _jsonl([
+            {'type': 'result', 'subtype': 'success', 'is_error': True, 'session_id': 's',
+             'result': 'Permission to use Edit has been denied.'}])
+        factory = _SeqPopenFactory([FakePopen(stream, returncode=1)])
+        sleeps = []
+        out = self.run_with(factory, sleeps=sleeps)
+        self.assertEqual(factory.calls, 1)
+        self.assertEqual(out['retry_count'], 0)
+        self.assertEqual(sleeps, [])
+        self.assertTrue(out['stopped'])
+
+    def test_success_first_attempt_zero_retry_and_usage_none_when_absent(self):
+        factory = _SeqPopenFactory([FakePopen(self.success_stream(), pid=4242)])
+        sleeps = []
+        out = self.run_with(factory, bind_child_pid=True, sleeps=sleeps)
+        self.assertTrue(out['passed'], out)
+        self.assertEqual(out['retry_count'], 0)
+        self.assertEqual(sleeps, [])
+        self.assertEqual(len(out['retry_attempts']), 1)
+        self.assertFalse(out['retry_attempts'][0]['retried'])
+        self.assertIsNone(out['facts']['usage'])  # 无 usage 字段时如实 None，绝不编造
+
+    def test_unknown_exit_never_retried(self):
+        # 真实退出未知 → 保留 launch_unknown，绝不盲目重试制造更多未知子进程。
+        factory = _SeqPopenFactory(
+            [FakePopen('', raise_comm=RuntimeError('interrupted'))])
+        sleeps = []
+        out = self.run_with(factory, sleeps=sleeps)
+        self.assertTrue(out.get('launch_unknown'), out)
+        self.assertEqual(factory.calls, 1)
+        self.assertEqual(out['retry_count'], 0)
+        self.assertEqual(sleeps, [])
+        self.assertEqual(self._active(), 1)
+
+    def test_retry_rebind_mismatch_keeps_unknown(self):
+        # store 绑定单发语义：重试时既有绑定若非本 run 首绑 pid（异常状态）→ 保守
+        # unknown，绝不假称已核验、绝不写任务给该子进程。
+        factory = _SeqPopenFactory([
+            FakePopen(_transport_error_stream(), returncode=1, pid=4242),
+            FakePopen(_transport_error_stream(), returncode=1, pid=5252)])
+        with mock.patch.object(dp, 'bind_child', side_effect=[
+                {'bound': True, 'child_pid': 4242},
+                {'bound': False, 'existing_child': {'child_pid': 9999}}]):
+            out = self.run_with(factory, bind_child_pid=True, sleeps=[])
+        self.assertTrue(out.get('launch_unknown'), out)
+        self.assertFalse(out['sent'])
+        self.assertEqual(out['retry_count'], 1)
+        self.assertFalse(out['child_verified'])
+        self.assertEqual(self._active(), 1)
+
+    def test_invalid_retry_delays_rejected_zero_popen(self):
+        factory = _SeqPopenFactory([FakePopen(self.success_stream())])
+        out = cd.run(self.cfg(), workspace=str(self.ws), prompt_file=self.prompt,
+                     out_dir=self.out, stage=self.STAGE, task_id='t1',
+                     prompt_sha256=self.sha(), now=OFFPEAK, popen_factory=factory,
+                     environ={'ANTHROPIC_API_KEY': SECRET}, dispatch_store=self.store,
+                     required_tools=['Read'], transport_retry_delays=[-1.0])
+        self.assertTrue(out['dispatch_failed'])
+        self.assertFalse(out['sent'])
+        self.assertEqual(out['reason'], 'retry_config_invalid')
+        self.assertEqual(factory.calls, 0)  # 零 Popen、零占位
+        self.assertEqual(self._active(), 0)
+
+
 if __name__ == '__main__':
     unittest.main()
