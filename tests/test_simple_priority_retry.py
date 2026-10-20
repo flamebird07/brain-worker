@@ -231,6 +231,38 @@ class RoundFailedValidationTests(_Base):
         self.assertEqual(r['selected']['pool_key'], CN_MAX, r)
         self.assertEqual(r['candidate_filters'][QMAX], 'already_tried_this_round')
 
+    def test_structured_event_entries_accepted_and_strictly_validated(self):
+        """BW-ROUND-TRANSITION-FIX：round_failed_candidates 兼容结构化失败事件对象
+        （分类/时间/事件引用），与纯 pool_key 字符串可混用、既有调用方不破坏；畸形
+        事件（缺分类/缺时间/未知键/无时区/不可解析/空白项）一律拒绝，绝不猜。"""
+        good = {'pool_key': QMAX, 'failure_class': 'network_failure',
+                'failed_at_utc': dp._iso(T_NIGHT), 'event_ref': 'tk-net-1'}
+        r = self.plan([QMAX, CN_MAX], round_failed=[good, CN_FLASH])
+        self.assertEqual(r['refused'], None, r)
+        self.assertEqual(r['candidate_filters'][QMAX], 'already_tried_this_round', r)
+        self.assertEqual(r['selected']['pool_key'], CN_MAX, r)
+        self.assertEqual(sorted(r['round_failed_candidates']), sorted([QMAX, CN_FLASH]))
+        self.assertEqual(r['round_failed_events'][0]['failure_class'],
+                         'network_failure', r)
+        self.assertEqual(r['round_failed_events'][0]['failed_at_utc'],
+                         dp._iso(T_NIGHT), r)
+        self.assertEqual(r['round_failed_events'][0]['event_ref'], 'tk-net-1', r)
+        self.assertFalse(r['round_failed_events'][1]['structured'], r)
+        bad_events = (
+            {'pool_key': QMAX},                                   # 缺分类与时间
+            {'pool_key': QMAX, 'failure_class': 'quota_429'},     # 缺 failed_at_utc
+            dict(good, unexpected='x'),                           # 未知键
+            dict(good, failed_at_utc='2026-10-08T15:00:00'),      # 无时区
+            dict(good, failed_at_utc='not-a-time'),               # 不可解析
+            dict(good, pool_key=''),                              # 空白 pool_key
+            dict(good, pool_key=' x '),                           # 未去空白
+            dict(good, failure_class=''),                         # 空白分类
+            dict(good, event_ref=''),                             # 空白事件引用
+        )
+        for bad in bad_events:
+            r = self.plan([QMAX, CN_MAX], round_failed=[bad])
+            self.assertEqual(r['refused'], 'invalid_round_failed_candidates', bad)
+
 
 class HistoryQuotaNoLongerBlocksFreshRoundTests(_Base):
     def test_explicit_limit_no_longer_blocks_new_round(self):

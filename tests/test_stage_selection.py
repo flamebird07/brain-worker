@@ -187,8 +187,14 @@ class AuthorizationTests(_Base):
             conn.execute('PRAGMA journal_mode=DELETE')
         # BW-ZCODE-RETIRE-20261020：原第二候选 zcode 已退役，改用同场景的 QMAX 之外的
         # 空授权集不改变本例语义——只保留 claude，验证到期后 claude 重新可选与新轮开启。
+        # BW-ROUND-TRANSITION-FIX：轮转必须由**结构化限额事件**且与过期窗口同一事件触发，
+        # 本例改用携带分类/时间/事件引用的结构化入参（failed_at_utc 与限额参照一致）。
         auth = self.auth('auto', 'T', 's2', [dp.CLAUDE_POOL_KEY],
-                         round_failed_candidates=[dp.CLAUDE_POOL_KEY],
+                         round_failed_candidates=[
+                             {'pool_key': dp.CLAUDE_POOL_KEY,
+                              'failure_class': 'quota_429',
+                              'failed_at_utc': dp._iso(failed_at),
+                              'event_ref': 'tk-claude-429'}],
                          dispatch_round={'id': 7,
                                          'started_at_utc': dp._iso(failed_at)})
         r = self.plan(auth, now=now)
@@ -197,6 +203,14 @@ class AuthorizationTests(_Base):
         self.assertEqual(r['effective_round_failed_candidates'], [])
         self.assertEqual(r['round_transition']['reason'],
                          'structured_limit_window_expired_no_inflight')
+        # 回执附加字段：触发轮转事件的标识/分类/时间（纯附加，供 UI 解释）。
+        trig = r['round_transition']['trigger_events']
+        self.assertEqual(len(trig), 1, trig)
+        self.assertEqual(trig[0]['pool_key'], dp.CLAUDE_POOL_KEY)
+        self.assertEqual(trig[0]['failure_class'], 'quota_429')
+        self.assertEqual(trig[0]['failed_at_utc'], dp._iso(failed_at))
+        self.assertEqual(trig[0]['event_ref'], 'tk-claude-429')
+        self.assertEqual(trig[0]['limit_expires_at_utc'], dp._iso(now))
         self.assertEqual(r['selected']['pool_key'], dp.CLAUDE_POOL_KEY, r)
 
     def test_task_scope_generates_first_qoder_permission_plan(self):
@@ -309,6 +323,204 @@ class AuthorizationTests(_Base):
         r = self.plan(auth, task='T2')
         self.assertEqual(r['selected'], None, r)
         self.assertEqual(r['refused'], 'no_eligible_candidate', r)
+
+
+class RoundTransitionIdentityTests(_Base):
+    """BW-ROUND-TRANSITION-FIX 回归：旧过期结构化限额窗口记录绝不再冒充当前轮真实失败
+    清空失败列表并触发 structured_limit_window_expired_no_inflight 轮转。只有“当前轮
+    失败本身是结构化限额事件、且过期窗口参照时刻正是该同一事件”才允许滚轮；纯字符串
+    旧形态与非限额分类（网络/连接重置/权限/协议）一律保留到本轮结束。覆盖组合：
+    旧限额过期/限额未过期 × 纯字符串/结构化入参 × 无上一轮回执/携带回执。"""
+
+    def _seed_limit(self, pk, recorded_at):
+        with closing(dp.connect(self.store)) as conn:
+            conn.execute(
+                'INSERT INTO main_force_limits(pool_key, limited, recorded_at_utc) '
+                'VALUES(?,1,?)', (pk, dp._iso(recorded_at)))
+            conn.execute('PRAGMA journal_mode=DELETE')
+
+    def _event(self, pk, failed_at, failure_class='network_failure', event_ref=None):
+        return {'pool_key': pk, 'failure_class': failure_class,
+                'failed_at_utc': dp._iso(failed_at),
+                'event_ref': event_ref or f'tk-{pk.split(":")[0]}'}
+
+    def test_old_expired_limit_never_clears_plain_string_without_receipt(self):
+        """实测缺陷场景 1（stage-selection-r1-round2.json）：codebuddy 真实失败后按纯
+        pool_key 字符串入参、全新调用未携带上一轮回执（round_started=None），同 pool
+        存在 6 小时前的旧过期限额行——绝不清空失败列表、绝不轮转、绝不重选该 pool，
+        下一候选必须是 claude:deepseek-flash。"""
+        self.build_store()
+        old_ref = T_NIGHT - timedelta(hours=6)  # 早已过期的历史限额窗口
+        self._seed_limit(dp.CODEBUDDY_POOL_KEY, old_ref)
+        allowed = [dp.CODEBUDDY_POOL_KEY, dp.CLAUDE_POOL_KEY]
+        auth = self.auth('auto', 'T', 's2', allowed,
+                         round_failed_candidates=[dp.CODEBUDDY_POOL_KEY])
+        r = self.plan(auth, now=T_NIGHT)
+        self.assertIsNone(r['refused'], r)
+        self.assertIsNone(r['round_transition'], r)
+        self.assertEqual(r['dispatch_round']['id'], 1, r)
+        self.assertEqual(r['effective_round_failed_candidates'],
+                         [dp.CODEBUDDY_POOL_KEY], r)
+        self.assertEqual(r['candidate_filters'][dp.CODEBUDDY_POOL_KEY],
+                         'already_tried_this_round', r)
+        self.assertEqual(r['selected']['pool_key'], dp.CLAUDE_POOL_KEY, r)
+
+    def test_old_expired_limit_never_clears_structured_network_failure_with_receipt(self):
+        """实测缺陷场景 2（login-log-repair TLS 502）：当前轮失败是结构化**网络**事件、
+        携带上一轮回执，旧限额行（早于本轮开始）过期——网络失败保留到本轮结束，绝不
+        被限额轮转逻辑清除，下一候选必须是 claude:deepseek-flash；回执含当前轮失败
+        事件（标识/分类/时间）。"""
+        self.build_store()
+        old_ref = T_NIGHT - timedelta(hours=6)
+        self._seed_limit(dp.CODEBUDDY_POOL_KEY, old_ref)
+        round_started = T_NIGHT - timedelta(minutes=10)
+        failed_at = T_NIGHT - timedelta(minutes=5)
+        allowed = [dp.CODEBUDDY_POOL_KEY, dp.CLAUDE_POOL_KEY]
+        auth = self.auth('auto', 'T', 's2', allowed,
+                         round_failed_candidates=[
+                             self._event(dp.CODEBUDDY_POOL_KEY, failed_at)],
+                         dispatch_round={'id': 3,
+                                         'started_at_utc': dp._iso(round_started)})
+        r = self.plan(auth, now=T_NIGHT)
+        self.assertIsNone(r['refused'], r)
+        self.assertIsNone(r['round_transition'], r)
+        self.assertEqual(r['dispatch_round']['id'], 3, r)
+        self.assertEqual(r['effective_round_failed_candidates'],
+                         [dp.CODEBUDDY_POOL_KEY], r)
+        self.assertEqual(r['candidate_filters'][dp.CODEBUDDY_POOL_KEY],
+                         'already_tried_this_round', r)
+        self.assertEqual(r['selected']['pool_key'], dp.CLAUDE_POOL_KEY, r)
+        self.assertEqual(r['round_failed_events'][0]['failure_class'],
+                         'network_failure', r)
+        self.assertEqual(r['round_failed_events'][0]['failed_at_utc'],
+                         dp._iso(failed_at), r)
+
+    def test_active_limit_window_never_rotates_round(self):
+        """限额**未过期**（窗口仍 active）：即便当前轮失败是结构化 quota_429 同一事件，
+        也绝不触发轮转；轮号/失败列表原样，该 pool 本轮不可重选。"""
+        self.build_store()
+        ref = T_NIGHT - timedelta(seconds=60)  # 60 秒前，1800 秒窗口内仍 active
+        self._seed_limit(dp.CODEBUDDY_POOL_KEY, ref)
+        allowed = [dp.CODEBUDDY_POOL_KEY, dp.CLAUDE_POOL_KEY]
+        auth = self.auth('auto', 'T', 's2', allowed,
+                         round_failed_candidates=[
+                             self._event(dp.CODEBUDDY_POOL_KEY, ref,
+                                         failure_class='quota_429')],
+                         dispatch_round={'id': 2, 'started_at_utc': dp._iso(ref)})
+        r = self.plan(auth, now=T_NIGHT)
+        self.assertIsNone(r['refused'], r)
+        self.assertIsNone(r['round_transition'], r)
+        self.assertEqual(r['dispatch_round']['id'], 2, r)
+        self.assertEqual(r['effective_round_failed_candidates'],
+                         [dp.CODEBUDDY_POOL_KEY], r)
+        self.assertEqual(r['candidate_filters'][dp.CODEBUDDY_POOL_KEY],
+                         'main_force_limited', r)
+        self.assertEqual(r['selected']['pool_key'], dp.CLAUDE_POOL_KEY, r)
+
+    def test_same_event_expired_limit_rotates_and_keeps_other_failures(self):
+        """正例（携带回执）：当前轮失败本身是结构化 quota_429、过期窗口正是同一事件、
+        参照时刻不早于本轮开始——允许轮转；只清该同一限额事件，同轮的结构化网络失败
+        与纯字符串失败一律保留（绝不清空整表）。"""
+        self.build_store()
+        ref = T_NIGHT - timedelta(seconds=dp.QUOTA_LIMIT_WINDOW_SECONDS)  # 恰满 1800 秒
+        self._seed_limit(dp.CODEBUDDY_POOL_KEY, ref)
+        round_started = ref - timedelta(minutes=5)
+        net_failed_at = ref - timedelta(minutes=1)
+        allowed = [dp.CODEBUDDY_POOL_KEY, dp.QMAX_POOL_KEY, dp.CLAUDE_POOL_KEY]
+        auth = self.auth('auto', 'T', 's2', allowed,
+                         round_failed_candidates=[
+                             self._event(dp.CODEBUDDY_POOL_KEY, ref,
+                                         failure_class='quota_429'),
+                             self._event(dp.QMAX_POOL_KEY, net_failed_at),
+                             dp.CLAUDE_POOL_KEY],
+                         dispatch_round={'id': 4,
+                                         'started_at_utc': dp._iso(round_started)})
+        r = self.plan(auth, now=T_NIGHT)
+        self.assertIsNone(r['refused'], r)
+        self.assertEqual(r['round_transition']['from_round'], 4, r)
+        self.assertEqual(r['round_transition']['to_round'], 5, r)
+        self.assertEqual(r['round_transition']['reason'],
+                         'structured_limit_window_expired_no_inflight')
+        self.assertEqual(sorted(r['effective_round_failed_candidates']),
+                         sorted([dp.QMAX_POOL_KEY, dp.CLAUDE_POOL_KEY]), r)
+        trig = r['round_transition']['trigger_events']
+        self.assertEqual(len(trig), 1, trig)
+        self.assertEqual(trig[0]['pool_key'], dp.CODEBUDDY_POOL_KEY)
+        self.assertEqual(trig[0]['failure_class'], 'quota_429')
+        self.assertEqual(trig[0]['failed_at_utc'], dp._iso(ref))
+        self.assertEqual(trig[0]['limit_reference_utc'], dp._iso(ref))
+        # 到期后 codebuddy 恢复原最高优先级（真实尝试仍由正式入口复核），其余失败保留。
+        self.assertEqual(r['selected']['pool_key'], dp.CODEBUDDY_POOL_KEY, r)
+        self.assertEqual(r['candidate_filters'][dp.QMAX_POOL_KEY],
+                         'already_tried_this_round', r)
+        self.assertEqual(r['candidate_filters'][dp.CLAUDE_POOL_KEY],
+                         'already_tried_this_round', r)
+
+    def test_expired_limit_without_receipt_same_event_rotates(self):
+        """无上一轮回执（round_started=None）+ 结构化 quota_429 同一事件已到期：允许
+        轮转（1→2）；这与旧缺陷的区别是身份绑定成立，而非任何旧窗口都能清表。"""
+        self.build_store()
+        ref = T_NIGHT - timedelta(seconds=dp.QUOTA_LIMIT_WINDOW_SECONDS)
+        self._seed_limit(dp.CODEBUDDY_POOL_KEY, ref)
+        allowed = [dp.CODEBUDDY_POOL_KEY, dp.CLAUDE_POOL_KEY]
+        auth = self.auth('auto', 'T', 's2', allowed,
+                         round_failed_candidates=[
+                             self._event(dp.CODEBUDDY_POOL_KEY, ref,
+                                         failure_class='quota_429')])
+        r = self.plan(auth, now=T_NIGHT)
+        self.assertIsNone(r['refused'], r)
+        self.assertEqual(r['dispatch_round']['id'], 2, r)
+        self.assertEqual(r['round_transition']['reason'],
+                         'structured_limit_window_expired_no_inflight', r)
+        self.assertEqual(r['effective_round_failed_candidates'], [], r)
+        self.assertEqual(r['selected']['pool_key'], dp.CODEBUDDY_POOL_KEY, r)
+
+    def test_expired_limit_event_time_mismatch_never_rotates(self):
+        """身份绑定：结构化 quota_429 事件时间与其 pool 上过期窗口的参照时刻**不是同一
+        事件**（当前失败晚于旧窗口）——旧窗口绝不清除当前失败、绝不轮转。"""
+        self.build_store()
+        old_ref = T_NIGHT - timedelta(hours=6)
+        self._seed_limit(dp.CODEBUDDY_POOL_KEY, old_ref)
+        failed_at = T_NIGHT - timedelta(minutes=5)  # 当前轮真实失败，晚于旧窗口参照
+        round_started = T_NIGHT - timedelta(minutes=10)
+        allowed = [dp.CODEBUDDY_POOL_KEY, dp.CLAUDE_POOL_KEY]
+        auth = self.auth('auto', 'T', 's2', allowed,
+                         round_failed_candidates=[
+                             self._event(dp.CODEBUDDY_POOL_KEY, failed_at,
+                                         failure_class='quota_429')],
+                         dispatch_round={'id': 9,
+                                         'started_at_utc': dp._iso(round_started)})
+        r = self.plan(auth, now=T_NIGHT)
+        self.assertIsNone(r['refused'], r)
+        self.assertIsNone(r['round_transition'], r)
+        self.assertEqual(r['dispatch_round']['id'], 9, r)
+        self.assertEqual(r['effective_round_failed_candidates'],
+                         [dp.CODEBUDDY_POOL_KEY], r)
+        self.assertEqual(r['candidate_filters'][dp.CODEBUDDY_POOL_KEY],
+                         'already_tried_this_round', r)
+        self.assertEqual(r['selected']['pool_key'], dp.CLAUDE_POOL_KEY, r)
+
+    def test_limit_record_older_than_round_start_never_clears(self):
+        """即便分类是结构化限额，但限额窗口参照时刻**早于当前轮开始时间**（旧轮遗留
+        记录）：不得清除当前轮失败、不得轮转。"""
+        self.build_store()
+        old_ref = T_NIGHT - timedelta(hours=2)  # 过期，但早于本轮开始
+        self._seed_limit(dp.CODEBUDDY_POOL_KEY, old_ref)
+        round_started = T_NIGHT - timedelta(minutes=30)
+        allowed = [dp.CODEBUDDY_POOL_KEY, dp.CLAUDE_POOL_KEY]
+        auth = self.auth('auto', 'T', 's2', allowed,
+                         round_failed_candidates=[
+                             self._event(dp.CODEBUDDY_POOL_KEY, old_ref,
+                                         failure_class='quota_429')],
+                         dispatch_round={'id': 5,
+                                         'started_at_utc': dp._iso(round_started)})
+        r = self.plan(auth, now=T_NIGHT)
+        self.assertIsNone(r['refused'], r)
+        self.assertIsNone(r['round_transition'], r)
+        self.assertEqual(r['dispatch_round']['id'], 5, r)
+        self.assertEqual(r['effective_round_failed_candidates'],
+                         [dp.CODEBUDDY_POOL_KEY], r)
+        self.assertEqual(r['selected']['pool_key'], dp.CLAUDE_POOL_KEY, r)
 
 
 class WindowAndLimitTests(_Base):

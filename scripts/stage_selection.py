@@ -146,28 +146,79 @@ def _normalize_permission_grants(grants):
     return norm
 
 
+# BW-ROUND-TRANSITION-FIX：结构化失败事件对象的封闭键集与“结构化限额”分类白名单。
+# 只有分类落在白名单里、且事件时间与到期限额窗口参照时刻**同一事件**的失败，才可能
+# 触发 structured_limit_window_expired_no_inflight 轮转；网络失败/连接重置/权限失败/
+# 协议失败等其它分类与纯字符串旧形态一律保留到本轮结束，由调用方在下一新轮清空。
+ROUND_FAILED_EVENT_KEYS = ('pool_key', 'failure_class', 'failed_at_utc', 'event_ref')
+STRUCTURED_LIMIT_FAILURE_CLASSES = frozenset(
+    {'quota_429', 'quota_402', 'structured_limit'})
+
+
 def _normalize_round_failed(raw):
-    """本轮已真实尝试失败的 pool_key 列表（BW-SIMPLE-PRIORITY-RETRY）：由**主脑当前轮**
-    在 authorization JSON 里维护的内存入参，只作本轮过滤输入，不落新库/表/服务/定时器，
-    下一新轮不传或传空即重新从最高优先级开始。严格校验，绝不猜：
+    """本轮已真实尝试失败的候选列表（BW-SIMPLE-PRIORITY-RETRY / BW-ROUND-TRANSITION-FIX）：
+    由**主脑当前轮**在 authorization JSON 里维护的内存入参，只作本轮过滤输入，不落新库/
+    表/服务/定时器，下一新轮不传或传空即重新从最高优先级开始。严格校验，绝不猜：
     - None/缺省 → 空列表（新轮，无历史失败）；
     - 裸字符串一律拒绝（防把 'zcode:GLM-5.3' 逐字符当 set）；
-    - 必须是非空 pool_key 字符串列表，空白/非字符串元素拒绝；
+    - 元素允许两种形态：
+      a) 纯 pool_key 字符串（既有调用方兼容形态，不携带事件身份，绝不参与限额轮转清除）；
+      b) 结构化失败事件对象 {pool_key, failure_class, failed_at_utc[, event_ref]}——
+         failure_class 为分类标识（如 quota_429/network_failure），failed_at_utc 必须为
+         带时区 ISO-8601，event_ref 可选事件引用（attempt token/证据引用）；未知键拒绝；
+    - 空白/非字符串/无时区/不可解析时间一律拒绝；
     - 只过滤本轮，绝不改变完整 allowed_candidates 授权集合，也不因失败项扩权。
-    返回归一后的列表副本，绝不突变调用方原对象。"""
+    返回归一后的内部事件字典列表副本（绝不突变调用方原对象）：每项含
+    pool_key/failure_class/failed_at(datetime|None)/failed_at_utc(ISO|None)/
+    event_ref/structured(bool)。"""
     if raw is None:
         return []
     if isinstance(raw, str):
-        raise ValueError('round_failed_candidates must be a list of pool_key strings, '
-                         'not a bare string (would be split char-by-char)')
+        raise ValueError('round_failed_candidates must be a list of pool_key strings '
+                         'or structured event objects, not a bare string (would be '
+                         'split char-by-char)')
     if not isinstance(raw, list):
         raise ValueError('round_failed_candidates must be a JSON list')
     out = []
     for x in raw:
-        if not isinstance(x, str) or not x or x != x.strip():
-            raise ValueError('round_failed_candidates must contain non-empty, '
-                             'untrimmed pool_key strings')
-        out.append(x)
+        if isinstance(x, str):
+            if not x or x != x.strip():
+                raise ValueError('round_failed_candidates must contain non-empty, '
+                                 'untrimmed pool_key strings')
+            out.append({'pool_key': x, 'failure_class': None, 'failed_at': None,
+                        'failed_at_utc': None, 'event_ref': None, 'structured': False})
+            continue
+        if not isinstance(x, dict):
+            raise ValueError('round_failed_candidates entries must be pool_key strings '
+                             'or structured event objects')
+        unknown = [k for k in x if k not in ROUND_FAILED_EVENT_KEYS]
+        if unknown:
+            raise ValueError(f'round_failed_candidates event has unknown keys: {unknown}')
+        pk = x.get('pool_key')
+        if not isinstance(pk, str) or not pk or pk != pk.strip():
+            raise ValueError('round_failed_candidates event requires a non-empty, '
+                             'untrimmed pool_key')
+        fc = x.get('failure_class')
+        if not isinstance(fc, str) or not fc or fc != fc.strip():
+            raise ValueError('round_failed_candidates event requires a non-empty, '
+                             'untrimmed failure_class')
+        ts_raw = x.get('failed_at_utc')
+        if not isinstance(ts_raw, str) or not ts_raw.strip():
+            raise ValueError('round_failed_candidates event requires an ISO-8601 '
+                             'failed_at_utc string')
+        try:
+            failed_at = dp._parse(ts_raw)
+        except (TypeError, ValueError):
+            raise ValueError(f'unparseable failed_at_utc: {ts_raw!r}')
+        if failed_at is None or failed_at.tzinfo is None:
+            raise ValueError('failed_at_utc must be timezone-aware ISO-8601')
+        ref = x.get('event_ref')
+        if ref is not None and (not isinstance(ref, str) or not ref or ref != ref.strip()):
+            raise ValueError('event_ref must be a non-empty, untrimmed string '
+                             'when provided')
+        out.append({'pool_key': pk, 'failure_class': fc, 'failed_at': failed_at,
+                    'failed_at_utc': dp._iso(failed_at), 'event_ref': ref,
+                    'structured': True})
     return out
 
 
@@ -393,6 +444,7 @@ def plan_stage_selection(authorization, *, previous=None, store_path=None, quota
         'allowed_candidates': list(auth.get('allowed_candidates') or []),
         'round_failed_candidates': [],
         'effective_round_failed_candidates': [],
+        'round_failed_events': [],
         'dispatch_round': None,
         'round_transition': None,
         'codebuddy_quota_evidence': None,
@@ -433,11 +485,18 @@ def plan_stage_selection(authorization, *, previous=None, store_path=None, quota
                         if round_failed_candidates is not None
                         else auth.get('round_failed_candidates'))
     try:
-        round_failed = _normalize_round_failed(raw_round_failed)
+        round_failed_events = _normalize_round_failed(raw_round_failed)
     except ValueError as exc:
         return _refuse('invalid_round_failed_candidates', str(exc))
-    receipt['round_failed_candidates'] = list(round_failed)
-    receipt['effective_round_failed_candidates'] = list(round_failed)
+    round_failed_pks = [e['pool_key'] for e in round_failed_events]
+    receipt['round_failed_candidates'] = list(round_failed_pks)
+    receipt['effective_round_failed_candidates'] = list(round_failed_pks)
+    # BW-ROUND-TRANSITION-FIX 回执附加字段（纯附加，不改既有字段语义）：当前轮失败
+    # 事件（标识/分类/时间/事件引用），供 UI 解释；已脱敏（无原始错误文本）。
+    receipt['round_failed_events'] = [
+        {k: e[k] for k in ('pool_key', 'failure_class', 'failed_at_utc',
+                           'event_ref', 'structured')}
+        for e in round_failed_events]
     # task_scope 严格直查（BW-PERMISSION-SCOPE-S1）：畸形输入拒绝、不猜测；只进回执，
     # 不参与能力过滤/授权，绝不突变调用方原对象，也绝不弱化 permission_grants 硬合同。
     try:
@@ -489,7 +548,7 @@ def plan_stage_selection(authorization, *, previous=None, store_path=None, quota
     if isinstance(raw_evidence, str):
         quota_evidence = cbf.verify_quota_evidence(raw_evidence)
     glm_authorized = dp.CODEBUDDY_GLM_POOL_KEY in allowed
-    glm_deepseek_failed = dp.CODEBUDDY_POOL_KEY in round_failed
+    glm_deepseek_failed = dp.CODEBUDDY_POOL_KEY in round_failed_pks
     glm_allowed = bool(glm_authorized)
     # 脱敏回执：只有路径/哈希/原因码/分类，不含任何原始错误文本或请求头。
     receipt['codebuddy_quota_evidence'] = {
@@ -569,10 +628,18 @@ def plan_stage_selection(authorization, *, previous=None, store_path=None, quota
         if dp._domestic_active(conn) >= dp.DOMESTIC_TOTAL_CAPACITY:
             return _refuse('domestic_total_full')
 
-        # BW-DISPATCH-ROUND-S1：结构化限额短窗到期且当前没有在途（上面的 task/workspace
-        # 门已核验）时，结束旧轮并清空**仅属于旧轮**的失败列表。这样“满 1800 秒恢复
-        # 原优先级”不会继续被 already_tried_this_round 永久挡住。这里不清额度记录、
-        # 不声称额度已经恢复，也不启动模型；正式入口仍会真实验证。
+        # BW-DISPATCH-ROUND-S1 + BW-ROUND-TRANSITION-FIX：结构化限额短窗到期且当前没有
+        # 在途（上面的 task/workspace 门已核验）时，结束旧轮并清空**恰好到期的同一限额
+        # 事件**——绝不清与它无关的失败。轮转触发条件全部满足才成立：
+        # 1) 当前轮失败本身是**结构化事件对象**且分类属结构化限额白名单（纯字符串旧
+        #    形态一律不再被任何旧窗口清除；下一新轮由调用方控制清空，引擎不越权代清）；
+        # 2) 轮转检查到的过期窗口参照时刻与该失败事件时间**同一事件**（身份绑定，旧
+        #    历史限额行不得冒充当前失败）；
+        # 3) 窗口参照时刻不早于当前轮开始时间（早于本轮开始的旧记录绝不清本轮失败），
+        #    且显式轮起点未在到期点之后（不重复滚轮；调用方应保存本回执）。
+        # 网络失败/连接重置/权限失败/协议失败等非限额分类保留到本轮结束，绝不被限额
+        # 轮转逻辑清除。这里不清额度记录、不声称额度已经恢复，也不启动模型；正式入口
+        # 仍会真实验证。
         round_meta = auth.get('dispatch_round')
         round_id = 1
         round_started = None
@@ -590,26 +657,52 @@ def plan_stage_selection(authorization, *, previous=None, store_path=None, quota
             if round_started is None or round_started.tzinfo is None:
                 return _refuse('invalid_dispatch_round')
         expired = []
-        for failed_pk in round_failed:
-            if failed_pk not in set(allowed):
+        trigger_events = []
+        rotated_indexes = set()
+        allowed_set = set(allowed)
+        for idx, event in enumerate(round_failed_events):
+            pk = event['pool_key']
+            if pk not in allowed_set or not event['structured']:
                 continue
-            limit = dp.quota_limit_window_status(conn, failed_pk, now)
+            if event['failure_class'] not in STRUCTURED_LIMIT_FAILURE_CLASSES:
+                continue
+            limit = dp.quota_limit_window_status(conn, pk, now)
             if limit['state'] != 'expired':
+                continue
+            ref = dp._parse(limit['reference_utc'])
+            # 身份绑定：过期窗口的真实参照时刻必须正是当前轮该失败事件本身。
+            if ref is None or ref.tzinfo is None or ref != event['failed_at']:
+                continue
+            # 早于当前轮开始时间的旧限额记录不得清除当前轮失败。
+            if round_started is not None and ref < round_started:
                 continue
             expiry = dp._parse(limit['expires_at_utc'])
             # 有显式新轮且起点已经在到期点之后时，不重复滚轮；调用方应保存本回执。
-            if round_started is None or round_started < expiry:
-                expired.append(limit)
+            if round_started is not None and round_started >= expiry:
+                continue
+            expired.append(limit)
+            trigger_events.append({
+                'pool_key': pk,
+                'failure_class': event['failure_class'],
+                'failed_at_utc': event['failed_at_utc'],
+                'event_ref': event['event_ref'],
+                'limit_reference_utc': limit['reference_utc'],
+                'limit_expires_at_utc': limit['expires_at_utc'],
+            })
+            rotated_indexes.add(idx)
         if expired:
             old_id = round_id
             round_id += 1
-            round_failed = []
-            receipt['effective_round_failed_candidates'] = []
+            round_failed_events = [e for i, e in enumerate(round_failed_events)
+                                   if i not in rotated_indexes]
+            round_failed_pks = [e['pool_key'] for e in round_failed_events]
+            receipt['effective_round_failed_candidates'] = list(round_failed_pks)
             receipt['round_transition'] = {
                 'from_round': old_id,
                 'to_round': round_id,
                 'reason': 'structured_limit_window_expired_no_inflight',
                 'expired_candidates': expired,
+                'trigger_events': trigger_events,
             }
             round_started = now
         elif round_started is None:
@@ -692,7 +785,7 @@ def plan_stage_selection(authorization, *, previous=None, store_path=None, quota
             entry_missing = []
         passed, filters = _filter_candidates(conn, eff_allowed, zcode_blocked, now,
                                              requirements, controlled_file_ok,
-                                             round_failed=round_failed,
+                                             round_failed=round_failed_pks,
                                              codebuddy_glm_allowed=glm_allowed,
                                              entry_missing=set(entry_missing))
         receipt['candidate_filters'] = _per_candidate_view(eff_allowed, filters)
