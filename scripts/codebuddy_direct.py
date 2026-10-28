@@ -1030,7 +1030,8 @@ def main():
 
     BW-CODEBUDDY-MAIN-S3 / BW-CODEBUDDY-GLM-FALLBACK-20261018 / BW-WORKER-WIDGET-20261018-S3：
     只有独立 CodeBuddy CLI 的两个**精确**模型被恢复并移交生产传输入口 `codebuddy_live.main()`：
-    - `deepseek-v4.1-flash`（界面名 Deepseek-V4.1-Flash）：最高优先主力；
+    - `deepseek-v4.1-flash`（界面名 Deepseek-V4.1-Flash）：AUTO 层=3，排在 Claude 之后、
+      两 OpenCode 免费模型之前；
     - `glm-5.3-flash`（界面名 GLM-5.3-Flash）：低层补位、额度独立——自 BW-LIMIT30-20261019-S3
       起不再要求当轮 DeepSeek 限额证据（旧证据门口径作废，`--codebuddy-quota-evidence`
       仅作兼容参数）；自 BW-WORKER-WIDGET-20261018-S3（用户 2026-10-18 最新明确）起与

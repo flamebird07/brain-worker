@@ -1,5 +1,40 @@
 # Quota Routing & Persistent Cooldown（BW-QUOTA-20261008-S1，S2/S3 修订）
 
+> **最新权威覆盖（BW-QODERCN-TOKEN-MAX-DISABLE-20261028，优先于下文一切旧覆盖）：**
+> 用户明确要求 `Qoder CN / token plan / Qwen-3.8-Max`（精确池 `qodercn:Qwen-3.8-Max`，
+> 短横线友好名）**从所有档位禁用新派发**（`dispatch_mode.USER_DISABLED_POOL_KEYS`）。三档
+> 可新派集合变为 strong/medium/weak = 5/4/10 池、6/5/13 槽（物理登记仍 16、该池登记容量仍
+> 2）；AUTO、显式 reserve/select-and-claim、claim-due（该拒绝先于 Luna 总门，不被
+> `luna_disabled` 遮蔽）、无 claim 的正式 CN 入口（在读取私有 CN 配置/模型映射、建目录、
+> Popen 之前）一律 `mode_excluded`、拒绝原因如实为「用户要求禁用」。禁用前合法取得且仍
+> reserved 的精确 claim 继续经完整校验启动；遗留在途不追杀、不假释放；额度/限额标记语义
+> 不变、不查余额。绝不误伤内置名 `qodercn:Qwen3.8-Max`（无短横线，照常可派）。下文
+> 「三路 Max/自定义 Max 当前可新派/参与候选」的叙述均为历史覆盖前记录，涉及该池现行可派
+> 性时以此段为准。
+
+> **当前权威覆盖（BW-MANUAL-THREE-MODE-DOCS-20261023，已被上方 2026-10-28 禁用段就
+> `qodercn:Qwen-3.8-Max` 一池进一步覆盖；其余仍优先于下文旧叙述）：**
+> 派发档位是全宿主共享的**手动三档** strong／medium／weak，**默认 weak**，唯一策略来源
+> `scripts/dispatch_mode.py`（`~/.brain-worker/dispatch-mode.json`，`BRAIN_WORKER_DISPATCH_MODE_FILE`
+> 可覆盖；切档原子保存、**只影响新派发**，在途任务不中断；缺文件/畸形/非法/不可读一律**安全回落
+> weak**）。strong 仅 5 个精确池（ZCode > Claude > 三路 Qwen3.8-Max，全部无时段门）；medium 同
+> 5 池但层序为 三 Max > Claude > ZCode（三 Max 夜间门 + Claude 工作日高峰门）；weak（默认）才有
+> 全部 11 池（两个 CN Max > ZCode > Claude > 国际 Max > CodeBuddy DeepSeek > 两 OpenCode >
+> CodeBuddy GLM > 两 Flash），三 Max 夜间门 + Claude 高峰门照旧；层序权威数字见
+> `scripts/dispatch_mode.py` 三张按档表（`dispatch_pool` 只消费）。**额度语义完全不变**：各池
+> `main_force_limits`、1800 秒真实限额短窗、Qoder 三池各自独立落标与人工恢复口径、ZCode
+> availability 全部照旧、与档位正交；不新增/删除任何限额标记、不查余额、不宣称额度恢复。
+> Claude 时段门经 `deepseek_offpeak` 纯时间判定（仅 medium/weak 调用），**依赖异常 fail-closed**
+> （当作窗口关闭）。下方「Claude 全天可派」「国际 Max 全天可派」两段旧覆盖一律归档，已被本段取代。
+
+> 【历史档案，已被上方 BW-MANUAL-THREE-MODE-DOCS-20261023 覆盖】**旧覆盖（BW-CLAUDE-ALLDAY-QMAX-AFTER-20261023）：**
+> `claude:deepseek-flash` 曾解除全部派发时段限制、全天可派；国际 `qoder:Qwen3.8-Max` 曾全天可派
+> 且层序排 Claude 紧邻之后。额度语义当时不变、现在也不变。
+
+> 【历史档案，已被上方 BW-MANUAL-THREE-MODE-DOCS-20261023 覆盖】**旧覆盖（BW-QODER-INTL-MAX-ALLDAY-20261023）：**
+> 国际 Qoder Max `qoder:Qwen3.8-Max` 曾解除北京时间 22:00–08:00 时段限制、全天可参与 AUTO、显式
+> `reserve`/`select`/`consume`/`claim-due`，时段门权威集合当时只剩两个 CN Max。额度语义不变。
+
 > **最新政策覆盖（BW-SIMPLE-PRIORITY-RETRY-S3，优先于下文旧叙述）：** 用户决定「反复试不是
 > 问题，每轮从优先级最高的候选起，不做复杂设计」。每个新调度轮都从时段/容量/权限/授权与明确
 > 停用仍合格的**最高优先级**候选开始真实尝试；同一 `runtime:model` 本轮最多试一次，真实调用
@@ -13,11 +48,15 @@
 > unknown 在途/硬审批拒绝/用户明确暂停的 CN 自定义 `qodercn:Qwen-3.8-Max`（按候选授权范围
 > 排除）**照常**，绝不通过重试或改派绕过。
 
-> **当前状态（2026-10-18，BW-CODEBUDDY-GLM-FALLBACK；2026-10-19 BW-LIMIT30-20261019-S3
-> 覆盖旧额度条件）：** `codebuddy:deepseek-v4.1-flash`
-> 仍为最高优先主力；`codebuddy:glm-5.3-flash` 为低层补位（非条件补位），排在
-> ZCode之后、两区Qwen3.8-Flash之前。两个精确模型**额度独立、不共享名额，各自独立 1 槽**
-> （总 14 不变，BW-WORKER-WIDGET-20261018-S3）；
+> **当前状态（BW-CLAUDE-ALLDAY-QMAX-AFTER-20261023，覆盖旧层序）：**
+> `codebuddy:deepseek-v4.1-flash` 为优先级层 **5**，排在两个 CN Max（1）、ZCode（2，恢复可派
+> 容量 1）、Claude（3，**全天**）与国际 Qoder Max（4，**全天**）之后、两 OpenCode 免费模型（6）
+> 之前；`codebuddy:glm-5.3-flash` 为低层补位（**7**），排在两 OpenCode 之后、两区
+> Qwen3.8-Flash（8）之前。
+> ZCode 恢复为正常可派主力：`zcode:GLM-5.3` 最近一次真实结构化限额在 1800 秒内仍须从新
+> 派发候选过滤，恰满 1800 秒自动恢复原优先级；availability 诊断照旧保留、绝不伪造额度健康。
+> BW-QWEN-MAX-LIMIT15-20261028：两个 Qoder 内置 Max（`qoder:Qwen3.8-Max`、`qodercn:Qwen3.8-Max`）的真实限额标记改走 **900 秒（15 分钟）只读短窗**——窗口内 AUTO/显式 reserve/select-and-claim/consume/claim-due 与浮窗同口径拒绝并显示“上轮限额”，恰满 900 秒自动消退、按原优先级重新可选；不删 `main_force_limits` 证据、不宣称额度恢复。原三池（ZCode/Claude/CodeBuddy deepseek）仍为 1800 秒；带短横线的 `qodercn:Qwen-3.8-Max` 不进短窗（维持全档禁用现状），`qoder:Sonus` 不吃任何 Max 限额标记。
+> 两个 CodeBuddy 精确模型**额度独立、不共享名额，各自独立 1 槽**（现行总 15）；
 > 不套时段门。GLM **不再要求当轮 DeepSeek 明确限额证据**（旧证据门自
 > BW-LIMIT30-20261019-S3 起撤销，`--codebuddy-quota-evidence` 仅作兼容参数保留、缺失不拒绝）。
 > 传输均在 `scripts/codebuddy_live.py`；只有

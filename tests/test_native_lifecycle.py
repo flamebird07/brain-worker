@@ -13,8 +13,9 @@
 4. launch_unknown 拒结算且不重派；
 5. 国内旧 finish 安全边界不变（reserved 无 child：start_failed 允许、finished
    拒绝 no_child_terminal_unverified），且 Luna attempt 不能再走国内 finish；
-6. Z6-A 夹具顺序服从生产轮转（BW-ZCODE-RETIRE-20261020：现役组合逐一显式 claim，
-   各独立 workspace，逐一核验 allowed/token/pool_key 直至全满）；
+6. Z6-A 夹具顺序服从生产轮转（BW-ZCODE-RESTORE-1-20261022：现役组合（含恢复的
+   ZCode 1 槽）逐一显式 claim，各独立 workspace，逐一核验 allowed/token/pool_key
+   直至全满）；
 7. Z6-B 回执 sha256 严格 64 位 ASCII 十六进制（大小写规范化）、string content 按
    UTF-8 原文哈希（不加 JSON 引号）、content 与 sha256 同给必须一致；
 8. Z6-C 重复结算只有同终态+同原回执哈希才算合法幂等（不覆盖旧证据），错误
@@ -30,8 +31,11 @@ from datetime import datetime, timedelta, timezone
 from pathlib import Path
 
 sys.path.insert(0, str(Path(__file__).resolve().parent.parent / 'scripts'))
+sys.path.insert(0, str(Path(__file__).resolve().parent))
+from dispatch_mode_support import user_disabled_pools  # noqa: E402
 
 import dispatch_pool as dp  # noqa: E402
+from dispatch_mode_support import insert_sonus_leftover  # noqa: E402
 dp.LUNA_DISABLED = False
 dp.CAPACITY[dp.LUNA_KEY] = None
 
@@ -56,20 +60,22 @@ class NativeLifecycleTests(unittest.TestCase):
         self._tmp.cleanup()
 
     # ---------- 夹具：现役全满 → ask → 到期 claim Luna → 登记 agent_id ----------
-    # Z6-A（BW-ZCODE-RETIRE-20261020 起改为现役组合逐一显式 claim）：请求顺序服从
+    # Z6-A（BW-ZCODE-RESTORE-1-20261022 起现役组合含恢复的 ZCode）：请求顺序服从
     # 生产轮转，各独立 workspace，逐一核验 allowed/token/pool_key 直至全满。
     def _fill_domestic(self):
         # BW-CODEBUDDY-MAIN-S3 + BW-WORKER-WIDGET-20261018-S3 + BW-OPENCODE-20261019-S3
-        # + BW-ZCODE-RETIRE-20261020 十四满：codebuddy deepseek×1 + codebuddy GLM×1（各自
-        # 独立 1 槽，GLM 需显式当轮额度条件授权）+ 两内置 Max 各 1 + CN 自定义 Max×2 +
-        # 两地区 Flash 各 2 + claude:deepseek-flash×2 + 两个 OpenCode 免费模型各 1 独立槽
-        # （T0=北京周四 23:00，主力时段内且 claude offhours，OpenCode 无时段门，真实 API
-        # 直接 claim；ZCode 已退役——组合在授权门即 unknown_pool，从填满夹具移除）。
+        # + BW-ZCODE-RESTORE-1-20261022 十五满：codebuddy deepseek×1 + codebuddy GLM×1
+        # （各自独立 1 槽，GLM 需显式当轮额度条件授权）+ zcode×1（恢复可派、容量严格 1）
+        # + 两内置 Max 各 1 + CN 自定义 Max×2 + 两地区 Flash 各 2 + claude:deepseek-flash×2
+        # + 两个 OpenCode 免费模型各 1 独立槽（T0=北京周四 23:00，主力时段内且 claude
+        # offhours，OpenCode 无时段门，真实 API 直接 claim）。
         # 全部经显式 executor 逐一确定性 claim（CN 池只能 executor='qodercn'，claude 只能
         # executor='claude'，codebuddy 两模型只能 executor='codebuddy'，OpenCode 经
-        # executor='opencode'，AUTO 轮换不保证落某特定主力），每次核验 allowed/token/pool_key。
+        # executor='opencode'，ZCode 经 executor='zcode'，AUTO 轮换不保证落某特定主力），
+        # 每次核验 allowed/token/pool_key。
         plan = [('codebuddy', 'deepseek-v4.1-flash', 'codebuddy'),
                 ('codebuddy', 'glm-5.3-flash', 'codebuddy'),
+                ('zcode', 'GLM-5.3', 'zcode'),
                 ('qoder', 'Qwen3.8-Max', 'qoder'),
                 ('qodercn', 'Qwen3.8-Max', 'qodercn'),
                 ('qodercn', 'Qwen-3.8-Max', 'qodercn'),
@@ -83,20 +89,28 @@ class NativeLifecycleTests(unittest.TestCase):
                 ('opencode', dp.OPENCODE_DEEPSEEK_MODEL, 'opencode'),
                 ('opencode', dp.OPENCODE_GLM_MODEL, 'opencode')]
         tokens = []
-        for i, (runtime, model, ex) in enumerate(plan):
-            out = dp.reserve(self.store, task_id=f'dom-{i}', runtime=runtime,
-                             model=model, workspace=f'ws-dom-{i}',
-                             prompt_sha256='d' * 64, executor=ex, now=T0,
-                             codebuddy_glm_allowed=(model == 'glm-5.3-flash'))
-            self.assertTrue(out.get('allowed') and out.get('token'), out)
-            self.assertEqual(out['pool_key'], f'{runtime}:{model}', out)
-            tokens.append(out['token'])
+        # BW-QODERCN-TOKEN-MAX-DISABLE-20261028：物理 16/16 满池需要目标池两槽 legacy
+        # 占位——生产禁用期间该池不可再 reserve，这里临时用空禁用集复现禁用前的物理满池
+        # 基线（Luna 生命周期历史场景），fill 结束即恢复真实禁用集；后续断言不变。
+        with user_disabled_pools(frozenset()):
+            for i, (runtime, model, ex) in enumerate(plan):
+                out = dp.reserve(self.store, task_id=f'dom-{i}', runtime=runtime,
+                                 model=model, workspace=f'ws-dom-{i}',
+                                 prompt_sha256='d' * 64, executor=ex, now=T0,
+                                 codebuddy_glm_allowed=(model == 'glm-5.3-flash'))
+                self.assertTrue(out.get('allowed') and out.get('token'), out)
+                self.assertEqual(out['pool_key'], f'{runtime}:{model}', out)
+                tokens.append(out['token'])
+        # BW-STRONG-SONUS-20261024：弱档新派上限仍是 15；按真实形态补一条 strong
+        # 遗留 Sonus 在途，使物理在途达到 16/16（切档不追杀）。
+        insert_sonus_leftover(self.store, reserved_at_utc=dp._iso(T0))
         st = dp.status(self.store, now=T0)
         self.assertEqual(st['domestic']['active'], dp.DOMESTIC_TOTAL_CAPACITY,
                          st['domestic'])
-        # Qoder 主力组（两内置 Max + 自定义 Max 合计）记 committed_qoder=4；
-        # BW-ZCODE-RETIRE-20261020：退役池不可能再提交，committed_zcode 恒为 0。
-        self.assertEqual(st['rotation']['committed_zcode'], 0, st['rotation'])
+        self.assertEqual(st['domestic']['active'], 16, st['domestic'])
+        # 1 个 zcode（BW-ZCODE-RESTORE-1-20261022 容量严格 1）记 committed_zcode；
+        # Qoder 主力组（两内置 Max + 自定义 Max 合计）记 committed_qoder=4。
+        self.assertEqual(st['rotation']['committed_zcode'], 1, st['rotation'])
         self.assertEqual(st['rotation']['committed_qoder'], 4, st['rotation'])
         return tokens
 

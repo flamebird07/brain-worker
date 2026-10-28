@@ -3,8 +3,9 @@
 全部使用临时 SQLite + 进程内合成 stub（tests/stub_codebuddy_live.py），零真实网络/账号/模型/
 子进程、零真实池。覆盖任务政策：
 - 独立池 codebuddy:deepseek-v4.1-flash=1（BW-WORKER-WIDGET-20261018-S3 起与 GLM 各自
-  独立 1 槽），AUTO 最高优先（高于所有 Qwen3.8-Max）；本轮真实
-  失败（round 候选剔除）后落 Max/其他合格；显式 executor/qodercn 不越权跨执行器改派；
+  独立 1 槽），AUTO 层=3（BW-CB-REORDER-20261020 用户明确指令：由旧层=0 下调，排三
+  Qwen3.8-Max（1）与 claude（2）之后、紧挨 opencode:deepseek-v4.1-flash-free（4）之前）；
+  本轮真实失败（round 候选剔除）后落其余合格层；显式 executor/qodercn 不越权跨执行器改派；
 - 仅 1 个 CodeBuddy deepseek，第二个拒绝，终态释放后可复用；总 16（BW-OPENCODE-20261019
   起含两 OpenCode 免费模型各 1 槽）与迁移债务守卫、同 workspace/unknown 不绕过；
 - codebuddy 无时段门（PEAK/GAP/DAY 仍可选，不套 Claude 离峰窗 / Max 夜间窗）；
@@ -35,6 +36,8 @@ for p in (str(SCRIPTS), str(REPO / 'tests')):
         sys.path.insert(0, p)
 
 import dispatch_pool as dp  # noqa: E402
+from dispatch_mode_support import dispatch_mode, user_disabled_pools  # noqa: E402
+import dispatch_mode as dm  # noqa: E402
 import execution_control as ec  # noqa: E402
 import prompt_contract as pc  # noqa: E402
 import codebuddy_direct as cb  # noqa: E402
@@ -53,7 +56,8 @@ CN_FLASH = 'qodercn:Qwen3.8-Flash'
 MAXES = (QMAX, CN_MAX, CN_CUSTOM_MAX)
 SHA = 'p' + '0' * 63
 
-# 北京时间工作日高峰（Max 窗外 + claude 高峰关）/间隙/夜间，用于验证 codebuddy 无时段门。
+# 北京时间工作日高峰（两个 CN Max 窗外；claude 自 BW-CLAUDE-ALLDAY-QMAX-AFTER-20261023
+# 起全天可派）/间隙/夜间，用于验证 codebuddy 无时段门。
 PEAK = datetime(2026, 10, 12, 1, 0, 0, tzinfo=timezone.utc)    # 北京周一 09:00
 GAP = datetime(2026, 10, 12, 4, 30, 0, tzinfo=timezone.utc)    # 北京周一 12:30
 DAY = datetime(2026, 10, 8, 0, 0, 0, tzinfo=timezone.utc)      # 北京 08:00（窗外）
@@ -169,24 +173,65 @@ class TestCodebuddyPoolPriority(_PoolBase):
     def test_codebuddy_has_one_independent_slot(self):
         self.assertEqual(dp.capacity_for(CB), 1)
         self.assertIn(CB, dp.MAIN_FORCE_KEYS)
-        # BW-ZCODE-RETIRE-20261020：zcode 2 槽退役，权威总容量 16→14。
-        self.assertEqual(dp.DOMESTIC_TOTAL_CAPACITY, 14)
+        # BW-STRONG-SONUS-20261024：物理总 16（原 15 + strong 专属 Sonus 1 槽）；
+        # weak 可新派仍为 15。
+        self.assertEqual(dp.DOMESTIC_TOTAL_CAPACITY, 16)
+        self.assertEqual(sum(dp.capacity_for(k) for k in dm.ALL_POOL_KEYS), 15)
 
-    def test_auto_prefers_codebuddy_over_all_max_when_free(self):
+    def test_pool_priority_codebuddy_is_five(self):
+        # BW-CLAUDE-ALLDAY-QMAX-AFTER-20261023：codebuddy:deepseek-v4.1-flash priority=5，
+        # 紧挨 opencode:deepseek-v4.1-flash-free（6）之前；其上为 claude（3）与国际
+        # Qoder Max（4）；ZCode 为层=2。
+        self.assertEqual(dp.POOL_PRIORITY[CB], 5)
+        self.assertEqual(dp.POOL_PRIORITY[dp.ZCODE_POOL_KEY], 2)
+        self.assertEqual(dp.POOL_PRIORITY[CLAUDE], 3)
+        self.assertEqual(dp.POOL_PRIORITY[QMAX], 4)
+        self.assertEqual(dp.POOL_PRIORITY[dp.OPENCODE_DEEPSEEK_POOL_KEY], 6)
+        self.assertLess(dp.POOL_PRIORITY[CLAUDE], dp.POOL_PRIORITY[QMAX])
+        self.assertLess(dp.POOL_PRIORITY[QMAX], dp.POOL_PRIORITY[CB])
+        self.assertLess(dp.POOL_PRIORITY[CB],
+                        dp.POOL_PRIORITY[dp.OPENCODE_DEEPSEEK_POOL_KEY])
+        for pk in (CN_MAX, CN_CUSTOM_MAX):
+            self.assertEqual(dp.POOL_PRIORITY[pk], 1)
+
+    def test_auto_prefers_max_over_codebuddy_when_all_free(self):
+        # BW-CB-REORDER-20261020：空库 AUTO 不再落 CodeBuddy——三 Qoder Max（层=1）在先，
+        # CodeBuddy（层=3）绝不在 Max/claude 有空位时被选中。
         out = self.reserve('t1', 'qoder', 'Qwen3.8-Max', 'auto')
         self.assertTrue(out.get('routing_required'), out)
-        self.assertEqual(out['selected']['pool_key'], CB)
+        self.assertIn(out['selected']['pool_key'], MAXES, out)
+        self.assertNotEqual(out['selected']['pool_key'], CB, out)
+
+    def test_auto_lands_codebuddy_after_max_zcode_and_claude_full(self):
+        # 新 AUTO 选择顺序的完整走位：三 Max（4 槽）、ZCode（1 槽）与 claude（2 槽）全满
+        # → 下一层正是 CodeBuddy deepseek（4）；CodeBuddy 也满 → 才轮到两 OpenCode 免费
+        # 模型（5）。
+        self.reserve('qm', 'qoder', 'Qwen3.8-Max', 'qoder')
+        self.reserve('cm', 'qodercn', 'Qwen3.8-Max', 'qodercn')
+        self.reserve('cx1', 'qodercn', 'Qwen-3.8-Max', 'qodercn')
+        self.reserve('cx2', 'qodercn', 'Qwen-3.8-Max', 'qodercn')
+        self.reserve('z1', 'zcode', 'GLM-5.3', 'zcode')
+        self.reserve('cl1', 'claude', 'deepseek-flash', 'claude')
+        self.reserve('cl2', 'claude', 'deepseek-flash', 'claude')
+        out = self.reserve('t3', 'qoder', 'Qwen3.8-Flash', 'auto')
+        self.assertTrue(out.get('routing_required'), out)
+        self.assertEqual(out['selected']['pool_key'], CB, out)
+        self.reserve('cb1', 'codebuddy', CB_MODEL, 'codebuddy')
+        out2 = self.reserve('t4', 'qoder', 'Qwen3.8-Flash', 'auto')
+        self.assertTrue(out2.get('routing_required'), out2)
+        self.assertIn(out2['selected']['pool_key'],
+                      (dp.OPENCODE_DEEPSEEK_POOL_KEY, dp.OPENCODE_GLM_POOL_KEY), out2)
 
     def test_after_codebuddy_occupied_auto_lands_max(self):
-        # 占用 CodeBuddy 唯一名额（本轮真实失败/在用）→ AUTO 落最高层的下一档三 Qoder Max。
-        # BW-ZCODE-RETIRE-20261020：原 zcode 请求组合已退役（会先撞 unknown_pool），
-        # 改用现役国际 Flash 请求组合验证同一 AUTO 层序。
+        # CodeBuddy 唯一名额被占（本轮真实失败/在用）→ AUTO 仍按新层序从三 Qoder Max
+        # （层=1，本就先于 CodeBuddy 层=4）中选择；ZCode（层=2）也在其前。
         self.reserve('occ', 'codebuddy', CB_MODEL, 'codebuddy')
         out = self.reserve('t2', 'qoder', 'Qwen3.8-Flash', 'auto')
         self.assertIn(out['selected']['pool_key'], MAXES)
 
     def test_round_failed_codebuddy_falls_to_next_qualified(self):
-        # 本轮 codebuddy 真实失败 → 候选剔除后，_select_main_force 落到 Max（新层序下一档）。
+        # 本轮 codebuddy 真实失败 → 候选剔除后，_select_main_force 在剩余合格候选里仍按
+        # 层序选择（三 Max 层=1 高于 CodeBuddy 层=3，落于 Max）。
         with closing(dp.connect(self.store)) as conn:
             elig = set(dp._eligible_main_forces(conn, False, NIGHT))
             self.assertIn(CB, elig)  # codebuddy 无时段门，默认可选
@@ -209,22 +254,33 @@ class TestCodebuddyPoolPriority(_PoolBase):
         self.assertFalse(out.get('routing_required'))
 
     def test_codebuddy_no_time_window_gate_across_dayparts(self):
+        # CodeBuddy deepseek 自身无任何时段门（weak 档下各时刻都在候选里）。
         for now in (PEAK, GAP, DAY, NIGHT):
             with closing(dp.connect(self.store)) as conn:
                 elig = dp._eligible_main_forces(conn, False, now)
             self.assertIn(CB, elig, f'codebuddy must be eligible at {now}')
             self.assertFalse(dp._max_window_blocks(CB, now))
-        # 对照：claude 在 PEAK 被高峰门关、Max 在 DAY 被夜间门关，codebuddy 不受任何时段门。
+        # 对照（BW-MANUAL-THREE-MODE-20261023）：weak 档恢复 claude 工作日高峰门与三个 Max
+        # 夜间门——PEAK 的 claude、DAY 的三个 Max 都不在候选；strong 档则 CodeBuddy 被档位
+        # 排除（mode_excluded），claude 与三个 Max 全天在候选。
         with closing(dp.connect(self.store)) as conn:
             self.assertNotIn(CLAUDE, dp._eligible_main_forces(conn, False, PEAK))
-            self.assertNotIn(QMAX, dp._eligible_main_forces(conn, False, DAY))
+            for pk in (CN_MAX, QMAX, CN_CUSTOM_MAX):
+                self.assertNotIn(pk, dp._eligible_main_forces(conn, False, DAY))
+        # BW-QODERCN-TOKEN-MAX-DISABLE-20261028：「strong 档三个 Max 全天无门」对照属
+        # 禁用前三 Max 历史口径——目标池现行被用户禁用，临时空禁用集复现历史语义。
+        with user_disabled_pools(frozenset()),                 dispatch_mode('strong'), closing(dp.connect(self.store)) as conn:
+            elig_s = dp._eligible_main_forces(conn, False, DAY)
+            self.assertNotIn(CB, elig_s)
+            for pk in (CN_MAX, QMAX, CN_CUSTOM_MAX, CLAUDE):
+                self.assertIn(pk, elig_s)
 
-    def test_total_guard_blocks_seventeenth(self):
-        # 真实填 16：codebuddy1 + glm1 + zcode2 + qmax1 + cnmax1 + cnx2 + claude2
-        # + opencode-deepseek1 + opencode-glm1 + qflash2 + cnflash2 = 16
+    def test_total_guard_blocks_sixteenth(self):
+        # 真实填 15：zcode1 + codebuddy1 + glm1 + qmax1 + cnmax1 + cnx2 + claude2
+        # + opencode-deepseek1 + opencode-glm1 + qflash2 + cnflash2 = 15
+        self.seed(ZCODE, 1, task_prefix='full')
         self.seed(CB, 1, task_prefix='full')
         self.seed('codebuddy:glm-5.3-flash', 1, task_prefix='full')
-        self.seed(ZCODE, 2, task_prefix='full')
         self.seed(QMAX, 1, task_prefix='full')
         self.seed(CN_MAX, 1, task_prefix='full')
         self.seed(CN_CUSTOM_MAX, 2, task_prefix='full')
@@ -233,6 +289,9 @@ class TestCodebuddyPoolPriority(_PoolBase):
         self.seed(dp.OPENCODE_GLM_POOL_KEY, 1, task_prefix='full')
         self.seed(QFLASH, 2, task_prefix='full')
         self.seed(CN_FLASH, 2, task_prefix='full')
+        # BW-STRONG-SONUS-20261024：weak 不能新派 Sonus；按真实形态 seed 一条 strong
+        # 遗留在途，使全局在途达到物理总 16。
+        self.seed(dp.SONUS_POOL_KEY, 1, task_prefix='full')
         with closing(dp.connect(self.store)) as conn:
             self.assertEqual(dp._domestic_active(conn), 16)
         out = self.reserve('over', 'codebuddy', CB_MODEL, 'codebuddy')

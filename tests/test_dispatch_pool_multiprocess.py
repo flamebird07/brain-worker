@@ -47,6 +47,7 @@ _SCRIPTS = Path(__file__).resolve().parent.parent / 'scripts'
 if str(_SCRIPTS) not in sys.path:
     sys.path.insert(0, str(_SCRIPTS))
 import dispatch_pool as dp  # noqa: E402
+from dispatch_mode_support import user_disabled_pools  # noqa: E402
 dp.LUNA_DISABLED = False
 dp.CAPACITY[dp.LUNA_KEY] = None
 
@@ -58,8 +59,7 @@ _CTX = mp.get_context('spawn')
 
 
 # ------------------------------------------------------------------ 顶层 workers
-def _claim_worker(store, barrier, q, worker_id, runtime, model, chat_id,
-                  executor='auto'):
+def _claim_worker(store, barrier, q, worker_id, runtime, model, chat_id):
     """并发合法 claim：不同 task、不同 chat，各自独立连接/事务。"""
     try:
         barrier.wait(timeout=BARRIER_TIMEOUT)
@@ -68,7 +68,7 @@ def _claim_worker(store, barrier, q, worker_id, runtime, model, chat_id,
                                   chat_id=chat_id,
                                   stage=f's{worker_id}',
                                   prompt_sha256=f'{worker_id:x}' * 64, now=T0,
-                                  executor=executor, _preclaim=False)
+                                  _preclaim=False)
         q.put({'kind': 'claim', 'worker': worker_id,
                'allowed': out['allowed'], 'pool_key': out.get('pool_key'),
                'selected': out.get('selected'),
@@ -83,7 +83,7 @@ def _consume_worker(store, barrier, q, worker_id, token):
     try:
         barrier.wait(timeout=BARRIER_TIMEOUT)
         out = dp.consume_for_entry(store, claim_token=token, task_id='mpk',
-                                   runtime='qoder', model='Qwen3.8-Max',
+                                   runtime='zcode', model='GLM-5.3',
                                    workspace='C:/mp', prompt_sha256='k' * 64,
                                    stage='sk', chat_id='ck', wrapper_pid=os.getpid(),
                                    now=T0)
@@ -128,14 +128,13 @@ def _sleep_worker(alive_event):
 
 def _ws_claim_worker(store, barrier, q, worker_id, workspace):
     """Z4：同真实 workspace 不同 task 的并发 claim 竞争（跨 OS spawn）。
-    BW-ZCODE-RETIRE-20261020：原显式 executor='zcode' 固定组合改用现役 claude（容量 2，
-    显式 executor 绕过 AUTO 跨层改派，BW-MAIN-PRIORITY-S1），让并发只考验单写入守卫
-    本身；父用例与此 worker 保持一致。"""
+    显式 executor='zcode' 固定组合，绕过 AUTO 跨层改派（BW-MAIN-PRIORITY-S1），让并发只
+    考验单写入守卫本身；父用例与此 worker 保持一致。"""
     try:
         barrier.wait(timeout=BARRIER_TIMEOUT)
-        out = dp.select_and_claim(store, task_id=f'ws-{worker_id}', runtime='claude',
-                                  model='deepseek-flash', workspace=workspace,
-                                  stage=f'w{worker_id}', executor='claude',
+        out = dp.select_and_claim(store, task_id=f'ws-{worker_id}', runtime='zcode',
+                                  model='GLM-5.3', workspace=workspace,
+                                  stage=f'w{worker_id}', executor='zcode',
                                   prompt_sha256=f'{worker_id:x}' * 64, now=T0,
                                   _preclaim=False)
         q.put({'kind': 'claim', 'worker': worker_id, 'allowed': out['allowed'],
@@ -191,18 +190,20 @@ class _SpawnMixin(unittest.TestCase):
             return [dict(r) for r in conn.execute(sql, params).fetchall()]
 
     def _fill_six_via_api(self):
-        """真实 API 填满十四满基线（BW-CODEBUDDY-MAIN-S3 + BW-WORKER-WIDGET-20261018-S3 +
-        BW-OPENCODE-20261019-S3 + BW-ZCODE-RETIRE-20261020：codebuddy deepseek×1 +
-        codebuddy GLM×1（各自独立 1 槽，GLM 需显式当轮额度条件授权）+ 两内置 Max 各 1 +
-        CN 自定义 Max×2 + 两地区 Flash 各 2 + claude 2 + 两个 OpenCode 免费模型各 1 独立槽；
-        ZCode 两槽全局退役，从填满基线移除；
+        """真实 API 填满十五满基线（BW-CODEBUDDY-MAIN-S3 + BW-WORKER-WIDGET-20261018-S3 +
+        BW-OPENCODE-20261019-S3：codebuddy deepseek×1 + codebuddy GLM×1（各自独立 1 槽，
+        GLM 需显式当轮额度条件授权）+ zcode×1（BW-ZCODE-RESTORE-1-20261022 恢复、容量严格 1）
+        + 两内置 Max 各 1 + CN 自定义 Max×2 +
+        两地区 Flash 各 2 + claude 2 + 两个 OpenCode 免费模型各 1 独立槽；
         T0=北京周四 23:00 claude offhours，OpenCode 无时段门）。全部经显式 executor
         逐一 claim 保证确定性（CN 池只能经 executor='qodercn'，claude 经
         executor='claude'，codebuddy 两模型经 executor='codebuddy'，OpenCode 经
-        executor='opencode'，AUTO 轮换不保证落某特定主力），返回 14 个 token。"""
+        executor='opencode'，ZCode 经 executor='zcode'，AUTO 轮换不保证落某特定主力），
+        返回 15 个 token。"""
         toks = []
         plan = [('codebuddy', 'deepseek-v4.1-flash', 'codebuddy'),
                 ('codebuddy', 'glm-5.3-flash', 'codebuddy'),
+                ('zcode', 'GLM-5.3', 'zcode'),
                 ('qoder', 'Qwen3.8-Max', 'qoder'),
                 ('qodercn', 'Qwen3.8-Max', 'qodercn'),
                 ('qodercn', 'Qwen-3.8-Max', 'qodercn'),
@@ -215,16 +216,26 @@ class _SpawnMixin(unittest.TestCase):
                 ('claude', 'deepseek-flash', 'claude'),
                 ('opencode', dp.OPENCODE_DEEPSEEK_MODEL, 'opencode'),
                 ('opencode', dp.OPENCODE_GLM_MODEL, 'opencode')]
-        for i, (rt, md, ex) in enumerate(plan):
-            out = dp.select_and_claim(self.store, task_id=f'base-{i}', runtime=rt,
-                                      model=md, workspace=f'C:/mp/base-{i}',
-                                      chat_id=f'bc{i}',
-                                      stage=f'bs{i}', prompt_sha256=f'{i:x}' * 64,
-                                      executor=ex, now=T0,
-                                      codebuddy_glm_allowed=(md == 'glm-5.3-flash'),
-                                      _preclaim=False)
-            self.assertTrue(out['allowed'], out)
-            toks.append(out['token'])
+        # BW-QODERCN-TOKEN-MAX-DISABLE-20261028：目标池两槽按禁用前 legacy 占位构造
+        # 物理 15 满基线（临时空禁用集，仅限本 fill；后续竞态断言不变）。
+        with user_disabled_pools(frozenset()):
+            for i, (rt, md, ex) in enumerate(plan):
+                out = dp.select_and_claim(self.store, task_id=f'base-{i}', runtime=rt,
+                                          model=md, workspace=f'C:/mp/base-{i}',
+                                          chat_id=f'bc{i}',
+                                          stage=f'bs{i}', prompt_sha256=f'{i:x}' * 64,
+                                          executor=ex, now=T0,
+                                          codebuddy_glm_allowed=(md == 'glm-5.3-flash'),
+                                          _preclaim=False)
+                self.assertTrue(out['allowed'], out)
+                toks.append(out['token'])
+        # BW-STRONG-SONUS-20261024：物理总 16 含 strong-only `qoder:Sonus` 1 槽；本基线
+        # 在 strong 档，故第 16 槽按真实在途记录占住（弱/中档无法新派 Sonus）。
+        with closing(dp.connect(self.store)) as conn:
+            conn.execute('INSERT INTO attempts(token, task_id, runtime, model, pool_key, '
+                         "state, reserved_at_utc) VALUES(?,?,?,?,?,?,?)",
+                         ('mp-sonus', 'mp-sonus-task', 'qoder', 'Sonus',
+                          dp.SONUS_POOL_KEY, 'reserved', dp._iso(T0)))
         return toks
 
 
@@ -234,20 +245,16 @@ class TestConcurrentClaims(_SpawnMixin, unittest.TestCase):
         n = 12
         barrier = _CTX.Barrier(n)
         q = _CTX.Queue()
-        # BW-ZCODE-RETIRE-20261020：退役 zcode 组合竞争只会得到 honest unknown_pool
-        # 拒绝（不是竞争路径），并发/容量/轮转语义改用三个现役组合显式 executor 竞速
-        # （qoder Max 容量 1 + 两地区 Flash 各 2，最多 5 个 allowed，7 个必被拒）。
-        combos = [('qoder', 'Qwen3.8-Max', 'qoder'),
-                  ('qoder', 'Qwen3.8-Flash', 'qoder'),
-                  ('qodercn', 'Qwen3.8-Flash', 'qodercn')]
+        combos = [('zcode', 'GLM-5.3'), ('qoder', 'Qwen3.8-Max'),
+                  ('qoder', 'Qwen3.8-Flash')]
         for i in range(n):
-            rt, md, ex = combos[i % 3]
+            rt, md = combos[i % 3]
             self._spawn(_claim_worker,
-                        (self.store, barrier, q, i, rt, md, f'chat-{i}', ex))
+                        (self.store, barrier, q, i, rt, md, f'chat-{i}'))
         results = self._drain(q, n)
         allowed = [r for r in results if r['allowed']]
         denied = [r for r in results if not r['allowed']]
-        # 现役总容量 14：12 个竞争者按各池容量最多 5 个 allowed，必有人被拒。
+        # 六池总 10（BW-MAX-WINDOW-20261010-S2）：12 个竞争者最多 10 个 allowed，必有人被拒。
         self.assertLessEqual(len(allowed), dp.DOMESTIC_TOTAL_CAPACITY)
         self.assertTrue(denied, f'with {n} racers on a '
                                 f'{dp.DOMESTIC_TOTAL_CAPACITY}-slot pool some must be denied')
@@ -260,23 +267,19 @@ class TestConcurrentClaims(_SpawnMixin, unittest.TestCase):
             self.assertEqual(len(lst), 1, f'task {task} double-started')
         for r in allowed:
             self.assertEqual(len(by_task[f"mpc-{r['worker']}"]), 1)
-        # 各池不越自身容量；pool_key 恒等于 runtime+':'+model（无偷换落库）。
-        for pk, lim in (('zcode:GLM-5.3', 0),        # 退役池：真实在途必须为 0
-                        ('qoder:Qwen3.8-Max', 1), ('qodercn:Qwen3.8-Max', 1),
-                        ('qoder:Qwen3.8-Flash', 2), ('qodercn:Qwen-3.8-Max', 2),
-                        ('qodercn:Qwen3.8-Flash', 2)):
+        # 各池 ≤2；pool_key 恒等于 runtime+':'+model（无偷换落库）。
+        for pk in ('zcode:GLM-5.3', 'qoder:Qwen3.8-Max', 'qoder:Qwen3.8-Flash',
+                   'qodercn:Qwen3.8-Max', 'qodercn:Qwen-3.8-Max', 'qodercn:Qwen3.8-Flash'):
             act = dp.status(self.store, now=T0)['pools'][pk]['active']
-            self.assertLessEqual(act, lim, f'{pk} over capacity: {act}')
+            self.assertLessEqual(act, 2, f'{pk} over capacity: {act}')
         for row in rows:
             self.assertEqual(row['pool_key'], f"{row['runtime']}:{row['model']}")
-        # 持久轮转：BW-ZCODE-RETIRE-20261020 退役池不可能再提交，committed_zcode 恒为 0，
-        # 等于 Z 真实 claim 数（0）；committed_qoder 等于 Qoder 主力组
+        # 持久 1:1：committed_zcode 等于 Z 真实 claim 数；committed_qoder 等于 Qoder 主力组
         # （两内置 Max + 自定义 Max）真实 claim 总数（_bump_rotation 三池同记入 committed_qoder）。
         z = sum(1 for r in rows if r['pool_key'] == 'zcode:GLM-5.3')
         qgroup = ('qoder:Qwen3.8-Max', 'qodercn:Qwen3.8-Max', 'qodercn:Qwen-3.8-Max')
         qq = sum(1 for r in rows if r['pool_key'] in qgroup)
         st = dp.status(self.store, now=T0)['rotation']
-        self.assertEqual(z, 0)
         self.assertEqual(st['committed_zcode'], z)
         self.assertEqual(st['committed_qoder'], qq)
         # 拒绝方只能是 routing_required / capacity_full，绝无静默落错池。
@@ -286,11 +289,9 @@ class TestConcurrentClaims(_SpawnMixin, unittest.TestCase):
 
 class TestConcurrentConsume(_SpawnMixin, unittest.TestCase):
     def test_same_reserved_token_single_winner(self):
-        # BW-ZCODE-RETIRE-20261020：CAS 单赢家验的是 consume 生命周期，与具体池无关；
-        # 原 zcode 预留改用现役 Qoder Max（显式 executor 固定组合）。
-        res = dp.reserve(self.store, task_id='mpk', runtime='qoder', model='Qwen3.8-Max',
+        res = dp.reserve(self.store, task_id='mpk', runtime='zcode', model='GLM-5.3',
                          workspace='C:/mp', prompt_sha256='k' * 64, stage='sk',
-                         chat_id='ck', executor='qoder', now=T0, _preclaim=False)
+                         chat_id='ck', executor='zcode', now=T0, _preclaim=False)
         self.assertTrue(res['allowed'], res)
         n = 4
         barrier = _CTX.Barrier(n)
@@ -406,13 +407,10 @@ class TestPidReuseAndLateFinish(_SpawnMixin, unittest.TestCase):
                 wrapper.join(timeout=JOIN_TIMEOUT)
 
     def test_old_attempt_late_finish_never_releases_new_attempt(self):
-        # BW-ZCODE-RETIRE-20261020：旧 attempt 组合由退役 zcode 改为现役 Qoder Max
-        # （显式 executor 固定组合）；释放后同 task 再 claim 同池，旧 token 晚到
-        # finish 幂等不影响新行——生命周期语义与具体池无关。
-        old = dp.select_and_claim(self.store, task_id='lat', runtime='qoder',
-                                  model='Qwen3.8-Max', workspace='C:/mp',
+        old = dp.select_and_claim(self.store, task_id='lat', runtime='zcode',
+                                  model='GLM-5.3', workspace='C:/mp',
                                   prompt_sha256='o' * 64, stage='ls', chat_id='lc',
-                                  executor='qoder', now=T0, _preclaim=False)
+                                  executor='zcode', now=T0, _preclaim=False)
         self.assertTrue(old['allowed'], old)
         self.assertTrue(dp.finish(self.store, old['token'], terminal='cancelled',
                                   now=T0)['released'])
@@ -480,9 +478,8 @@ class TestAdoptLegacyOffline(_SpawnMixin, unittest.TestCase):
         self.assertTrue(dup['idempotent'])
         self.assertEqual(dup['token'], out['token'])
         self.assertEqual(len(self._rows('SELECT * FROM attempts')), 1)
-        # BW-ZCODE-RETIRE-20261020：退役池的 adopt-legacy 只作历史审计计数（真实在途行
-        # 仍如实入库），绝不再写轮转提交——committed_zcode 恒为 0。
-        self.assertEqual(dp.status(self.store, now=T0)['rotation']['committed_zcode'], 0)
+        # 主力计数如实 +1。
+        self.assertEqual(dp.status(self.store, now=T0)['rotation']['committed_zcode'], 1)
 
     def test_identity_drift_and_unknown_and_exited_refused(self):
         rp, pp = self._receipts(self._tmp.name)
@@ -558,17 +555,15 @@ class TestAdoptLegacyOffline(_SpawnMixin, unittest.TestCase):
                                   prompt_sha256='z' * 64, stage='as', chat_id='ac',
                                   executor='qoder', now=T0, _preclaim=False)
         # Max 池不受影响可 claim（显式 executor='qoder' 固定该组合：CodeBuddy 空位存在时
-        # AUTO 会 routing_required 改派，与本例“旧债务不挡新派发”的目标无关）；
-        # BW-ZCODE-RETIRE-20261020：zcode 组合已全局退役——请求在授权门即诚实拒绝
-        # （unknown_pool，非改派、非容量），老行仍如实保留（不许丢老 worker）。
+        # AUTO 会 routing_required 改派，与本例“旧债务不挡新派发”的目标无关）；但请求 zcode
+        # 已 3>2 必须被阻止（不许丢老 worker）。
         self.assertTrue(nxt['allowed'], nxt)
         z = dp.select_and_claim(self.store, task_id='after2', runtime='zcode',
                                 model='GLM-5.3', workspace='C:/mp/after2',
                                 prompt_sha256='y' * 64, stage='as', chat_id='ac',
                                 now=T0, _preclaim=False)
         self.assertFalse(z['allowed'])
-        self.assertFalse(z['routing_required'])
-        self.assertEqual(z['reason'], 'unknown_pool')
+        self.assertTrue(z['routing_required'])
         rows = self._rows("SELECT COUNT(*) AS n FROM attempts WHERE origin='adopt-legacy'")
         self.assertEqual(rows[0]['n'], 1)
 
@@ -616,24 +611,20 @@ class TestWorkspaceSingleWriterZ4(_SpawnMixin, unittest.TestCase):
         if os.name == 'nt':
             aliases.append(base.replace('\\', '/'))  # Windows 正斜杠表示
             aliases.append(base.replace('/', '\\'))  # Windows 反斜杠表示
-        # BW-ZCODE-RETIRE-20261020：原 zcode 组合改用现役 claude（同为容量 2 的池），
-        # 单写入别名归一拒绝语义原样。
-        a = dp.select_and_claim(self.store, task_id='wa', runtime='claude',
-                                model='deepseek-flash', workspace=base, executor='claude',
+        a = dp.select_and_claim(self.store, task_id='wa', runtime='zcode',
+                                model='GLM-5.3', workspace=base, executor='zcode',
                                 prompt_sha256='a' * 64, now=T0, _preclaim=False)
         self.assertTrue(a['allowed'], a)
         for alias in aliases:
-            b = dp.select_and_claim(self.store, task_id='wb', runtime='claude',
-                                    model='deepseek-flash', workspace=alias,
-                                    executor='claude',
+            b = dp.select_and_claim(self.store, task_id='wb', runtime='zcode',
+                                    model='GLM-5.3', workspace=alias, executor='zcode',
                                     prompt_sha256='b' * 64, now=T0, _preclaim=False)
             self.assertFalse(b['allowed'], alias)
             self.assertEqual(b['reason'], 'workspace_in_flight', alias)
             self.assertFalse(b['sent'])
         # reserve / claim_due 国内回收与 Luna 分支同样不绕过（Luna 票据 scope 同目录）。
-        r = dp.reserve(self.store, task_id='wc', runtime='claude',
-                       model='deepseek-flash', workspace=base, prompt_sha256='c' * 64,
-                       executor='claude',
+        r = dp.reserve(self.store, task_id='wc', runtime='zcode', model='GLM-5.3',
+                       workspace=base, prompt_sha256='c' * 64, executor='zcode',
                        now=T0, _preclaim=False)
         self.assertFalse(r['allowed'])
         self.assertEqual(r['reason'], 'workspace_in_flight')

@@ -486,26 +486,35 @@ class ZcodeSendEvidenceTests(_SubprocessBase):
         return recs
 
     def test_zcode_contract_reaches_request_prompt_and_receipt(self):
-        # BW-ZCODE-RETIRE-20261020：zcode 池全局退役——正确 plan 仍先通过计划绑定预检，
-        # 但在权威原子门即诚实拒绝（rc=2、refused_before_dispatch），绝不进入提交通道：
-        # 零 receipt、零 request.json、零 sent，绝不改派别池。载荷契约的完整提交链路
-        # 已随池退役不可达（preflight-only 契约路径见同组另一用例，仍真实覆盖组装）。
         prompt = self.base / 'prompt.txt'
         prompt.write_text(f'ZCode 载荷任务 {MARKER_ASCII} {MARKER_UNICODE}\n',
                           encoding='utf-8', newline='\n')
         out = self.ws / 'out'
         proc = self._run(prompt, out, plan=self._plan_for('zcode', prompt, model='GLM-5.3'))
-        self.assertEqual(proc.returncode, 2, proc.stdout.decode('utf-8', 'replace'))
-        refusal = json.loads(proc.stdout.decode('utf-8'))
-        self.assertTrue(refusal['refused_before_dispatch'], refusal)
-        self.assertFalse(refusal['sent'], refusal)
-        self.assertIn(refusal['reason'], ('unknown_pool', 'retired_pool'), refusal)
-        self.assertEqual(self._receipts(out), [])
-        self.assertFalse((out / 'request.json').exists())
-        self.assertFalse((out / 'sent-task-payload.bin').exists())
-        # 原 prompt 文件逐字节不动。
-        self.assertEqual(prompt.read_bytes(),
-                         f'ZCode 载荷任务 {MARKER_ASCII} {MARKER_UNICODE}\n'.encode('utf-8'))
+        self.assertEqual(proc.returncode, 0, proc.stderr.decode('utf-8', 'replace'))
+        request = read_json(out / 'request.json')
+        self.assertEqual(request['prompt_sha256'],
+                         hashlib.sha256(prompt.read_bytes()).hexdigest())
+        pp = request['prompt_payload']
+        # receipts 记录 runner 真实收到的完整 request，证明 prompt/prompt_sha256 被消费。
+        recv = next(r['request'] for r in self._receipts(out) if r.get('event') == 'request')
+        self.assertEqual(recv['prompt'], request['prompt'])
+        self.assertEqual(recv['prompt_sha256'], request['prompt_sha256'])
+        self.assertEqual(pp['sent_payload_sha256'],
+                         hashlib.sha256(recv['prompt'].encode('utf-8')).hexdigest())
+        self.assertEqual((out / 'sent-task-payload.bin').read_bytes(),
+                         recv['prompt'].encode('utf-8'))
+        self.assertTrue(pp['readback_match'])
+        self._assert_headers_in(recv['prompt'])
+        # ZCode 实际发送载荷同样携带本轮 runtime/请求模型身份。
+        self.assertIn('runtime=zcode；请求模型=GLM-5.3', recv['prompt'])
+        self.assertEqual(request['executor_identity']['runtime'], 'zcode')
+        self.assertEqual(request['executor_identity']['request_model'], 'GLM-5.3')
+        self.assertEqual(request['executor_identity']['contract_sha256'],
+                         pp['contract_sha256'])
+        submit = [r for r in self._receipts(out) if r.get('event') == 'submit']
+        self.assertEqual(len(submit), 1)
+        self.assertEqual(submit[0]['prompt_sha256'], request['prompt_sha256'])
 
     def test_zcode_preflight_only_submits_nothing_and_omits_contract(self):
         prompt = self.base / 'prompt-pf.txt'
@@ -529,18 +538,17 @@ class ZcodeSendEvidenceTests(_SubprocessBase):
         normalized_hash = hashlib.sha256(prompt.read_bytes().decode('utf-8').replace('\r\n', '\n').encode('utf-8')).hexdigest()
         self.assertNotEqual(raw_hash, normalized_hash, 'fixture must actually exercise CRLF')
 
-        # 正确 plan（原始文件字节哈希）：预检计划绑定放行、真实走到权威原子门；
-        # BW-ZCODE-RETIRE-20261020：zcode 池已全局退役，该门诚实拒绝 rc=2、
-        # refused_before_dispatch、零 receipt——与错误 plan 在预检即拒形成可辨对照。
+        # 正确 plan 使用原始文件字节哈希 → 真实派发，且发送 hash 与原始 filehash 不同。
         ok_plan = self._plan_for('zcode', prompt, model='GLM-5.3')
         self.assertEqual(json.loads(ok_plan.read_text(encoding='utf-8'))['prompt_sha256'], raw_hash)
         out = self.ws / 'out-crlf'
         proc = self._run(prompt, out, plan=ok_plan)
-        self.assertEqual(proc.returncode, 2, proc.stdout.decode('utf-8', 'replace'))
-        refusal = json.loads(proc.stdout.decode('utf-8'))
-        self.assertTrue(refusal['refused_before_dispatch'], refusal)
-        self.assertIn(refusal['reason'], ('unknown_pool', 'retired_pool'), refusal)
-        self.assertEqual(self._receipts(out), [])
+        self.assertEqual(proc.returncode, 0, proc.stderr.decode('utf-8', 'replace'))
+        pp = read_json(out / 'request.json')['prompt_payload']
+        self.assertEqual(pp['prompt_sha256'], raw_hash)
+        self.assertTrue(pp['newline_conversion']['raw_file_has_crlf'])
+        self.assertNotEqual(pp['prompt_sha256'], pp['task_text_utf8_sha256'])
+        self.assertIn('CRLF/CR-to-LF', pp['newline_conversion']['caliber'])
 
         # 错误 plan（发送文本哈希）→ 预检在 Popen 之前拒绝：rc 2、零目录、零提交。
         bad_plan = self.base / 'plan-badhash.json'

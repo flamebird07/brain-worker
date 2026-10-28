@@ -35,6 +35,7 @@ import execution_control as ec  # noqa: E402
 import codebuddy_fallback as cbf  # noqa: E402
 import qoder_permissions as qp  # noqa: E402
 import entry_runtime_probe as erp  # noqa: E402  只读 entry 实存可见性（非资格门）
+import dispatch_mode as dmode  # noqa: E402  手动三档（strong/medium/weak）共享策略
 
 SELECTION_MODES = ('auto', 'fixed', 'executor', 'temporary_fallback')
 USER_DIRECT_SELECTION_FIELD = 'user_direct_selection'
@@ -320,7 +321,7 @@ def _permission_incompatibility_details(filters, requirements):
 
 def _filter_candidates(conn, allowed, zcode_blocked, now, requirements=None,
                        controlled_file_ok=False, round_failed=None,
-                       codebuddy_glm_allowed=False, entry_missing=None):
+                       codebuddy_glm_allowed=False, entry_missing=None, mode=None):
     """逐候选只读过滤，返回 (通过集合, {pk: 拒绝原因})。
     未授权/权限能力/本轮已试/时段/容量 分开记录。
     `permission_incompatible`（能力冲突）与 `not_authorized`（不在授权集合）分别为可辨
@@ -345,10 +346,17 @@ def _filter_candidates(conn, allowed, zcode_blocked, now, requirements=None,
     requirements = requirements or {'fine_grained': False, 'read_dirs': False}
     failed_this_round = set(round_failed or [])
     entry_missing = set(entry_missing or ())
+    mode = dmode.normalize_mode(mode) if mode is not None else dmode.current_mode()
+    mode_allowed = set(dmode.allowed_pools_for_mode(mode))
     filters, passed = {}, []
     for pk in allowed:
         if not _allowed_candidate(pk):
             filters[pk] = 'unauthorized'
+            continue
+        # BW-MANUAL-THREE-MODE-20261023：档位硬策略先于权限/时段/容量——本档排除的池一律
+        # `mode_excluded`（绝不是 not_authorized，也不是 window_closed）。
+        if pk not in mode_allowed:
+            filters[pk] = dp.MODE_EXCLUDED
             continue
         if _permission_incompatible(pk, requirements, controlled_file_ok):
             filters[pk] = 'permission_incompatible'
@@ -365,7 +373,7 @@ def _filter_candidates(conn, allowed, zcode_blocked, now, requirements=None,
         if pk in failed_this_round:
             filters[pk] = 'already_tried_this_round'
             continue
-        if dp._max_window_blocks(pk, now):
+        if dp._max_window_blocks(pk, now, mode):
             filters[pk] = 'window_closed'
             continue
         # BW-WORKER-WIDGET-20261018-S3：两个 CodeBuddy 模型各自独立 1 槽，容量按自身
@@ -377,34 +385,45 @@ def _filter_candidates(conn, allowed, zcode_blocked, now, requirements=None,
     return passed, filters
 
 
-def _per_candidate_view(allowed, filters):
-    """逐候选（全部已知主/兜底池）原因：不在本轮有效授权集合内 / 时段 / 明确限额 /
-    容量 / 合格。**只把授权集合内的候选**显示为可用，集合外一律 `not_authorized`，
-    绝不把未选范围（别的执行器/地区）显示成 eligible。"""
+def _per_candidate_view(allowed, filters, mode=None):
+    """逐候选（全部已知主/兜底池）原因：不在本轮有效授权集合内 / **本档不参与** / 时段 /
+    明确限额 / 容量 / 合格。**只把授权集合内且本档可派的候选**显示为可用，集合外一律
+    `not_authorized`，本档排除一律 `mode_excluded`——两者绝不互相冒充，也绝不把未选范围
+    （别的执行器/地区）显示成 eligible。"""
+    mode_allowed = set(dmode.allowed_pools_for_mode(mode))
     view = {}
     aset = set(allowed)
     for pk in tuple(dp.MAIN_FORCE_KEYS) + tuple(dp.OVERFLOW_KEYS):
         if pk not in aset:
             view[pk] = 'not_authorized'
+        elif pk not in mode_allowed:
+            view[pk] = dp.MODE_EXCLUDED
         else:
             view[pk] = filters.get(pk, 'eligible')
     return view
 
 
-def _relational_select(conn, mode, auth, allowed, passed, now):
+def _relational_select(conn, mode, auth, allowed, passed, now, dispatch_mode=None):
     """auto/executor 的关系选择：先主力（复用 `_select_main_force` 公平轮换）再 Flash；
-    executor 只在本 runtime 内、绝不跨区；返回 (pk_or_None, reason)。"""
+    executor 只在本 runtime 内、绝不跨区；候选只在**当前档可派集合**内。
+    返回 (pk_or_None, reason)。"""
+    dispatch_mode = (dmode.normalize_mode(dispatch_mode) if dispatch_mode is not None
+                     else dmode.current_mode())
+    mode_allowed = set(dmode.allowed_pools_for_mode(dispatch_mode))
     pset = set(passed)
     ex = str(auth.get('executor')) if mode == 'executor' and auth.get('executor') else None
     mains = [k for k in dp.MAIN_FORCE_KEYS
-             if k in allowed and (ex is None or k.startswith(ex + ':'))]
+             if k in allowed and k in mode_allowed
+             and (ex is None or k.startswith(ex + ':'))]
     flashes = [k for k in dp.OVERFLOW_KEYS
-               if k in allowed and (ex is None or k.startswith(ex + ':'))]
+               if k in allowed and k in mode_allowed
+               and (ex is None or k.startswith(ex + ':'))]
     elig = [k for k in mains if k in pset]
     if elig:
         if not _rotation_present(conn):
             return None, 'rotation_state_unavailable'
-        target, _why = dp._select_main_force(conn, elig[0], now, eligible=set(elig))
+        target, _why = dp._select_main_force(conn, elig[0], now, eligible=set(elig),
+                                            mode=dispatch_mode)
         if target is not None:
             if ex:
                 return target, 'executor_region_main'
@@ -433,6 +452,10 @@ def plan_stage_selection(authorization, *, previous=None, store_path=None, quota
     now = now or dp.utcnow()
     auth = authorization if isinstance(authorization, dict) else {}
     mode = auth.get('selection_mode')
+    # BW-MANUAL-THREE-MODE-20261023：本次规划只读一次档位，回执如实标注档位与来源/读取
+    # 错误；档位排除的候选写 `mode_excluded`（不是 not_authorized / window_closed）。
+    dm_state = dmode.load_mode()
+    dispatch_mode = dm_state['mode']
     receipt = {
         'preview_only': True, 'sent': False, 'placeholder': False,
         'task_id': task_id, 'stage': stage, 'workspace': workspace,
@@ -462,6 +485,11 @@ def plan_stage_selection(authorization, *, previous=None, store_path=None, quota
         'next_candidate': None,
         'qoder_permission_plan': None,
         'candidate_filters': {}, 'zcode_blocked': False, 'refused': None,
+        'dispatch_mode': dispatch_mode,
+        'dispatch_mode_source': dm_state['source'],
+        'dispatch_mode_error': dm_state['error'],
+        'dispatch_mode_default': dm_state['default_mode'],
+        'dispatch_mode_allowed_pools': list(dmode.allowed_pools_for_mode(dispatch_mode)),
         'snapshot_note': ('snapshot time is not live capacity; the authoritative entry '
                           're-checks atomically; this snapshot is never a placeholder, a '
                           'dispatch, or a real-time success proof'),
@@ -787,12 +815,14 @@ def plan_stage_selection(authorization, *, previous=None, store_path=None, quota
                                              requirements, controlled_file_ok,
                                              round_failed=round_failed_pks,
                                              codebuddy_glm_allowed=glm_allowed,
-                                             entry_missing=set(entry_missing))
-        receipt['candidate_filters'] = _per_candidate_view(eff_allowed, filters)
+                                             entry_missing=set(entry_missing),
+                                             mode=dispatch_mode)
+        receipt['candidate_filters'] = _per_candidate_view(eff_allowed, filters,
+                                                           dispatch_mode)
         eligible_rows = []
         excluded_rows = []
         for candidate in eff_allowed:
-            priority = dp.priority_for_pool(candidate)
+            priority = dp.priority_for_pool(candidate, dispatch_mode)
             if candidate in set(passed):
                 eligible_rows.append({
                     'pool_key': candidate,
@@ -838,13 +868,13 @@ def plan_stage_selection(authorization, *, previous=None, store_path=None, quota
             sel_pk, reason = pk, 'temporary_fallback_selected'
         else:
             sel_pk, reason = _relational_select(conn, eff_mode, eff_auth, eff_allowed,
-                                                passed, now)
+                                                passed, now, dispatch_mode)
             if sel_pk is None:
                 return _refuse(reason)
 
         receipt['selected'] = _pk_parts(sel_pk)
         receipt['selected_reason'] = reason
-        receipt['selected_priority'] = dp.priority_for_pool(sel_pk)
+        receipt['selected_priority'] = dp.priority_for_pool(sel_pk, dispatch_mode)
         receipt['next_candidate'] = next(
             (_pk_parts(row['pool_key']) | {'priority': row['priority']}
              for row in eligible_rows if row['pool_key'] != sel_pk), None)

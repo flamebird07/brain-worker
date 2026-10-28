@@ -6,7 +6,8 @@
 真实拒绝/待核行为。
 BW-WORKER-WIDGET-20261018-S3：两 CodeBuddy 模型各自独立 1 槽；BW-OPENCODE-20261019-S3：
 两个 OpenCode 免费模型（deepseek-v4.1-flash-free / glm-5.3-flash-free）各独立 1 槽、
-主行排两行（总 16、展示 12 行）；展示层主行
+主行排两行；BW-ZCODE-RESTORE-1-20261022：zcode:GLM-5.3 恢复为可派主力恰好 1 行
+（总 15、生产 11 行，本文件追加 Luna 兼容行后 12 行）；展示层主行
 状态绝不只信 DB running——死 PID/复用/探测未知/未绑定的 running 主行必须显著待核
 （待核优先，不被同池真 running 掩盖），只有匹配活 PID 才显示运行中；reserved 无子
 进程仍已预留；Luna 原生不套本机探针。
@@ -33,19 +34,25 @@ for p in (str(SCRIPTS), str(REPO / 'tests')):
     if p not in sys.path:
         sys.path.insert(0, p)
 
+import dispatch_mode as dm  # noqa: E402
 import dispatch_pool as dp  # noqa: E402
 import worker_status_widget as wsw  # noqa: E402
+from dispatch_mode_support import dispatch_mode  # noqa: E402
 
-# 历史浮窗用例显式开启旧 Luna 行；生产 ROW_DEFS 保持 11 行，禁用用例单独复核。
+# 历史浮窗用例显式开启旧 Luna 行；生产 ROW_DEFS 保持 11 行（BW-ZCODE-RESTORE-1-20261022：
+# 恰好一个 ZCode 行），禁用用例单独复核。追加 Luna 前先留存生产行定义原件，供
+# “11 行、唯一 ZCode 行、新行序”断言。
+PROD_ROW_DEFS = wsw.ROW_DEFS
 dp.LUNA_DISABLED = False
 dp.CAPACITY[dp.LUNA_KEY] = None
 wsw.ROW_DEFS = wsw.ROW_DEFS + (
     (dp.LUNA_KEY, 'Luna／原生外援', '历史测试兼容'),
 )
 
-# 北京 2026-10-08(周四) 23:00：三 Qoder Max 夜间窗开、claude 空闲时段放行。
+# 北京 2026-10-08(周四) 23:00：两个 CN Max 夜间窗开、claude 与各无门池均可派。
 T0 = datetime(2026, 10, 8, 15, 0, 0, tzinfo=timezone.utc)
-# 北京 2026-10-08(周四) 10:00：Max 夜间窗关、claude 工作日高峰门关。
+# 北京 2026-10-08(周四) 10:00：两个 CN Max 夜间窗关；claude 自 BW-CLAUDE-ALLDAY-QMAX-
+# AFTER-20261023 起全天可派，白天不再被挡。
 PEAK = datetime(2026, 10, 8, 2, 0, 0, tzinfo=timezone.utc)
 
 _COLUMNS = ('token, task_id, stage, runtime, model, pool_key, state, child_pid, '
@@ -121,26 +128,68 @@ class TestModuleDiscipline(_WidgetBase):
 
     def test_row_defs_match_authoritative_priority_and_totals(self):
         order = [pk for pk, _, _ in wsw.ROW_DEFS]
-        # BW-OPENCODE-20261019-S3 + BW-ZCODE-RETIRE-20261020：ZCode 已退役，不再显示可派行；
-        # 两个 OpenCode 免费模型各独立 1 槽，排在 Claude 之后、条件补位 CodeBuddy GLM 之前
-        # （AUTO 层序 tier 4 < 条件 GLM tier 5），其后是两地区 Flash。
-        self.assertEqual(order[:9], [
-            dp.CODEBUDDY_POOL_KEY, dp.CN_CUSTOM_MAX_POOL_KEY, dp.CN_MAX_POOL_KEY,
-            dp.QMAX_POOL_KEY, dp.CLAUDE_POOL_KEY,
+        # BW-STRONG-SONUS-20261024：静态 ROW_DEFS = Sonus（strong 第一） + weak 11 行，
+        # 共 12 行；Luna 已删除，不得再出现任何 Luna 行。各档实际空闲可见行由 read_snapshot
+        # 动态过滤：strong 6（Sonus + 五窄池）、medium 5（无 Sonus）、weak 11（无 Sonus）。
+        # BW-SONUS-TEMP-DISABLE-20261026：Sonus 被用户要求暂时禁用——三档空闲时整行都
+        # 隐藏，strong 空闲也只剩五窄池；STRONG_PRIORITY 里的 Sonus=1 保留为历史层号。
+        self.assertEqual(order[:12], [
+            dp.SONUS_POOL_KEY,
+            dp.CN_CUSTOM_MAX_POOL_KEY, dp.CN_MAX_POOL_KEY, dp.ZCODE_POOL_KEY,
+            dp.CLAUDE_POOL_KEY, dp.QMAX_POOL_KEY, dp.CODEBUDDY_POOL_KEY,
             dp.OPENCODE_DEEPSEEK_POOL_KEY, dp.OPENCODE_GLM_POOL_KEY,
-            dp.CODEBUDDY_GLM_POOL_KEY, dp.QFLASH_POOL_KEY])
-        self.assertEqual(set(order[9:11]), {dp.CN_FLASH_POOL_KEY, dp.LUNA_KEY})
-        self.assertEqual(order[-1], dp.LUNA_KEY)  # 模块顶部追加的历史 Luna 兼容行
+            dp.CODEBUDDY_GLM_POOL_KEY, dp.QFLASH_POOL_KEY, dp.CN_FLASH_POOL_KEY])
+        self.assertEqual(order[12:], [dp.LUNA_KEY])  # 本测试模块为历史用例追加的 Luna 行
+        self.assertNotIn(dp.LUNA_KEY, order[:12])
+        # 生产 ROW_DEFS 原件：恰好 12 行、含且只含一个 Sonus 与一个 ZCode 行、无 Luna。
+        prod_order = [pk for pk, _, _ in PROD_ROW_DEFS]
+        self.assertEqual(prod_order, order[:12])
+        self.assertEqual(len(prod_order), 12)
+        self.assertEqual(prod_order.count(dp.SONUS_POOL_KEY), 1)
+        self.assertEqual(prod_order.count(dp.ZCODE_POOL_KEY), 1)
+        self.assertEqual(prod_order[0], dp.SONUS_POOL_KEY)
+        # BW-STRONG-SONUS-20261024：静态 ROW_DEFS = Sonus + weak 11 行基准序，其前六行
+        # **不是** strong 动态层序，绝不得对静态前六行要求 STRONG_PRIORITY 单调。真实
+        # strong 排序由 read_snapshot 动态生成：Sonus(1)、ZCode(2)、Claude(3)、三个
+        # Max(4,4,4，按基准序 stable tie)——用真实 strong 快照核验动态顺序。
+        self.assertEqual(dm.STRONG_PRIORITY[dp.SONUS_POOL_KEY], 1)
+        self.assertEqual(dm.STRONG_PRIORITY[dp.ZCODE_POOL_KEY], 2)
+        self.assertEqual(dm.STRONG_PRIORITY[dp.CLAUDE_POOL_KEY], 3)
+        self.assertEqual({dm.STRONG_PRIORITY[pk] for pk in dm.MAX_POOL_KEYS}, {4})
+        self.assertNotIn(dp.LUNA_KEY, prod_order)
+        with closing(self._conn()):
+            pass
+        with dispatch_mode('strong'):
+            strong_snap = self._snap()
+        self.assertTrue(strong_snap['ok'])
+        # BW-SONUS-REENABLE-20261028：strong 空闲显示 Sonus 行且排第一（层=1）；
+        # 其余五池层号不变（2/3/4/4/4，不重编号）。
+        strong_rows = [r for r in strong_snap['rows']
+                       if r['pool_key'] != dp.LUNA_KEY]
+        self.assertEqual([r['pool_key'] for r in strong_rows], [
+            dp.SONUS_POOL_KEY, dp.ZCODE_POOL_KEY, dp.CLAUDE_POOL_KEY,
+            dp.CN_MAX_POOL_KEY, dp.QMAX_POOL_KEY])
+        strong_prios = [r['priority'] for r in strong_rows]
+        self.assertEqual(strong_prios, sorted(strong_prios), strong_prios)
+        self.assertEqual(strong_prios, [1, 2, 3, 4, 4])
+        # 其余 11 行与 weak 权威整表逐行一致。
+        weak_prios = [dp.POOL_PRIORITY[pk] for pk in prod_order[1:]]
+        self.assertEqual(weak_prios, sorted(weak_prios), weak_prios)
+        self.assertEqual(weak_prios, [1, 1, 2, 3, 4, 5, 6, 6, 7, 8, 8])
+        # 国际 Qoder Max 行紧邻 Claude 之后（用户明确要求"排到 Claude 后面"）。
+        self.assertEqual(prod_order.index(dp.QMAX_POOL_KEY),
+                         prod_order.index(dp.CLAUDE_POOL_KEY) + 1)
         # 退休池绝不显示成可派行。
         self.assertNotIn('qodercn:DeepSeek-Flash', order)
-        self.assertNotIn(dp.ZCODE_POOL_KEY, order)  # BW-ZCODE-RETIRE-20261020
         self.assertFalse(any(pk.startswith('workbuddy') for pk in order))
-        # BW-WORKER-WIDGET-20261018-S3 + BW-OPENCODE-20261019-S3 + BW-ZCODE-RETIRE-20261020
-        # 当前权威：两 CodeBuddy 模型与两 OpenCode 免费模型各独立 1 槽，ZCode 两槽退役
-        # → 物理总 14。
-        self.assertEqual(dp.DOMESTIC_TOTAL_CAPACITY, 14)
+        # BW-STRONG-SONUS-20261024：物理总 16 = 原 15 槽 + strong-only Sonus 独立 1 槽；
+        # medium/weak 新派容量仍为 15（Sonus 不属于其候选）。
+        self.assertEqual(dp.DOMESTIC_TOTAL_CAPACITY, 16)
         self.assertEqual((sum(dp.MAIN_FORCE_CAPACITY.values())
-                          + sum(dp.OVERFLOW_CAPACITY.values())), 14)
+                          + sum(dp.OVERFLOW_CAPACITY.values())), 16)
+        self.assertEqual(dp.MAIN_FORCE_CAPACITY[dp.SONUS_POOL_KEY], 1)
+        self.assertEqual(sum(dp.capacity_for(k) for k in dm.ALL_POOL_KEYS), 15)
+        self.assertEqual(dp.MAIN_FORCE_CAPACITY[dp.ZCODE_POOL_KEY], 1)
         self.assertEqual(dp.MAIN_FORCE_CAPACITY[dp.CODEBUDDY_GLM_POOL_KEY], 1)
         self.assertEqual(dp.MAIN_FORCE_CAPACITY[dp.OPENCODE_DEEPSEEK_POOL_KEY], 1)
         self.assertEqual(dp.MAIN_FORCE_CAPACITY[dp.OPENCODE_GLM_POOL_KEY], 1)
@@ -165,6 +214,15 @@ class TestModuleDiscipline(_WidgetBase):
             self.assertNotIn('CN 内置', note)
             self.assertNotIn('CN 自定义', note)
             self.assertNotIn('共用', note)
+            # BW-CLAUDE-ALLDAY-QMAX-AFTER-20261023：CodeBuddy DeepSeek 已下调至层=5，
+            # 任何行注释/标签都不得再写「最高优先」。
+            self.assertNotIn('最高优先', note)
+        # Claude 行文案明确「全天 / 无时段门」，不得再写"空闲时段门"。
+        notes = dict((pk, note) for pk, _label, note in wsw.ROW_DEFS)
+        self.assertIn('全天', notes[dp.CLAUDE_POOL_KEY])
+        self.assertIn('无时段门', notes[dp.CLAUDE_POOL_KEY])
+        self.assertNotIn('空闲时段门', notes[dp.CLAUDE_POOL_KEY])
+        self.assertIn('全天', notes[dp.QMAX_POOL_KEY])
 
     def test_once_cli_outputs_safe_json(self):
         with closing(self._conn()) as conn:
@@ -190,6 +248,35 @@ class TestModuleDiscipline(_WidgetBase):
         self.assertEqual(code, 2)
         self.assertFalse(json.loads(buf.getvalue())['ok'])
 
+    def test_store_precedence_explicit_then_environment_then_home(self):
+        with closing(self._conn()):
+            pass
+        missing = self.base / 'other.sqlite3'
+        with mock.patch.dict(os.environ, {'BRAIN_WORKER_DISPATCH_STORE': str(missing)}):
+            self.assertEqual(dp.default_store_path(), missing)
+            snap = wsw.read_snapshot()
+            self.assertEqual(Path(snap['store']), missing)
+            self.assertFalse(snap['ok'])
+            self.assertTrue(wsw.read_snapshot(self.store)['ok'])
+        with mock.patch.dict(os.environ, {'BRAIN_WORKER_DISPATCH_STORE': self.store}):
+            buf = io.StringIO()
+            with redirect_stdout(buf):
+                self.assertEqual(wsw.main(['--once']), 0)
+            self.assertEqual(Path(json.loads(buf.getvalue())['store']), Path(self.store))
+        with mock.patch.dict(os.environ, {'BRAIN_WORKER_DISPATCH_STORE': ''}), \
+                mock.patch.object(Path, 'home', return_value=self.base):
+            expected = self.base / '.brain-worker' / 'dispatch-pool.sqlite3'
+            self.assertEqual(dp.default_store_path(), expected)
+            self.assertEqual(Path(wsw.read_snapshot()['store']), expected)
+            self.assertFalse(expected.exists())
+
+    def test_single_instance_refusal_does_not_reconfigure_existing_gui(self):
+        with mock.patch.object(wsw, '_acquire_single_instance', return_value=False), \
+                mock.patch.object(wsw, 'run_gui') as gui, \
+                mock.patch.object(sys, 'stderr', io.StringIO()):
+            self.assertEqual(wsw.main(['--store', self.store]), 0)
+        gui.assert_not_called()
+
 
 class TestSnapshotStates(_WidgetBase):
 
@@ -199,8 +286,15 @@ class TestSnapshotStates(_WidgetBase):
         snap = self._snap()
         self.assertTrue(snap['ok'])
         self.assertEqual(snap['domestic_active'], 0)
-        self.assertEqual(snap['domestic_total_capacity'], 14)  # BW-ZCODE-RETIRE-20261020
-        self.assertEqual(len(snap['rows']), len(wsw.ROW_DEFS))
+        # BW-STRONG-SONUS-20261024：物理总 16；默认 weak 档空闲只显示 11 个 weak 池
+        # （Sonus 为 strong 专属，空闲时整行隐藏）；测试模块追加的 Luna 兼容行不属档位。
+        self.assertEqual(snap['domestic_total_capacity'], 16)
+        policy_rows = [r for r in snap['rows'] if r['pool_key'] != dp.LUNA_KEY]
+        self.assertEqual(len(policy_rows), 10)
+        self.assertEqual([r['pool_key'] for r in policy_rows],
+                         [pk for pk, _, _ in PROD_ROW_DEFS
+                          if pk not in (dp.SONUS_POOL_KEY, dp.CN_CUSTOM_MAX_POOL_KEY)])
+        self.assertNotIn(dp.SONUS_POOL_KEY, [r['pool_key'] for r in snap['rows']])
         for row in snap['rows']:
             self.assertEqual(row['state'], 'idle', row['pool_key'])
             self.assertEqual(row['state_label'], '空闲')
@@ -264,7 +358,7 @@ class TestSnapshotStates(_WidgetBase):
         self.assertEqual(glm['own_active'], 0)
         self.assertEqual(glm['state'], 'idle')
         self.assertEqual(snap['domestic_active'], 1)
-        self.assertEqual(snap['domestic_total_capacity'], 14)  # BW-ZCODE-RETIRE-20261020
+        self.assertEqual(snap['domestic_total_capacity'], 16)  # BW-STRONG-SONUS-20261024
         # 两模型可同时各 1 在途 → 总占用 2，绝不按共享槽压成 1。
         with closing(self._conn()) as conn:
             self._insert(conn, 'g1', dp.CODEBUDDY_GLM_POOL_KEY, 'reserved',
@@ -349,22 +443,43 @@ class TestSnapshotStates(_WidgetBase):
         with closing(self._conn()) as conn:
             self._insert(conn, 'cn1', dp.CN_MAX_POOL_KEY, 'running', child_pid=4321,
                          child_created='111', started=PEAK - timedelta(seconds=600))
-        snap = self._snap(now=PEAK, probe=probe)
-        cn = self._row(snap, dp.CN_MAX_POOL_KEY)
-        # 跨时段在途：运行中优先于时段门，绝不遮盖。
-        self.assertEqual(cn['state'], 'running')
-        self.assertTrue(cn['window_blocked'])
-        qm = self._row(snap, dp.QMAX_POOL_KEY)
-        self.assertEqual(qm['state'], 'window_closed')
-        # 三 Qoder Max：固定夜间窗口富标签（仅显示层）。
-        self.assertEqual(qm['state_label'], wsw.MAX_WINDOW_CLOSED_LABEL)
-        self.assertEqual(qm['state_label'], '时段外（22:00–次日08:00）')
-        cl = self._row(snap, dp.CLAUDE_POOL_KEY)
-        self.assertEqual(cl['state'], 'window_closed')
-        # Claude 10:00(北京周四)高峰：下一连续放行区间 12:00–14:00。
-        self.assertEqual(cl['state_label'], '时段外（下次12:00–14:00）')
-        # CodeBuddy 主力无时段门。
-        self.assertFalse(self._row(snap, dp.CODEBUDDY_POOL_KEY)['window_blocked'])
+        # 弱档白天：三个 Max 与 claude 都在各自时段门外，空闲行显示「时段外」，
+        # 跨时段在途仍按运行中如实显示（时段门只挡新派，绝不遮盖在途）。
+        with dispatch_mode('weak'):
+            snap = self._snap(now=PEAK, probe=probe)
+            cn = self._row(snap, dp.CN_MAX_POOL_KEY)
+            self.assertEqual(cn['state'], 'running')
+            self.assertTrue(cn['window_blocked'])
+            self.assertNotIn(dp.CN_CUSTOM_MAX_POOL_KEY, {r['pool_key'] for r in snap['rows']})
+            for pk in (dp.QMAX_POOL_KEY, dp.CLAUDE_POOL_KEY):
+                row = self._row(snap, pk)
+                self.assertEqual(row['state'], 'window_closed', pk)
+                self.assertTrue(row['window_blocked'], pk)
+            # 三个 Max：固定夜间窗口富标签（仅显示层）。
+            self.assertEqual(self._row(snap, dp.QMAX_POOL_KEY)['state_label'],
+                             wsw.MAX_WINDOW_CLOSED_LABEL)
+            self.assertEqual(self._row(snap, dp.QMAX_POOL_KEY)['state_label'],
+                             '时段外（22:00–次日08:00）')
+            self.assertEqual(self._row(snap, dp.QMAX_POOL_KEY)['state_label'],
+                             wsw.MAX_WINDOW_CLOSED_LABEL)
+            # claude：工作日高峰标签，与 Max 夜间窗可辨。
+            self.assertEqual(self._row(snap, dp.CLAUDE_POOL_KEY)['state_label'],
+                             wsw.CLAUDE_PEAK_CLOSED_LABEL)
+            # CodeBuddy 主力无时段门。
+            self.assertFalse(self._row(snap, dp.CODEBUDDY_POOL_KEY)['window_blocked'])
+        # 强档白天：五个可派池全部无时段门，空闲即「空闲」，在途仍如实运行中；
+        # 被本档排除且无在途的池整行隐藏（BW-WIDGET-LEGACY-VISIBILITY-20261023）。
+        with dispatch_mode('strong'):
+            snap = self._snap(now=PEAK, probe=probe)
+            self.assertNotIn(dp.CN_CUSTOM_MAX_POOL_KEY, {r['pool_key'] for r in snap['rows']})
+            for pk in (dp.QMAX_POOL_KEY, dp.CLAUDE_POOL_KEY):
+                row = self._row(snap, pk)
+                self.assertEqual(row['state'], 'idle', pk)
+                self.assertFalse(row['window_blocked'], pk)
+                self.assertEqual(row['state_label'], '空闲', pk)
+            shown = {r['pool_key'] for r in snap['rows']}
+            self.assertNotIn(dp.CODEBUDDY_POOL_KEY, shown)
+            self.assertEqual(self._row(snap, dp.CN_MAX_POOL_KEY)['state'], 'running')
 
     def test_luna_optional_row_not_counted_in_domestic_total(self):
         with closing(self._conn()) as conn:
@@ -379,7 +494,7 @@ class TestSnapshotStates(_WidgetBase):
         self.assertEqual(luna['attempts'][0]['pid_check'], 'native')
         self.assertEqual(snap['luna_active'], 1)
         self.assertEqual(snap['domestic_active'], 0)
-        self.assertEqual(snap['domestic_total_capacity'], 14)  # BW-ZCODE-RETIRE-20261020
+        self.assertEqual(snap['domestic_total_capacity'], 16)  # BW-STRONG-SONUS-20261024
 
     def test_retired_pools_not_shown_but_real_in_flight_counted(self):
         with closing(self._conn()) as conn:
@@ -391,6 +506,234 @@ class TestSnapshotStates(_WidgetBase):
         self.assertNotIn('workbuddy:gpt-x', shown)
         self.assertEqual(snap['retired_active'], 2)
         self.assertEqual(snap['domestic_active'], 2)
+
+
+class TestModeExcludedRowVisibility(_WidgetBase):
+    """BW-WIDGET-LEGACY-VISIBILITY-20261023：strong/medium 展示快照只列本档参与的五个池；
+    排除池在 attempts 无任何在途（reserved/running/unknown）时整行隐藏，绝不按终态历史/
+    失败记录/时间推断遗留在途；有遗留在途的排除池整行保留——真实 display_state/占用/
+    attempts 与 mode_excluded=true、participates=false 标记照常，直到真实终态；weak 仍
+    显示全部行。过滤只影响 rows：汇总计数、容量、activity 签名语义全部不变。"""
+
+    NARROW = frozenset((dp.ZCODE_POOL_KEY, dp.CLAUDE_POOL_KEY, dp.QMAX_POOL_KEY,
+                        dp.CN_MAX_POOL_KEY))
+    EXCLUDED = (dp.CODEBUDDY_POOL_KEY, dp.CODEBUDDY_GLM_POOL_KEY,
+                dp.OPENCODE_DEEPSEEK_POOL_KEY, dp.OPENCODE_GLM_POOL_KEY,
+                dp.QFLASH_POOL_KEY, dp.CN_FLASH_POOL_KEY)
+
+    def test_strong_medium_hide_excluded_rows_without_in_flight(self):
+        with closing(self._conn()) as conn:
+            # 排除池只有终态历史（近期失败结束）：不得据此当作遗留在途保留显示。
+            self._insert(conn, 'cb-old', dp.CODEBUDDY_POOL_KEY, 'finished',
+                         started=T0 - timedelta(hours=2),
+                         ended=T0 - timedelta(minutes=5),
+                         terminal='finished', success=0)
+        for mode in ('strong', 'medium'):
+            with dispatch_mode(mode):
+                snap = self._snap()
+                self.assertTrue(snap['ok'], mode)
+                shown = {r['pool_key'] for r in snap['rows']}
+                # BW-SONUS-REENABLE-20261028：strong 空闲显示 Sonus（本档参与、排第
+                # 一）；medium 不含 Sonus（强档专属）。
+                expected = self.NARROW | {dp.LUNA_KEY}
+                allowed = set(self.NARROW)
+                if mode == 'strong':
+                    expected = expected | {dp.SONUS_POOL_KEY}
+                    allowed = allowed | {dp.SONUS_POOL_KEY}
+                    self.assertTrue(self._row(snap, dp.SONUS_POOL_KEY)['participates'],
+                                    mode)
+                else:
+                    self.assertNotIn(dp.SONUS_POOL_KEY, shown, mode)
+                self.assertEqual(shown, expected, mode)
+                for pk in self.EXCLUDED:
+                    self.assertNotIn(pk, shown, (mode, pk))
+                for pk in self.NARROW:
+                    self.assertTrue(self._row(snap, pk)['participates'], (mode, pk))
+                # 汇总口径与档位允许池不受 rows 过滤影响。
+                self.assertEqual(snap['domestic_active'], 0, mode)
+                self.assertEqual(snap['domestic_total_capacity'], 16, mode)
+                self.assertEqual(snap['retired_active'], 0, mode)
+                self.assertEqual(set(snap['dispatch_mode_allowed_pools']),
+                                 allowed, mode)
+
+    def test_excluded_pools_with_legacy_in_flight_stay_visible(self):
+        probe = _probe({4321: {'pid': 4321, 'state': 'alive', 'created': '111'}})
+        with closing(self._conn()) as conn:
+            # 三个排除池各一种遗留在途：running（匹配活 PID）、reserved、unknown。
+            self._insert(conn, 'cb1', dp.CODEBUDDY_POOL_KEY, 'running', child_pid=4321,
+                         child_created='111', started=T0 - timedelta(seconds=600))
+            self._insert(conn, 'og1', dp.OPENCODE_GLM_POOL_KEY, 'reserved',
+                         reserved=T0 - timedelta(seconds=300))
+            self._insert(conn, 'qf1', dp.QFLASH_POOL_KEY, 'unknown',
+                         started=T0 - timedelta(seconds=60))
+        for mode in ('strong', 'medium'):
+            with dispatch_mode(mode):
+                snap = self._snap(probe=probe)
+                shown = {r['pool_key'] for r in snap['rows']}
+                # 遗留在途行必须保留；无在途的排除池仍整行隐藏。
+                for pk in (dp.CODEBUDDY_POOL_KEY, dp.OPENCODE_GLM_POOL_KEY,
+                           dp.QFLASH_POOL_KEY):
+                    self.assertIn(pk, shown, (mode, pk))
+                for pk in (dp.OPENCODE_DEEPSEEK_POOL_KEY, dp.CODEBUDDY_GLM_POOL_KEY,
+                           dp.CN_FLASH_POOL_KEY):
+                    self.assertNotIn(pk, shown, (mode, pk))
+                cb = self._row(snap, dp.CODEBUDDY_POOL_KEY)
+                self.assertTrue(cb['mode_excluded'], mode)
+                self.assertFalse(cb['participates'], mode)
+                self.assertEqual(cb['mode_excluded_label'], '本档不参与')
+                self.assertEqual(cb['state'], 'running')
+                self.assertEqual(cb['active'], 1)
+                self.assertEqual(cb['attempts'][0]['display_state'], 'running')
+                self.assertEqual(cb['attempts'][0]['elapsed_seconds'], 600)
+                og = self._row(snap, dp.OPENCODE_GLM_POOL_KEY)
+                self.assertEqual(og['state'], 'reserved')
+                self.assertTrue(og['mode_excluded'])
+                self.assertEqual(og['attempts'][0]['display_state'], 'reserved')
+                self.assertEqual(og['active'], 1)
+                qf = self._row(snap, dp.QFLASH_POOL_KEY)
+                self.assertEqual(qf['state'], 'unknown')
+                self.assertTrue(qf['mode_excluded'])
+                self.assertEqual(qf['attempts'][0]['display_state'], 'unknown')
+                # 在途汇总不因 rows 过滤改变（占位仍权威计数，绝不释放）。
+                self.assertEqual(snap['domestic_active'], 3, mode)
+                self.assertEqual(snap['domestic_total_capacity'], 16, mode)
+                self.assertEqual(snap['retired_active'], 0, mode)
+                # 展开视图保留遗留在途行；精简视图照常列出真实运行行。
+                self.assertIn(dp.CODEBUDDY_POOL_KEY,
+                              [r['pool_key'] for r in wsw.view_rows(snap,
+                                                                    expanded=True)])
+                self.assertIn(dp.CODEBUDDY_POOL_KEY,
+                              [r['pool_key'] for r in wsw.view_rows(snap)])
+                # 详情文案明确「本档不参与」且遗留在途如实展示。
+                detail = wsw.detail_text(cb)
+                self.assertIn('本档不参与', detail)
+                self.assertIn('运行中', detail)
+
+    def test_weak_still_shows_every_row(self):
+        probe = _probe({4321: {'pid': 4321, 'state': 'alive', 'created': '111'}})
+        with closing(self._conn()) as conn:
+            self._insert(conn, 'cb1', dp.CODEBUDDY_POOL_KEY, 'running', child_pid=4321,
+                         child_created='111', started=T0 - timedelta(seconds=600))
+        with dispatch_mode('weak'):
+            snap = self._snap(probe=probe)
+            shown = {r['pool_key'] for r in snap['rows']}
+            # BW-STRONG-SONUS-20261024：weak 空闲不显示 Sonus（强档专属，无在途整行隐藏）；
+            # 其余全部行（含测试兼容 Luna 行）照常显示。
+            self.assertNotIn(dp.SONUS_POOL_KEY, shown)
+            self.assertNotIn(dp.CN_CUSTOM_MAX_POOL_KEY, shown)
+            self.assertEqual(len(snap['rows']), len(wsw.ROW_DEFS) - 2)
+            for pk in self.EXCLUDED:
+                row = self._row(snap, pk)
+                self.assertTrue(row['participates'], pk)
+                self.assertFalse(row['mode_excluded'], pk)
+            self.assertEqual(self._row(snap, dp.CODEBUDDY_POOL_KEY)['state'], 'running')
+            self.assertEqual(snap['domestic_active'], 1)
+
+    def test_sonus_strong_first_medium_weak_hidden_and_legacy_in_flight(self):
+        """BW-SONUS-REENABLE-20261028：恢复启用后回到 strong 专属常态口径——strong
+        空闲显示 Sonus 且排第一；medium/weak 空闲整行隐藏；切档前遗留的
+        reserved/running/unknown Sonus 在 medium/weak 整行保留、标「本档不参与」
+        直到真实终态；物理总容量仍 16。"""
+        probe = _probe({4321: {'pid': 4321, 'state': 'alive', 'created': '111'}})
+        with closing(self._conn()):
+            pass  # 建库（缺库快照 ok=False，绝不冒充空闲）
+        # 三档空闲：strong 显示 Sonus（第一、参与）；medium/weak 整行隐藏。
+        with dispatch_mode('strong'):
+            snap = self._snap(probe=probe)
+            shown = {r['pool_key'] for r in snap['rows']}
+            self.assertIn(dp.SONUS_POOL_KEY, shown)
+            sonus = self._row(snap, dp.SONUS_POOL_KEY)
+            self.assertTrue(sonus['participates'])
+            self.assertFalse(sonus['mode_excluded'])
+            self.assertIsNone(sonus['mode_excluded_label'])
+            self.assertEqual(sonus['priority'], 1)
+            self.assertEqual(snap['rows'][0]['pool_key'], dp.SONUS_POOL_KEY)
+        for mode in ('medium', 'weak'):
+            with dispatch_mode(mode):
+                snap = self._snap(probe=probe)
+                self.assertNotIn(dp.SONUS_POOL_KEY,
+                                 {r['pool_key'] for r in snap['rows']}, mode)
+        with closing(self._conn()) as conn:
+            self._insert(conn, 's1', dp.SONUS_POOL_KEY, 'reserved',
+                         reserved=T0 - timedelta(seconds=120))
+        # strong 在途照常参与；medium/weak 遗留在途整行保留 + 通用「本档不参与」标签。
+        with dispatch_mode('strong'):
+            snap = self._snap(probe=probe)
+            sonus = self._row(snap, dp.SONUS_POOL_KEY)
+            self.assertTrue(sonus['participates'])
+            self.assertEqual(sonus['state'], 'reserved')
+            self.assertEqual(sonus['active'], 1)
+            self.assertEqual(snap['domestic_active'], 1)
+            self.assertEqual(snap['domestic_total_capacity'], 16)
+        for mode in ('medium', 'weak'):
+            with dispatch_mode(mode):
+                snap = self._snap(probe=probe)
+                shown = {r['pool_key'] for r in snap['rows']}
+                self.assertIn(dp.SONUS_POOL_KEY, shown, mode)
+                sonus = self._row(snap, dp.SONUS_POOL_KEY)
+                self.assertTrue(sonus['mode_excluded'], mode)
+                self.assertFalse(sonus['participates'], mode)
+                self.assertEqual(sonus['mode_excluded_label'], '本档不参与')
+                self.assertEqual(sonus['state'], 'reserved')
+                self.assertEqual(sonus['active'], 1)
+                detail = wsw.detail_text(sonus)
+                self.assertIn('本档不参与', detail)
+                self.assertIn('已在途', detail)
+                self.assertEqual(snap['domestic_active'], 1, mode)
+                self.assertEqual(snap['domestic_total_capacity'], 16, mode)
+        # 真实终态后：medium/weak 空闲不再显示 Sonus 行；strong 空闲照常显示。
+        with closing(self._conn()) as conn:
+            conn.execute("UPDATE attempts SET state='finished', terminal='finished', "
+                         "success=1, ended_at_utc=? WHERE token='s1'", (_iso(T0),))
+        for mode in ('medium', 'weak'):
+            with dispatch_mode(mode):
+                snap = self._snap(probe=probe)
+                self.assertNotIn(dp.SONUS_POOL_KEY,
+                                 {r['pool_key'] for r in snap['rows']}, mode)
+                self.assertEqual(snap['domestic_active'], 0, mode)
+        with dispatch_mode('strong'):
+            snap = self._snap(probe=probe)
+            self.assertIn(dp.SONUS_POOL_KEY,
+                          {r['pool_key'] for r in snap['rows']})
+
+
+class TestUserDisabledCustomMax(_WidgetBase):
+    def test_idle_hidden_legacy_visible_until_real_terminal_in_all_modes(self):
+        pk = dp.CN_CUSTOM_MAX_POOL_KEY
+        probe = _probe({4321: {'pid': 4321, 'state': 'alive', 'created': '111'}})
+        with closing(self._conn()):
+            pass
+        for mode in dm.MODES:
+            with dispatch_mode(mode):
+                self.assertNotIn(pk, {r['pool_key'] for r in self._snap()['rows']})
+        for state in ('reserved', 'running', 'unknown'):
+            with closing(self._conn()) as conn:
+                self._insert(conn, state, pk, state, child_pid=4321 if state == 'running' else None,
+                             child_created='111' if state == 'running' else None, started=T0)
+            for mode in dm.MODES:
+                with dispatch_mode(mode):
+                    snap = self._snap(probe=probe)
+                    row = self._row(snap, pk)
+                    self.assertEqual(row['state'], state)
+                    self.assertEqual(row['active'], 1)
+                    self.assertEqual(row['capacity'], 2)
+                    self.assertEqual(row['mode_excluded_label'], '已禁用（用户指令）')
+                    self.assertTrue(row['mode_excluded'])
+                    self.assertFalse(row['participates'])
+                    self.assertIn('已禁用（用户指令）', wsw.detail_text(row))
+                    self.assertIn(('mode', '已禁用（用户指令）'), wsw.row_badges(row))
+                    self.assertEqual(snap['domestic_active'], 1)
+                    self.assertEqual(snap['domestic_total_capacity'], 16)
+                    self.assertEqual(snap['retired_active'], 0)
+                    self.assertIn(pk, {r['pool_key'] for r in wsw.view_rows(snap, expanded=True)})
+            with closing(self._conn()) as conn:
+                conn.execute("UPDATE attempts SET state='finished', terminal='finished', "
+                             'success=1, ended_at_utc=? WHERE token=?', (_iso(T0), state))
+            for mode in dm.MODES:
+                with dispatch_mode(mode):
+                    snap = self._snap(probe=probe)
+                    self.assertNotIn(pk, {r['pool_key'] for r in snap['rows']})
+                    self.assertEqual(snap['domestic_active'], 0)
 
 
 class TestLastResultAndLimits(_WidgetBase):
@@ -421,19 +764,22 @@ class TestLastResultAndLimits(_WidgetBase):
                          (dp.QMAX_POOL_KEY, 1, 'T-old', 'q-old', _iso(T0)))
             self._insert(conn, 'q-old', dp.QMAX_POOL_KEY, 'finished', started=T0,
                          ended=T0, terminal='finished', success=0)
-        # 场景 A：标记仍绑定该池最新 attempt → 显示“上轮限额”。
+        # 场景 A：绑定 attempt 终态时刻仍在 15 分钟窗口内 → 显示“上轮限额”。
         snap = self._snap()
         self.assertTrue(self._row(snap, dp.QMAX_POOL_KEY)['prev_limited'])
-        # 场景 B：出现更新的成功 attempt → 旧历史标记绝不当当前不可用。
+        # 场景 B（BW-QWEN-MAX-LIMIT15-20261028）：更新的成功 attempt 不再把窗口内真实
+        # 限额提前隐藏（与 CodeBuddy 窗口同口径）；恰满 900 秒才撤下。
         with closing(self._conn()) as conn:
             self._insert(conn, 'q-new', dp.QMAX_POOL_KEY, 'finished',
                          started=T0 + timedelta(minutes=5),
                          ended=T0 + timedelta(minutes=9),
                          terminal='finished', success=1)
-        snap = self._snap()
+        snap = self._snap(now=T0 + timedelta(seconds=899))
         qm = self._row(snap, dp.QMAX_POOL_KEY)
-        self.assertFalse(qm['prev_limited'])
+        self.assertTrue(qm['prev_limited'])
         self.assertEqual(qm['last_result'], 'passed')
+        self.assertFalse(self._row(self._snap(now=T0 + timedelta(seconds=900)),
+                                   dp.QMAX_POOL_KEY)['prev_limited'])
         # 场景 C：标记已解除（limited=0）→ 不显示。
         with closing(self._conn()) as conn:
             conn.execute('UPDATE main_force_limits SET limited=0, released_at_utc=? '
@@ -594,23 +940,26 @@ class TestQuota30Window(_WidgetBase):
                     self._snap(now=T0), dp.CODEBUDDY_POOL_KEY)['prev_limited'])
 
     def test_other_model_keeps_original_token_rule(self):
-        # 非 deepseek 池（qoder 国际 Max）保持原有“绑定最新 attempt token”规则与既有期限。
+        # BW-QWEN-MAX-LIMIT15-20261028：qoder 国际 Max 已入 15 分钟窗口表；改用不在窗口表
+        # 的 Flash 池验证非窗口池保持原有“绑定最新 attempt token”规则与既有期限。
+        pk = dp.QFLASH_POOL_KEY
+        self.assertNotIn(pk, wsw.WINDOW_LIMIT_POOLS)
         with closing(self._conn()) as conn:
             conn.execute('INSERT INTO main_force_limits(pool_key, limited, task_id, '
                          'attempt_token, recorded_at_utc) VALUES(?,?,?,?,?)',
-                         (dp.QMAX_POOL_KEY, 1, 'T-q', 'q-old', _iso(T0)))
-            self._insert(conn, 'q-old', dp.QMAX_POOL_KEY, 'finished', started=T0,
+                         (pk, 1, 'T-q', 'q-old', _iso(T0)))
+            self._insert(conn, 'q-old', pk, 'finished', started=T0,
                          ended=T0, terminal='finished', success=0)
         self.assertTrue(self._row(self._snap(now=T0 + timedelta(seconds=60)),
-                                  dp.QMAX_POOL_KEY)['prev_limited'])
-        # 更新的成功 attempt 顶掉 token → 原规则下立即隐藏（不受半小时窗口延长）。
+                                  pk)['prev_limited'])
+        # 更新的成功 attempt 顶掉 token → 原规则下立即隐藏（不受任何时间窗口延长）。
         with closing(self._conn()) as conn:
-            self._insert(conn, 'q-new', dp.QMAX_POOL_KEY, 'finished',
+            self._insert(conn, 'q-new', pk, 'finished',
                          started=T0 + timedelta(seconds=30),
                          ended=T0 + timedelta(seconds=40),
                          terminal='finished', success=1)
         self.assertFalse(self._row(self._snap(now=T0 + timedelta(seconds=60)),
-                                   dp.QMAX_POOL_KEY)['prev_limited'])
+                                   pk)['prev_limited'])
 
     def test_in_flight_and_limit_both_visible(self):
         # 有在途（unknown 待核）时：真实待核状态与半小时限额同时可辨，不被限额遮盖。
@@ -688,11 +1037,10 @@ class TestQuota30Window(_WidgetBase):
 
 
 class TestWindowLimitPools(_WidgetBase):
-    """BW-LIMIT30-20261019-S3：claude:deepseek-flash 与 CodeBuddy deepseek 同口径——按
-    绑定 attempt 的真实 ended_at_utc 计 0<=age<1800 显示；空闲显示“上轮限额”，真实运行中
-    只显示“运行中”，恰好 1800 秒撤下提示且不声称恢复。
-    BW-ZCODE-RETIRE-20261020：zcode:GLM-5.3 已退役，不再出现在可派行，原 zcode 窗口用例
-    改用现役 CodeBuddy deepseek 池（同属窗口池，口径一致）。"""
+    """BW-LIMIT30-20261019-S3：CodeBuddy deepseek / zcode:GLM-5.3 / claude:deepseek-flash
+    三个窗口限额池同口径——按绑定 attempt 的真实 ended_at_utc 计 0<=age<1800 显示；
+    空闲显示“上轮限额”，真实运行中只显示“运行中”，恰好 1800 秒撤下提示且不声称恢复。
+    BW-ZCODE-RESTORE-1-20261022：zcode:GLM-5.3 恢复可派，三池全部现役，展示同口径覆盖。"""
 
     def _mark(self, pk, *, ended=T0, token=None):
         token = token or f'{pk}-old'
@@ -705,9 +1053,9 @@ class TestWindowLimitPools(_WidgetBase):
         return token
 
     def test_claude_boundary_1799_shows_1800_hides(self):
-        # BW-ZCODE-RETIRE-20261020：退役 zcode 不显示行，边界用例保留 claude，另补
-        # 现役 CodeBuddy deepseek 同口径验证。
-        for pk in (dp.CLAUDE_POOL_KEY, dp.CODEBUDDY_POOL_KEY):
+        # BW-ZCODE-RESTORE-1-20261022：三个窗口池（含恢复的 zcode）全部现役，
+        # 1799/1800 秒边界同口径验证。
+        for pk in (dp.CLAUDE_POOL_KEY, dp.CODEBUDDY_POOL_KEY, dp.ZCODE_POOL_KEY):
             with self.subTest(pool=pk):
                 self._mark(pk)
                 row = self._row(self._snap(now=T0 + timedelta(seconds=1799)), pk)
@@ -719,8 +1067,10 @@ class TestWindowLimitPools(_WidgetBase):
 
     def test_running_hides_limit_for_new_pools(self):
         created = '2026-10-08T15:00:00+00:00'
-        # BW-ZCODE-RETIRE-20261020：只测现役窗口池 claude（zcode 已退役无展示行）。
-        for i, pk in enumerate((dp.CLAUDE_POOL_KEY,)):
+        # BW-ZCODE-RESTORE-1-20261022：三个窗口限额池（含恢复的 zcode）全部现役，
+        # 真实运行中一律不展示历史限额。
+        for i, pk in enumerate((dp.CODEBUDDY_POOL_KEY, dp.ZCODE_POOL_KEY,
+                                dp.CLAUDE_POOL_KEY)):
             with self.subTest(pool=pk):
                 pid = 5000 + i
                 self._mark(pk)
@@ -735,12 +1085,11 @@ class TestWindowLimitPools(_WidgetBase):
                 self.assertEqual(row['main_state_label'], '运行中')
                 self.assertNotIn(('limit', '限额'), wsw.row_badges(row))
                 self.assertNotIn('上轮限额：', wsw.detail_text(row))
-                # 退役 zcode 绝不显示成可派行（含限额标记也不复活）。
-                self.assertNotIn(dp.ZCODE_POOL_KEY,
-                                 [r['pool_key'] for r in self._snap()['rows']])
+        # 恢复后的 ZCode 在快照里含且只含一行（含限额标记也不新增第二行）。
+        rows_now = [r['pool_key'] for r in self._snap()['rows']]
+        self.assertEqual(rows_now.count(dp.ZCODE_POOL_KEY), 1)
 
     def test_expired_window_does_not_claim_recovery(self):
-        # BW-ZCODE-RETIRE-20261020：原 zcode 窗口池改用现役 CodeBuddy deepseek（同口径）。
         self._mark(dp.CODEBUDDY_POOL_KEY)
         row = self._row(self._snap(now=T0 + timedelta(seconds=1801)),
                         dp.CODEBUDDY_POOL_KEY)
@@ -849,29 +1198,45 @@ class TestGuiHelpers(_WidgetBase):
         self.assertEqual(wsw.format_duration(3720), '1时02分')
 
     def test_detail_text_window_only_for_the_three_window_pools(self):
-        """BW-LIMIT30-20261019-S3：只有 zcode:GLM-5.3 / claude:deepseek-flash /
-        codebuddy:deepseek-v4.1-flash 三个精确池详情说“近 30 分钟/超过 30 分钟撤下”；
-        其它池保留“标记绑定最新 attempt、历史非实时额度”说明，绝不冒称 30 分钟。
-        BW-ZCODE-RETIRE-20261020：zcode 已退役不再有展示行，常量 WINDOW_LIMIT_POOLS
-        仍含其精确池键（历史诊断保留）；展示层循环只覆盖现役两池，并断言退役 zcode
-        不出现在任何行。"""
-        # 非窗口池（Qoder 国际 Max）按原有 token 规则落标且仍绑定最新 attempt → prev_limited。
+        """BW-LIMIT30-20261019-S3：codebuddy:deepseek-v4.1-flash / zcode:GLM-5.3 /
+        claude:deepseek-flash 三个精确池详情说“近 30 分钟/超过 30 分钟撤下”；
+        其它窗口外池保留“标记绑定最新 attempt、历史非实时额度”说明，绝不冒称 30 分钟。
+        BW-ZCODE-RESTORE-1-20261022：zcode:GLM-5.3 恢复可派，三池全部现役，
+        窗口限额详情同口径覆盖。BW-QWEN-MAX-LIMIT15-20261028：两个 Qoder 内置 Max
+        加入窗口表（15 分钟短窗），非窗口池改用 Flash 池表达旧 token 规则。"""
+        # 两个内置 Max：详情明确写 15 分钟短窗、绝不冒称 30 分钟。
+        for pk in (dp.QMAX_POOL_KEY, dp.CN_MAX_POOL_KEY):
+            with self.subTest(max_pool=pk):
+                with closing(self._conn()) as conn:
+                    conn.execute('DELETE FROM main_force_limits WHERE pool_key=?', (pk,))
+                    conn.execute('INSERT INTO main_force_limits(pool_key, limited, '
+                                 'task_id, attempt_token, recorded_at_utc) '
+                                 'VALUES(?,?,?,?,?)',
+                                 (pk, 1, 'T-m', f'm-{pk}', _iso(T0)))
+                    self._insert(conn, f'm-{pk}', pk, 'finished',
+                                 started=T0, ended=T0, terminal='finished', success=0)
+                row = self._row(self._snap(now=T0), pk)
+                self.assertTrue(row['prev_limited'], row)
+                text = wsw.detail_text(row)
+                self.assertIn('15 分钟', text)
+                self.assertNotIn('30 分钟', text)
+                self.assertIn('不代表实时余额', text)
+        # 非窗口池（Flash）按原有 token 规则落标且仍绑定最新 attempt → prev_limited。
         with closing(self._conn()) as conn:
             conn.execute('INSERT INTO main_force_limits(pool_key, limited, task_id, '
                          'attempt_token, recorded_at_utc) VALUES(?,?,?,?,?)',
-                         (dp.QMAX_POOL_KEY, 1, 'T-q', 'q-old', _iso(T0)))
-            self._insert(conn, 'q-old', dp.QMAX_POOL_KEY, 'finished', started=T0,
+                         (dp.QFLASH_POOL_KEY, 1, 'T-q', 'q-old', _iso(T0)))
+            self._insert(conn, 'q-old', dp.QFLASH_POOL_KEY, 'finished', started=T0,
                          ended=T0, terminal='finished', success=0)
-        qrow = self._row(self._snap(), dp.QMAX_POOL_KEY)
+        qrow = self._row(self._snap(), dp.QFLASH_POOL_KEY)
         self.assertTrue(qrow['prev_limited'])
         qtext = wsw.detail_text(qrow)
         self.assertIn('上轮限额', qtext)
         self.assertNotIn('30 分钟', qtext)      # 其它池绝不冒称半小时窗口
         self.assertNotIn('30分钟', qtext)
         self.assertIn('最新 attempt', qtext)    # 保留原“绑定最新 attempt、历史非实时额度”语义
-        # 现役两个窗口池：Claude / CodeBuddy deepseek 均保留 30 分钟说明；
-        # BW-ZCODE-RETIRE-20261020：退役 zcode 不再有任何展示行。
-        for pk in (dp.CODEBUDDY_POOL_KEY, dp.CLAUDE_POOL_KEY):
+        # 三个原窗口池：CodeBuddy deepseek / zcode / claude 均保留 30 分钟说明。
+        for pk in (dp.CODEBUDDY_POOL_KEY, dp.ZCODE_POOL_KEY, dp.CLAUDE_POOL_KEY):
             with self.subTest(pool=pk):
                 with closing(self._conn()) as conn:
                     conn.execute('DELETE FROM main_force_limits WHERE pool_key=?', (pk,))
@@ -887,7 +1252,13 @@ class TestGuiHelpers(_WidgetBase):
                 self.assertIn('30 分钟', text)
                 self.assertIn('不代表实时余额', text)
         snap = self._snap(now=T0 + timedelta(seconds=30))
-        self.assertNotIn(dp.ZCODE_POOL_KEY, [r['pool_key'] for r in snap['rows']])
+        # 恢复后的 ZCode 行含且只含一行，且其限额展示走 30 分钟窗口口径。
+        rows_now = [r['pool_key'] for r in snap['rows']]
+        self.assertEqual(rows_now.count(dp.ZCODE_POOL_KEY), 1)
+        self.assertEqual(wsw.WINDOW_LIMIT_POOLS,
+                         (dp.ZCODE_POOL_KEY, dp.CLAUDE_POOL_KEY,
+                          dp.CODEBUDDY_POOL_KEY,
+                          dp.QMAX_POOL_KEY, dp.CN_MAX_POOL_KEY))
 
 
 class TestCompactViewHelpers(unittest.TestCase):
@@ -1389,71 +1760,80 @@ class TestIdleShutdownController(unittest.TestCase):
 
 # ------------------------------------------- 时段外展示标签（BW-OPENCODE-20261019-S4）
 class TestWindowClosedLabels(unittest.TestCase):
-    """仅显示层的时段外富标签；不改时段门/容量/派工/关机。纯函数注入 naive 北京时间；
-    不启动 Tk、不联网、不读日历。Claude 复用 deepseek_offpeak 纯函数计算下一个连续
-    放行区间，跨日/跨周末/跨法定假日都不硬截成"次日09:00"。"""
+    """仅显示层的时段外标签；不改时段门/容量/派工/关机。纯函数注入 naive 北京时间；
+    不启动 Tk、不联网、不读日历。BW-MANUAL-THREE-MODE-20261023：标签按**当前档**——
+    中/弱档三个 Max 走夜间窗标签、claude 走工作日高峰标签；强档五个池全部无时段门。"""
 
     def test_max_pools_fixed_window_label_independent_of_now(self):
-        for pk in dp.WINDOW_GATED_MAIN_FORCES:
-            for now in (datetime(2026, 10, 8, 15, 0, tzinfo=timezone.utc),
-                        datetime(2026, 10, 8, 0, 0, tzinfo=timezone.utc)):
-                self.assertEqual(wsw.window_closed_display_label(pk, now),
-                                 '时段外（22:00–次日08:00）')
+        for mode in ('medium', 'weak'):
+            for pk in (dp.QMAX_POOL_KEY, dp.CN_MAX_POOL_KEY,
+                       dp.CN_CUSTOM_MAX_POOL_KEY):
+                for now in (datetime(2026, 10, 8, 15, 0, tzinfo=timezone.utc),
+                            datetime(2026, 10, 8, 0, 0, tzinfo=timezone.utc)):
+                    self.assertEqual(wsw.window_closed_display_label(pk, now, mode),
+                                     '时段外（22:00–次日08:00）', (pk, mode))
         self.assertEqual(wsw.MAX_WINDOW_CLOSED_LABEL, '时段外（22:00–次日08:00）')
+        self.assertEqual(wsw.CLAUDE_PEAK_CLOSED_LABEL,
+                         '时段外（工作日高峰 09–12／14–18）')
 
     def test_max_window_boundary_22_open_08_closed(self):
         # 北京 22:00(=UTC 14:00, 10-07) 含 → 窗口开，不挡；北京 08:00(=UTC 00:00, 10-08)
-        # 不含 → 窗口关，挡下。
-        self.assertFalse(dp._max_window_blocks(dp.QMAX_POOL_KEY,
-                                               datetime(2026, 10, 7, 14, 0,
-                                                        tzinfo=timezone.utc)))
-        self.assertTrue(dp._max_window_blocks(dp.QMAX_POOL_KEY,
-                                              datetime(2026, 10, 8, 0, 0,
-                                                       tzinfo=timezone.utc)))
+        # 不含 → 窗口关，挡下。中/弱档三个 Max 同门；强档全部放行。
+        utc22 = datetime(2026, 10, 7, 14, 0, tzinfo=timezone.utc)
+        utc08 = datetime(2026, 10, 8, 0, 0, tzinfo=timezone.utc)
+        max_pools = (dp.QMAX_POOL_KEY, dp.CN_MAX_POOL_KEY, dp.CN_CUSTOM_MAX_POOL_KEY)
+        for mode in ('medium', 'weak'):
+            for pk in max_pools:
+                self.assertFalse(dp._max_window_blocks(pk, utc22, mode), (pk, mode))
+                self.assertTrue(dp._max_window_blocks(pk, utc08, mode), (pk, mode))
+        for pk in max_pools:
+            self.assertFalse(dp._max_window_blocks(pk, utc22, 'strong'), pk)
+            self.assertFalse(dp._max_window_blocks(pk, utc08, 'strong'), pk)
 
-    def test_claude_next_open_window_boundaries_cross_day_weekend_holiday(self):
-        # 周四 10:00 高峰(09-12) → 下一放行 12:00–14:00 同日。
-        self.assertEqual(wsw.claude_next_open_window(datetime(2026, 10, 8, 10, 0)),
-                         (datetime(2026, 10, 8, 12, 0), datetime(2026, 10, 8, 14, 0)))
-        # 周四 15:00 高峰(14-18) → 下一放行 18:00–次日(周五)09:00。
-        self.assertEqual(wsw.claude_next_open_window(datetime(2026, 10, 8, 15, 0)),
-                         (datetime(2026, 10, 8, 18, 0), datetime(2026, 10, 9, 9, 0)))
-        # 周五 15:00 → 跨整个周末到周一 09:00（绝不硬截成"次日09:00"）。
-        self.assertEqual(wsw.claude_next_open_window(datetime(2026, 10, 9, 15, 0)),
-                         (datetime(2026, 10, 9, 18, 0), datetime(2026, 10, 12, 9, 0)))
-        # 9-30(周三)15:00 → 跨国庆假期 10-01..07 到 10-08(周四)09:00。
-        self.assertEqual(wsw.claude_next_open_window(datetime(2026, 9, 30, 15, 0)),
-                         (datetime(2026, 9, 30, 18, 0), datetime(2026, 10, 8, 9, 0)))
-        # 未知年度 2027-01-07(周四)10:00 → 高峰保守关闭，下一放行 12:00–14:00。
-        self.assertEqual(wsw.claude_next_open_window(datetime(2027, 1, 7, 10, 0)),
-                         (datetime(2027, 1, 7, 12, 0), datetime(2027, 1, 7, 14, 0)))
-        # 可派时刻（周末/非高峰）返回 None。
-        self.assertIsNone(wsw.claude_next_open_window(datetime(2026, 10, 8, 13, 0)))
-        self.assertIsNone(wsw.claude_next_open_window(datetime(2026, 10, 10, 10, 0)))
-
-    def test_claude_display_label_via_aware_utc_now(self):
-        # UTC 02:00 = 北京周四 10:00 → 富标签 12:00–14:00。
-        self.assertEqual(
-            wsw.window_closed_display_label(
-                dp.CLAUDE_POOL_KEY, datetime(2026, 10, 8, 2, 0, tzinfo=timezone.utc)),
-            '时段外（下次12:00–14:00）')
-        # UTC 07:00 = 北京周四 15:00 → 跨日到次日 09:00。
-        self.assertEqual(
-            wsw.window_closed_display_label(
-                dp.CLAUDE_POOL_KEY, datetime(2026, 10, 8, 7, 0, tzinfo=timezone.utc)),
-            '时段外（下次18:00–次日09:00）')
-        # 北京周五 15:00 → 跨周末到 10-12，写明日期，不截次日。
-        self.assertEqual(
-            wsw.window_closed_display_label(
-                dp.CLAUDE_POOL_KEY, datetime(2026, 10, 9, 7, 0, tzinfo=timezone.utc)),
-            '时段外（下次18:00–10-12 09:00）')
+    def test_claude_peak_label_only_outside_strong_mode(self):
+        # 中/弱档：工作日高峰（周四 10:00 / 15:00）与未知年度工作日挡下 claude；周末、
+        # 法定假日与离峰放行。强档：任何时刻都不挡，标签也绝不出现"时段外"。
+        peak_times = (datetime(2026, 10, 8, 2, 0, tzinfo=timezone.utc),    # 北京周四 10:00
+                      datetime(2026, 10, 8, 7, 0, tzinfo=timezone.utc),    # 北京周四 15:00
+                      datetime(2027, 1, 7, 2, 0, tzinfo=timezone.utc))     # 未知年度工作日
+        open_times = (datetime(2026, 10, 10, 2, 0, tzinfo=timezone.utc),   # 北京周六 10:00
+                      datetime(2026, 10, 1, 2, 0, tzinfo=timezone.utc),    # 北京十一 10:00
+                      datetime(2026, 10, 8, 5, 0, tzinfo=timezone.utc),    # 北京周四 13:00
+                      datetime(2026, 10, 8, 15, 0, tzinfo=timezone.utc))   # 北京 23:00
+        for mode in ('medium', 'weak'):
+            for now in peak_times:
+                self.assertTrue(dp._max_window_blocks(dp.CLAUDE_POOL_KEY, now, mode),
+                                (mode, now))
+                self.assertEqual(
+                    wsw.window_closed_display_label(dp.CLAUDE_POOL_KEY, now, mode),
+                    wsw.CLAUDE_PEAK_CLOSED_LABEL, (mode, now))
+            for now in open_times:
+                self.assertFalse(dp._max_window_blocks(dp.CLAUDE_POOL_KEY, now, mode),
+                                 (mode, now))
+                # 非时段外时绝不进入「时段外」展示分支（标签函数只对已判时段外的行调用）。
+                self.assertEqual(
+                    wsw.window_closed_display_label(dp.CLAUDE_POOL_KEY, now, mode),
+                    wsw.CLAUDE_PEAK_CLOSED_LABEL, (mode, now))
+        for now in peak_times + open_times:
+            self.assertFalse(dp._max_window_blocks(dp.CLAUDE_POOL_KEY, now, 'strong'), now)
+        self.assertIn(dp.CLAUDE_POOL_KEY, dp.WINDOW_GATED_MAIN_FORCES)
+        self.assertNotIn(dp.CLAUDE_POOL_KEY, dp.window_gated_pools('strong'))
 
     def test_display_only_no_state_gate_mutation(self):
         # 标签富化绝不改变时段门判定本身（同一 now 下 blocked 结果与原语义一致）。
         now = datetime(2026, 10, 8, 2, 0, tzinfo=timezone.utc)  # 北京周四 10:00
-        self.assertTrue(dp._max_window_blocks(dp.CLAUDE_POOL_KEY, now))
-        self.assertTrue(dp._max_window_blocks(dp.QMAX_POOL_KEY, now))
-        self.assertFalse(dp._max_window_blocks(dp.CODEBUDDY_POOL_KEY, now))
+        gated = (dp.CLAUDE_POOL_KEY, dp.CN_MAX_POOL_KEY,
+                 dp.CN_CUSTOM_MAX_POOL_KEY, dp.QMAX_POOL_KEY)
+        for mode in ('medium', 'weak'):
+            for pk in gated:
+                self.assertTrue(dp._max_window_blocks(pk, now, mode), (pk, mode))
+            self.assertFalse(dp._max_window_blocks(dp.CODEBUDDY_POOL_KEY, now, mode))
+        for pk in gated + (dp.CODEBUDDY_POOL_KEY,):
+            self.assertFalse(dp._max_window_blocks(pk, now, 'strong'), pk)
+        # 纯函数只读：取标签不改变任何判定。
+        before = dp._max_window_blocks(dp.CLAUDE_POOL_KEY, now, 'weak')
+        wsw.window_closed_display_label(dp.CLAUDE_POOL_KEY, now, 'weak')
+        self.assertEqual(dp._max_window_blocks(dp.CLAUDE_POOL_KEY, now, 'weak'), before)
 
 
 class TestRealShutdownCommandMocked(unittest.TestCase):
@@ -1615,6 +1995,185 @@ class TestRealTkLayoutHeight(unittest.TestCase):
         self.assertEqual(self.frames['empty'].winfo_manager(), 'pack')
 
 
+class TestPollerDelivery(unittest.TestCase):
+    def test_polling_delivers_transitions_and_safe_failure_every_two_seconds(self):
+        import queue
+        out = queue.Queue()
+        poller = wsw._Poller(out, store_path='isolated.sqlite3')
+        idle = {'ok': True, 'rows': []}
+        running = {'ok': True, 'rows': [{'pool_key': dp.CLAUDE_POOL_KEY}]}
+        poller._stop = mock.Mock()
+        poller._stop.is_set.side_effect = [False] * 4 + [True]
+        with mock.patch.object(wsw, 'read_snapshot', side_effect=[
+                idle, running, ValueError('synthetic-private-error'), idle]) as read:
+            poller.run()
+        self.assertEqual(read.call_count, 4)
+        self.assertEqual(poller._stop.wait.call_args_list, [mock.call(2.0)] * 4)
+        self.assertIs(out.get_nowait(), idle)
+        self.assertIs(out.get_nowait(), running)
+        failed = out.get_nowait()
+        self.assertFalse(failed['ok'])
+        self.assertEqual(failed['error_code'], 'read_failed')
+        self.assertNotIn('synthetic-private-error', wsw.snapshot_to_json_str(failed))
+        self.assertIs(out.get_nowait(), idle)
+        self.assertTrue(out.empty())
+
+
+class TestGuiRefreshLifecycle(_WidgetBase):
+    def setUp(self):
+        super().setUp()
+        try:
+            import tkinter as tk
+            self.root = tk.Tk()
+        except Exception:
+            self.skipTest('no display for production Tk refresh regression')
+        self.tk = tk
+        self.root.withdraw()
+        self.addCleanup(self.root.destroy)
+
+    def _transitions(self):
+        with closing(self._conn()):
+            pass
+        probe = _probe({4321: {'pid': 4321, 'state': 'alive', 'created': '111'}})
+
+        def read(now):
+            before = Path(self.store).read_bytes()
+            snap = self._snap(now=now, probe=probe)
+            self.assertTrue(snap['ok'])
+            self.assertEqual(Path(self.store).read_bytes(), before)
+            self.assertEqual(self._sidecars(), [])
+            return snap
+
+        idle = read(T0)
+        with closing(self._conn()) as conn:
+            self._insert(conn, 'claude-visibility', dp.CLAUDE_POOL_KEY, 'running',
+                         child_pid=4321, child_created='111', started=T0)
+        running = read(T0 + timedelta(seconds=30))
+        with closing(self._conn()) as conn:
+            conn.execute("UPDATE attempts SET state='finished', terminal='finished', "
+                         "success=1, ended_at_utc=? WHERE token='claude-visibility'",
+                         (_iso(T0 + timedelta(seconds=60)),))
+        finished = read(T0 + timedelta(seconds=61))
+        return idle, running, finished
+
+    def _drive_gui(self, exercise, *, use_default=False):
+        pollers = []
+        pending = []
+
+        def after(delay, callback):
+            pending.append((delay, callback))
+            return f'job-{len(pending)}'
+
+        def mainloop():
+            frames = layout.call_args.args[0]
+            cards = dict(zip((pk for pk, _, _ in wsw.ROW_DEFS),
+                             frames['rows'].winfo_children()))
+
+            def tick(*snapshots):
+                for snap in snapshots:
+                    pollers[0]._q.put(snap)
+                delay, callback = pending.pop(0)
+                self.assertIn(delay, (80, 150))
+                callback()
+
+            exercise(tick, frames, cards, pollers[0], pending)
+
+        with mock.patch.object(self.tk, 'Tk', return_value=self.root), \
+                mock.patch.object(self.root, 'mainloop', side_effect=mainloop), \
+                mock.patch.object(self.root, 'after', side_effect=after), \
+                mock.patch.object(self.root, 'winfo_pointerxy', return_value=(-1000, -1000)), \
+                mock.patch.object(wsw._Poller, 'start', new=lambda p: pollers.append(p)), \
+                mock.patch.dict(os.environ, {'BRAIN_WORKER_DISPATCH_STORE':
+                    self.store if use_default else str(self.base / 'other.sqlite3')}), \
+                mock.patch.object(wsw.dp, 'connect', side_effect=AssertionError('shared write')), \
+                mock.patch.object(wsw.dp, 'process_identity', side_effect=AssertionError('real probe')), \
+                mock.patch.object(wsw.dmode, 'save_mode', side_effect=AssertionError('mode write')), \
+                mock.patch.object(wsw, '_system_shutdown', side_effect=AssertionError('shutdown')), \
+                mock.patch.object(wsw, 'apply_layout', wraps=wsw.apply_layout) as layout:
+            wsw.run_gui(None if use_default else self.store)
+
+    def _texts(self, widget):
+        texts = [widget.cget('text')] if widget.winfo_class() == 'Label' else []
+        for child in widget.winfo_children():
+            texts.extend(self._texts(child))
+        return texts
+
+    def test_claude_idle_running_finished_reaches_production_compact_layout(self):
+        idle, running, finished = self._transitions()
+        attempt = self._row(running, dp.CLAUDE_POOL_KEY)['attempts'][0]
+        self.assertEqual((attempt['display_state'], attempt['pid_check'],
+                          attempt['elapsed_seconds']), ('running', 'alive_matched', 30))
+        self.assertEqual(self._row(finished, dp.CLAUDE_POOL_KEY)['last_result'], 'passed')
+
+        def exercise(tick, frames, cards, poller, pending):
+            card = cards[dp.CLAUDE_POOL_KEY]
+            heights = []
+            for snap, visible in ((idle, False), (running, True), (finished, False)):
+                tick(snap)
+                self.assertEqual(card.winfo_manager(), 'pack' if visible else '')
+                self.assertEqual(frames['rows'].winfo_manager(), 'pack' if visible else '')
+                self.assertEqual(frames['empty'].winfo_manager(), '' if visible else 'pack')
+                self.assertEqual(frames['detail'].winfo_manager(), '')
+                if visible:
+                    self.assertIn('运行中', self._texts(card))
+                    self.assertIn('1/2', self._texts(card))
+                heights.append(frames['rows'].master.winfo_reqheight())
+                self.assertEqual(len(pending), 1)
+            self.assertEqual(heights[0], heights[2])
+            self.assertNotEqual(heights[0], heights[1])
+
+        self._drive_gui(exercise)
+
+    def test_drain_uses_latest_snapshot_without_replaying_finished_running(self):
+        idle, running, finished = self._transitions()
+
+        def exercise(tick, frames, cards, poller, pending):
+            tick(idle, running, finished)
+            self.assertEqual(cards[dp.CLAUDE_POOL_KEY].winfo_manager(), '')
+            self.assertEqual(frames['rows'].winfo_manager(), '')
+            self.assertTrue(poller._q.empty())
+            self.assertEqual(len(pending), 1)
+
+        self._drive_gui(exercise)
+
+    def test_render_exception_clears_old_running_and_keeps_drain_scheduled(self):
+        idle, running, finished = self._transitions()
+
+        def exercise(tick, frames, cards, poller, pending):
+            tick(running)
+            with mock.patch.object(wsw, 'compact_state_text',
+                                   side_effect=ValueError('synthetic-private-error')):
+                try:
+                    tick(finished)
+                except ValueError:
+                    pass
+            self.assertEqual(len(pending), 1, 'render exception stopped queue refresh')
+            self.assertEqual(cards[dp.CLAUDE_POOL_KEY].winfo_manager(), '')
+            self.assertEqual(frames['rows'].winfo_manager(), '')
+            self.assertIn('render_failed', ' '.join(self._texts(self.root)))
+            self.assertNotIn('synthetic-private-error', ' '.join(self._texts(self.root)))
+            tick(running)
+            self.assertEqual(cards[dp.CLAUDE_POOL_KEY].winfo_manager(), 'pack')
+            tick(idle)
+            self.assertEqual(cards[dp.CLAUDE_POOL_KEY].winfo_manager(), '')
+
+        self._drive_gui(exercise)
+
+    def test_actual_store_is_visible_in_compact_on_success_and_read_failure(self):
+        idle, _, _ = self._transitions()
+        failed = wsw._failure(self.store, T0, 'read_failed', 'synthetic-private-error')
+
+        def exercise(tick, frames, cards, poller, pending):
+            self.assertEqual(Path(poller._store), Path(self.store).resolve())
+            for snap in (idle, failed):
+                tick(snap)
+                self.assertEqual(frames['footer'].winfo_manager(), 'pack')
+                self.assertIn(str(Path(self.store).resolve()), frames['footer'].cget('text'))
+                self.assertNotIn('synthetic-private-error', ' '.join(self._texts(self.root)))
+
+        self._drive_gui(exercise, use_default=True)
+
+
 class LunaDisabledWidgetTests(unittest.TestCase):
     def setUp(self):
         self._rows = wsw.ROW_DEFS
@@ -1628,8 +2187,11 @@ class LunaDisabledWidgetTests(unittest.TestCase):
 
     def test_luna_row_removed(self):
         self.assertNotIn(dp.LUNA_KEY, [row[0] for row in wsw.ROW_DEFS])
-        # BW-ZCODE-RETIRE-20261020：ZCode 行同样退役 → 可派展示行为 10。
-        self.assertEqual(len(wsw.ROW_DEFS), 10)
+        # BW-ZCODE-RESTORE-1-20261022 + BW-STRONG-SONUS-20261024：ZCode 行恢复 + 新增
+        # strong 专属 Sonus 行 → 生产 ROW_DEFS 为 12（含且只含一个 ZCode 行、一个 Sonus 行）。
+        self.assertEqual(len(wsw.ROW_DEFS), 12)
+        self.assertEqual([row[0] for row in wsw.ROW_DEFS].count(dp.ZCODE_POOL_KEY), 1)
+        self.assertEqual([row[0] for row in wsw.ROW_DEFS].count(dp.SONUS_POOL_KEY), 1)
 
 
 if __name__ == '__main__':

@@ -102,6 +102,13 @@ _CHILD_FIXED_ENV = {'CLAUDE_CODE_MAX_RETRIES': '0', 'API_TIMEOUT_MS': '60000',
 # 额度/认证/权限/协议解析错误在分类上恒优先于 transport，绝不进入重试。
 _TRANSPORT_RETRY_DELAYS_SECONDS = (5.0, 15.0)
 
+# BW-CLAUDE-TURN-BUDGET-20261021：工程任务不再使用会在正常推进中截断的固定 40 轮。
+# 仍保持有界；只读/非工程任务可用较低内置预算。收尾指令只随 system prompt 注入一次，
+# 提前告知模型在软阈值前停止扩张并完成 diff/测试/九节报告，不做无界续跑。
+DEFAULT_ENGINEERING_MAX_TURNS = 120
+DEFAULT_SIMPLE_MAX_TURNS = 40
+DEFAULT_CLOSEOUT_RESERVE_TURNS = 10
+
 DEFAULT_CONFIG = _SCRIPTS_DIR / 'claude-entry.local.json'
 EXAMPLE_CONFIG = _SCRIPTS_DIR / 'claude-entry.json.example'
 # 仅作说明：worker 工具不得访问真实私有配置属工具作用域约束；入口加载器本身不按文件名拒绝。
@@ -143,6 +150,96 @@ def load_entry_config(path=None) -> dict:
     if not isinstance(cfg, dict):
         raise ValueError(f'entry config must be a JSON object: {cfg_path}')
     return cfg
+
+
+def _turn_budget(cfg: dict, *, is_engineering_task: bool) -> dict:
+    """解析有界轮次预算及来源；内部元数据绝不进入 Claude argv。"""
+    configured = cfg.get('max_turns')
+    if configured is None:
+        configured = (DEFAULT_ENGINEERING_MAX_TURNS if is_engineering_task
+                      else DEFAULT_SIMPLE_MAX_TURNS)
+        source = ('builtin_engineering_default' if is_engineering_task
+                  else 'builtin_simple_default')
+    else:
+        source = str(cfg.get('_max_turns_source') or 'config:max_turns')
+    try:
+        configured = int(configured)
+        reserve = int(cfg.get('closeout_reserve_turns',
+                              DEFAULT_CLOSEOUT_RESERVE_TURNS))
+    except (TypeError, ValueError) as exc:
+        raise ValueError('max_turns and closeout_reserve_turns must be integers') from exc
+    if configured <= 0:
+        raise ValueError('max_turns must be positive')
+    if reserve < 5 or reserve > 10:
+        raise ValueError('closeout_reserve_turns must be between 5 and 10')
+    if configured <= reserve:
+        raise ValueError('max_turns must be greater than closeout_reserve_turns')
+    threshold = configured - reserve
+    return {'max_turns_configured': configured, 'max_turns_source': source,
+            'closeout_reserve_turns': reserve,
+            'closeout_soft_threshold': threshold,
+            'closeout_instruction_injected': True}
+
+
+def _closeout_instruction(budget: dict) -> str:
+    """一次性预置的软收尾指令；不在运行中反复注入或启动新会话。"""
+    return (
+        'TURN_BUDGET_CLOSEOUT (injected exactly once): this run is bounded to '
+        f"{budget['max_turns_configured']} turns. No later than turn "
+        f"{budget['closeout_soft_threshold']}, stop expanding investigation; inspect the "
+        'actual diff, run the critical authorized tests, and produce the complete nine-section '
+        'WORKER_REPORT. Reserve the final '
+        f"{budget['closeout_reserve_turns']} turns for closeout. Do not start unbounded "
+        'follow-up work or another session.'
+    )
+
+
+def _snapshot_controlled_files(workspace, files) -> list[dict]:
+    """对显式受控文件做前/后哈希；不扫描整个工作区，也不读取范围外文件。"""
+    root = Path(workspace).resolve()
+    rows = []
+    for raw in files or []:
+        if not isinstance(raw, str) or not raw.strip():
+            raise ValueError('write_files must contain non-blank paths')
+        p = Path(raw)
+        p = p.resolve() if p.is_absolute() else (root / p).resolve()
+        try:
+            rel = p.relative_to(root).as_posix()
+        except ValueError as exc:
+            raise ValueError(f'controlled file escapes workspace: {raw!r}') from exc
+        exists = p.is_file()
+        rows.append({'path': rel, 'exists': exists,
+                     'sha256': _sha(p.read_bytes()) if exists else None})
+    return rows
+
+
+def _controlled_file_changes(before, after) -> list[dict]:
+    old = {r['path']: r for r in before or []}
+    new = {r['path']: r for r in after or []}
+    changes = []
+    for path in sorted(set(old) | set(new)):
+        a = old.get(path, {'exists': False, 'sha256': None})
+        b = new.get(path, {'exists': False, 'sha256': None})
+        if a.get('exists') != b.get('exists') or a.get('sha256') != b.get('sha256'):
+            changes.append({'path': path, 'before_exists': bool(a.get('exists')),
+                            'before_sha256': a.get('sha256'),
+                            'after_exists': bool(b.get('exists')),
+                            'after_sha256': b.get('sha256')})
+    return changes
+
+
+def _observed_bash_commands(summary: dict) -> list[dict]:
+    """只转录 Bash tool_use 的命令；无结构化退出码时明确写 unknown，不从正文猜。"""
+    out = []
+    for block in summary.get('tool_use') or []:
+        if not isinstance(block, dict) or str(block.get('name', '')).lower() != 'bash':
+            continue
+        inp = block.get('input') if isinstance(block.get('input'), dict) else {}
+        command = inp.get('command')
+        if isinstance(command, str) and command.strip():
+            out.append({'tool_use_id': block.get('id'), 'command': command[:4000],
+                        'exit_code': None, 'exit_code_observed': False})
+    return out
 
 
 # ------------------------------------------------------------------ 凭据解析（零日志）
@@ -1212,6 +1309,10 @@ def classify_result(summary: dict, exit_code: int, stderr_text: str,
     只认**结构化/开头独立**的明确 429（`execution_control.explicit_429`），普通成功正文里的
     429 字样与取消退出码（4294967295/-1）绝不被误判为限额。"""
     result_event = summary.get('result_event') or {}
+    turn_budget_exhausted = summary.get('subtype') == 'error_max_turns'
+    turns_used = result_event.get('num_turns')
+    if not isinstance(turns_used, int) or isinstance(turns_used, bool) or turns_used < 0:
+        turns_used = None
     errors, errors_info, carrier_error = _result_error_carrier(result_event)
     subtype_ok = summary.get('subtype') == 'success'
     is_error = bool(summary.get('is_error') or carrier_error)
@@ -1257,6 +1358,11 @@ def classify_result(summary: dict, exit_code: int, stderr_text: str,
     facts = {
         'exit_code': exit_code,
         'subtype': summary.get('subtype'),
+        'terminal_class': ('turn_budget_exhausted'
+                           if turn_budget_exhausted else None),
+        'turn_budget_exhausted': bool(turn_budget_exhausted),
+        # CLI result.num_turns 是模型轮次；绝不拿 tool_use_count 代替。
+        'turns_used': turns_used,
         'is_error': is_error,
         'protocol_success': protocol_success,
         'quota_429': bool(quota_429),
@@ -1352,6 +1458,57 @@ def write_evidence(out_dir: Path, *, events, facts: dict, report_text: str,
     return result
 
 
+def _turn_budget_continuation(out_dir: Path, *, facts: dict, summary: dict,
+                              binding: dict, evidence: dict, controlled_before,
+                              controlled_after, required_test_commands, started_at,
+                              finished_at, secret: str) -> dict:
+    """最大轮次耗尽时生成事实型接续包；不是原 Agent 报告，也不代写业务结论。"""
+    changed = _controlled_file_changes(controlled_before, controlled_after)
+    commands = _observed_bash_commands(summary)
+    observed_command_text = {x['command'] for x in commands}
+    unrun = [cmd for cmd in required_test_commands or []
+             if cmd not in observed_command_text]
+    partial = bool(facts.get('ok_tool_receipts', 0) > 0 or changed)
+    meta = {'partial_progress': partial, 'changed_files': len(changed),
+            'continuation_generated': False, 'continuation_path': None,
+            'continuation_sha256': None}
+    if not facts.get('turn_budget_exhausted') or not partial:
+        return meta
+    payload = {
+        'kind': 'claude-turn-budget-continuation',
+        'terminal_class': 'turn_budget_exhausted',
+        'partial_progress': True,
+        'not_original_worker_report': True,
+        'resume_rule': ('read this continuation and the actual diff first; preserve verified '
+                        'completed work and do not restart the exhausted session'),
+        'session_id': summary.get('session_id'),
+        'started_at_utc': started_at,
+        'finished_at_utc': finished_at,
+        'turns_used': facts.get('turns_used'),
+        'max_turns_configured': facts.get('max_turns_configured'),
+        'tool_receipts': {
+            'successful': facts.get('ok_tool_receipts', 0),
+            'error': facts.get('error_tool_receipts', 0),
+            'missing': facts.get('missing_tool_receipts', 0)},
+        'changed_files': changed,
+        'observed_commands': commands,
+        'required_test_commands': list(required_test_commands or []),
+        'unobserved_required_test_commands': unrun,
+        'report_complete': bool(facts.get('report_complete')),
+        'evidence': {
+            'events_jsonl': evidence.get('events_jsonl'),
+            'report_md': evidence.get('report_md'),
+            'result_json': evidence.get('result_json')},
+        'binding_reasons': list(binding.get('reasons') or []),
+    }
+    path = Path(out_dir) / 'continuation.json'
+    path.write_text(_redact(json.dumps(payload, ensure_ascii=False, indent=2), secret),
+                    encoding='utf-8')
+    meta.update({'continuation_generated': True, 'continuation_path': str(path),
+                 'continuation_sha256': _sha(path.read_bytes())})
+    return meta
+
+
 def _write_unknown_evidence(out_dir, *, stage, task_id, process, raw_stdout,
                             raw_stderr, permission_stop, secret,
                             raw_stdout_partial=False) -> dict:
@@ -1412,7 +1569,7 @@ def run(cfg: dict, *, workspace: str, prompt_file: Path, out_dir: Path, stage: s
         is_engineering_task: bool = True, now=None, popen_factory=subprocess.Popen,
         environ=None, dispatch_store=None, child_prober=None, bind_child_pid=True,
         plan=None, active_tasks=None, required_tools=None, write_files=None,
-        transport_retry_delays=None, sleeper=None) -> dict:
+        required_test_commands=None, transport_retry_delays=None, sleeper=None) -> dict:
     """真实编排：outdir/预检/凭据前置 → 时段+容量门 → Popen → 监控 → 绑定 → 终态释放。
 
     - outdir 必须不存在（存在即 0 Popen 拒绝，绝不覆写旧证据）；
@@ -1440,6 +1597,14 @@ def run(cfg: dict, *, workspace: str, prompt_file: Path, out_dir: Path, stage: s
     model = cfg.get('model', MODEL)
     mode = str(cfg.get('permission_mode', PERMISSION_MODE))
     bypass = mode == PERMISSION_MODE
+    try:
+        budget = _turn_budget(cfg, is_engineering_task=is_engineering_task)
+    except Exception as exc:  # noqa: BLE001
+        return {'dispatch_failed': True, 'sent': False, 'dispatched': False,
+                'reason': 'turn_budget_invalid', 'error_class': type(exc).__name__,
+                'reasons': [str(exc)]}
+    effective_cfg = dict(cfg)
+    effective_cfg['max_turns'] = budget['max_turns_configured']
 
     # (0) outdir 必须不存在。
     if Path(out_dir).exists():
@@ -1478,7 +1643,8 @@ def run(cfg: dict, *, workspace: str, prompt_file: Path, out_dir: Path, stage: s
         # 本轮身份取自真实入口 runtime 与本轮请求模型（不读旧提示词推断身份）。
         contract_text = pc.build_contract(stage, workspace, mode='direct',
                                           runtime=RUNTIME, model=model)
-        argv = build_argv(cfg, str(workspace), model, contract_text)
+        contract_text += '\n\n' + _closeout_instruction(budget)
+        argv = build_argv(effective_cfg, str(workspace), model, contract_text)
     except Exception as exc:  # noqa: BLE001
         return {'dispatch_failed': True, 'sent': False, 'dispatched': False,
                 'reason': 'precheck_failed', 'error_class': type(exc).__name__,
@@ -1492,7 +1658,7 @@ def run(cfg: dict, *, workspace: str, prompt_file: Path, out_dir: Path, stage: s
     if bypass:
         try:
             permission_preflight = _bypass_permission_preflight(
-                cfg, required_tools, write_files)
+                effective_cfg, required_tools, write_files)
         except Exception as exc:  # noqa: BLE001
             return {'dispatch_failed': True, 'sent': False, 'dispatched': False,
                     'reason': 'required_tools_invalid', 'error_class': type(exc).__name__,
@@ -1500,7 +1666,8 @@ def run(cfg: dict, *, workspace: str, prompt_file: Path, out_dir: Path, stage: s
     else:
         try:
             permission_preflight = preflight_required_permissions(
-                cfg, required_tools, write_files=write_files, workspace=str(workspace))
+                effective_cfg, required_tools, write_files=write_files,
+                workspace=str(workspace))
         except Exception as exc:  # noqa: BLE001
             return {'dispatch_failed': True, 'sent': False, 'dispatched': False,
                     'reason': 'required_tools_invalid', 'error_class': type(exc).__name__,
@@ -1509,7 +1676,7 @@ def run(cfg: dict, *, workspace: str, prompt_file: Path, out_dir: Path, stage: s
             permission_preflight, mode=DONT_ASK_MODE, enforcement='dontask_exact_preflight',
             exact_file_authorization=bool(permission_preflight.get('ok')
                                           and not permission_preflight.get('skipped')),
-            tools=_validate_rule_list(cfg.get('tools'), 'tools'))
+            tools=_validate_rule_list(effective_cfg.get('tools'), 'tools'))
         if not permission_preflight.get('ok'):
             return {'dispatch_failed': True, 'sent': False, 'dispatched': False,
                     'reason': 'required_tools_not_granted',
@@ -1519,7 +1686,7 @@ def run(cfg: dict, *, workspace: str, prompt_file: Path, out_dir: Path, stage: s
     # (2) --dispatch-plan 精确预检（占位之前，0 Popen）。
     if plan is not None:
         try:
-            actual = _build_actual(cfg, task_id=task_id, stage=stage, model=model,
+            actual = _build_actual(effective_cfg, task_id=task_id, stage=stage, model=model,
                                    workspace=workspace, prompt_sha256=prompt_sha256,
                                    argv=argv, task_text=task_text)
             pf = ec.preflight(plan, actual, active_tasks=active_tasks)
@@ -1532,15 +1699,26 @@ def run(cfg: dict, *, workspace: str, prompt_file: Path, out_dir: Path, stage: s
                     'reason': 'dispatch_plan_rejected', 'preflight': pf,
                     'reasons': pf.get('reasons') or []}
 
+    # (2b) 只冻结调用方显式声明的受控文件；默认 bypass 不据任务正文猜范围，更不扫描
+    # 工作区。路径校验仍在凭据读取、容量 consume 与 Popen 之前。
+    try:
+        controlled_before = _snapshot_controlled_files(workspace, write_files or [])
+    except Exception as exc:  # noqa: BLE001
+        return {'dispatch_failed': True, 'sent': False, 'dispatched': False,
+                'reason': 'controlled_files_invalid', 'error_class': type(exc).__name__,
+                'reasons': [str(exc)]}
+    required_test_commands = [str(x) for x in (required_test_commands or [])
+                              if isinstance(x, str) and x.strip()]
+
     # (3) 凭据解析（失败 → 0 Popen、零占位）。
     try:
-        token = resolve_token(cfg, environ)
+        token = resolve_token(effective_cfg, environ)
     except Exception as exc:  # noqa: BLE001
         return {'dispatch_failed': True, 'sent': False, 'dispatched': False,
                 'reason': 'credential_unavailable', 'error_class': type(exc).__name__,
                 'reasons': [f'credential resolution failed before any claim: {exc!r}']}
 
-    child_env = build_subprocess_env(cfg, token, environ)
+    child_env = build_subprocess_env(effective_cfg, token, environ)
     secret = child_env.get('ANTHROPIC_API_KEY', '')
 
     # (3b) 连接类故障有界重试参数（BW-CLAUDE-RETRY-FIX）：默认 5s/15s 至多 2 次额外
@@ -1808,6 +1986,15 @@ def run(cfg: dict, *, workspace: str, prompt_file: Path, out_dir: Path, stage: s
                                 is_engineering_task=is_engineering_task)
         # 首次真实权限拒绝的停止事实单独保留（原始回执/触发 tool id/是否由本 run 终止）。
         facts = dict(facts,
+                     max_turns_configured=budget['max_turns_configured'],
+                     max_turns_source=budget['max_turns_source'],
+                     closeout_reserve_turns=budget['closeout_reserve_turns'],
+                     closeout_soft_threshold=budget['closeout_soft_threshold'],
+                     closeout_instruction_injected=True,
+                     # 这是终态对 CLI num_turns 的阈值判断，不冒充已观测模型行为。
+                     soft_closeout_triggered=bool(
+                         facts.get('turns_used') is not None
+                         and facts['turns_used'] >= budget['closeout_soft_threshold']),
                      permission_stop=bool(permission_stop),
                      permission_stop_source=(permission_stop or {}).get('source'),
                      permission_stop_tool_use_id=(permission_stop or {}).get('tool_use_id'),
@@ -1847,6 +2034,15 @@ def run(cfg: dict, *, workspace: str, prompt_file: Path, out_dir: Path, stage: s
                                          'delays_seconds': retry_delays,
                                          'max_additional_attempts': max_transport_retries,
                                          'retry_count': retry_count},
+                                     'max_turns_configured': budget[
+                                         'max_turns_configured'],
+                                     'max_turns_source': budget['max_turns_source'],
+                                     'closeout_reserve_turns': budget[
+                                         'closeout_reserve_turns'],
+                                     'closeout_soft_threshold': budget[
+                                         'closeout_soft_threshold'],
+                                     'closeout_instruction_injected': True,
+                                     'soft_closeout_triggered': False,
                                      'started_at_utc': _iso_utc(started_at_utc),
                                      'finished_at_utc': _iso_utc(finished_at_utc),
                                      'executor_identity': {
@@ -1873,6 +2069,15 @@ def run(cfg: dict, *, workspace: str, prompt_file: Path, out_dir: Path, stage: s
             body['body_ok'], body.get('reasons'), protocol_success=facts['protocol_success'],
             session_id=summary.get('session_id'), requested_session_id=None,
             readback_match=bool(readback_match))
+        facts['report_complete'] = bool(body.get('body_ok'))
+        controlled_after = _snapshot_controlled_files(workspace, write_files or [])
+        continuation = _turn_budget_continuation(
+            Path(out_dir), facts=facts, summary=summary, binding=binding, evidence=ev,
+            controlled_before=controlled_before, controlled_after=controlled_after,
+            required_test_commands=required_test_commands,
+            started_at=_iso_utc(started_at_utc),
+            finished_at=_iso_utc(finished_at_utc), secret=secret)
+        facts.update(continuation)
         Path(ev['result_json']).write_text(_redact(json.dumps(
             {'facts': facts, 'binding': binding,
              'task_sha256': pc.sha256_hex(sent_payload.encode('utf-8'))},
@@ -1929,6 +2134,14 @@ def run(cfg: dict, *, workspace: str, prompt_file: Path, out_dir: Path, stage: s
             'facts': facts, 'binding': binding, 'evidence': ev, 'launched': True,
             'limit_recorded': limit_recorded, 'limit_error': limit_error,
             'retry_count': retry_count, 'retry_attempts': retry_attempts,
+            'max_turns_configured': budget['max_turns_configured'],
+            'max_turns_source': budget['max_turns_source'],
+            'turns_used': facts.get('turns_used'),
+            'soft_closeout_triggered': facts.get('soft_closeout_triggered', False),
+            'partial_progress': facts.get('partial_progress', False),
+            'changed_files': facts.get('changed_files', 0),
+            'report_complete': facts.get('report_complete', False),
+            'terminal_class': facts.get('terminal_class'),
             'started_at_utc': _iso_utc(started_at_utc),
             'finished_at_utc': _iso_utc(finished_at_utc),
             'capacity_release': release, 'passed': passed, 'business_verified': False,
@@ -1945,6 +2158,10 @@ def build_parser():
     ap.add_argument('--config', default=None,
                     help='entry config path (default: scripts/claude-entry.local.json)')
     ap.add_argument('--model', default=MODEL)
+    ap.add_argument('--max-turns', type=int, default=None,
+                    help='explicit bounded task override; engineering default is 120')
+    ap.add_argument('--closeout-reserve-turns', type=int, default=None,
+                    help='reserve 5-10 final turns for diff/tests/nine-section report')
     ap.add_argument('--dispatch-claim', default=None)
     ap.add_argument('--dispatch-store', default=None)
     ap.add_argument('--dispatch-plan', default=None,
@@ -1960,6 +2177,9 @@ def build_parser():
                     help='optional explicit workspace-relative edit target (repeatable). '
                          'Only explicit dontAsk validates the exact Edit(./file)/Write(./file) '
                          'profile; default bypassPermissions does not require registration')
+    ap.add_argument('--required-test-command', action='append', default=None,
+                    dest='required_test_commands',
+                    help='exact expected test command for factual continuation accounting')
     return ap
 
 
@@ -1981,8 +2201,16 @@ def main(argv=None) -> int:
                           'reason': 'required_tools_invalid', 'reasons': [str(exc)]},
                          ensure_ascii=False))
         return 2
-    cfg = load_entry_config(args.config or str(DEFAULT_CONFIG))
+    config_path = str(Path(args.config or str(DEFAULT_CONFIG)).resolve())
+    cfg = load_entry_config(config_path)
     cfg.setdefault('model', args.model)
+    if args.max_turns is not None:
+        cfg['max_turns'] = args.max_turns
+        cfg['_max_turns_source'] = 'task_override:--max-turns'
+    elif cfg.get('max_turns') is not None:
+        cfg['_max_turns_source'] = config_path
+    if args.closeout_reserve_turns is not None:
+        cfg['closeout_reserve_turns'] = args.closeout_reserve_turns
     plan = None
     active_tasks = None
     if args.dispatch_plan:
@@ -1995,7 +2223,8 @@ def main(argv=None) -> int:
               prompt_sha256=_sha(prompt_bytes), claim_token=args.dispatch_claim,
               is_engineering_task=not args.not_engineering_task,
               dispatch_store=args.dispatch_store, plan=plan, active_tasks=active_tasks,
-              required_tools=required_tools, write_files=args.write_files)
+              required_tools=required_tools, write_files=args.write_files,
+              required_test_commands=args.required_test_commands)
     print(json.dumps(out, ensure_ascii=False))
     if not out.get('dispatched'):
         return 2  # not dispatched (precheck/credential/gate)

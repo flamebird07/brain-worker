@@ -13,18 +13,27 @@ BW-WORKER-WIDGET-20261018-S2 边界（必须遵守）：
   另一个真 running 掩盖），只有创建身份匹配的活 PID 才显示「运行中」。
 - 两个 CodeBuddy 模型（deepseek-v4.1-flash / glm-5.3-flash）与两个 OpenCode 免费模型
   （deepseek-v4.1-flash-free / glm-5.3-flash-free）**各自独立 1 槽、互不占位互斥**，
-  各行独立计数，物理总 16（`dp.DOMESTIC_TOTAL_CAPACITY`）。
-- Luna（`luna:native`）为可选外援行：无上限、不计入 16、不套本机 child PID 探针。
+  各行独立计数；物理总 16（`dp.DOMESTIC_TOTAL_CAPACITY`，BW-ZCODE-RESTORE-1-20261022
+  起 ZCode 恢复为正常可派主力 1 槽；BW-STRONG-SONUS-20261024 起 qoder:Sonus 另加强档
+  专属独立 1 槽）。
+- Luna 不显示为生产行；真正退役池（qodercn:DeepSeek-Flash）的旧在途仅通过汇总字段
+  `retired_active` 保留审计口径。
 - 界面不显示 token、argv、prompt、原始错误正文或任何秘密；`--once` 输出的 JSON
   同样只含脱敏后的状态字段。
 - 空闲自动关机（BW-WIDGET-IDLE-20261018-S2）：默认不勾选、不持久化；勾选后连续
   30 分钟“有效空闲”才由 GUI 路径经 finalize 复核触发系统既有
   `shutdown.exe /s /t 0`（不加 /f、不重启）；import/--once/未勾选/关闭绝不触发。
 - 桌面交互（BW-WIDGET-HOVER-20261019-S1/S2）：默认精简只列 `display_state=running`
-  的行；hover 整窗展开全部 12 行，移出边界约 200ms 收回；精简/展开同宽 560、动态高度
+  的行；hover 整窗展开全部 11 行，移出边界约 200ms 收回；精简/展开同宽 560、动态高度
   并夹紧屏幕（贴底时整体上移、完整内容优先）；无手动收起/展开按钮；hover 只切视图，
   绝不勾选/停用/重置空闲关机 controller。真实运行中的行（含未知+运行混池）不展示历史
   限额，`prev_limited` 原始证据与 30 分钟计时保持不变。
+- 遗留牛马可见性（BW-WIDGET-LEGACY-VISIBILITY-20261023）：strong/medium 的展示快照
+  只列本档参与的五个池；被本档排除且 attempts 无任何在途（reserved/running/unknown）
+  的池整行隐藏。切档前已在途的遗留牛马即使新档不参与也整行保留——真实状态/占用/
+  attempt 与「本档不参与」标记照常显示，直到真实终态；在途判定只复用 attempts
+  ACTIVE_STATES 权威读取，绝不按历史失败/最后结果/时间推断。weak 仍显示全部行。
+  过滤只影响 rows 展示，不改汇总/容量/activity 签名与在途释放语义。
 - 收回高度恢复（BW-HOVER-REPAIR-20261019-S6）：`apply_layout` 统一决定各区块 pack；
   紧凑且无可见行时绝不 pack `rows_frame`（空/残留 rows_frame 会保留展开时的请求高度，
   导致鼠标移出后外框收不回），改由 empty_card 顶上，使窗口高度恢复到紧凑内容需要的高度；
@@ -33,13 +42,14 @@ BW-WORKER-WIDGET-20261018-S2 边界（必须遵守）：
 """
 import argparse
 import json
+import os
 import queue
 import sqlite3
 import subprocess
 import sys
 import threading
 import time
-from datetime import datetime, timedelta
+from datetime import datetime
 from pathlib import Path
 
 _SCRIPTS_DIR = Path(__file__).resolve().parent
@@ -48,22 +58,30 @@ if str(_SCRIPTS_DIR) not in sys.path:
 
 import dispatch_pool as dp  # noqa: E402
 import stage_selection as ss  # noqa: E402
-try:
-    import deepseek_offpeak as offpeak  # noqa: E402
-except Exception:  # noqa: BLE001 - 缺模块时 Claude 时段外退回纯「时段外」标签
-    offpeak = None
+import dispatch_mode as dmode  # noqa: E402  手动三档（strong/medium/weak）共享策略
 
 # ------------------------------------------------------------------ 展示常量
-# 10 个可派组合按现有主力优先级显示（BW-OPENCODE-20261019 层序）。
+# 12 个已知池行：weak/medium/strong 各按**当前档**动态排序（read_snapshot 末尾按
+# dispatch_mode.priority_map_for_mode 重排），本表只定名称/注释与 stable-tie 基准序
+# （weak 档层序：两个 CN Max(1) > ZCode(2) > Claude(3) > 国际 Qoder Max(4) > CodeBuddy
+# DeepSeek(5) > 两 OpenCode(6) > CodeBuddy GLM(7) > 两区 Flash(8)；Sonus 不参与 weak）。
+# BW-STRONG-SONUS-20261024（BW-SONUS-REENABLE-20261028 起重新生效）：qoder:Sonus 是
+# strong 专属行（strong 档排第一）；medium/weak 空闲时整行隐藏，strong 启动后在途切档
+# 仍保留显示并标「本档不参与」。
+# BW-SONUS-TEMP-DISABLE-20261026（历史）：Sonus 曾被用户要求暂时禁用新派发（三档空闲
+# 整行隐藏、遗留标「暂时禁用（用户指令）」）；该展示只在 dmode.SONUS_TEMP_DISABLED=True
+# 时生效，2026-10-28 恢复启用后回到 strong 专属常态口径。
 # BW-LUNA-DISABLED-20261019：Luna 已从牛马删除，绝不显示可派行；旧记录只按退休历史审计。
-# 退休池（qodercn:DeepSeek-Flash、zcode:GLM-5.3[WB-ZCODE-RETIRE-20261020 用户明确指令]、
-# WorkBuddy 等）不显示成可派，但其真实在途仍计入总占用（见 retired_active）。
+# 退休池（qodercn:DeepSeek-Flash、WorkBuddy 等）不显示成可派，但其真实在途仍计入总占用
+# （见 retired_active）；zcode:GLM-5.3 已按 BW-ZCODE-RESTORE-1-20261022 恢复为可派行。
 ROW_DEFS = (
-    (dp.CODEBUDDY_POOL_KEY, 'CodeBuddy 国际／Deepseek-V4.1-Flash', '主力 · 最高优先 · 无时段门'),
+    (dp.SONUS_POOL_KEY, 'Qoder 国际／Sonus', '强档独占 · 独立 1 槽 · 无时段门'),
     (dp.CN_CUSTOM_MAX_POOL_KEY, 'Qoder CN／token plan／Qwen-3.8-Max', '主力 Max · 夜间窗'),
     (dp.CN_MAX_POOL_KEY, 'Qoder CN／Qwen3.8-Max', '主力 Max · 夜间窗'),
-    (dp.QMAX_POOL_KEY, 'Qoder 国际／Qwen3.8-Max', '主力 Max · 国际内置 · 夜间窗'),
-    (dp.CLAUDE_POOL_KEY, 'Claude Code／deepseek-flash', '主力 · 空闲时段门'),
+    (dp.ZCODE_POOL_KEY, 'ZCode／GLM-5.3', '主力 · 全天'),
+    (dp.CLAUDE_POOL_KEY, 'Claude Code／deepseek-flash', '主力 · 全天 · 无时段门'),
+    (dp.QMAX_POOL_KEY, 'Qoder 国际／Qwen3.8-Max', '主力 Max · 国际内置 · 全天'),
+    (dp.CODEBUDDY_POOL_KEY, 'CodeBuddy 国际／Deepseek-V4.1-Flash', '主力 · 无时段门'),
     (dp.OPENCODE_DEEPSEEK_POOL_KEY, 'OpenCode／deepseek-v4.1-flash-free',
      '主力 · 独立 1 槽 · 无时段门'),
     (dp.OPENCODE_GLM_POOL_KEY, 'OpenCode／glm-5.3-flash-free',
@@ -75,92 +93,60 @@ ROW_DEFS = (
 )
 
 STATE_LABELS = {'running': '运行中', 'unknown': '待核实', 'reserved': '已预留',
-                'idle': '空闲', 'window_closed': '时段外', 'read_failed': '读取失败'}
+                'idle': '空闲', 'window_closed': '时段外', 'read_failed': '读取失败',
+                'mode_excluded': '本档不参与'}
+# BW-SONUS-TEMP-DISABLE-20261026（历史）：Sonus 排除行的专属标签——只在
+# dmode.SONUS_TEMP_DISABLED=True（全档暂时禁用）期间用于 Sonus 行，绝不冒充失败/限额/
+# 永久退役；只影响展示文案，不改任何判定。
+SONUS_TEMP_DISABLED_LABEL = '暂时禁用（用户指令）'
+
+
+def _sonus_temp_disabled() -> bool:
+    """Sonus「暂时禁用」展示分支的唯一权威门：直读 dispatch_mode 开关，绝不复制副本。"""
+    return bool(getattr(dmode, 'SONUS_TEMP_DISABLED', False))
+
+# BW-MANUAL-THREE-MODE-20261023（用户明确指令）：浮窗顶部三个手动档位按钮「强 / 中 / 弱」，
+# 当前档明显选中；点击后**原子保存**并立即刷新行序/可见性/状态。档位只影响之后的新派发，
+# 绝不中断、释放或改派任何在途 attempt；按钮不是自动档，不增加任何计时切换。
+MODE_BUTTONS = (('strong', '强'), ('medium', '中'), ('weak', '弱'))
+MODE_SOURCE_LABELS = {
+    'file': '已保存',
+    'default': '默认',
+    'error_fallback': '读取失败·回落默认',
+}
+
+
+def mode_note_text(mode, source_label=None, error=None):
+    """档位按钮右侧的纯文本说明：当前档 + 来源；读取错误如实标注（绝不冒充用户选择）。"""
+    label = dmode.MODE_LABELS.get(mode, mode)
+    parts = [f'{label}档']
+    if source_label:
+        parts.append(source_label)
+    if error:
+        parts.append(f'读取异常：{error}')
+    return ' · '.join(parts)
 
 # 时段外展示（仅显示层，不改时段门/容量/派工/关机行为）：
-# - 三个 Qoder Max：固定夜间窗口 22:00（含）–次日 08:00（不含），不写"北京时间"。
-# - Claude（deepseek-flash）：显示下一个连续可派区间（复用 deepseek_offpeak 纯函数，
-#   UTC+8 工作日/周末/法定假日），周末/假日连续放行绝不硬截到"次日 09:00"；跨日/跨月
-#   用"次日 HH:MM"或"MM-DD HH:MM"标注日期消歧；无网络日历。
+# - 两个 CN Max（CN 内置 / CN 自定义）：固定夜间窗口 22:00（含）–次日 08:00（不含），
+#   不写"北京时间"。
+# - BW-CLAUDE-ALLDAY-QMAX-AFTER-20261023：国际内置 Max 与 claude:deepseek-flash 均全天
+#   可派，不再进入本标签分支（`window_blocked` 恒 false、空闲即显示"空闲"）；浮窗也不再
+#   复用 deepseek_offpeak 决定 claude 是否可派。
 MAX_WINDOW_CLOSED_LABEL = '时段外（22:00–次日08:00）'
+CLAUDE_PEAK_CLOSED_LABEL = '时段外（工作日高峰 09–12／14–18）'
 _MAX_WINDOW_POOLS = tuple(getattr(dp, 'WINDOW_GATED_MAIN_FORCES', ()))
 
 
-def _bj_minute_of(dt_naive) -> int:
-    return dt_naive.hour * 60 + dt_naive.minute
-
-
-def _claude_blocked_probe(dt_naive) -> bool:
-    """naive 北京时间该分钟是否"关闭新派"（复用 offpeak 纯函数，绝不再次 to_beijing，
-    避免对已是北京时间的入参二次 +8）。与 classify_dispatch 判定顺序一致：
-    周末/假日放行；已知工作日仅高峰关闭；未知年度仅高峰保守关闭。"""
-    if offpeak.is_weekend(dt_naive):
-        return False
-    if offpeak.year_known(dt_naive):
-        if offpeak.is_holiday(dt_naive):
-            return False
-        return offpeak.in_peak_minutes(dt_naive)
-    return offpeak.in_peak_minutes(dt_naive)
-
-
-def claude_next_open_window(bj_now):
-    """给定 naive 北京时间，若当前不可派，返回下一个连续可派区间的 (start, end)
-    （均为 naive datetime，end 不含）。可派或 offpeak 不可用时返回 None。
-    纯函数、无网络；周末/法定假日整天放行，故放行区间可连续跨过整个假期/周末，
-    绝不硬截成"次日 09:00"。"""
-    if offpeak is None or bj_now is None:
-        return None
-    if not _claude_blocked_probe(bj_now):
-        return None
-    midnight = bj_now.replace(hour=0, minute=0, second=0, microsecond=0)
-    start = None
-    for lo, hi in offpeak.PEAK_INTERVALS:
-        if lo <= _bj_minute_of(bj_now) < hi:
-            start = midnight + timedelta(minutes=hi)
-            break
-    if start is None:
-        return None
-    end = start
-    cap = 15 * 24 * 60
-    opened = False
-    for _ in range(cap):
-        if _claude_blocked_probe(end):
-            opened = True
-            break
-        end = end + timedelta(minutes=1)
-    if not opened:
-        return None
-    return (start, end)
-
-
-def _fmt_claude_interval(start, end):
-    """把 (start,end) naive 北京时间格式化成"下次…"片段。同日只写 HH:MM；目标日正好
-    是次日写"次日HH:MM"；更远的跨日/跨月写"MM-DD HH:MM"消歧（周末/假日连续放行）。"""
-    s = f'{start:%H:%M}'
-    day_delta = (end.date() - start.date()).days
-    if day_delta <= 0:
-        e = f'{end:%H:%M}'
-    elif day_delta == 1:
-        e = f'次日{end:%H:%M}'
-    else:
-        e = f'{end:%m-%d %H:%M}'
-    return f'下次{s}–{e}'
-
-
-def window_closed_display_label(pk, now):
-    """时段外行的展示标签（仅显示）。三 Qoder Max → 固定夜间窗口；Claude → 下一个
-    连续可派区间；offpeak 缺失/无法解析时退回纯 STATE_LABELS['window_closed']。"""
-    if pk in _MAX_WINDOW_POOLS:
-        return MAX_WINDOW_CLOSED_LABEL
-    if pk == getattr(dp, 'CLAUDE_POOL_KEY', None) and offpeak is not None:
-        try:
-            bj = offpeak.to_beijing(now if now is not None else dp.utcnow())
-            win = claude_next_open_window(bj)
-            if win is not None:
-                return f'时段外（{_fmt_claude_interval(*win)}）'
-        except Exception:  # noqa: BLE001 - 展示层永不冒进，退回纯标签
-            pass
-    return STATE_LABELS['window_closed']
+def window_closed_display_label(pk, now, mode=None):
+    """时段外行的展示标签（仅显示）。按**当前档**判定：
+    - strong：五个可派池全部无时段门，永不走本分支；
+    - medium/weak：三个 Max 显示固定夜间窗口标签，claude 显示工作日高峰标签；
+    - 其它池保持通用标签。"""
+    if pk not in dmode.window_gated_pools_for_mode(mode):
+        return STATE_LABELS['window_closed']
+    if pk == dp.CLAUDE_POOL_KEY:
+        return CLAUDE_PEAK_CLOSED_LABEL
+    return MAX_WINDOW_CLOSED_LABEL
 
 RESULT_LABELS = {'passed': '上轮调用通过', 'failed': '上轮调用未通过',
                  'unknown': '上轮调用待核', 'none': '暂无调用记录'}
@@ -187,7 +173,11 @@ PREV_LIMIT_LABEL = '上轮限额'
 QUOTA_LIMIT_WINDOW_SECONDS = 1800
 # BW-LIMIT30-20261019-S3：浮窗 30 分钟窗口覆盖 CodeBuddy/deepseek、ZCode/GLM-5.3 与
 # Claude/deepseek-flash 三个精确池；其它池（Qoder Max 等）保持原有 token 规则。
-WINDOW_LIMIT_POOLS = (dp.CODEBUDDY_POOL_KEY, dp.ZCODE_POOL_KEY, dp.CLAUDE_POOL_KEY)
+# BW-QWEN-MAX-LIMIT15-20261028：两个 Qoder 内置 Max（qoder:Qwen3.8-Max / qodercn:Qwen3.8-Max）
+# 加入同一权威映射并改走 **900 秒（15 分钟）展示短窗**；原三池仍 1800 秒。窗口秒数一律取
+# dispatch_pool.QUOTA_LIMIT_WINDOW_BY_POOL（派发门与浮窗同口径），不在本文件另设数字。
+WINDOW_LIMIT_POOLS = tuple(dp.QUOTA_LIMIT_WINDOW_BY_POOL)
+WINDOW_LIMIT_SECONDS_BY_POOL = dp.QUOTA_LIMIT_WINDOW_BY_POOL
 
 
 def _within_recent_window(ref_text, now, window_seconds):
@@ -204,8 +194,8 @@ def _within_recent_window(ref_text, now, window_seconds):
 
 
 def _quota_window_limited(lim, bound_ended, now, window_seconds=QUOTA_LIMIT_WINDOW_SECONDS):
-    """CodeBuddy deepseek 精确池专用：真实限额标记按绑定 attempt 的真实终止时间是否仍落在
-    半小时内展示，**不再用最新 attempt_token 相等**让新预留/新失败把半小时内真实限额提前隐藏。
+    """WINDOW_LIMIT_POOLS 表内精确池通用：真实限额标记按绑定 attempt 的真实终止时间是否仍
+    落在按池窗口内展示，**不再用最新 attempt_token 相等**让新预留/新失败把窗口内真实限额提前隐藏。
     重复限额由现有入口更新同一标记与其绑定 attempt（更晚的 ended_at_utc），自然重新计时。"""
     if not lim or int(lim.get('limited') or 0) != 1:
         return False
@@ -214,11 +204,13 @@ def _quota_window_limited(lim, bound_ended, now, window_seconds=QUOTA_LIMIT_WIND
 
 
 def _prev_limited_for(pk, lim, latest_any, bound_ended, now):
-    """按池选择限额展示规则：CodeBuddy/deepseek、ZCode/GLM-5.3 与 Claude/deepseek-flash
-    使用半小时真实窗口（BW-LIMIT30-20261019-S3 扩展）；其余池保持原有“标记仍绑定该池最新
-    attempt”的既有规则，不改动其它模型现有期限。"""
+    """按池选择限额展示规则：WINDOW_LIMIT_POOLS 表内精确池使用按池秒数的真实窗口
+    （原三池 30 分钟、两个 Qoder 内置 Max 15 分钟，BW-QWEN-MAX-LIMIT15-20261028）；其余池
+    保持原有“标记仍绑定该池最新 attempt”的既有规则，不改动其它模型现有期限。"""
     if pk in WINDOW_LIMIT_POOLS:
-        return _quota_window_limited(lim, bound_ended, now)
+        return _quota_window_limited(
+            lim, bound_ended, now,
+            WINDOW_LIMIT_SECONDS_BY_POOL.get(pk, QUOTA_LIMIT_WINDOW_SECONDS))
     return bool(
         lim is not None and int(lim.get('limited') or 0) == 1
         and latest_any.get(pk, {}).get('token') is not None
@@ -252,8 +244,16 @@ def _display_state(db_state, pid_check):
 
 
 def _failure(store, now, code, detail):
+    # BW-MANUAL-THREE-MODE-20261023：读取失败也如实带当前档位与来源/错误（绝不因为快照
+    # 读失败就假装档位不存在）。
+    mode_state = dmode.load_mode()
     return {'ok': False, 'store': str(store), 'now_utc': dp._iso(now),
             'error_code': code, 'error': detail,
+            'dispatch_mode': mode_state['mode'],
+            'dispatch_mode_label': dmode.MODE_LABELS[mode_state['mode']],
+            'dispatch_mode_source': mode_state['source'],
+            'dispatch_mode_error': mode_state['error'],
+            'dispatch_mode_path': mode_state['path'],
             'domestic_total_capacity': dp.DOMESTIC_TOTAL_CAPACITY,
             'domestic_active': None, 'luna_active': None, 'rows': []}
 
@@ -326,6 +326,11 @@ def read_snapshot(store_path=None, *, now=None, pid_probe=None):
     now = now or dp.utcnow()
     probe = pid_probe or dp.process_identity
     path = store_path if store_path else dp.default_store_path()
+    # BW-MANUAL-THREE-MODE-20261023：快照每次现读档位（多进程切换后下一轮即反映），
+    # 并如实带来源/读取错误；档位只影响展示与**新派发**判定，绝不改库/释放占位。
+    mode_state = dmode.load_mode()
+    mode = mode_state['mode']
+    mode_allowed = set(dmode.allowed_pools_for_mode(mode))
     try:
         conn = ss._open_store_ro(path)
     except ss.Refused as exc:
@@ -408,7 +413,7 @@ def read_snapshot(store_path=None, *, now=None, pid_probe=None):
         return _annotate(out, now)
 
     rows = []
-    for pk, label, note in ROW_DEFS:
+    for index, (pk, label, note) in enumerate(ROW_DEFS):
         own = by_pool.get(pk, [])
         # BW-WORKER-WIDGET-20261018-S3：两个 CodeBuddy 模型各自独立 1 槽，容量/占用
         # 只按自身 pool_key 计数，绝不合并、绝不跨模型互斥。
@@ -420,7 +425,20 @@ def read_snapshot(store_path=None, *, now=None, pid_probe=None):
         db_states = {a['state'] for a in attempts}
         state = next((s for s in _DISPLAY_PRIORITY if s in disp_states), None)
         db_state = next((s for s in _STATE_PRIORITY if s in db_states), None)
-        window_blocked = bool(dp._max_window_blocks(pk, now))
+        # 档位只管策略内的可派池：历史/兼容行（如已禁用的 Luna）不属于任何档位，
+        # 绝不冒充「本档不参与」。BW-STRONG-SONUS-20261024：strong 专属池（Sonus）也
+        # 属于档位策略管辖（KNOWN_POLICY_POOL_KEYS）——medium/weak 空闲时整行隐藏，
+        # 遗留在途时保留并标「本档不参与」。
+        participates = ((pk in mode_allowed)
+                        if pk in dmode.KNOWN_POLICY_POOL_KEYS else True)
+        window_blocked = bool(dp._max_window_blocks(pk, now, mode))
+        if state is None and not participates:
+            # BW-WIDGET-LEGACY-VISIBILITY-20261023：本档排除且 attempts 无任何在途
+            # （reserved/running/unknown）→ 整行不进入展示快照；绝不伪装成空闲可派，
+            # 也不再留「本档不参与」占位行。有遗留在途的排除池不走本分支：整行保留，
+            # 按真实状态展示并带 mode_excluded 标记，直到真实终态。只过滤 rows 展示，
+            # 汇总/容量/activity 签名与在途释放语义完全不变。
+            continue
         if state is None:
             state = 'window_closed' if window_blocked else 'idle'
         if db_state is None:
@@ -439,9 +457,9 @@ def read_snapshot(store_path=None, *, now=None, pid_probe=None):
         prev_limited = _prev_limited_for(pk, lim, latest_any,
                                           bound_ended.get(pk), now)
         has_true_running = any(a['display_state'] == 'running' for a in attempts)
-        # 时段外行的展示标签富化（仅显示层）：三 Qoder Max 固定夜间窗口 / Claude 下一个
-        # 连续可派区间；其它状态沿用 STATE_LABELS。
-        state_label = (window_closed_display_label(pk, now)
+        # 时段外行的展示标签（仅显示层）：按当前档，三个 Max 显示夜间窗口、claude 显示
+        # 工作日高峰；strong 档无时段门。
+        state_label = (window_closed_display_label(pk, now, mode)
                        if state == 'window_closed' else STATE_LABELS[state])
         rows.append({
             'pool_key': pk, 'label': label, 'note': note,
@@ -449,13 +467,39 @@ def read_snapshot(store_path=None, *, now=None, pid_probe=None):
             'own_active': len(own), 'state': state,
             'db_state': db_state,
             'state_label': state_label, 'window_blocked': window_blocked,
+            'mode_excluded': not participates,
+            'participates': participates,
+            'mode_excluded_label': (None if participates else
+                                    ('已禁用（用户指令）'
+                                     if pk in dmode.USER_DISABLED_POOL_KEYS else
+                                     SONUS_TEMP_DISABLED_LABEL
+                                     if pk == dp.SONUS_POOL_KEY
+                                     and _sonus_temp_disabled() else
+                                     STATE_LABELS['mode_excluded'])),
+            'priority': dmode.priority_for_pool(pk, mode),
+            'row_index': index,
             'main_state_label': _main_state_display(
                 state, state_label, prev_limited, has_true_running),
             'last_result': last_result, 'last_result_label': RESULT_LABELS[last_result],
             'prev_limited': prev_limited,
             'attempts': attempts,
         })
+    # 行序按**当前档**动态排列：可派行按该档层号（weak 与既有 ROW_DEFS 顺序一致），
+    # 本档排除的行统一排到最后（展开时以「本档不参与」显示，绝不冒充空闲可派）。
+    rows.sort(key=lambda r: (1 if r['mode_excluded'] else 0,
+                             r['priority'] if r['priority'] is not None else 99,
+                             r['row_index']))
     return {'ok': True, 'store': str(path), 'now_utc': dp._iso(now),
+            'dispatch_mode': mode,
+            'dispatch_mode_label': dmode.MODE_LABELS[mode],
+            'dispatch_mode_note': dmode.MODE_NOTES[mode],
+            'dispatch_mode_source': mode_state['source'],
+            'dispatch_mode_source_label': MODE_SOURCE_LABELS.get(mode_state['source'],
+                                                                mode_state['source']),
+            'dispatch_mode_error': mode_state['error'],
+            'dispatch_mode_path': mode_state['path'],
+            'dispatch_mode_default': mode_state['default_mode'],
+            'dispatch_mode_allowed_pools': list(mode_allowed),
             'domestic_total_capacity': dp.DOMESTIC_TOTAL_CAPACITY,
             'domestic_active': domestic_active, 'luna_active': luna_active,
             'retired_active': retired_active, 'activity': activity, 'rows': rows}
@@ -677,6 +721,25 @@ def detail_text(row):
                     if row['window_blocked'] and row['state'] in _STATE_PRIORITY else '')
                  + ('（新派受时段门限制）'
                     if row['window_blocked'] and row['state'] not in _STATE_PRIORITY else ''))
+    if row.get('mode_excluded'):
+        # BW-MANUAL-THREE-MODE-20261023：被本档排除的池明确说明「本档不参与」，并强调
+        # 在途 attempt 不受切档影响（不追杀、不假释放）。BW-SONUS-TEMP-DISABLE-20261026
+        # （历史）：Sonus 在 dmode.SONUS_TEMP_DISABLED=True 期间是用户要求的**全档暂时
+        # 禁用**——文案写明临时禁用缘由；恢复启用后回到通用「本档不参与」口径。
+        if row['pool_key'] in dmode.USER_DISABLED_POOL_KEYS:
+            lines.append('已禁用（用户指令）：' + dmode.mode_excluded_reason(row['pool_key']))
+        elif row['pool_key'] == dp.SONUS_POOL_KEY and _sonus_temp_disabled():
+            lines.append('暂时禁用（用户指令）：qoder:Sonus 当前不参与任何档位的新派发'
+                         '（可逆临时禁用，不是额度/认证/时段问题，也不是永久退役）；'
+                         '新 reserve/select/consume/claim-due 一律 mode_excluded'
+                         '（sent=false、零占位）。已在途 attempt 照原状态自然结束，'
+                         '绝不中断、释放或改派')
+        else:
+            lines.append('本档不参与：当前档位只允许 '
+                         + dmode.MODE_SCOPE_TEXT[dmode.load_mode()['mode']]
+                         + ' 新派发；该池的新 reserve/select/consume/claim-due 一律 '
+                         'mode_excluded（sent=false、零占位）。已在途 attempt 照原状态自然结束，'
+                         '切档绝不中断、释放或改派')
     if not row['attempts']:
         lines.append('当前无在途任务')
     for a in row['attempts']:
@@ -693,8 +756,13 @@ def detail_text(row):
     if row['prev_limited'] and not row_has_true_running(row):
         if row['pool_key'] == dp.CODEBUDDY_POOL_KEY:
             lines.append('上轮限额：近 30 分钟内的真实限额/429 错误记录（按绑定 attempt 的真实终止时间计时），'
-                         '仅代表历史期限展示窗口、不代表实时余额、不猜恢复时间、不阻止下一轮最高优先重试；'
+                         '仅代表历史期限展示窗口、不代表实时余额、不猜恢复时间、不阻止下一轮按优先级重试；'
                          '超过 30 分钟仅撤下本提示，绝不声称额度已恢复')
+        elif row['pool_key'] in (dp.QMAX_POOL_KEY, dp.CN_MAX_POOL_KEY):
+            lines.append('上轮限额：近 15 分钟内的真实限额/429 错误记录（按绑定 attempt 的真实终止时间计时），'
+                         '仅代表 15 分钟历史限额短窗、不代表实时余额、不猜恢复时间；15 分钟内新派发跳过该池，'
+                         '满 15 分钟后按原优先级恢复可选（原错误证据保留，无需手动重置）；'
+                         '超过 15 分钟仅撤下本提示，绝不声称额度已恢复')
         elif row['pool_key'] in WINDOW_LIMIT_POOLS:
             lines.append('上轮限额：近 30 分钟内的真实限额/402 余额不足/429 错误记录（按绑定 attempt 的真实终止时间计时），'
                          '仅代表历史期限、不代表实时余额、不猜恢复时间；30 分钟内新派发跳过该池，'
@@ -793,10 +861,12 @@ _DIM = '#64748b'
 _GREEN = '#5fd39a'
 _RED = '#f07f7f'
 _STATE_COLORS = {'running': _GREEN, 'reserved': '#9aa8c0', 'unknown': _RED,
-                 'idle': _DIM, 'window_closed': '#7f9bc4', 'read_failed': _RED}
+                 'idle': _DIM, 'window_closed': '#7f9bc4', 'read_failed': _RED,
+                 'mode_excluded': _DIM}
 # 限额专属橙：只覆盖展示层文字/徽标，不改 row['state']/容量计数/空闲判定原语义。
 _QUOTA_LIMIT_COLOR = '#f5a524'
 _BADGE_LIMIT_BG = '#2b2417'
+_BADGE_MODE_BG = '#232c3a'
 _BADGE_RUN_BG = '#173126'
 _BADGE_RUN_FG = _GREEN
 _BADGE_WINDOW_BG = '#17263b'
@@ -818,7 +888,9 @@ def row_has_true_running(row):
 
 
 def view_rows(snap, expanded=False):
-    """精简模式只列有真运行 attempt 的行；展开模式保留全部 ROW_DEFS 行。
+    """精简模式只列有真运行 attempt 的行；展开模式保留快照内全部行（BW-WIDGET-LEGACY-
+    VISIBILITY-20261023：本档排除且无在途的池已不在 rows 中；带遗留在途的排除行照常
+    显示并标「本档不参与」，绝不隐藏其真实在途、也绝不伪装成空闲可派）。
     读取失败绝不返回可冒充空闲的空表语义（调用方另行显示待核）。"""
     if not isinstance(snap, dict) or not snap.get('ok'):
         return []
@@ -879,11 +951,18 @@ def wrapped_state_text(text):
 
 
 def row_badges(row):
-    """行内小徽标：含运行（混池不冒充全绿）、时段外（在途也如实标注）、限额（橙色）。
-    真实运行中的行不出限额徽标；只返回展示文案，不改 state/占用/空闲判定。"""
+    """行内小徽标：含运行（混池不冒充全绿）、时段外（在途也如实标注）、限额（橙色）、
+    本档不参与（档位排除）。真实运行中的行不出限额徽标；只返回展示文案，不改
+    state/占用/空闲判定。"""
     badges = []
     if row.get('state') != 'running' and row_has_true_running(row):
         badges.append(('run', '含运行'))
+    if row.get('mode_excluded'):
+        badges.append(('mode', '已禁用（用户指令）'
+                       if row['pool_key'] in dmode.USER_DISABLED_POOL_KEYS else
+                       SONUS_TEMP_DISABLED_LABEL
+                       if row['pool_key'] == dp.SONUS_POOL_KEY
+                       and _sonus_temp_disabled() else '本档不参与'))
     if row.get('window_blocked') and not str(compact_state_text(row)).startswith('时段外'):
         badges.append(('window', '时段外'))
     if row_shows_limit(row):
@@ -937,10 +1016,17 @@ def apply_layout(frames, *, expanded, has_rows, idle_compact):
     区块却收不回紧凑内容高度（Root 真实 Tk 复现：展开 710、行隐藏后仍 643）。
     有运行行（has_rows）或展开时 rows_frame 正常参与布局，高度按真实行数缩；展开仍
     显示全部。pack 顺序/参数与旧 `_apply_mode` 完全一致，只改「无行时不 pack rows_frame」。
+    BW-MANUAL-THREE-MODE-20261023：新增可选的 `mode` 区块（三个手动档位按钮），排在
+    摘要之后、行区之前；旧调用方不传该键时行为与之前完全一致。
     """
-    for key in ('summary', 'rows', 'empty', 'compact_idle', 'idle', 'detail', 'footer'):
-        frames[key].pack_forget()
+    order = ('summary', 'mode', 'rows', 'empty', 'compact_idle', 'idle', 'detail', 'footer')
+    for key in order:
+        widget = frames.get(key)
+        if widget is not None:
+            widget.pack_forget()
     frames['summary'].pack(fill='x')
+    if frames.get('mode') is not None:
+        frames['mode'].pack(fill='x', pady=(6, 0))
     if has_rows:
         frames['rows'].pack(fill='x', pady=(8, 0))
     else:
@@ -948,14 +1034,17 @@ def apply_layout(frames, *, expanded, has_rows, idle_compact):
     if expanded:
         frames['idle'].pack(fill='x', pady=(8, 2))
         frames['detail'].pack(fill='x', pady=(6, 0))
-        frames['footer'].pack(fill='x', pady=(6, 0))
     elif idle_compact:
         frames['compact_idle'].pack(fill='x', pady=(6, 0))
+    frames['footer'].pack(fill='x', pady=(6, 0))
 
 
 def run_gui(store_path=None, interval=2.0):
     import tkinter as tk
 
+    store_source = ('--store' if store_path else '环境变量'
+                    if os.environ.get('BRAIN_WORKER_DISPATCH_STORE') else '默认')
+    store_path = Path(store_path or dp.default_store_path()).resolve()
     font = ('Microsoft YaHei UI', 9)
     font_bold = ('Microsoft YaHei UI', 9, 'bold')
     font_title = ('Microsoft YaHei UI', 11, 'bold')
@@ -1029,6 +1118,52 @@ def run_gui(store_path=None, interval=2.0):
     rows_frame = tk.Frame(shell, bg=_BG)
     rows_frame.pack(fill='x', pady=(8, 0))
 
+    # --- BW-MANUAL-THREE-MODE-20261023：手动三档「强 / 中 / 弱」。当前档明显选中；
+    # 点击后原子保存并立即刷新行序/可见性/状态。只影响之后的新派发，绝不中断/释放/改派
+    # 任何在途 attempt；这不是自动档，不增加任何计时切换。
+    mode_frame = tk.Frame(shell, bg=_BG)
+    mode_title = tk.Label(mode_frame, text='派发档位', bg=_BG, fg=_DIM, font=font_small)
+    mode_title.pack(side='left', padx=(0, 8))
+    mode_state = {'current': None, 'note': None}
+    mode_btns = {}
+    for _value, _label in MODE_BUTTONS:
+        _btn = tk.Button(mode_frame, text=_label, font=font_bold, relief='flat', bd=0,
+                         padx=10, pady=1, cursor='hand2', bg=_CARD, fg=_SUB,
+                         activebackground=_CARD_SEL, activeforeground=_FG)
+        _btn.pack(side='left', padx=(0, 6))
+        mode_btns[_value] = _btn
+    mode_note_lbl = tk.Label(mode_frame, text='', bg=_BG, fg=_DIM, font=font_small,
+                             anchor='e')
+    mode_note_lbl.pack(side='right')
+
+    def _render_mode_buttons(mode, source_label, error):
+        """把当前档位画成明显选中态，并如实显示来源（已保存/默认/读取失败回落）。"""
+        for value, btn in mode_btns.items():
+            if value == mode:
+                btn.configure(bg=_BORDER_SEL, fg=_TITLE)
+            else:
+                btn.configure(bg=_CARD, fg=_SUB)
+        note = f'{mode_note_text(mode, source_label, error)}'
+        if mode_state['note'] != note:
+            mode_state['note'] = note
+            mode_note_lbl.configure(text=note,
+                                    fg=_RED if error else _DIM)
+
+    def _on_mode_click(value):
+        try:
+            dmode.save_mode(value)
+        except (OSError, ValueError) as exc:
+            # 保存失败绝不冒充已切换：立即以真实读回结果重画，并显示错误短码。
+            snap_err = read_snapshot(store_path)
+            _render(snap_err)
+            _set_footer(f'档位保存失败 · 仍按读回档位派发 · {type(exc).__name__}')
+            return
+        _render(read_snapshot(store_path))
+        _fit_window()
+
+    for _value, _btn in mode_btns.items():
+        _btn.configure(command=lambda v=_value: _on_mode_click(v))
+
     empty_card = tk.Frame(shell, bg=_CARD, highlightbackground=_BORDER,
                           highlightthickness=1)
     empty_lbl = tk.Label(empty_card, text='正在读取本地只读快照…', bg=_CARD, fg=_SUB,
@@ -1065,8 +1200,12 @@ def run_gui(store_path=None, interval=2.0):
     detail_txt.configure(state='disabled')
 
     footer_var = tk.StringVar(value='')
-    footer_lbl = tk.Label(shell, textvariable=footer_var, bg=_BG, fg=_DIM,
-                          font=font_small, anchor='w')
+    footer_lbl = tk.Label(shell, textvariable=footer_var, bg=_BG, fg=_SUB,
+                          font=font_small, anchor='w', justify='left',
+                          wraplength=width - 24)
+
+    def _set_footer(text):
+        footer_var.set(f'{text}\n数据源（{store_source}）：{store_path}')
 
     # --- 11 行卡片（ROW_DEFS 顺序/名称原样，完整不截断；左色条+行卡层次）。
     row_widgets = {}
@@ -1093,6 +1232,7 @@ def run_gui(store_path=None, interval=2.0):
         occ.grid(row=0, column=3, sticky='e', padx=(6, 0))
         badge_widgets = {}
         for key, fg, bg in (('run', _BADGE_RUN_FG, _BADGE_RUN_BG),
+                            ('mode', _DIM, _BADGE_MODE_BG),
                             ('window', _BADGE_WINDOW_FG, _BADGE_WINDOW_BG),
                             ('limit', _QUOTA_LIMIT_COLOR, _BADGE_LIMIT_BG)):
             badge_widgets[key] = tk.Label(badges, text='', bg=bg, fg=fg,
@@ -1139,7 +1279,8 @@ def run_gui(store_path=None, interval=2.0):
             return
         layout_state['sig'] = sig
         apply_layout(
-            {'summary': summary_frame, 'rows': rows_frame, 'empty': empty_card,
+            {'summary': summary_frame, 'mode': mode_frame, 'rows': rows_frame,
+             'empty': empty_card,
              'compact_idle': compact_idle_lbl, 'idle': idle_frame,
              'detail': detail_frame, 'footer': footer_lbl},
             expanded=(mode == 'expanded'), has_rows=has_rows,
@@ -1313,7 +1454,13 @@ def run_gui(store_path=None, interval=2.0):
         ok = bool(snap and snap.get('ok'))
         if not ok:
             code = (snap or {}).get('error_code', 'read_failed')
-            _render_summary([('error', f'读取失败 · 待核（{code}） · 下轮自动重试', _RED)])
+            failure_label = '界面刷新失败' if code == 'render_failed' else '读取失败'
+            _render_summary([('error', f'{failure_label} · 待核（{code}） · 下轮自动重试', _RED)])
+            # 档位读取独立于快照：读失败也要如实显示当前（或回落）档位与来源。
+            _render_mode_buttons(
+                (snap or {}).get('dispatch_mode') or dmode.DEFAULT_MODE,
+                MODE_SOURCE_LABELS.get((snap or {}).get('dispatch_mode_source'), ''),
+                (snap or {}).get('dispatch_mode_error'))
             dot.configure(fg=_RED)
             for w in row_widgets.values():
                 w['name'].configure(fg=_SUB)
@@ -1331,14 +1478,23 @@ def run_gui(store_path=None, interval=2.0):
             detail_txt.configure(height=2)
             _set_detail('本地只读快照暂不可用（缺库/锁定/解析失败均如实待核，'
                         '绝不显示成空闲）。')
-            empty_lbl.configure(text='本地只读快照不可用 · 待核', fg=_RED)
+            empty_lbl.configure(text=f'{failure_label} · 待核', fg=_RED)
             _set_rows(list(row_widgets) if hover['expanded'] else [])
-            footer_var.set('本地只读 · 读取失败 · 下轮自动重试')
+            _set_footer(f'本地只读 · {failure_label} · 下轮自动重试')
             return
 
         counts = view_summary(snap)
         total, cap = counts['total'], counts['capacity']
-        summary_items = [('total', f'总占用 {total}/{cap}', _FG),
+        # BW-MANUAL-THREE-MODE-20261023：摘要首位常驻当前档位（含来源/读取异常），
+        # 让人一眼看出本档只含三组还是全部牛马。
+        _mode = snap.get('dispatch_mode') or dmode.DEFAULT_MODE
+        _mode_src = snap.get('dispatch_mode_source_label') or ''
+        _mode_err = snap.get('dispatch_mode_error')
+        _render_mode_buttons(_mode, _mode_src, _mode_err)
+        summary_items = [('mode', f"{dmode.MODE_LABELS.get(_mode, _mode)}档"
+                                  + (f'（{_mode_src}）' if _mode_src else ''),
+                          _RED if _mode_err else _SUB),
+                         ('total', f'总占用 {total}/{cap}', _FG),
                          ('run', f"运行 {counts['running']}",
                           _GREEN if counts['running'] else _DIM)]
         # 零项不占位：待核/预留/限额/Luna/其他在途只在非零时按固定顺序出现。
@@ -1377,7 +1533,8 @@ def run_gui(store_path=None, interval=2.0):
             w['accent'].configure(
                 bg=color if (row['state'] != 'idle' or row_shows_limit(row)) else _BORDER)
             badge_map = dict(row_badges(row))
-            badge_sig = tuple(k for k in ('run', 'window', 'limit') if k in badge_map)
+            badge_sig = tuple(k for k in ('run', 'mode', 'window', 'limit')
+                              if k in badge_map)
             if w['badge_sig'] != badge_sig:
                 for badge in w['badge_widgets'].values():
                     badge.pack_forget()
@@ -1409,8 +1566,8 @@ def run_gui(store_path=None, interval=2.0):
         else:
             detail_txt.configure(height=2)
             _set_detail('悬停展开全部模型 · 点击行查看任务详情')
-        footer_var.set(f"本地只读 · 每 {max(1, int(interval))} 秒更新 · "
-                       f"更新 {datetime.now().strftime('%H:%M:%S')} · 详情可滚轮")
+        _set_footer(f"本地只读 · 每 {max(1, int(interval))} 秒轮询 · "
+                    f"已应用 {datetime.now().strftime('%H:%M:%S')}")
 
     def _render(snap):
         _render_snapshot(snap)
@@ -1469,7 +1626,12 @@ def run_gui(store_path=None, interval=2.0):
     _bind_hover(root)
 
     _render_summary([('loading', '正在读取本地只读快照…', _SUB)])
-    footer_var.set(f'本地只读 · 每 {max(1, int(interval))} 秒更新')
+    # 首帧就按真实读回的档位画按钮（读失败按回落档显示并标注来源），绝不留空选中态。
+    _boot_mode = dmode.load_mode()
+    _render_mode_buttons(_boot_mode['mode'],
+                         MODE_SOURCE_LABELS.get(_boot_mode['source'], ''),
+                         _boot_mode['error'])
+    _set_footer(f'本地只读 · 每 {max(1, int(interval))} 秒轮询 · 等待快照')
     _set_detail('悬停展开全部模型 · 点击行查看任务详情')
     _refresh_idle_text()
     _set_rows([])
@@ -1481,19 +1643,25 @@ def run_gui(store_path=None, interval=2.0):
     def _drain():
         latest = None
         try:
-            while True:
-                latest = q.get_nowait()
-        except queue.Empty:
-            pass
-        if latest is not None:
-            _render(latest)
-        action = hover_poll_action(hover['expanded'], hover['dragging'],
-                                   _pointer_inside(), hover['after'] is not None)
-        if action == 'schedule':
-            hover['after'] = root.after(_HOVER_COLLAPSE_MS, _maybe_collapse)
-        elif action == 'cancel':
-            _cancel_collapse()
-        root.after(150, _drain)
+            try:
+                while True:
+                    latest = q.get_nowait()
+            except queue.Empty:
+                pass
+            if latest is not None:
+                _render(latest)
+            action = hover_poll_action(hover['expanded'], hover['dragging'],
+                                       _pointer_inside(), hover['after'] is not None)
+            if action == 'schedule':
+                hover['after'] = root.after(_HOVER_COLLAPSE_MS, _maybe_collapse)
+            elif action == 'cancel':
+                _cancel_collapse()
+        except Exception:
+            layout_state['sig'] = None
+            _render(_failure(store_path, dp.utcnow(), 'render_failed',
+                             'unexpected GUI refresh error'))
+        finally:
+            root.after(150, _drain)
 
     poller.start()
     root.after(80, _drain)
@@ -1512,7 +1680,20 @@ def main(argv=None):
                     help='刷新间隔秒（默认 2，最小 1）')
     ap.add_argument('--once', action='store_true',
                     help='只做一次只读快照并输出安全 JSON（不启动 GUI）；ok=false 时退出码 2')
+    ap.add_argument('--set-mode', choices=list(dmode.MODES), default=None,
+                    help='手动切换派发档位（strong/medium/weak）并原子保存；'
+                         '随后按 --once 口径输出读回快照（无 GUI）')
     args = ap.parse_args(argv)
+    if args.set_mode:
+        try:
+            dmode.save_mode(args.set_mode)
+        except (OSError, ValueError) as exc:
+            print(json.dumps({'ok': False, 'set_mode': args.set_mode,
+                              'error': type(exc).__name__}, ensure_ascii=False))
+            return 2
+        snap = read_snapshot(args.store)
+        print(snapshot_to_json_str(snap))
+        return 0 if snap.get('ok') else 2
     if args.once:
         snap = read_snapshot(args.store)
         print(snapshot_to_json_str(snap))

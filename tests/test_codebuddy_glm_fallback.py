@@ -12,8 +12,9 @@
   eligible 才限制范围；
 - 独立名额（BW-WORKER-WIDGET-20261018-S3 用户最新明确，覆盖旧共享 1 槽口径）：
   DeepSeek 与 GLM 各独立 1 槽、互不占位互斥；同模型第 2 个在途仍拒绝；并发同模型只有
-  一个赢家、两模型可同时各赢一个；finish 只释放自己的槽；物理总 16（BW-OPENCODE-20261019
-  起含两 OpenCode 免费模型各 1 槽）不双计、status 按各自独立容量口径；
+  一个赢家、两模型可同时各赢一个；finish 只释放自己的槽；物理总 15（BW-ZCODE-RESTORE-
+  1-20261022 恢复 ZCode 1 槽；BW-OPENCODE-20261019 起含两 OpenCode 免费模型各 1 槽）
+  不双计、status 按各自独立容量口径；
 - planner 与正式 reserve/consume 裁决一致（均不要求 DeepSeek 限额证据）；正式 GLM 无
   proof 仍可进入配置读取并 Popen；带 proof 的 CLI argv/model/pool/evidence 正确，不硬记
   DeepSeek；
@@ -525,11 +526,13 @@ class TestIndependentModelSlots(_Base):
             self.assertEqual(dp._count_active(conn, GLM), 1)
 
     def test_total_physical_capacity_16_and_status_independent_counts(self):
-        # BW-ZCODE-RETIRE-20261020 起物理总 14（原 16 去掉 zcode 2 槽）：
-        # 两 OpenCode 免费模型各独立 1 槽、独立计数。
-        self.assertEqual(dp.DOMESTIC_TOTAL_CAPACITY, 14)
+        # BW-STRONG-SONUS-20261024：物理总 16（原 15 + strong 专属 Sonus 1 槽）；
+        # 两 OpenCode 免费模型各独立 1 槽、独立计数。弱档不能新派 Sonus，这里按真实
+        # 形态 seed 一条 strong 遗留在途以满足 16/16。
+        self.assertEqual(dp.DOMESTIC_TOTAL_CAPACITY, 16)
         self.assertEqual(dp.CAPACITY[GLM], 1)
         self.assertEqual(dp.MAIN_FORCE_CAPACITY[GLM], 1)
+        self.seed(ZCODE, 1)
         self.seed(CB, 1)
         self.seed(GLM, 1)
         self.seed(QMAX, 1)
@@ -540,9 +543,10 @@ class TestIndependentModelSlots(_Base):
         self.seed(dp.OPENCODE_GLM_POOL_KEY, 1)
         self.seed(QFLASH, 2)
         self.seed(CN_FLASH, 2)
+        self.seed(dp.SONUS_POOL_KEY, 1)
         st = dp.status(self.store, now=T_NIGHT)
-        self.assertEqual(st['domestic']['capacity'], 14)
-        self.assertEqual(st['domestic']['active'], 14)
+        self.assertEqual(st['domestic']['capacity'], 16)
+        self.assertEqual(st['domestic']['active'], 16)
         self.assertEqual(st['pools'][CB]['active'], 1)
         self.assertEqual(st['pools'][CB]['free'], 0)
         self.assertEqual(st['pools'][GLM]['active'], 1)
@@ -550,7 +554,7 @@ class TestIndependentModelSlots(_Base):
         self.assertNotIn('shared_active', st['pools'][GLM])
         self.assertNotIn('shared_group', st['pools'][GLM])
         self.assertNotIn('shared_capacity', st['pools'][CB])
-        self.assertEqual(sum(p['active'] for p in st['pools'].values()), 14)
+        self.assertEqual(sum(p['active'] for p in st['pools'].values()), 16)
         for model in (GLM_MODEL, CB_MODEL):
             out = dp.reserve(self.store, task_id=f'full-{model}',
                              runtime='codebuddy',

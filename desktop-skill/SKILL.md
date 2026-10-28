@@ -19,6 +19,7 @@ ZCode 桌面端与 Qoder 桌面端共用的**同一份**入口，安装到两个
 
 - `<engine_root>/scripts/stage_selection.py`
 - `<engine_root>/scripts/dispatch_pool.py`
+- `<engine_root>/scripts/dispatch_mode.py`
 - `<engine_root>/scripts/worker_status_widget.py`
 
 缺文件时明确报告桌面入口未正确安装，不猜路径、不新建另一套状态库。宿主应用不提供统一的技能目录环境变量，因此路径在安装时烘焙为字面值，不在运行时探测。
@@ -33,14 +34,23 @@ ZCode 桌面端与 Qoder 桌面端共用的**同一份**入口，安装到两个
 
 | 宿主 | 识别信号（环境变量存在即命中） | 本宿主不可派发的精确组合 |
 |---|---|---|
-| Qoder 桌面 | `QODER_CONFIG_DIR` 或 `QODERCN_CONFIG_DIR` 或 `QODER_PRODUCT_ID` | `qoder:Qwen3.8-Max`、`qodercn:Qwen-3.8-Max`、`qodercn:Qwen3.8-Max` |
-| ZCode 桌面 | `ZCODE_SKILL_DIR` 或 `ZCODE_DESKTOP_CONTEXT_PROMPT_ENABLED` 或 `ZCODE_APP_VERSION` | 无（`zcode:GLM-5.3` 已由引擎全局退役，任何宿主均不派发） |
+| Qoder 桌面 | `QODER_CONFIG_DIR` 或 `QODERCN_CONFIG_DIR` 或 `QODER_PRODUCT_ID` | `qoder:Qwen3.8-Max`、`qodercn:Qwen-3.8-Max`、`qodercn:Qwen3.8-Max`、`zcode:GLM-5.3`、`qoder:Sonus` |
+| ZCode 桌面 | `ZCODE_SKILL_DIR` 或 `ZCODE_DESKTOP_CONTEXT_PROMPT_ENABLED` 或 `ZCODE_APP_VERSION` | `zcode:GLM-5.3`（宿主不递归自派自己；BW-ZCODE-RESTORE-1-20261022 起该组合恢复为引擎正常可派主力，故须显式排除） |
 
 **无法确定宿主时必须 fail-closed：排除上表全部组合的并集**，并在回执中说明宿主未识别。绝不默认放行、绝不猜测宿主、绝不因为识别失败而放宽候选。
 
 构造本轮 `allowed_candidates` 时施加上表排除集，并在回执中记录 `host_excluded_candidates=[<本宿主实际排除的组合>]` 与 `host_identified_as=<qoder-desktop|zcode-desktop|unknown>`，防止宿主递归启动自己或占用本宿主不可派发的通道。
 
 排除集只收窄本轮候选，**绝不修改完整授权集合**。未列入排除集的其余已授权组合照常可接受派发，仍由引擎按优先级、时段、容量和限额裁决。
+
+## 共享派发三档（强／中／弱）
+
+brain-worker 的派发档位是**全宿主共享的手动三档**：strong（强）、medium（中）、weak（弱），**默认 weak**。ZCode 桌面、Qoder 桌面与主脑宿主读的是**同一份**档位状态，不存在按宿主分叉的私有档位。
+
+- 档位状态文件：`~/.brain-worker/dispatch-mode.json`（可用环境变量 `BRAIN_WORKER_DISPATCH_MODE_FILE` 覆盖）。浮窗手动切换后原子保存，**只影响之后的新派发**；已在途的任务绝不中断、追杀或改派，按原状态自然结束。
+- 缺文件、损坏 JSON、非法值或不可读路径时**安全回落 weak**，回执如实报出来源与错误短码，绝不把读取错误冒充成用户选过的档位。
+- 各档允许哪些精确池、按什么层序、受哪些时段门，**唯一数字来源是 `<engine_root>/scripts/dispatch_mode.py`**（`dispatch_pool`/`stage_selection`/浮窗统一消费，每次裁决现读）。本文不抄写任何池清单、层号、时段或容量数字；桌面宿主需要细节时读引擎代码或浮窗只读输出，绝不凭记忆复述。
+- 档位与守卫正交：限额短窗、容量、总守卫、工作区单写、权限门、失败轮转、Luna 禁用全部照旧；时段门依赖异常时按 fail-closed 处理（当作窗口关闭，绝不当作放行）。
 
 ## 其余规则一律以引擎为准
 

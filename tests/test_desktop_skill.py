@@ -20,7 +20,10 @@ class DesktopSkillTestBase(unittest.TestCase):
         (engine / "SKILL.md").write_text(
             "---\nname: brain-worker\n---\n", encoding="utf-8"
         )
-        for script in ("stage_selection.py", "dispatch_pool.py", "worker_status_widget.py"):
+        # BW-MANUAL-THREE-MODE-INSTALL-REPAIR-20261023：安装器要求引擎副本含
+        # scripts/dispatch_mode.py（三档策略唯一来源），假引擎必须提供。
+        for script in ("stage_selection.py", "dispatch_pool.py", "dispatch_mode.py",
+                       "worker_status_widget.py"):
             (engine / "scripts" / script).write_text("# test\n", encoding="utf-8")
         return engine
 
@@ -101,7 +104,16 @@ class TemplateContractTests(DesktopSkillTestBase):
     def test_template_rejects_missing_fail_closed_rule(self):
         with tempfile.TemporaryDirectory() as raw:
             root = Path(raw)
-            broken = self.template_text.replace("fail-closed", "best-effort", 1)
+            # BW-MANUAL-THREE-MODE-INSTALL-REPAIR-20261023：模板正文现有两处
+            # "fail-closed"（未知宿主契约句 + 时段门说明）。安装器要求的契约句是
+            # installer.FAIL_CLOSED_RULE（精确独特标记），测试必须精确删除该句，
+            # 否则另一处的裸 token 会掩盖契约句被破坏的事实。
+            broken = self.template_text.replace(
+                "无法确定宿主时必须 fail-closed：排除上表全部组合的并集",
+                "无法确定宿主时按上表并集外的候选放行",
+                1,
+            )
+            self.assertIn("无法确定宿主时按上表并集外的候选放行", broken)
             source = self._source_root_with(root, broken)
             with self.assertRaisesRegex(ValueError, "fail-closed"):
                 installer._validate_template(source / "desktop-skill" / "SKILL.md")
@@ -167,13 +179,26 @@ class GuardOnePoolKeyRealityTests(DesktopSkillTestBase):
             for candidate in installer.HOST_EXCLUDED[host]:
                 self.assertIn(candidate, union)
 
-    def test_retired_zcode_worker_is_not_relisted_by_any_host(self):
-        # BW-ZCODE-RETIRE-20261020：zcode:GLM-5.3 已由引擎全局退役，宿主排除集不再
-        # （G1 也禁止）列出已退役键；Qoder 宿主的递归防护由引擎退役本身兜底，
-        # 排除集只保留各自真实占用的 Qwen Max 通道。
-        for host in installer.HOSTS:
-            self.assertNotIn("zcode:GLM-5.3", installer.HOST_EXCLUDED[host])
+    def test_restored_zcode_combo_is_excluded_by_both_hosts(self):
+        # BW-ZCODE-RESTORE-1-20261022：zcode:GLM-5.3 恢复为引擎正常可派主力（容量 1）
+        # 后，宿主排除集回到退役前的最小一致形态：Qoder 宿主排除自身 Max 三池与 ZCode
+        # 精确组合；ZCode 宿主递归排除自己（zcode:GLM-5.3，且仅此一键）。被排除键仍必须
+        # 是引擎真实可派键（G1 由上面的 dispatchable 用例兜住）。
+        self.assertEqual(installer.HOST_EXCLUDED["zcode"], ("zcode:GLM-5.3",))
+        self.assertIn("zcode:GLM-5.3", installer.HOST_EXCLUDED["qoder"])
         self.assertIn("qoder:Qwen3.8-Max", installer.HOST_EXCLUDED["qoder"])
+        self.assertIn("zcode:GLM-5.3", dp.CAPACITY)
+
+    def test_sonus_excluded_by_qoder_host_only(self):
+        # BW-STRONG-SONUS-20261024：qoder:Sonus 是 strong 专属独立 1 槽正常池；
+        # Qoder 桌面宿主必须排除它（绝不递归自派自己），ZCode 宿主范围不扩大。
+        # 该键必须是引擎真实可派键，否则 G1 的 dispatchable 断言会先兜住。
+        self.assertIn("qoder:Sonus", installer.HOST_EXCLUDED["qoder"])
+        self.assertNotIn("qoder:Sonus", installer.HOST_EXCLUDED["zcode"])
+        self.assertEqual(installer.HOST_EXCLUDED["zcode"], ("zcode:GLM-5.3",))
+        self.assertIn("qoder:Sonus", installer.HOST_EXCLUDED_UNION)
+        self.assertIn("qoder:Sonus", dp.CAPACITY)
+        self.assertEqual(dp.CAPACITY["qoder:Sonus"], 1)
 
     def test_rejects_exclusion_naming_a_renamed_pool_key(self):
         with self.assertRaisesRegex(ValueError, "renamed or retired"):

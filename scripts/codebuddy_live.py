@@ -2,7 +2,8 @@
 
 BW-CODEBUDDY-MAIN-S3 / BW-CODEBUDDY-GLM-FALLBACK-20261018：这是**唯一**允许对
 CodeBuddy 精确模型执行正式 Popen 的生产入口，且只服务两个组合 ——
-`codebuddy` + `deepseek-v4.1-flash`（界面名 Deepseek-V4.1-Flash，最高优先主力）；
+`codebuddy` + `deepseek-v4.1-flash`（界面名 Deepseek-V4.1-Flash；AUTO 层=3，排在 Claude
+之后、两 OpenCode 免费模型之前）；
 `codebuddy` + `glm-5.3-flash`（界面名 GLM-5.3-Flash；与 deepseek **额度独立**、各有独立
 1 槽，国内总容量 14）。其它 CodeBuddy 旧模型（含其它旧 GLM 组合）与 WorkBuddy 一律由
 `codebuddy_direct.main()` 的 `manual_relay_only` 拒绝路径在**任何副作用之前**挡下，绝不
@@ -66,7 +67,7 @@ import codebuddy_direct as cb  # 已保留的纯解析/argv/权限/失败事实�
 import codebuddy_fallback as cbf  # 失败事实只读复验工具（同目录；证据门已于 BW-LIMIT30-20261019-S3 撤销）
 
 RUNTIME = 'codebuddy'
-MODEL = 'deepseek-v4.1-flash'  # 默认/最高优先模型（界面名 Deepseek-V4.1-Flash）
+MODEL = 'deepseek-v4.1-flash'  # 默认模型；AUTO 层=3（Claude 后、OpenCode 前）
 GLM_MODEL = 'glm-5.3-flash'    # 仅额度条件成立时的低层补位（界面名 GLM-5.3-Flash）
 MODELS = (MODEL, GLM_MODEL)
 POOL_KEY = dp.pool_key(RUNTIME, MODEL)  # 兼容默认；真实 pool_key 始终按 model 计算

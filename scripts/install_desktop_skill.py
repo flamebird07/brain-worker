@@ -33,15 +33,20 @@ LEGACY_MANAGED_BY = ("brain-worker-zcode-adapter", "brain-worker-qoder-adapter")
 HOSTS = ("zcode", "qoder")
 
 HOST_EXCLUDED = {
-    # BW-ZCODE-RETIRE-20261020：zcode:GLM-5.3 已由引擎全局退役（LEGACY_RETIRED_POOL_KEYS），
-    # 任何宿主都不再需要（G1 也禁止）在排除集里列出已退役键；两宿主排除集只剩各自
-    # 真实占用的 Qwen Max 通道。
+    # BW-ZCODE-RESTORE-1-20261022：zcode:GLM-5.3 恢复为引擎正常可派主力（容量 1）——
+    # 宿主排除集恢复退役前的最小一致形态：Qoder 宿主排除自身 Max 三池与 ZCode 精确
+    # 组合，ZCode 宿主递归排除自己（zcode:GLM-5.3）；G1 守卫要求排除键必须是引擎
+    # 真实可派键，恢复后该键重新合法。
+    # BW-STRONG-SONUS-20261024：Qoder 桌面宿主另排除 qoder:Sonus（strong 专属独立
+    # 1 槽正常池）——宿主绝不经 Sonus 递归自派自己；ZCode 宿主不受影响。
     "qoder": (
         "qoder:Qwen3.8-Max",
         "qodercn:Qwen-3.8-Max",
         "qodercn:Qwen3.8-Max",
+        "zcode:GLM-5.3",
+        "qoder:Sonus",
     ),
-    "zcode": (),
+    "zcode": ("zcode:GLM-5.3",),
 }
 # Fail-closed set applied when the host cannot be identified at runtime.
 HOST_EXCLUDED_UNION = tuple(
@@ -72,6 +77,11 @@ DRIFT_PRONE_PATTERNS = (
 )
 
 LUNA_RULE = "Luna 已删除并强制禁用"
+
+# BW-MANUAL-THREE-MODE-INSTALL-REPAIR-20261023：模板正文新增段落后，裸 token
+# "fail-closed" 已在多处出现，仅校验该 token 无法发现未知宿主契约句被删。改为
+# 校验安装器真正要求的 fail-closed 契约句本身（精确独特标记），要求只增不减。
+FAIL_CLOSED_RULE = "无法确定宿主时必须 fail-closed：排除上表全部组合的并集"
 
 
 def _default_engine_root() -> Path:
@@ -106,6 +116,9 @@ def _validate_engine(engine_root: Path) -> None:
         "SKILL.md",
         "scripts/stage_selection.py",
         "scripts/dispatch_pool.py",
+        # BW-MANUAL-THREE-MODE-DOCS-20261023：dispatch_pool 硬 import dispatch_mode
+        # （三档策略唯一来源）；引擎副本缺它会在第一次裁决时崩溃，安装期必须拒绝。
+        "scripts/dispatch_mode.py",
         "scripts/worker_status_widget.py",
     )
     missing = [item for item in required if not (engine_root / item).is_file()]
@@ -187,7 +200,7 @@ def validate_template_text(text: str) -> None:
                 raise ValueError(
                     f"desktop skill template omits {host} detection signal: {signal}"
                 )
-    if "fail-closed" not in text:
+    if FAIL_CLOSED_RULE not in text:
         raise ValueError("desktop skill template must keep the fail-closed unknown-host rule")
     if LUNA_RULE not in text:
         raise ValueError("desktop skill template must keep the Luna disablement rule")

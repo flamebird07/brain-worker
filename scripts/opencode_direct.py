@@ -50,6 +50,7 @@ if str(_SCRIPTS_DIR) not in sys.path:
 
 import dispatch_pool as dp  # noqa: E402
 import execution_control as ec  # noqa: E402
+import install_desktop_skill as ids  # noqa: E402
 import prompt_contract as pc  # noqa: E402
 import qoder_direct as qd  # noqa: E402
 
@@ -59,6 +60,14 @@ DEFAULT_MODEL = MODELS[0]
 POOL_KEY = dp.OPENCODE_DEEPSEEK_POOL_KEY
 DEFAULT_CONFIG = _SCRIPTS_DIR / 'opencode-entry.json'
 EXAMPLE_CONFIG = _SCRIPTS_DIR / 'opencode-entry.json.example'
+
+
+def installed_engine_entry_config() -> Path:
+    """本用户已安装 brain-worker 引擎（复用 install_desktop_skill 既有引擎根约定，
+    含 BRAIN_WORKER_HOME 覆盖）下的 opencode-entry.json 跨用户默认路径。只用于
+    缺省配置缺失时的发现回退；由 Path.home() 推导，绝不硬编码当前用户名或本机
+    绝对路径，也绝不复制或输出该私有配置的内容（只消费路径存在性与解析结果）。"""
+    return ids._default_engine_root() / 'scripts' / 'opencode-entry.json'
 
 # 有界墙钟：OpenCode 独占一个真实槽，必须有界，避免未知 writer 永久占位。
 DEFAULT_TIMEOUT_SECONDS = 1800
@@ -160,15 +169,8 @@ def _now_utc() -> datetime:
     return datetime.now(timezone.utc)
 
 
-def load_entry_config(path=None) -> dict:
-    """加载入口配置（可选）。缺省路径不存在时返回空配置（exe 走 PATH 发现）。
-    显式传入的路径不存在/非 JSON 对象一律抛错，绝不猜。"""
-    explicit = path is not None
-    candidate = Path(path) if path else DEFAULT_CONFIG
-    if not candidate.is_file():
-        if explicit:
-            raise ValueError(f'entry config not found: {candidate}')
-        return {}
+def _read_entry_config(candidate: Path) -> dict:
+    """读取并校验一份已确认存在的入口配置；不可读/非法一律抛错，绝不静默跳过。"""
     try:
         cfg = json.loads(candidate.read_text(encoding='utf-8'))
     except (OSError, ValueError) as exc:
@@ -179,6 +181,27 @@ def load_entry_config(path=None) -> dict:
     if tools is not None:
         _validate_allowed_tools(tools)
     return cfg
+
+
+def load_entry_config(path=None) -> dict:
+    """加载入口配置（可选，fail-closed，绝不静默降级）。发现顺序：
+    1. 显式 `--config` 最高优先；显式路径不存在/非法一律抛错，绝不回退任何候选。
+    2. 未显式指定时：仓库相邻真实配置 `scripts/opencode-entry.json` 存在即优先。
+    3. 仅当该默认配置缺失时，才回退本用户已安装 brain-worker 引擎的同名配置
+       （installed_engine_entry_config；存在但非法同样抛错，不静默跳过）。
+    4. 两处都不存在 → 空配置（executable 走 OPENCODE_EXE/PATH 发现，缺失即如实
+       抛错，绝不伪造发现）。"""
+    if path is not None:
+        candidate = Path(path)
+        if not candidate.is_file():
+            raise ValueError(f'entry config not found: {candidate}')
+        return _read_entry_config(candidate)
+    if DEFAULT_CONFIG.is_file():
+        return _read_entry_config(DEFAULT_CONFIG)
+    engine_cfg = installed_engine_entry_config()
+    if engine_cfg.is_file():
+        return _read_entry_config(engine_cfg)
+    return {}
 
 
 def resolve_executable(cfg=None, environ=None) -> str:
@@ -895,8 +918,10 @@ def build_parser():
                     help=f'one of {list(MODELS)}; no paid fallback or other model')
     ap.add_argument('--config', default=None,
                     help='optional entry config JSON (executable / allowed_tools); '
-                         f'defaults to {DEFAULT_CONFIG.name} when present, otherwise '
-                         'PATH discovery of opencode')
+                         'an explicit path must exist and is never fallen back from; '
+                         'defaults to scripts/opencode-entry.json when present, else '
+                         'the installed brain-worker engine copy, else OPENCODE_EXE '
+                         'or PATH discovery of opencode')
     ap.add_argument('--dispatch-claim', dest='dispatch_claim', default=None)
     ap.add_argument('--dispatch-store', dest='dispatch_store', default=None)
     ap.add_argument('--dispatch-plan', dest='dispatch_plan', default=None)

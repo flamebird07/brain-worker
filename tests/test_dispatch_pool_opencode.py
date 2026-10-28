@@ -5,14 +5,14 @@
 - 各独立 1 槽、互不占位：填满一个不影响另一个；释放只释放自己；
 - unknown 保容量：标 unknown 后新 claim 仍拒，绝不抢占；
 - 同 workspace 单写入守卫跨池生效；
-- AUTO 层序：… CodeBuddy deepseek(0) > 三 Qoder Max(1) > Claude(2) > 两 OpenCode(4，同级)
-  > CodeBuddy GLM(5，额度独立、缺省候选即含) > 两地区 Flash（BW-ZCODE-RETIRE-20261020：
-  ZCode 已退役、不再占任何层）；
+- AUTO 层序（BW-CB-REORDER-20261020 + BW-ZCODE-RESTORE-1-20261022）：三 Qoder Max(1)
+  > ZCode(2，恢复可派、容量严格 1) > Claude(3) > CodeBuddy deepseek(4)
+  > 两 OpenCode(5，同级) > CodeBuddy GLM(6，额度独立、缺省候选即含) > 两地区 Flash(7)；
   两 OpenCode 之间按真实在途平衡（同级公平）；
 - 精确点名：executor 冲突/未知 model 一律拒绝，绝不跨执行器改派；
 - 无时段门（北京白天照常）且无 CodeBuddy 额度前提（BW-LIMIT30-20261019-S3 起 GLM 也无需证据）；
-- 总容量 14（BW-ZCODE-RETIRE-20261020 起 zcode 退役不再占槽）：两 OpenCode 计入国内总在途，
-  满 14 绝不派第 15 个。
+- 总容量 15（BW-ZCODE-RESTORE-1-20261022 起 ZCode 恢复占 1 槽）：两 OpenCode 计入国内总在途，
+  满 15 绝不派第 16 个。
 """
 import sys
 import tempfile
@@ -24,6 +24,8 @@ REPO = Path(__file__).resolve().parent.parent
 SCRIPTS = REPO / 'scripts'
 sys.path.insert(0, str(SCRIPTS))
 import dispatch_pool as dp  # noqa: E402
+from dispatch_mode_support import (dispatch_mode, insert_sonus_leftover,  # noqa: E402
+                                               user_disabled_pools)
 
 DEEPSEEK = dp.OPENCODE_DEEPSEEK_MODEL
 GLM = dp.OPENCODE_GLM_MODEL
@@ -66,16 +68,24 @@ class _PoolBase(unittest.TestCase):
         return dp.status(self.store, now=now)['pools'][pk]['active']
 
     def fill_tiers_above_opencode(self):
-        """真实占满 CodeBuddy deepseek(1) + 三 Qoder Max(1+1+2) + claude(2)=7，
-        全部经显式 executor 逐一 claim 保证确定性。BW-ZCODE-RETIRE-20261020：ZCode 已
-        退役（capacity=0，不再占 tier）。GLM 额度独立始终参与候选（BW-LIMIT30-
-        20261019-S3），本方法只填 tier 0-3，保留 tier 4 (OpenCode) 和 tier 5 (CBGLM) 空位。"""
+        """真实占满 CodeBuddy deepseek + 三 Qoder Max(1+1+2) + ZCode(1，BW-ZCODE-
+        RESTORE-1-20261022 恢复、容量严格 1) + claude(2) = 8，全部经显式 executor 逐一
+        claim 保证确定性。GLM 额度独立始终参与候选（BW-LIMIT30-20261019-S3），本方法只填
+        tier<=4（三 Max=1、zcode=2、claude=3、CodeBuddy deepseek=4，BW-CB-REORDER-
+        20261020 + BW-ZCODE-RESTORE-1-20261022），保留 tier 5 (OpenCode) 和 tier 6
+        (CBGLM) 空位。"""
         toks = [self.reserve('cb1', 'codebuddy', dp.CODEBUDDY_MODEL,
                              executor='codebuddy')]
+        toks.append(self.reserve('zc1', 'zcode', 'GLM-5.3', executor='zcode'))
         toks.append(self.reserve('qm', 'qoder', 'Qwen3.8-Max', executor='qoder'))
         toks.append(self.reserve('cm', 'qodercn', 'Qwen3.8-Max', executor='qodercn'))
-        toks.append(self.reserve('cx1', 'qodercn', 'Qwen-3.8-Max', executor='qodercn'))
-        toks.append(self.reserve('cx2', 'qodercn', 'Qwen-3.8-Max', executor='qodercn'))
+        # BW-QODERCN-TOKEN-MAX-DISABLE-20261028：目标池两槽按禁用前 legacy 占位构造
+        # 「上层全满」历史层序场景（临时空禁用集，仅限这两次 reserve）。
+        with user_disabled_pools(frozenset()):
+            toks.append(self.reserve('cx1', 'qodercn', 'Qwen-3.8-Max',
+                                     executor='qodercn'))
+            toks.append(self.reserve('cx2', 'qodercn', 'Qwen-3.8-Max',
+                                     executor='qodercn'))
         toks.append(self.reserve('cl1', 'claude', 'deepseek-flash', executor='claude'))
         toks.append(self.reserve('cl2', 'claude', 'deepseek-flash', executor='claude'))
         return toks
@@ -91,8 +101,8 @@ class CapacityConstantTests(_PoolBase):
         self.assertEqual(dp.capacity_for(GPOOL), 1)
         self.assertTrue(dp.is_known_pool(DPOOL))
         self.assertTrue(dp.is_known_pool(GPOOL))
-        # BW-ZCODE-RETIRE-20261020：zcode 退役后国内总容量 16→14。
-        self.assertEqual(dp.DOMESTIC_TOTAL_CAPACITY, 14)
+        # BW-STRONG-SONUS-20261024：物理总 16（原 15 + strong 专属 Sonus 1 槽）。
+        self.assertEqual(dp.DOMESTIC_TOTAL_CAPACITY, 16)
 
 
 class IndependentSlotTests(_PoolBase):
@@ -188,12 +198,38 @@ class NoWindowNoQuotaGateTests(_PoolBase):
                        workspace=str(self._ws_for('day1')), prompt_sha256='p',
                        executor='opencode', now=DAY, _preclaim=False)
         self.assertTrue(r.get('allowed'), r)
-        # 同一时刻三个 Qoder Max 全部时段外拒派——对照证明 OpenCode 无时段门。
-        for task, model in (('m1', 'Qwen3.8-Max'),):
-            r2 = dp.reserve(self.store, task_id=task, runtime='qoder', model=model,
+        # 同一时刻三个 Qwen3.8-Max 都时段外拒派（BW-MANUAL-THREE-MODE-20261023：weak 档
+        # 恢复三个 Max 的夜间门）——对照证明 OpenCode 自身无时段门。
+        # BW-QODERCN-TOKEN-MAX-DISABLE-20261028：目标池现行被用户禁用——禁用拒绝
+        # （mode_excluded，「用户要求禁用」）优先于时段门，先单独断言它；两个仍可派的
+        # Max 白天照旧 main_force_window_closed。
+        r2d = dp.reserve(self.store, task_id='m2', runtime='qodercn',
+                         model='Qwen-3.8-Max', workspace=str(self._ws_for('m2')),
+                         prompt_sha256='p', executor='qodercn', now=DAY,
+                         _preclaim=False)
+        self.assertEqual(r2d.get('reason'), 'mode_excluded', r2d)
+        for task, runtime, model, executor in (
+                ('m1', 'qodercn', 'Qwen3.8-Max', 'qodercn'),
+                ('m3', 'qoder', 'Qwen3.8-Max', 'qoder')):
+            r2 = dp.reserve(self.store, task_id=task, runtime=runtime, model=model,
                             workspace=str(self._ws_for(task)), prompt_sha256='p',
-                            executor='qoder', now=DAY, _preclaim=False)
+                            executor=executor, now=DAY, _preclaim=False)
             self.assertEqual(r2.get('reason'), 'main_force_window_closed', r2)
+        # strong 档：三个 Max 无夜间门，同一白天时刻照常可派；OpenCode 则被档位排除。
+        with dispatch_mode('strong'):
+            r3 = dp.reserve(self.store, task_id='s3', runtime='qoder',
+                            model='Qwen3.8-Max', workspace=str(self._ws_for('s3')),
+                            prompt_sha256='p', executor='qoder', now=DAY,
+                            _preclaim=False)
+            self.assertTrue(r3.get('allowed'), r3)
+            self.assertEqual(r3['pool_key'], 'qoder:Qwen3.8-Max', r3)
+            dp.finish(self.store, r3['token'], terminal='cancelled', now=DAY)
+            r4 = dp.reserve(self.store, task_id='s4', runtime='opencode', model=DEEPSEEK,
+                            workspace=str(self._ws_for('s4')), prompt_sha256='p',
+                            executor='opencode', now=DAY, _preclaim=False)
+            self.assertFalse(r4.get('allowed'), r4)
+            self.assertEqual(r4.get('reason'), 'mode_excluded', r4)
+            self.assertFalse(r4.get('sent', True), r4)
 
     def test_no_codebuddy_quota_precondition(self):
         # BW-LIMIT30-20261019-S3：GLM 额度独立、不再需要当轮 DeepSeek 限额证据，
@@ -213,12 +249,29 @@ class NoWindowNoQuotaGateTests(_PoolBase):
 
 
 class AutoTierOrderTests(_PoolBase):
+    def test_codebuddy_tier3_before_opencode_tier4(self):
+        # BW-CB-REORDER-20261020 + BW-ZCODE-RESTORE-1-20261022：三 Max(1)+ZCode(2)+
+        # claude(3) 全满后，AUTO 下一层是 CodeBuddy deepseek(4)，仍先于两 OpenCode
+        # 免费模型(5)。
+        self.reserve('qm', 'qoder', 'Qwen3.8-Max', executor='qoder')
+        self.reserve('cm', 'qodercn', 'Qwen3.8-Max', executor='qodercn')
+        # 同上：目标池两槽 legacy 占位（临时空禁用集）。
+        with user_disabled_pools(frozenset()):
+            self.reserve('cx1', 'qodercn', 'Qwen-3.8-Max', executor='qodercn')
+            self.reserve('cx2', 'qodercn', 'Qwen-3.8-Max', executor='qodercn')
+        self.reserve('zc1', 'zcode', 'GLM-5.3', executor='zcode')
+        self.reserve('cl1', 'claude', 'deepseek-flash', executor='claude')
+        self.reserve('cl2', 'claude', 'deepseek-flash', executor='claude')
+        r = self.select('a0', 'qoder', 'Qwen3.8-Flash')
+        self.assertTrue(r.get('routing_required'), r)
+        self.assertEqual(r['selected']['pool_key'], dp.CODEBUDDY_POOL_KEY, r)
+
     def test_auto_after_zcode_before_conditional_cbglm(self):
-        # BW-ZCODE-RETIRE-20261020：ZCode 层已退役，高层只剩 tier 0-2（共 7 槽）；
-        # 测试名保留历史标签，验证目标不变——OpenCode(tier4) 在高层全满后被 AUTO 选中、
-        # 且先于条件性 tier5 CBGLM。
+        # BW-ZCODE-RESTORE-1-20261022：ZCode 层恢复（tier=2、容量 1），OpenCode 之上
+        # tier<=4 共 8 槽；验证目标不变——OpenCode(tier5) 在高层全满后被 AUTO 选中、
+        # 且先于低层 tier6 CBGLM。
         self.fill_tiers_above_opencode()
-        # 高层 7 槽全满 → AUTO 落到 tier4 的 OpenCode（而非 Flash 或 tier5 GLM）。
+        # 高层 8 槽全满 → AUTO 落到 tier5 的 OpenCode（而非 Flash 或 tier6 GLM）。
         r = self.select('a1', 'qoder', 'Qwen3.8-Flash')
         self.assertTrue(r.get('routing_required'), r)
         self.assertFalse(r.get('sent', True), r)
@@ -236,7 +289,7 @@ class AutoTierOrderTests(_PoolBase):
         self.reserve('of1', 'opencode', DEEPSEEK)
         self.reserve('of2', 'opencode', GLM)
         # BW-LIMIT30-20261019-S3：GLM 额度独立、始终参与候选（无需证据）；
-        # 两 OpenCode(4) 满 → tier5 GLM 先于 Flash。
+        # 两 OpenCode(5) 满 → tier6 GLM 先于 Flash。
         r = self.select('a1', 'qoder', 'Qwen3.8-Flash')
         self.assertTrue(r.get('routing_required'), r)
         self.assertEqual(r['selected']['pool_key'], dp.CODEBUDDY_GLM_POOL_KEY, r)
@@ -266,38 +319,42 @@ class AutoTierOrderTests(_PoolBase):
     def test_opencode_beats_conditional_cbglm_even_when_cbglm_first_free(self):
         self.fill_tiers_above_opencode()
         self.reserve('od', 'opencode', DEEPSEEK)
-        # deepseek 槽已满、glm-5.3-flash-free 仍空；GLM 始终参与候选 → tier4 OpenCode
-        # 仍先于 tier5 CodeBuddy GLM。
+        # deepseek 槽已满、glm-5.3-flash-free 仍空；GLM 始终参与候选 → tier5 OpenCode
+        # 仍先于 tier6 CodeBuddy GLM。
         r = self.select('a1', 'qoder', 'Qwen3.8-Flash')
         self.assertTrue(r.get('routing_required'), r)
         self.assertEqual(r['selected']['pool_key'], GPOOL, r)
 
 
-class TotalGuardFourteenTests(_PoolBase):
-    def test_all_fourteen_and_never_fifteen(self):
-        # BW-ZCODE-RETIRE-20261020：zcode 退役不再占槽，总容量 16→14。
-        toks = self.fill_tiers_above_opencode()           # 7
+class TotalGuardSixteenTests(_PoolBase):
+    def test_all_fifteen_weak_slots_plus_sonus_leftover(self):
+        # BW-STRONG-SONUS-20261024：weak 可新派仍为 15（Sonus 弱档不可新派）；物理总 16。
+        toks = self.fill_tiers_above_opencode()           # 8
         toks.append(self.reserve('cbg', 'codebuddy', dp.CODEBUDDY_GLM_MODEL,
-                                 executor='codebuddy', allowed=True))  # 8
-        toks.append(self.reserve('od', 'opencode', DEEPSEEK))          # 9
-        toks.append(self.reserve('og', 'opencode', GLM))               # 10
-        toks.append(self.reserve('qf1', 'qoder', 'Qwen3.8-Flash'))     # 11
-        toks.append(self.reserve('qf2', 'qoder', 'Qwen3.8-Flash'))     # 12
+                                 executor='codebuddy', allowed=True))  # 9
+        toks.append(self.reserve('od', 'opencode', DEEPSEEK))          # 10
+        toks.append(self.reserve('og', 'opencode', GLM))               # 11
+        toks.append(self.reserve('qf1', 'qoder', 'Qwen3.8-Flash'))     # 12
+        toks.append(self.reserve('qf2', 'qoder', 'Qwen3.8-Flash'))     # 13
         toks.append(self.reserve('cf1', 'qodercn', 'Qwen3.8-Flash',
-                                 executor='qodercn'))                 # 13
-        toks.append(self.reserve('cf2', 'qodercn', 'Qwen3.8-Flash',
                                  executor='qodercn'))                 # 14
+        toks.append(self.reserve('cf2', 'qodercn', 'Qwen3.8-Flash',
+                                 executor='qodercn'))                 # 15
         st = dp.status(self.store, now=NIGHT)
-        self.assertEqual(st['domestic']['active'], 14)
-        self.assertEqual(dp.DOMESTIC_TOTAL_CAPACITY, 14)
+        self.assertEqual(st['domestic']['active'], 15)
+        self.assertEqual(dp.DOMESTIC_TOTAL_CAPACITY, 16)
+        # 弱档填满 15 后仍不是物理全满；按真实形态补一条 strong 遗留 Sonus 在途。
+        insert_sonus_leftover(self.store)
+        st = dp.status(self.store, now=NIGHT)
+        self.assertEqual(st['domestic']['active'], 16)
         self.assertTrue(st['domestic']['full'])
         r = dp.reserve(self.store, task_id='over', runtime='opencode', model=DEEPSEEK,
                        workspace=str(self._ws_for('over')), prompt_sha256='p',
                        executor='opencode', now=NIGHT, _preclaim=False)
         self.assertFalse(r.get('allowed'), r)
         self.assertFalse(r.get('sent', True), r)
-        # 释放一个 OpenCode 槽 → 恢复可派（自己结束只影响自己）。
-        fin = dp.finish(self.store, toks[8], terminal='start_failed', now=NIGHT)
+        # 释放一个 OpenCode 槽（toks[9]=od）→ 恢复可派（自己结束只影响自己）。
+        fin = dp.finish(self.store, toks[9], terminal='start_failed', now=NIGHT)
         self.assertTrue(fin.get('released'), fin)
         r2 = dp.reserve(self.store, task_id='after', runtime='opencode', model=DEEPSEEK,
                         workspace=str(self._ws_for('after')), prompt_sha256='p',

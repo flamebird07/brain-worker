@@ -22,6 +22,7 @@ SCRIPTS = REPO / 'scripts'
 sys.path.insert(0, str(SCRIPTS))
 import claude_direct as cd      # noqa: E402
 import dispatch_pool as dp      # noqa: E402
+from dispatch_mode_support import dispatch_mode  # noqa: E402
 import execution_control as ec  # noqa: E402
 import prompt_contract as pc    # noqa: E402
 
@@ -176,6 +177,32 @@ class PureFunctionTests(unittest.TestCase):
         self.assertNotIn('bypass', joined)
         self.assertNotIn('yolo', joined)
         self.assertNotIn(SECRET, joined)
+
+    def test_turn_budget_defaults_and_one_time_closeout_instruction(self):
+        eng = cd._turn_budget({}, is_engineering_task=True)
+        simple = cd._turn_budget({}, is_engineering_task=False)
+        self.assertEqual(eng['max_turns_configured'], 120)
+        self.assertEqual(eng['max_turns_source'], 'builtin_engineering_default')
+        self.assertEqual(eng['closeout_reserve_turns'], 10)
+        self.assertEqual(eng['closeout_soft_threshold'], 110)
+        self.assertEqual(simple['max_turns_configured'], 40)
+        prompt = cd._closeout_instruction(eng)
+        self.assertEqual(prompt.count('TURN_BUDGET_CLOSEOUT'), 1)
+        self.assertIn('turn 110', prompt)
+
+    def test_error_max_turns_has_distinct_terminal_class_and_real_turn_count(self):
+        summary = cd.summarize_stream([json.dumps({
+            'type': 'result', 'subtype': 'error_max_turns', 'is_error': False,
+            'session_id': 's-budget', 'num_turns': 41, 'errors': []})])
+        facts = cd.classify_result(summary, 0, '', is_engineering_task=True)
+        self.assertEqual(facts['terminal_class'], 'turn_budget_exhausted')
+        self.assertTrue(facts['turn_budget_exhausted'])
+        self.assertEqual(facts['turns_used'], 41)
+        self.assertNotEqual(facts['turns_used'], facts['tool_use_count'])
+        self.assertFalse(facts['protocol_success'])
+        self.assertFalse(facts['execution_success'])
+        self.assertFalse(facts['quota_limited'])
+        self.assertIsNone(facts['transport_error'])
 
     def test_argv_rejects_unsupported_permission_mode(self):
         # 显式 dontAsk 与默认 bypassPermissions 之外不扩大支持；未知模式仍拒绝。
@@ -541,6 +568,12 @@ class LifecycleTests(unittest.TestCase):
         self.assertTrue(out['child_verified'], out)
         self.assertTrue(out['passed'])
         self.assertTrue(out['capacity_release'].get('released'), out['capacity_release'])
+        self.assertEqual(out['max_turns_configured'], 120)
+        self.assertEqual(out['max_turns_source'], 'builtin_engineering_default')
+        request = json.loads(Path(out['evidence']['request_path']).read_text(encoding='utf-8'))
+        self.assertEqual(request['max_turns_configured'], 120)
+        contract = Path(out['evidence']['sent_contract_path']).read_text(encoding='utf-8')
+        self.assertEqual(contract.count('TURN_BUDGET_CLOSEOUT'), 1)
         # 真实终态释放 → claude 槽空闲
         self.assertEqual(dp.status(self.store, now=OFFPEAK)['pools']['claude:deepseek-flash']['active'], 0)
         # token 只进 env，绝不进 argv
@@ -551,6 +584,70 @@ class LifecycleTests(unittest.TestCase):
             if f.is_file():
                 self.assertNotIn(SECRET, f.read_text(encoding='utf-8'), f.name)
 
+    def test_max_turns_partial_progress_generates_factual_continuation_and_releases(self):
+        controlled = self.ws / 'work.txt'
+        controlled.write_text('before', encoding='utf-8')
+        stream = _jsonl([
+            {'type': 'assistant', 'message': {'content': [
+                {'type': 'tool_use', 'name': 'Bash', 'id': 'b1',
+                 'input': {'command': 'python -m pytest tests/x.py -q'}}]}},
+            {'type': 'user', 'message': {'content': [
+                {'type': 'tool_result', 'tool_use_id': 'b1', 'is_error': False}]}},
+            {'type': 'result', 'subtype': 'error_max_turns', 'is_error': False,
+             'session_id': 's-budget', 'num_turns': 120, 'errors': []}])
+        fake = FakePopen(stream, pid=4343, sink=self.sink)
+
+        def factory(*args, **kwargs):
+            controlled.write_text('after', encoding='utf-8')
+            return fake(*args, **kwargs)
+
+        cfg = self.cfg()
+        cfg.update({'permission_mode': 'bypassPermissions',
+                    'tools': ['Read', 'Edit', 'Write', 'Bash'],
+                    'allowed_tools': [], 'max_turns': 120,
+                    '_max_turns_source': 'fixture.json'})
+        out = cd.run(
+            cfg, workspace=str(self.ws), prompt_file=self.prompt, out_dir=self.out,
+            stage='BW-CLAUDE-DEEPSEEK-S3', task_id='budget', prompt_sha256=self.sha(),
+            now=OFFPEAK, popen_factory=factory,
+            environ={'ANTHROPIC_API_KEY': SECRET}, dispatch_store=self.store,
+            child_prober=lambda pid: {'state': 'dead', 'created': 'c1'},
+            is_engineering_task=True, bind_child_pid=True,
+            write_files=['work.txt'],
+            required_test_commands=['python -m pytest tests/x.py -q'])
+        self.assertFalse(out['passed'])
+        self.assertEqual(out['terminal_class'], 'turn_budget_exhausted')
+        self.assertEqual(out['turns_used'], 120)
+        self.assertTrue(out['soft_closeout_triggered'])
+        self.assertTrue(out['partial_progress'])
+        self.assertEqual(out['changed_files'], 1)
+        self.assertFalse(out['report_complete'])
+        self.assertTrue(out['capacity_release'].get('released'))
+        self.assertEqual(dp.status(self.store, now=OFFPEAK)[
+            'pools']['claude:deepseek-flash']['active'], 0)
+        continuation = json.loads(Path(out['facts']['continuation_path']).read_text(
+            encoding='utf-8'))
+        self.assertTrue(continuation['not_original_worker_report'])
+        self.assertEqual(continuation['terminal_class'], 'turn_budget_exhausted')
+        self.assertEqual(continuation['changed_files'][0]['path'], 'work.txt')
+        self.assertEqual(continuation['observed_commands'][0]['command'],
+                         'python -m pytest tests/x.py -q')
+        self.assertEqual(continuation['unobserved_required_test_commands'], [])
+
+    def test_max_turns_zero_progress_does_not_fabricate_continuation(self):
+        facts = {'turn_budget_exhausted': True, 'ok_tool_receipts': 0,
+                 'turns_used': 40, 'report_complete': False,
+                 'max_turns_configured': 40}
+        meta = cd._turn_budget_continuation(
+            self.out, facts=facts, summary={'session_id': 's', 'tool_use': []},
+            binding={'reasons': ['missing report']}, evidence={},
+            controlled_before=[], controlled_after=[], required_test_commands=[],
+            started_at=OFFPEAK.isoformat(), finished_at=OFFPEAK.isoformat(),
+            secret=SECRET)
+        self.assertFalse(meta['partial_progress'])
+        self.assertFalse(meta['continuation_generated'])
+        self.assertFalse((self.out / 'continuation.json').exists())
+
     def test_output_dir_must_not_exist(self):
         self.out.mkdir()
         fake = FakePopen(self.success_stream(), sink=self.sink)
@@ -559,13 +656,24 @@ class LifecycleTests(unittest.TestCase):
         self.assertEqual(out['reason'], 'output_dir_exists')
         self.assertEqual(self.sink, [])  # 零 Popen
 
-    def test_peak_blocks_before_popen(self):
+    def test_peak_blocks_before_popen_in_weak_and_runs_in_strong(self):
+        # BW-MANUAL-THREE-MODE-20261023：claude 工作日高峰门**按档**——
+        # weak（默认）：北京周一 09:00 高峰如实拒派，零 Popen（绝不偷偷启动）；
+        # strong：无时段门，必须真实走到 Popen。
         fake = FakePopen(self.success_stream(), sink=self.sink)
-        out = self.run_with(fake, now=PEAK)
-        self.assertTrue(out['dispatch_failed'], out)
-        self.assertFalse(out['sent'])
+        out = self.run_with(fake, now=PEAK, bind_child_pid=True)
+        self.assertFalse(out['sent'], out)
+        self.assertEqual(out['gate']['reason'], 'main_force_window_closed', out['gate'])
         self.assertEqual(self.sink, [])  # 零 Popen
-        self.assertEqual(dp.status(self.store, now=PEAK)['pools']['claude:deepseek-flash']['active'], 0)
+        with dispatch_mode('strong'):
+            fake2 = FakePopen(self.success_stream(), sink=self.sink)
+            out2 = self.run_with(fake2, now=PEAK, bind_child_pid=True)
+            self.assertTrue(out2['sent'], out2)
+            self.assertTrue(self.sink)  # 真实启动过一次子进程
+            self.assertTrue(out2['facts']['execution_success'], out2['facts'])
+            # 真实终态释放 → claude 槽空闲。
+            self.assertEqual(
+                dp.status(self.store, now=PEAK)['pools']['claude:deepseek-flash']['active'], 0)
 
     def test_zero_tool_engineering_not_bound_success(self):
         body = _report_body('BW-CLAUDE-DEEPSEEK-S3', str(self.ws))

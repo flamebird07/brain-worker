@@ -39,11 +39,18 @@
 
 ## 可执行文件与私有配置（公开示例用通用路径）
 
-- 解析顺序：入口配置 `executable`/`exe`（绝对路径或 PATH 名）→ 环境变量 `OPENCODE_EXE` →
-  PATH 中的 `opencode`；缺失即抛错、0 副作用。**公开 example 一律用通用可配置名**
+- 配置发现顺序（fail-closed，BW-ZCODE-RESTORE-OPENCODE-REPAIR-20261022）：显式 `--config`
+  最高优先，路径不存在/非 JSON 对象一律拒绝、绝不回退；未显式指定时，仓库相邻真实配置
+  `scripts/opencode-entry.json` 存在即优先；仅当该默认配置缺失时，才回退本用户已安装
+  brain-worker 引擎的同名配置（复用 `install_desktop_skill` 既有引擎根约定，`Path.home()`
+  推导，跨用户、无当前用户名/本机路径硬编码；回退候选存在但非法同样抛错，不静默降级）。
+  两处都不存在 → 空配置。回退只消费"路径存在 + 解析后 executable 存在"类结果，
+  绝不复制或输出私有配置内容。
+- 可执行文件解析顺序：入口配置 `executable`/`exe`（绝对路径或 PATH 名）→ 环境变量
+  `OPENCODE_EXE` → PATH 中的 `opencode`；全部缺失即如实抛错、0 副作用。
+  **公开 example 一律用通用可配置名**
   （`scripts/opencode-entry.json.example`：`{"executable": "opencode", "allowed_tools": []}`），
-  不写真实用户安装路径；私有安装路径差异由 root 本机以非 example 配置持有，worker 不读取。
-- `--config` 显式路径不存在/非 JSON 对象一律拒绝；缺省路径不存在时返回空配置（走 PATH 发现）。
+  不写真实用户安装路径。
 - **不复制、不注入任何现有 OpenCode（含 OpenCode Go）凭据**；凭据不进 argv/request/异常/证据。
 
 ## 环境隔离（每 run 强制）

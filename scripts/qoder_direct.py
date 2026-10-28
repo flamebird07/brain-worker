@@ -41,6 +41,7 @@ if str(_SCRIPTS_DIR) not in sys.path:
 import execution_control as ec  # noqa: E402 任务级控制面（同目录，标准库）
 import prompt_contract as pc  # noqa: E402 三入口共享九节契约（标准库，不反向导入本模块）
 import dispatch_pool as dp  # noqa: E402 跨会话并发容量池（同目录，标准库 sqlite3）
+import dispatch_mode as dmode  # noqa: E402 档位/用户禁用开关（同目录，标准库）
 import qoder_permission_watch as qpw  # noqa: E402 CN 会话权限拒绝监视（同目录，标准库）
 import qoder_permissions as qp  # noqa: E402 从任务 scope 生成首次派发的精确规则
 
@@ -776,6 +777,25 @@ def main():
     args = ap.parse_args()
     if not args.stage or not args.stage.strip():
         ap.error('--stage is required and must be non-empty')
+    # BW-QODERCN-TOKEN-MAX-DISABLE-20261028：用户明确禁用 qodercn:Qwen-3.8-Max 的新派发。
+    # 无 --dispatch-claim 的正式 CN 入口请求精确落在该池时，在读取私有 CN 配置/模型映射、
+    # 建 output 目录、任何配置副作用与 Popen 之前以 mode_excluded（用户要求禁用）拒绝
+    # （sent=false、零占位、零证据目录）。带 --dispatch-claim 的请求不走本早门：禁用前
+    # 合法遗留的精确 reserved claim 仍由下方 consume_for_entry 完整校验
+    # （claim/config/model/token/workspace/权限/容量/时段），漂移照旧拒绝；其它被排除池
+    # 的 consume 语义不变。绝不误伤 qodercn:Qwen3.8-Max（内置名，短横线才是禁用目标）。
+    entry_pk = dp.pool_key(args.runtime, args.model)
+    if args.runtime == RUNTIME_CN and not args.dispatch_claim \
+            and entry_pk in dmode.USER_DISABLED_POOL_KEYS:
+        mode = dmode.current_mode()
+        print(json.dumps({'cn_user_disabled_pool_rejected': True, 'sent': False,
+                          'exit_code': 2, 'runtime': RUNTIME_CN,
+                          'model_requested': args.model,
+                          'reason': 'mode_excluded', 'mode_excluded': True,
+                          'dispatch_mode': mode, 'pool_key': entry_pk,
+                          'reasons': [dmode.mode_excluded_reason(entry_pk, mode)]},
+                         ensure_ascii=False))
+        return 2
     is_cn = args.runtime == RUNTIME_CN
     cn_model_id = None
     cn_config_dir = None

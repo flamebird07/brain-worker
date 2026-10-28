@@ -1,5 +1,7 @@
 # Qoder CLI 本机直连
 
+**2026-10-28 当前权威（BW-QODERCN-TOKEN-MAX-DISABLE-20261028）**：用户要求在所有强度禁用 `qodercn:Qwen-3.8-Max`（Qoder CN／token plan／Qwen-3.8-Max）的新派；不是 retired/legacy，不影响 CN 内置 `qodercn:Qwen3.8-Max`。正式 CN 入口通过 `consume_for_entry` 统一容量门：无 claim 时拒绝新建目标占位，`mode_excluded` 明示“用户要求禁用”，sent=false、零 Popen/输出目录，不冒充额度、认证、时段、容量或永久退役。禁用前合法且仍 reserved 的精确 `--dispatch-claim` 可沿既有生命周期启动、结束，配置、模型映射、token、工作区、PID、权限、容量和时段门全部保留；running/unknown 不追杀、不假释放、不改派，例外不泛化。目标容量登记 2、历史、宿主递归排除不变，物理总容量 16；strong/medium/weak 新派分别 5/4/10 池、6/5/13 槽。浮窗空闲隐藏目标，遗留在途标“已禁用（用户指令）”直至真实终态。下文“CN 自定义 Max 恢复/三路 Max”及包含目标的新派资格均被本次禁用覆盖，只作历史。
+
 使用已有官方 `@qoder-ai/qodercli` 运行时与官方保存的登录态。复制 `scripts/local-entry.json.example` 为同目录的 `local-entry.json`，填写本机 node 和 `qodercli.js` 的绝对路径；也可通过 `--config` 指定配置。真实配置不会进入 Git。
 
 ```text
@@ -25,6 +27,12 @@ BW-AVAILABILITY-20261009-B4：受信任主脑明确授权的 **`executor='qoder'
 **绝不因别的候选有空位而拒绝已授权组合**；ZCode availability 状态仅用于保证不会被绕回不可用的 ZCode，
 不参与 Qoder 组合选择。默认 AUTO 主力优先/容量/1:1 与 Z2/Max2/Flash2 容量不变（并发 2/4 是 Skill
 政策、非已核实的 Qoder 进程上限）。（注：此处 “Z2/Max2/Flash2” 是 B4 当时口径；已由 BW-POOL-SPLIT-20261010-S2/S3 定型为五池 Z2/国际内置 Max1/CN 内置 Max1/两区 Flash 各 2、合计 8，并由 BW-MAX-WINDOW-20261010-S2 加 CN 自定义主力 `qodercn:Qwen-3.8-Max`=2 升为六池、合计 10，当前口径见 [global-dispatch](global-dispatch.md) §11。）
+
+BW-STRONG-SONUS-20261024（用户明确指令，当前权威，2026-10-28 起重新生效）：国际 Qoder 入口维持 **strong 档专属**精确模型 `Sonus`（官方 CLI `--list-models` 只读核验的字面名，绝不改写/猜 ID）——正式派发用 `--model Sonus` 绑定/消费 `qoder:Sonus` 独立 1 槽 claim：strong 档有空即 claim、满即如实 `capacity_full`（sent=false），**绝不 fallback 到 Flash/ZCode/任何其它模型**；medium/weak 档显式 Sonus 一律 `mode_excluded`（sent=false、零新占位、绝不静默换模型）。Sonus 无任何时段门、**不属于** Qwen Max：不套 Max 北京夜间门，`_qoder_max_pool_key` 对 `Sonus` 恒返回 `None`（绝不吃 Max 限额标记/落标）。strong 档 AUTO 层序 Sonus=1 全档第一 > ZCode=2 > Claude=3 > 三路 Max=4。物理总容量升为 16（weak/medium 可新派容量仍 15）。详见 [global-dispatch](global-dispatch.md) 顶部三档覆盖段。
+
+BW-SONUS-REENABLE-20261028（用户明确指令，当前权威，取代下方 BW-SONUS-TEMP-DISABLE-20261026 的暂时禁用口径）：`qoder:Sonus` 恢复原有三档口径——strong 专属、层=1 全档第一、独立 1 槽、无时段限制；strong AUTO 在 Sonus 合格且有容量时首选 Sonus，显式 `--model Sonus` 有空即 claim、满即如实 `capacity_full`、绝不 fallback；medium/weak 显式 Sonus 一律如实 `mode_excluded`。唯一权威开关 `scripts/dispatch_mode.py` 的 `SONUS_TEMP_DISABLED = False`（True 时的禁用特殊分支只在 True 时生效）。物理总容量仍 16，容量登记/优先级表/宿主递归排除/历史 attempt 全部保留。下方 2026-10-26 禁用段为历史档案，不再覆盖当前策略。
+
+BW-SONUS-TEMP-DISABLE-20261026（用户明确指令，历史档案，已被上方 BW-SONUS-REENABLE-20261028 取代）：用户要求**暂时禁用** `qoder:Sonus` 参与任何新派发。国际 Qoder 入口的显式 `--model Sonus` 新请求（以及任何 AUTO/claim-due 新派发）在 strong/medium/weak **全部档位**一律如实 `mode_excluded`（sent=false、零新占位、绝不静默换模型、绝不 fallback），拒绝文案明确写「用户要求的临时禁用」——不是额度、认证、时段或永久退役。开关是 `scripts/dispatch_mode.py` 的 `SONUS_TEMP_DISABLED = True`，可逆：改回 False 即恢复原三档口径。Sonus 的池字面量、独立 1 槽容量登记、优先级历史层号、宿主递归排除、物理总容量 16 与历史 attempt 全部保留；禁用前遗留的 reserved/running/unknown Sonus 不追杀、不假释放，浮窗保留整行到真实终态。遗留生命周期（S2 收紧）：禁用只针对**新派发**——禁用前已合法取得 claim、仍为 reserved 的旧 Sonus token 可继续经 `consume_for_entry`（正式入口精确 `--model Sonus`）启动/mark running（Sonus 专项最小例外，置于精确 claim 校验之后，工作区/容量/PID/限额等门全部照旧）；新 reserve/select/claim-due 一律零占位拒绝，该例外绝不泛化到其它 mode_excluded 池。strong AUTO 首选因此变为 ZCode=2，其余五池优先级/无时段门不变。
 
 ## 统一契约与哈希口径
 
@@ -183,6 +191,8 @@ python tests/test_qoder_direct_permissions_offline.py
 ## 明确限额落标与识别（2026-10-10，BW-POOL-SPLIT-20261010-S5）
 
 **只有三个 Qoder 主力 Max 池可承载明确限额标记**：`qoder:Qwen3.8-Max`、`qodercn:Qwen3.8-Max`、CN 自定义主力 `qodercn:Qwen-3.8-Max`（BW-MAX-WINDOW-20261010-S2 并入；三池各自 pool_key 独立落标、互不连带，绝不因自定义落标误伤两内置 Max）。ZCode 走 `quota_control` 的 `zcode_availability` 独立口径；任一 Flash、退休 DeepSeek、Luna 永不落标，绝不误挡 Flash、绝不动 ZCode 既有 availability 规则。
+
+**BW-QWEN-MAX-LIMIT15-20261028（当前权威）**：两个 Qoder 内置 Max（`qoder:Qwen3.8-Max`、`qodercn:Qwen3.8-Max`）的明确限额标记改走 **900 秒（15 分钟）只读短窗**：从绑定 attempt 的真实 `ended_at_utc`（终态未落盘回退 `recorded_at_utc`）起 0<=age<900 秒内，AUTO、显式 reserve/select-and-claim、consume、claim-due 与浮窗同口径拒绝/显示“上轮限额”；恰满 900 秒自动消退并按现有优先级重新可选，不删 `main_force_limits` 证据、不宣称额度恢复、无需手动清标。原三池（ZCode/Claude/CodeBuddy deepseek）仍为 1800 秒；带短横线的 CN 自定义 `qodercn:Qwen-3.8-Max` 不进短窗（维持全档禁用现状），`qoder:Sonus` 不吃任何 Max 限额标记。离线回归见 `tests/test_qwen_max_limit15.py`。
 
 - **失败识别只扫结构化载体**：`_explicit_quota_limit_hit(summary)` 只读 `summary['result_errors']` / `summary['result_errors_info']`（真实 CLI 原始 envelope 的失败字段），绝不扫报告正文、`response.md` 或请求历史消息；`ec.explicit_429(errors, errors_info)` 命中或 `_hard_quota_limit_text` 命中任一 marker 才算真限额。识别大小写不敏感。
 - **硬限额 markers**（`_QUOTA_HARD_LIMIT_MARKERS`）：`credits exhausted / credits have been exhausted / out of credits / credit exhausted / credits depleted / insufficient credits / insufficient balance / no credits left / quota exhausted / credit usage limit / 积分用尽 / 积分不足 / 余额不足 / 额度用尽 / 额度不足`。用户真实失败文案 **"You've reached your credit usage limit."** 必识别；CN 内置 Max 实测终态文案 **"Your personal Credits have been exhausted. Please check your plan."** 必识别（“have been” 插在中间，不与旧的连续 `credits exhausted` 片段匹配，故单列 `credits have been exhausted`，大小写不敏感）。此识别**只针对该 runtime:model 的结构化终态错误**，绝不泛化成整个 `qodercn` executor，也绝不误标自定义 `qodercn:Qwen-3.8-Max`（自定义独立评估、互不连坐）。

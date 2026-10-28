@@ -11,6 +11,8 @@ stdin 携带完整九节契约（含本轮身份）+ 任务原文、JSON 流语�
 结构化分类 quota/auth/permission/transport、正常 read 正文里的 429/ECONNRESET 不误报、
 零工具回执不算工程成功）、真实终态释放本槽 vs 绑定失败/communicate 崩溃保留 unknown
 不假释放、business_verified 恒 false、session_id 缺失不绑定。
+BW-ZCODE-RESTORE-OPENCODE-REPAIR-20261022：缺省配置发现顺序（仓库相邻真实配置 →
+已安装引擎回退 → OPENCODE_EXE/PATH；显式 --config 缺失仍拒绝）fail-closed。
 真实 OpenCode 调用与免费额度由 root 本机执行验证；本文件只证明离线设计正确。
 """
 import hashlib
@@ -397,6 +399,104 @@ class PureFunctionTests(unittest.TestCase):
                                          ev_step_finish('stop')]))
         self.assertEqual(len(parsed['missing_tool_receipts']), 1)
         self.assertFalse(parsed['execution_evidence_ok'])
+
+
+class ConfigDiscoveryTests(unittest.TestCase):
+    """BW-ZCODE-RESTORE-OPENCODE-REPAIR-20261022：缺省配置发现顺序（fail-closed）。
+
+    仓库副本只有 example、无 OPENCODE_EXE 且 PATH 无 opencode 时，回退本用户已安装
+    brain-worker 引擎的 scripts/opencode-entry.json（复用 install_desktop_skill 引擎根
+    约定，Path.home() 推导，跨用户、无当前用户名/机器路径硬编码）；显式 --config 缺失
+    仍拒绝、绝不回退；全部缺失时如实拒绝。全部离线：引擎回退路径用注入替身，不读真实
+    ~/.ccsc 私有配置，不输出其内容。"""
+
+    def setUp(self):
+        self.tmp = tempfile.TemporaryDirectory()
+        self.base = Path(self.tmp.name)
+        self.addCleanup(self.tmp.cleanup)
+        self.repo_cfg = self.base / 'repo-scripts' / 'opencode-entry.json'
+        self.repo_cfg.parent.mkdir(parents=True)
+        self.engine_cfg = self.base / 'engine-scripts' / 'opencode-entry.json'
+        self.engine_cfg.parent.mkdir(parents=True)
+        self.engine_calls = []
+
+    def _write_cfg(self, path, exe):
+        path.write_bytes(json.dumps({'executable': exe, 'allowed_tools': []})
+                         .encode('utf-8'))
+
+    def _patch_discovery(self, *, engine_exists):
+        if engine_exists:
+            self._write_cfg(self.engine_cfg, str(sys.executable))
+
+        def fake_engine_cfg():
+            self.engine_calls.append('engine')
+            return self.engine_cfg
+
+        for patcher in (mock.patch.object(od, 'DEFAULT_CONFIG', self.repo_cfg),
+                        mock.patch.object(od, 'installed_engine_entry_config',
+                                          fake_engine_cfg)):
+            patcher.start()
+            self.addCleanup(patcher.stop)
+
+    def test_repo_adjacent_config_wins_and_engine_not_consulted(self):
+        # 默认仓库相邻真实配置存在 → 优先；引擎回退路径函数绝不被调用。
+        self._write_cfg(self.repo_cfg, str(sys.executable))
+        self._patch_discovery(engine_exists=True)
+        cfg = od.load_entry_config()
+        self.assertEqual(cfg.get('executable'), str(sys.executable))
+        self.assertEqual(self.engine_calls, [])
+
+    def test_engine_fallback_used_only_when_default_missing(self):
+        # 默认配置缺失 → 只此时才查安装引擎配置；可执行文件存在时解析成功，
+        # 不再抛 OpenCode executable not found。
+        self._patch_discovery(engine_exists=True)
+        cfg = od.load_entry_config()
+        self.assertEqual(self.engine_calls, ['engine'])
+        self.assertEqual(cfg.get('executable'), str(sys.executable))
+        self.assertEqual(od.resolve_executable(cfg, environ={'PATH': ''}),
+                         str(Path(sys.executable)))
+
+    def test_explicit_missing_config_never_falls_back(self):
+        self._patch_discovery(engine_exists=True)
+        with self.assertRaises(ValueError):
+            od.load_entry_config(str(self.base / 'missing-entry.json'))
+        self.assertEqual(self.engine_calls, [])
+
+    def test_invalid_engine_fallback_refused_not_silently_skipped(self):
+        # 回退候选存在但非法 → 抛错，绝不静默降级成空配置冒充 PATH 发现。
+        self._patch_discovery(engine_exists=False)
+        self.engine_cfg.write_bytes(b'{not-json')
+        with self.assertRaises(ValueError):
+            od.load_entry_config()
+
+    def test_all_missing_still_refuses_honestly(self):
+        self._patch_discovery(engine_exists=False)
+        cfg = od.load_entry_config()
+        self.assertEqual(cfg, {})
+        with self.assertRaisesRegex(ValueError, 'not found'):
+            od.resolve_executable(cfg, environ={'PATH': ''})
+
+    def test_opencode_exe_compatibility_retained(self):
+        # 无任何配置命中时空配置，executable 仍可来自既有 OPENCODE_EXE 环境变量。
+        self._patch_discovery(engine_exists=False)
+        cfg = od.load_entry_config()
+        self.assertEqual(od.resolve_executable(
+            cfg, environ={'PATH': '', 'OPENCODE_EXE': sys.executable}),
+            str(Path(sys.executable)))
+
+    def test_engine_config_path_follows_home_no_user_hardcode(self):
+        # 回退路径完全由 Path.home() 推导（跨用户默认）；opencode_direct 源码不含
+        # 当前用户名或 .ccsc 字面量——引擎根字面量唯一来源是共享的引擎根约定。
+        env = {k: v for k, v in os.environ.items() if k != 'BRAIN_WORKER_HOME'}
+        fake_home = self.base / 'some-other-user-home'
+        with mock.patch.dict(od.os.environ, env, clear=True), \
+                mock.patch.object(od.Path, 'home', return_value=fake_home):
+            derived = od.installed_engine_entry_config()
+        self.assertEqual(derived, fake_home / '.ccsc' / 'codex-mimo' / 'skills'
+                         / 'brain-worker' / 'scripts' / 'opencode-entry.json')
+        src = Path(od.__file__).read_text(encoding='utf-8')
+        self.assertNotIn('Administrator', src)
+        self.assertNotIn('.ccsc', src)
 
 
 class LifecycleTests(unittest.TestCase):

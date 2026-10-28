@@ -1,9 +1,29 @@
 # Claude Code / deepseek-flash 直连入口（claude-direct）
 
+> **当前权威覆盖：手动三档（BW-MANUAL-THREE-MODE-DOCS-20261023，2026-10-23 用户明确指令，
+> 覆盖本文件旧「Claude 全天可派」口径）：** 派发档位是全宿主共享的手动三档
+> strong／medium／weak，**默认 weak**，唯一策略来源 `scripts/dispatch_mode.py`
+> （`~/.brain-worker/dispatch-mode.json`，`BRAIN_WORKER_DISPATCH_MODE_FILE` 可覆盖；切档原子
+> 保存、**只影响新派发**，在途任务不中断；缺文件/畸形/非法/不可读一律**安全回落 weak**）。
+> 对本池 `claude:deepseek-flash`（容量 2）的含义：**strong 档无时段门**（五个可派池之一，
+> 层序 ZCode > Claude > 三 Max）；**medium 档恢复既有工作日高峰门**（工作日 09:00–12:00 /
+> 14:00–18:00 不新派，午休/夜间/周末/法定假日放行；层序 三 Max > Claude > ZCode）；**weak 档
+> （默认）同样恢复该高峰门**（层序中 Claude=3）。时段判定复用 `scripts/deepseek_offpeak.py`
+> 纯函数，其**加载/运行异常一律 fail-closed**（当作窗口关闭），绝不 fail-open；AUTO 候选、
+> 显式 `executor=claude`、预留后 `consume`、`claim_due`、`stage_selection` 与浮窗
+> `window_blocked` 全部复用同一判定。**时段门之外的语义全部照旧**：1800 秒真实限额短窗、
+> 容量 2、总容量守卫、同工作区单写、权限门、轮次预算与连接重试不受档位影响。下文旧
+> 「Claude 全天可派」「工作日高峰拒派」等段落均按此归档理解：前者已被三档覆盖，后者在
+> medium/weak 仍是现行规则。
+
+> **当前轮次预算覆盖（BW-CLAUDE-TURN-BUDGET-20261021）：** 普通工程默认 120 轮，简单非工程默认 40；任务可显式覆盖，证据记录 `max_turns_configured` 与 `max_turns_source`。一次性 system prompt 指令预留最后 10 轮用于 diff、关键测试和九节报告。`error_max_turns` 是独立的 `turn_budget_exhausted`，不属于 429/认证/权限/网络，也不触发连接重试；有成功工具回执或显式受控文件哈希变化时生成事实型 `continuation.json`，零进展不伪造接续成果。下文旧“40 轮”仅作历史配置档案。
+
 > 本文件描述 brain-worker 的主力执行器 `claude`（容量 2；客户 DeepSeek Anthropic 兼容端点，
-> 精确模型 `deepseek-flash`）。实现以 `scripts/claude_direct.py`、`scripts/deepseek_offpeak.py`
-> 与 `scripts/dispatch_pool.py` 为准，本文件为口径说明；二者不一致时以代码为准并回修文档。
-> **离线回归只证协议/绑定/时段门/容量语义；真实调用与端到端验收由根脑（root）在本机完成，
+> 精确模型 `deepseek-flash`）。实现以 `scripts/claude_direct.py` 与 `scripts/dispatch_pool.py`
+> 为准（Claude 时段门经 `scripts/dispatch_mode.py` 复用 `scripts/deepseek_offpeak.py` 纯时间
+> 判定，仅 medium/weak 档调用、strong 档不套门；依赖异常 fail-closed），本文件为
+> 口径说明；二者不一致时以代码为准并回修文档。
+> **离线回归只证协议/绑定/容量/限额语义；真实调用与端到端验收由根脑（root）在本机完成，
 > worker 不调 API。官方 Node CLI 2.1.76 真实 Read/Write 已成功（独立事实，见 §9），
 > native 2.1.220/296 连接失败单列，不与 Node 事实混写。**
 
@@ -33,27 +53,32 @@ python scripts/claude_direct.py \
 - runtime `claude`，池 `claude:deepseek-flash`，`CLAUDE_CAPACITY = 2`（BW-CLAUDE-CAPACITY2 由 1 增至 2），
   `MAIN_FORCE_CAPACITY[CLAUDE_POOL_KEY] = 2`。
 - **已登记入主力体系**：`claude:deepseek-flash` 在 `MAIN_FORCE_POOLS`/`MAIN_FORCE_KEYS`/
-  `MAIN_FORCE_CAPACITY` 内，`DOMESTIC_TOTAL_CAPACITY = 13`（含 `codebuddy:deepseek-v4.1-flash`
-  精确模型 1 槽，由 `MAIN_FORCE+OVERFLOW` 求和自动得出；**原 10 槽一项未减**）；
+  `MAIN_FORCE_CAPACITY` 内，`DOMESTIC_TOTAL_CAPACITY = 15`（含 ZCode 恢复的 1 槽与两个
+  CodeBuddy 精确模型各 1 槽，由 `MAIN_FORCE+OVERFLOW` 求和自动得出）；
   `_domestic_active` 统计所有非 Luna 在途 attempt，**claude 在途计入国内总额**。
 - **独立组 claude**：committed 由 attempts 真实提交历史
   `_count_committed_claude` 统计，**绝不污染** committed_zcode/committed_qoder；
-  当前口径（BW-CODEBUDDY-MAIN-S3 更新层序）：`codebuddy:deepseek-v4.1-flash`（层=0）>
-  三 Qoder Max（层=1）> claude（层=2）> `zcode:GLM-5.3`（层=3）；Max 全不可用时 claude
-  允许窗且有空位即优先于 Z；旧“平票排 Z2/Qoder 之后（`_grp_rank`）”的跨层 1:1 属历史、
-  已被覆盖，历史 committed 计数照旧保留记账但不再参与跨层竞争。
+  当前口径（BW-CLAUDE-ALLDAY-QMAX-AFTER-20261023）：两个 CN Max（层=1）>
+  `zcode:GLM-5.3`（层=2）> claude（层=3，**全天可派**）> `qoder:Qwen3.8-Max`（层=4，全天）>
+  `codebuddy:deepseek-v4.1-flash`（层=5）；旧"三 Qoder Max 同层""codebuddy 层=0"与跨层
+  1:1 属历史、已被覆盖，历史 committed 计数照旧保留记账但不再参与跨层竞争。
 - `AUTO` **可选** claude：AUTO 的 claude 入口请求**不绕过统一选择**，经同一权威 `_select_main_force`
-  优先级排序（先过滤真实空位与时段门/限额，再按优先级层选择、同层内在途平衡）；显式 `executor='claude'` 保持
-  精确组合、绝不跨到其它池或回退模型。
-- `_domestic_policy` claude 分支（S4 收口 + BW-CLAUDE-CAPACITY2 + BW-CODEBUDDY-MAIN-S3）：`executor_conflict` → **总 13 守卫先于一切**
-  （迁移债务满 13 时 `full`，**绝不派第 14 个**）→ 时段门 `main_force_window_closed` →
+  优先级排序（先过滤真实空位与限额，再按优先级层选择、同层内在途平衡；claude 无时段门）；
+  显式 `executor='claude'` 保持精确组合、绝不跨到其它池或回退模型。
+- `_domestic_policy` claude 分支（S4 收口 + BW-CLAUDE-CAPACITY2 + BW-CODEBUDDY-MAIN-S3）：`executor_conflict` → **总 15 守卫先于一切**
+  （迁移债务满 15 时 `full`，**绝不派第 16 个**）→ 时段门判定 `_max_window_blocks`
+  （BW-CLAUDE-ALLDAY-QMAX-AFTER-20261023 起对 claude 恒为 False，保留调用以维持单一权威路径）→
   限额 `full` → 有空位 `claim` → 满 `full`。
 - 未配置（缺 local/example 配置或 executable）时**不得读作就绪**：`build_argv` 缺
   `executable` 直接 `ValueError`（零 Popen）。旧 runs/unknown 记录一律保留、不迁移、不清库。
 
-## 2. 时段门（固定 UTC+8，无网络日历）
+## 2. 时段门（BW-CLAUDE-ALLDAY-QMAX-AFTER-20261023：已对 claude 整体解除）
 
-`scripts/deepseek_offpeak.py`（纯标准库）：
+**当前权威：claude 无派发时段门，全天可派。** `dispatch_pool._max_window_blocks` 对
+`claude:deepseek-flash` 恒返回 False，生产派发不再导入 `deepseek_offpeak`；本节余下内容是该纯
+函数的历史口径档案（保留用于读取旧证据与运行其独立测试），**不再决定 Claude 是否可派**。
+
+`scripts/deepseek_offpeak.py`（纯标准库，历史兼容保留）：
 
 - `BEIJING_UTC_OFFSET = 8h`；naive 输入按 UTC 解释，aware 输入先归一到 UTC 再 +8。
 - `PEAK_INTERVALS = ((540, 720), (840, 1080))` —— 09:00(含)–12:00(不含)、14:00(含)–18:00(不含) 为峰。
@@ -63,10 +88,8 @@ python scripts/claude_direct.py \
   `weekend / holiday / weekday_offpeak / weekday_peak / weekday_peak_unknown_year`。
 - **未知年份保守**：工作日峰值一律关闭（`weekday_peak_unknown_year`），非峰与周末仍放行；
   绝不把调休上班周六当峰值（周末优先放行）。
-- 峰期内**不新派**：`dispatch_pool._max_window_blocks` 让 claude 经 `offpeak.can_dispatch` 判定，
-  offpeak 不可用则 **fail-closed**（拒绝新派）。`_window_closed_reason(pk)` 给出池感知原因。
-- **跨峰预留只释放自身 token**：已 `reserve` 的 claude attempt 若在 `consume_for_entry` 时已进峰，
-  只把本任务自己的 reserved 真实释放为 `start_failed`，绝不启动、绝不抢占别人名额、绝不泄漏。
+- 历史行为（已作废）：峰期内曾不新派、offpeak 缺失时 fail-closed、跨峰 `consume_for_entry`
+  只释放自身 token。现在这些判定**不再参与** claude 可派性；跨峰 consume 正常放行。
 
 ## 3. 明确限额标记（受限池）
 
@@ -282,17 +305,17 @@ python scripts/claude_direct.py \
 - `_counts_domestic_concurrency` 排除 `claude`（low=='claude' 不计入本快照并发闸的
   qoder/zcode 活进程计数；claude 的容量 2 由 `dispatch_pool` 原子池权威强制）。
   **注意与总额守卫区分**：claude 在途**仍计入** `dispatch_pool._domestic_active`
-  的国内总在途（总 13，含 CodeBuddy 精确模型 1 槽），二者不矛盾——前者是二级业务快照闸、后者是原子总额守卫。
+  的国内总在途（当前总 15，含 ZCode 1 槽与两个 CodeBuddy 精确模型各 1 槽），二者不矛盾——前者是二级业务快照闸、后者是原子总额守卫。
 
 ## 8. 离线回归
 
 - `tests/test_deepseek_offpeak.py`：09/12/14/18 边界、Sat/Sun 周末、节日覆盖峰值、
-  未知年 2027 关峰放行非峰、时区折算、date 输入。
-- `tests/test_dispatch_pool_claude.py`：`CapacityAndRouting`（显式落第 11–12 槽、AUTO 经公平轮转
-  可选中 claude、总 13 语义）、`FairnessAndTotalGuard`（AUTO claude 请求不绕公平选择、
-  AUTO 峰值诚实关闭、**迁移债务满 13 时 claude 有空位也绝不派第 14**）、`WindowGate`
-  （含跨峰 consume 只释放本 token）、`QuotaLimitMarker`
-  （reserve→record→consume limited→release）、`WindowGateCaliber`。
+  未知年 2027 关峰放行非峰、时区折算、date 输入。**该纯函数仅作历史兼容保留，生产派发
+  与浮窗不再引用它**（BW-CLAUDE-ALLDAY-QMAX-AFTER-20261023）。
+- `tests/test_dispatch_pool_claude.py`：`CapacityAndRouting`（显式落第 1–2 槽、AUTO 经公平轮转
+  可选中 claude、总 15 语义）、`WindowGate`（**工作日高峰/周末/假日/未知年度一律可派**、
+  跨峰 consume 正常放行、高峰内 1800 秒真实限额短窗仍拒绝）、`QuotaLimitMarker`
+  （reserve→record→consume limited→release）、`WindowGateCaliber`（claude 与 offpeak 已解耦）。
 - `tests/test_claude_bypass_mode.py`（BW-CLAUDE-SIMPLE-20261018-S1）：默认/显式
   `--permission-mode bypassPermissions` 且真实 argv 含 `--dangerously-skip-permissions`、
   不是 allow-only；默认工程无 required_tools/write_files 仍到达 FakePopen 且回执记录

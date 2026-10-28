@@ -33,6 +33,9 @@ HERE = Path(__file__).resolve().parent
 _SCRIPTS = HERE.parent / 'scripts'
 if str(_SCRIPTS) not in sys.path:
     sys.path.insert(0, str(_SCRIPTS))
+if str(HERE) not in sys.path:
+    sys.path.insert(0, str(HERE))
+from dispatch_mode_support import user_disabled_pools  # noqa: E402
 
 
 def _load_qd():
@@ -870,18 +873,24 @@ class MainForceLimitRealEntryTests(_NoPopen):
     def test_main_records_custom_cn_max_without_touching_builtin(self):
         # 自定义友好名 Qwen-3.8-Max 与内置 Qwen3.8-Max 的真实 config 映射口径不同：
         # 前者必须经 model_ids 映射成服务端 ID 才能下发，本例据此走独立池落标。
-        argv, out = self._cn_case('custom-max', 'Qwen-3.8-Max',
-                                  {'Qwen-3.8-Max': 'synthetic-cn-custom-max-real-id'})
-        rc, printed = self._run_main(
-            argv, self._failure_envelope([_CN_LIMIT_TEXT]), exit_code=1)
-        self.assertEqual(rc, 3, rc)
-        self.assertEqual(self._limited_pools(), ['qodercn:Qwen-3.8-Max'])
-        summary = self._summary(out)
-        self.assertEqual(summary['main_force_limit']['pool_key'], 'qodercn:Qwen-3.8-Max')
-        attempt = self._attempt_by_task('T-custom-max')
-        self.assertEqual(attempt['pool_key'], 'qodercn:Qwen-3.8-Max')
-        self.assertEqual(attempt['state'], 'finished')
-        self.assertFalse(qd.dp.main_force_limited(self.store, 'qodercn:Qwen3.8-Max'))
+        # BW-QODERCN-TOKEN-MAX-DISABLE-20261028：目标池现行被用户禁用，无 claim 的正式
+        # CN 入口在读 CN 配置/模型映射之前即 mode_excluded 拒绝；「自定义 Max 失败只落
+        # 自己标」的落标机理属禁用前历史口径，这里临时用空禁用集复现该历史场景
+        # （真实禁用期间该池不可能再产生这类新失败）。
+        with user_disabled_pools(frozenset()):
+            argv, out = self._cn_case('custom-max', 'Qwen-3.8-Max',
+                                      {'Qwen-3.8-Max': 'synthetic-cn-custom-max-real-id'})
+            rc, printed = self._run_main(
+                argv, self._failure_envelope([_CN_LIMIT_TEXT]), exit_code=1)
+            self.assertEqual(rc, 3, rc)
+            self.assertEqual(self._limited_pools(), ['qodercn:Qwen-3.8-Max'])
+            summary = self._summary(out)
+            self.assertEqual(summary['main_force_limit']['pool_key'],
+                             'qodercn:Qwen-3.8-Max')
+            attempt = self._attempt_by_task('T-custom-max')
+            self.assertEqual(attempt['pool_key'], 'qodercn:Qwen-3.8-Max')
+            self.assertEqual(attempt['state'], 'finished')
+            self.assertFalse(qd.dp.main_force_limited(self.store, 'qodercn:Qwen3.8-Max'))
 
         # 反证"不波及内置"：同一库、同一时段下，内置 Max 随后仍被真实容量门放行到 Popen，
         # 且它这次的非限额终态绝不新增任何标记（自定义标记也不得扩大到内置）。

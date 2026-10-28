@@ -138,21 +138,23 @@ class _Base(unittest.TestCase):
 
 
 class RoundFailedRetryTests(_Base):
-    # BW-ZCODE-RETIRE-20261020：原 [QMAX, ZCODE] 集合的"下一个主力"改用现役
-    # qodercn:Qwen3.8-Max（同主力 Max 层，退役池绝不进授权候选集合）。
+    # BW-CLAUDE-ALLDAY-QMAX-AFTER-20261023：国际 Qoder Max 层=4、CN 内置 Max 层=1，故同集合
+    # 内的"最高优先主力"是 CN 内置 Max；本轮失败后换到下一候选（国际 Max）。
     def test_tried_combo_skipped_next_higher_priority_same_round(self):
         """首轮从最高优先层选；把该组合记入本轮失败列表后，同一轮换下一个更高优先级的
         合格候选；失败列表只剔本轮已试，不改授权集合。"""
         allowed = [QMAX, CN_MAX, CN_FLASH]
         r1 = self.plan(allowed)
         self.assertEqual(r1['refused'], None, r1)
-        self.assertEqual(r1['selected']['pool_key'], QMAX, r1)   # 主力最高层优先
+        self.assertEqual(r1['selected']['pool_key'], CN_MAX, r1)   # 主力最高层优先
+        self.assertEqual(r1['selected_priority'], 1, r1)
         self.assertEqual(r1['round_failed_candidates'], [])
 
-        r2 = self.plan(allowed, round_failed=[QMAX])
+        r2 = self.plan(allowed, round_failed=[CN_MAX])
         self.assertEqual(r2['refused'], None, r2)
-        self.assertEqual(r2['candidate_filters'][QMAX], 'already_tried_this_round', r2)
-        self.assertEqual(r2['selected']['pool_key'], CN_MAX, r2)  # 本轮换下一个主力
+        self.assertEqual(r2['candidate_filters'][CN_MAX], 'already_tried_this_round', r2)
+        self.assertEqual(r2['selected']['pool_key'], QMAX, r2)  # 本轮换下一个主力
+        self.assertEqual(r2['selected_priority'], 4, r2)
         self.assertEqual(sorted(r2['allowed_candidates']), sorted(allowed))  # 不缩权
 
     def test_next_new_round_empty_list_restarts_top_priority(self):
@@ -164,9 +166,9 @@ class RoundFailedRetryTests(_Base):
         # 新轮：空列表重新最高优先
         fresh = self.plan(allowed, round_failed=[])
         self.assertEqual(fresh['refused'], None, fresh)
-        self.assertEqual(fresh['selected']['pool_key'], QMAX, fresh)
+        self.assertEqual(fresh['selected']['pool_key'], CN_MAX, fresh)
         no_key = self.plan(allowed)  # 完全不传
-        self.assertEqual(no_key['selected']['pool_key'], QMAX, no_key)
+        self.assertEqual(no_key['selected']['pool_key'], CN_MAX, no_key)
 
     def test_all_candidates_tried_this_round_honestly_no_dispatch(self):
         """本轮所有已授权候选都试过 → 诚实无候选（不再派），绝不偷偷复用已试组合、
@@ -186,7 +188,7 @@ class RoundFailedRetryTests(_Base):
         r = self.plan(allowed, round_failed=[CN_FLASH])
         self.assertEqual(r['refused'], None, r)
         self.assertEqual(sorted(r['allowed_candidates']), sorted(allowed))
-        self.assertEqual(r['selected']['pool_key'], QMAX, r)   # 未被 CN_FLASH 干扰
+        self.assertEqual(r['selected']['pool_key'], CN_MAX, r)   # 未被 CN_FLASH 干扰
         self.assertEqual(r['round_failed_candidates'], [CN_FLASH])
 
     def test_cli_passes_round_failed_via_authorization_json(self):
@@ -278,25 +280,26 @@ class HistoryQuotaNoLongerBlocksFreshRoundTests(_Base):
     def test_old_zcode_hold_or_backoff_no_longer_blocks_new_round(self):
         """旧 hard_hold / 退避 / 未来时间等 availability 历史阻断不再挡一个新正常轮次：
         receipt 仍只读诊断回显 zcode_blocked=True（不假装 healthy、不清 hard_hold）。
-        BW-ZCODE-RETIRE-20261020：zcode 池已退役不可能再 eligible/被选中——退役前这半句
-        验的是"历史阻断不挡新轮"，现由现役 QMAX 承担该语义，诊断回显原样保留。"""
+        BW-ZCODE-RESTORE-1-20261022：ZCode 恢复逐候选枚举——未授权时如实 not_authorized，
+        历史 availability 阻断仍只作只读诊断、绝不产生过滤原因。"""
         with _patch_zcode(False):
             r = self.plan([QMAX], now=T_NIGHT)
         self.assertEqual(r['refused'], None, r)
         self.assertEqual(r['zcode_blocked'], True)               # 诊断如实保留
         self.assertEqual(r['candidate_filters'][QMAX], 'eligible', r)
         self.assertEqual(r['selected']['pool_key'], QMAX, r)
-        self.assertNotIn(ZCODE, r['candidate_filters'])          # 退役池不在枚举视图
+        self.assertEqual(r['candidate_filters'][ZCODE], 'not_authorized', r)
 
 
 class GuardsStillHonoredTests(_Base):
     def test_window_capacity_permission_not_bypassed_by_retry(self):
-        """重试绝不绕过时段/容量/权限能力：窗外 Max window_closed、满池 capacity_full、
+        """重试绝不绕过时段/容量/权限能力：窗外 CN Max window_closed、满池 capacity_full、
         需精确 Edit+Bash 的能力不兼容候选，各归各原因。
         BW-ZCODE-RETIRE-20261020：原 ZCode permission_incompatible 用例改用现役无精确
-        规则能力的 OpenCode deepseek 免费池（同样无 fine_grained 能力，语义平移）。"""
-        r = self.plan([QMAX], now=T_DAY)
-        self.assertEqual(r['candidate_filters'][QMAX], 'window_closed', r)
+        规则能力的 OpenCode deepseek 免费池（同样无 fine_grained 能力，语义平移）。
+        BW-QODER-INTL-MAX-ALLDAY-20261023：国际 Max 已全天可派，夜间门改由 CN Max 承载。"""
+        r = self.plan([CN_MAX], now=T_DAY)
+        self.assertEqual(r['candidate_filters'][CN_MAX], 'window_closed', r)
         self.assertEqual(r['refused'], 'no_eligible_candidate', r)
 
         self.fill(QMAX, 'occ-max')   # QMAX 容量 1 → 满
@@ -355,17 +358,21 @@ class DispatchPoolAutoNotBlockedByHistoryTests(_Base):
         self.assertEqual(r['pool_key'], QMAX, r)
 
     def test_auto_prefers_highest_priority_without_probing_quota(self):
-        """AUTO 新轮直接从最高优先级层起（夜间三 Max 优先），无需任何恢复 probe；
+        """AUTO 新轮直接从最高优先级层起（夜间两个 CN Max 优先），无需任何恢复 probe；
         绝不为绕限额把候选降到更低层。
-        BW-ZCODE-RETIRE-20261020：原 [ZCODE, QMAX] 集合的第二个主力改用现役 CN Max；
-        Max 层内 1:1 轮转下断言"落在主力 Max 层内"（层不降级），不锁死具体一侧。"""
-        allowed = [CN_MAX, QMAX]
+        BW-CLAUDE-ALLDAY-QMAX-AFTER-20261023：授权集合同时含 CodeBuddy deepseek（层=5）
+        时，夜间空库仍必须先落 CN Max 层（1），绝不回到旧「CodeBuddy 最高优先」口径；
+        授权集合不含 ZCode（层=2），不参与本集合选择。"""
+        allowed = [CN_MAX, QMAX, dp.CODEBUDDY_POOL_KEY]
         r = self.plan(allowed, now=T_NIGHT)
         self.assertIn(r['selected']['pool_key'], {QMAX, CN_MAX}, r)
         self.assertEqual(r['selected_priority'], dp.POOL_PRIORITY[r['selected']['pool_key']],
                          r)
         self.assertLess(r['selected_priority'],
                         dp.POOL_PRIORITY[CN_FLASH], r)  # 绝不降到 Flash 层
+        self.assertEqual(dp.POOL_PRIORITY[dp.CODEBUDDY_POOL_KEY], 5)
+        self.assertLess(r['selected_priority'],
+                        dp.POOL_PRIORITY[dp.CODEBUDDY_POOL_KEY], r)  # CN Max(1) 先于 CodeBuddy(5)
 
 
 @unittest.skipIf(qc is None, 'quota_control 不可用（隔离树）')
@@ -401,8 +408,7 @@ class ZcodeEntryPassesUnderHardHoldTests(_Base):
         blocking = qc.zcode_blocking_rows(self.quota, now=T_NIGHT)
         self.assertTrue(any(r['state'] == 'hard_hold' for r in blocking), blocking)
 
-        # 2) 真实入口：BW-ZCODE-RETIRE-20261020 起 zcode 组合在授权门即 unknown_pool，
-        #    入口整合改用现役 QMAX——dp.reserve 显式 executor='qoder' 预留成功、
+        # 2) 真实入口：现役 QMAX——dp.reserve 显式 executor='qoder' 预留成功、
         #    dp.consume_for_entry 消费成功，同一 dispatch 临时库上证明正式入口不再被
         #    consume_for_entry 里的 availability/main_force_limit 复核挡回（携带的
         #    quota_store 历史 hard_hold 只作诊断，绝不拦现役池）。
@@ -425,13 +431,14 @@ class ZcodeEntryPassesUnderHardHoldTests(_Base):
         self.assertNotIn('capacity_released', c)
         # 仍在途计数 = 1（未被历史 hold 复核踢掉）。
         self.assertEqual(dp.status(self.store, now=T_NIGHT)['pools'][QMAX]['active'], 1)
-        # 退役 zcode 组合经同一真实入口仍诚实拒绝（unknown_pool，不因 hold 诊断被绕开）。
+        # BW-ZCODE-RESTORE-1-20261022：恢复可派的 zcode 组合经同一真实入口照常预留
+        # 成功（历史 hard_hold 只作只读诊断，绝不拦新轮真实尝试、不谎称 healthy）。
         rz = dp.reserve(self.store, task_id='entry-zz', runtime='zcode', model='GLM-5.3',
                         workspace=self.ws('entry-zz'), prompt_sha256='p', stage='s',
                         chat_id='c', executor='zcode', quota_store=self.quota,
                         now=T_NIGHT, _preclaim=False)
-        self.assertFalse(rz['allowed'] and rz.get('token'), rz)
-        self.assertEqual(rz['reason'], 'unknown_pool', rz)
+        self.assertTrue(rz.get('allowed') and rz.get('token'), rz)
+        self.assertEqual(rz['pool_key'], ZCODE, rz)
 
 
 if __name__ == '__main__':
