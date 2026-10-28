@@ -65,12 +65,13 @@ import dispatch_mode as dmode  # noqa: E402  手动三档（strong/medium/weak�
 # dispatch_mode.priority_map_for_mode 重排），本表只定名称/注释与 stable-tie 基准序
 # （weak 档层序：两个 CN Max(1) > ZCode(2) > Claude(3) > 国际 Qoder Max(4) > CodeBuddy
 # DeepSeek(5) > 两 OpenCode(6) > CodeBuddy GLM(7) > 两区 Flash(8)；Sonus 不参与 weak）。
-# BW-STRONG-SONUS-20261024（BW-SONUS-REENABLE-20261028 起重新生效）：qoder:Sonus 是
+# BW-SONUS-TEMP-DISABLE-20261028-R2（当前权威）：Sonus 被用户要求再次暂时禁用新派
+# 发（三档空闲整行隐藏、遗留标「暂时禁用（用户指令）」）；该展示只在
+# dmode.SONUS_TEMP_DISABLED=True 时生效。历史：20261026 首次禁用 → 20261028 早上
+# BW-SONUS-REENABLE-20261028 恢复启用（strong 专属、排第一）→ 本次 R2 再禁用。
+# BW-STRONG-SONUS-20261024（常态口径，当前被 R2 禁用覆盖）：qoder:Sonus 是
 # strong 专属行（strong 档排第一）；medium/weak 空闲时整行隐藏，strong 启动后在途切档
 # 仍保留显示并标「本档不参与」。
-# BW-SONUS-TEMP-DISABLE-20261026（历史）：Sonus 曾被用户要求暂时禁用新派发（三档空闲
-# 整行隐藏、遗留标「暂时禁用（用户指令）」）；该展示只在 dmode.SONUS_TEMP_DISABLED=True
-# 时生效，2026-10-28 恢复启用后回到 strong 专属常态口径。
 # BW-LUNA-DISABLED-20261019：Luna 已从牛马删除，绝不显示可派行；旧记录只按退休历史审计。
 # 退休池（qodercn:DeepSeek-Flash、WorkBuddy 等）不显示成可派，但其真实在途仍计入总占用
 # （见 retired_active）；zcode:GLM-5.3 已按 BW-ZCODE-RESTORE-1-20261022 恢复为可派行。
@@ -95,7 +96,7 @@ ROW_DEFS = (
 STATE_LABELS = {'running': '运行中', 'unknown': '待核实', 'reserved': '已预留',
                 'idle': '空闲', 'window_closed': '时段外', 'read_failed': '读取失败',
                 'mode_excluded': '本档不参与'}
-# BW-SONUS-TEMP-DISABLE-20261026（历史）：Sonus 排除行的专属标签——只在
+# BW-SONUS-TEMP-DISABLE-20261026（历史；R2 20261028 再度生效）：Sonus 排除行的专属标签——只在
 # dmode.SONUS_TEMP_DISABLED=True（全档暂时禁用）期间用于 Sonus 行，绝不冒充失败/限额/
 # 永久退役；只影响展示文案，不改任何判定。
 SONUS_TEMP_DISABLED_LABEL = '暂时禁用（用户指令）'

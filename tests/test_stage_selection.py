@@ -189,31 +189,31 @@ class AuthorizationTests(_Base):
                              [dp.CN_CUSTOM_MAX_POOL_KEY, dp.CN_MAX_POOL_KEY])
             self.assertEqual(r['next_candidate']['priority'], 6)
             self.assertIn(r['next_candidate']['pool_key'], dp.OPENCODE_POOL_KEYS)
-        # 强档白天：六个可派池全部无时段门，层序 Sonus(1) → ZCode(2) → claude(3) →
+        # 强档白天：可派池全部无时段门，常态层序 Sonus(1) → ZCode(2) → claude(3) →
         # 三 Max(4)；回执层号与排除原因随档位切换，绝不沿用弱档表。CodeBuddy 不在强档
         # 硬集合内，即便带真实限额标记也先报 mode_excluded（档位排除先于限额原因，
-        # 绝不冒充 main_force_limited）。BW-SONUS-REENABLE-20261028：Sonus 恢复启用——
-        # strong 规划把它列为 eligible 且 AUTO 首选（层=1）。
+        # 绝不冒充 main_force_limited）。BW-SONUS-TEMP-DISABLE-20261028-R2：Sonus 全档
+        # 暂时禁用——strong 规划把它如实报 mode_excluded，AUTO 首选落 ZCode(2)。
         with dispatch_mode('strong'):
             r = self.plan(self.auth('auto', 'T', 's2', allowed), now=T_DAY)
             self.assertEqual(r['dispatch_mode'], 'strong', r)
-            self.assertEqual(r['selected_priority'], 1, r)
-            self.assertEqual(r['selected']['pool_key'], dp.SONUS_POOL_KEY, r)
+            self.assertEqual(r['selected_priority'], 2, r)
+            self.assertEqual(r['selected']['pool_key'], dp.ZCODE_POOL_KEY, r)
             eligible = {x['pool_key']: x for x in r['eligible_candidates']}
-            self.assertEqual(eligible[dp.SONUS_POOL_KEY]['priority'], 1)
+            self.assertNotIn(dp.SONUS_POOL_KEY, eligible)
             self.assertEqual(eligible[dp.ZCODE_POOL_KEY]['priority'], 2)
             self.assertEqual(eligible[dp.CLAUDE_POOL_KEY]['priority'], 3)
             self.assertEqual(eligible[dp.CLAUDE_POOL_KEY]['capacity'], 2)
             self.assertEqual(eligible[dp.QMAX_POOL_KEY]['priority'], 4)
             self.assertEqual(eligible[dp.CN_MAX_POOL_KEY]['priority'], 4)
             excluded = {x['pool_key']: x for x in r['excluded_candidates_with_reason']}
-            self.assertNotIn(dp.SONUS_POOL_KEY, excluded)
+            self.assertEqual(excluded[dp.SONUS_POOL_KEY]['reason'], 'mode_excluded')
             self.assertEqual(excluded[dp.CODEBUDDY_POOL_KEY]['reason'],
                              'mode_excluded')
             self.assertEqual(excluded[dp.OPENCODE_DEEPSEEK_POOL_KEY]['reason'],
                              'mode_excluded')
-            self.assertEqual(r['next_candidate']['priority'], 2)
-            self.assertEqual(r['next_candidate']['pool_key'], dp.ZCODE_POOL_KEY)
+            self.assertEqual(r['next_candidate']['priority'], 3)
+            self.assertEqual(r['next_candidate']['pool_key'], dp.CLAUDE_POOL_KEY)
 
     def test_expired_structured_limit_opens_new_round_and_restores_priority(self):
         self.build_store()

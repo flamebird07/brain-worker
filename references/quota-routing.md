@@ -1,6 +1,19 @@
 # Quota Routing & Persistent Cooldown（BW-QUOTA-20261008-S1，S2/S3 修订）
 
-> **最新权威覆盖（BW-QODERCN-TOKEN-MAX-DISABLE-20261028，优先于下文一切旧覆盖）：**
+> **最新权威覆盖（BW-SONUS-TEMP-DISABLE-20261028-R2，优先于下文一切旧覆盖）：**
+> 用户明确要求 `qoder:Sonus`（Qoder 国际／Sonus）**再次全档暂时禁用新派发**（唯一权威开关
+> `scripts/dispatch_mode.py` 的 `SONUS_TEMP_DISABLED = True`，可逆；覆盖同日早些时候
+> BW-SONUS-REENABLE-20261028 的恢复启用，该恢复与 2026-10-26 旧禁用均保留为历史）。
+> AUTO、显式 reserve/select-and-claim、claim-due、无 claim 的正式 Qoder 国际入口一律
+> `mode_excluded`、拒绝原因如实写「暂时禁用（用户指令）」，绝不伪装成额度/认证/时段/
+> 容量/永久退役；`qoder:Sonus` 不吃任何 Max 限额标记的口径不变。strong 实际可新派
+> 4 池/5 槽（ZCode > Claude > 两内置 Max，全无时段门）；medium 4/5、weak 10/13 不变；
+> 物理登记仍 16、Sonus 登记容量仍 1。禁用前合法取得且仍 reserved 的精确 Sonus claim
+> 继续经完整校验启动；已有 running/unknown 不追杀、不假释放、不改派；例外不泛化到其它
+> mode_excluded 池。额度/限额标记语义不变、不查余额。下文涉及 Sonus 现行可派性的叙述
+> 均为历史覆盖前记录，以此段为准。
+
+> **权威覆盖（BW-QODERCN-TOKEN-MAX-DISABLE-20261028，已被上方 R2 禁用段就 Sonus 一池进一步覆盖；其余仍优先于下文旧覆盖）：**
 > 用户明确要求 `Qoder CN / token plan / Qwen-3.8-Max`（精确池 `qodercn:Qwen-3.8-Max`，
 > 短横线友好名）**从所有档位禁用新派发**（`dispatch_mode.USER_DISABLED_POOL_KEYS`）。三档
 > 可新派集合变为 strong/medium/weak = 5/4/10 池、6/5/13 槽（物理登记仍 16、该池登记容量仍

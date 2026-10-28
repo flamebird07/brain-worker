@@ -158,16 +158,15 @@ class ModePolicyTests(unittest.TestCase):
             self.assertEqual(dm.normalize_mode(bad), 'weak', repr(bad))
 
     def test_allowed_sets_per_mode(self):
-        # BW-SONUS-REENABLE-20261028：Sonus 恢复启用——strong 回到 Sonus+五窄池；
-        # medium/weak 原口径不变（不含 Sonus）。
+        # BW-SONUS-TEMP-DISABLE-20261028-R2：Sonus 全档暂时禁用——strong 新派也是
+        # 四池（五窄池去 CN 自定义 Max）；STRONG_POOL_KEYS 常量表仍保留 Sonus 历史。
         self.assertEqual(set(dm.allowed_pools_for_mode('strong')),
-                         SIX_POOLS - {dm.QMAX_CN_CUSTOM_POOL_KEY})
+                         FIVE_POOLS - {dm.QMAX_CN_CUSTOM_POOL_KEY})
         self.assertEqual(set(dm.allowed_pools_for_mode('medium')),
                          FIVE_POOLS - {dm.QMAX_CN_CUSTOM_POOL_KEY})
         self.assertEqual(set(dm.allowed_pools_for_mode('weak')),
                          ELEVEN_POOLS - {dm.QMAX_CN_CUSTOM_POOL_KEY})
-        self.assertIn(SONUS_KEY, dm.allowed_pools_for_mode('strong'))
-        for m in ('medium', 'weak'):
+        for m in ('strong', 'medium', 'weak'):
             self.assertNotIn(SONUS_KEY, dm.allowed_pools_for_mode(m), m)
         # 非法档位按默认 weak 口径给全表；缺省读当前档（conftest 隔离下 weak）。
         self.assertEqual(set(dm.allowed_pools_for_mode('ultra')),
@@ -503,32 +502,34 @@ class SingleModeReadPerAdjudicationTests(_AdjudicationBase):
         self.assertEqual(calls, ['weak'], calls)
 
 
-class SonusReenabledTests(_AdjudicationBase):
-    """BW-SONUS-REENABLE-20261028：恢复启用 qoder:Sonus 的离线回归（回到
-    BW-STRONG-SONUS-20261024 三档常态口径）。
+class SonusTempDisabledR2Tests(_AdjudicationBase):
+    """BW-SONUS-TEMP-DISABLE-20261028-R2：用户指令再次暂时禁用 qoder:Sonus 的离线回归。
 
-    口径：strong=Sonus（层=1 全档第一、独立 1 槽、无时段门）+原五窄池；medium/weak
-    不含 Sonus，显式请求如实 mode_excluded（通用档位排除文案，不再写临时禁用）；
-    容量登记/优先级表/物理总容量 16/历史 attempt 全部保留；开关
-    SONUS_TEMP_DISABLED=False 为唯一权威，特殊禁用分支只在 True 时生效。"""
+    口径：SONUS_TEMP_DISABLED=True 为唯一权威——三档（含 strong）可新派集合全部剔除
+    Sonus；AUTO/显式 reserve/select-and-claim/claim-due/正式入口一律 mode_excluded
+    （sent=false、零新占位、文案明确「temporarily disabled」）；strong 新派 4 池/5 槽；
+    容量登记/优先级表历史层号/物理总容量 16/历史 attempt 全部保留；禁用前合法且仍
+    reserved 的精确 Sonus claim 照常 consume/mark running；其它 mode_excluded 池不继承
+    该例外。"""
 
     def test_flag_and_registration_facts(self):
-        self.assertFalse(dm.SONUS_TEMP_DISABLED)
+        self.assertTrue(dm.SONUS_TEMP_DISABLED)
         # 登记全部保留：池字面量、独立 1 槽、优先级表历史层号、非 legacy/retired。
         self.assertEqual(dm.SONUS_POOL_KEY, 'qoder:Sonus')
         self.assertEqual(dp.capacity_for(SONUS_KEY), 1)
         self.assertEqual(dm.STRONG_PRIORITY[SONUS_KEY], 1)
         self.assertNotIn(SONUS_KEY, dp.LEGACY_RETIRED_POOL_KEYS)
-        # 物理总守卫仍为 16；strong 可新派 = 五窄池 + Sonus 1 槽；medium/weak 原口径。
+        # 物理总守卫仍为 16；R2 禁用后 strong 新派口径 = medium（4 池/5 槽），weak 13。
         self.assertEqual(dp.DOMESTIC_TOTAL_CAPACITY, 16)
-        narrow = sum(dp.capacity_for(k) for k in dm.allowed_pools_for_mode('medium'))
         self.assertEqual(sum(dp.capacity_for(k)
-                             for k in dm.allowed_pools_for_mode('strong')),
-                         narrow + 1)
+                             for k in dm.allowed_pools_for_mode('strong')), 5)
         self.assertEqual(sum(dp.capacity_for(k)
-                             for k in dm.allowed_pools_for_mode('medium')), narrow)
+                             for k in dm.allowed_pools_for_mode('medium')), 5)
         self.assertEqual(sum(dp.capacity_for(k)
                              for k in dm.allowed_pools_for_mode('weak')), 13)
+        self.assertEqual(len(dm.allowed_pools_for_mode('strong')), 4)
+        self.assertEqual(len(dm.allowed_pools_for_mode('medium')), 4)
+        self.assertEqual(len(dm.allowed_pools_for_mode('weak')), 10)
         # strong 六池层号/无时段门口径不变。
         strong = dm.priority_map_for_mode('strong')
         self.assertEqual(strong[SONUS_KEY], 1)
@@ -537,8 +538,8 @@ class SonusReenabledTests(_AdjudicationBase):
         self.assertEqual({strong[k] for k in dm.MAX_POOL_KEYS}, {4})
         self.assertEqual(tuple(dm.window_gated_pools_for_mode('strong')), ())
 
-    def test_medium_weak_explicit_sonus_refused_with_zero_placeholders(self):
-        for m in ('medium', 'weak'):
+    def test_all_modes_explicit_sonus_refused_with_zero_placeholders(self):
+        for m in ('strong', 'medium', 'weak'):
             with dispatch_mode(m):
                 r = dp.reserve(self.store, task_id=f'x-{m}', runtime='qoder',
                                model='Sonus', workspace=str(self._ws(f'x-{m}')),
@@ -547,21 +548,38 @@ class SonusReenabledTests(_AdjudicationBase):
             self.assertFalse(r.get('sent'), (m, r))
             self.assertIsNone(r.get('token'), (m, r))
             self.assertEqual(r.get('reason'), 'mode_excluded', (m, r))
-            # 恢复启用后回通用档位排除文案，绝不再写「临时禁用」。
-            self.assertNotIn('temporarily disabled', r['reasons'][0], (m, r))
-            self.assertIn('not part of the', r['reasons'][0], (m, r))
+            # R2 禁用文案：明确写 temporarily disabled（用户指令），绝不写通用档位
+            # 排除，也绝不伪装成额度/认证/时段/容量/永久退役。
+            self.assertIn('temporarily disabled', r['reasons'][0], (m, r))
+            self.assertIn('user instruction', r['reasons'][0], (m, r))
+            self.assertNotIn('permanent retirement', r['reasons'][0].split('(')[0])
             with closing(dp.connect(self.store)) as conn:
                 n = conn.execute('SELECT COUNT(*) AS n FROM attempts').fetchone()['n']
             self.assertEqual(n, 0, (m, n))
 
-    def test_strong_explicit_sonus_reserves_and_consumes(self):
+    def test_strong_auto_never_selects_sonus_first_is_zcode(self):
+        # strong AUTO：禁用期间 Sonus 绝不被选；第一可用落 ZCode(2)。
         with dispatch_mode('strong'):
+            r = dp.select_and_claim(self.store, task_id='a1', runtime='qoder',
+                                    model='Qwen3.8-Max',
+                                    workspace=str(self._ws('a1')),
+                                    prompt_sha256='p', now=T0, _preclaim=False)
+        self.assertTrue(r.get('routing_required'), r)
+        self.assertEqual(r['selected']['pool_key'], 'zcode:GLM-5.3', r)
+
+    def test_legacy_reserved_sonus_claim_still_consumes(self):
+        # 禁用前合法取得且仍 reserved 的精确 Sonus claim：照常通过完整校验并 mark
+        # running（不追杀、不假释放）。用开关临时回 False 真实 reserve 出该遗留 claim，
+        # 再回 True 消费——绝不放开禁用期间的新 reserve。
+        with dispatch_mode('strong'), \
+                unittest.mock.patch.object(dm, 'SONUS_TEMP_DISABLED', False):
             r = dp.reserve(self.store, task_id='se1', runtime='qoder',
                            model='Sonus', workspace=str(self._ws('se1')),
                            prompt_sha256='p', executor='qoder', now=T0)
         self.assertTrue(r.get('allowed'), r)
         self.assertEqual(r.get('pool_key'), SONUS_KEY, r)
         tok = r['token']
+        self.assertTrue(dm.SONUS_TEMP_DISABLED)  # 消费时开关已是真禁用
         with dispatch_mode('strong'):
             out = dp.consume_for_entry(self.store, task_id='se1', runtime='qoder',
                                        model='Sonus', workspace=str(self._ws('se1')),
@@ -573,25 +591,6 @@ class SonusReenabledTests(_AdjudicationBase):
             state = conn.execute('SELECT state FROM attempts WHERE token=?',
                                  (tok,)).fetchone()['state']
         self.assertEqual(state, 'running', state)
-
-    def test_strong_auto_first_choice_is_sonus(self):
-        # strong AUTO：Sonus 有空即第一（层=1），满后才落 ZCode(2)。
-        with dispatch_mode('strong'):
-            r = dp.select_and_claim(self.store, task_id='a1', runtime='qoder',
-                                    model='Qwen3.8-Max',
-                                    workspace=str(self._ws('a1')),
-                                    prompt_sha256='p', now=T0, _preclaim=False)
-        self.assertTrue(r.get('routing_required'), r)
-        self.assertEqual(r['selected']['pool_key'], SONUS_KEY, r)
-        with dispatch_mode('strong'):
-            self._reserve('a-full', 'qoder', 'Sonus', 'qoder')
-        with dispatch_mode('strong'):
-            r2 = dp.select_and_claim(self.store, task_id='a2', runtime='qoder',
-                                     model='Qwen3.8-Max',
-                                     workspace=str(self._ws('a2')),
-                                     prompt_sha256='p', now=T0, _preclaim=False)
-        self.assertTrue(r2.get('routing_required'), r2)
-        self.assertEqual(r2['selected']['pool_key'], 'zcode:GLM-5.3', r2)
 
     def test_other_mode_excluded_pools_release_semantics_unchanged(self):
         """对照：非 Sonus 的 mode_excluded 池（strong 下的 CodeBuddy）consume 仍按既有

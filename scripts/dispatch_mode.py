@@ -8,18 +8,33 @@ BW-MANUAL-THREE-MODE-20261023（用户明确指令，当前权威）：
 - 缺文件 / 畸形 / 读失败一律**安全回落 weak**，并把真实来源与读取错误如实回报（
   `source` / `error`），绝不把错误冒充成用户选过的 strong/medium。
 
-三档新派池数 strong/medium/weak=5/4/10，槽数=6/5/13；物理登记仍为 16。
-strong：Sonus(1) > ZCode(2) > Claude(3) > 两内置 Max(4)，全部无时段门。
+三档常态新派池数 strong/medium/weak=5/4/10，槽数=6/5/13；物理登记仍为 16。
+strong 常态：Sonus(1) > ZCode(2) > Claude(3) > 两内置 Max(4)，全部无时段门。
+（当前生效 BW-SONUS-TEMP-DISABLE-20261028-R2：Sonus 全档暂时禁用——strong 新派
+实际为 4 池/5 槽：ZCode > Claude > 两内置 Max，全部无时段门；medium/weak 不变。）
 medium：两内置 Max(1) > Claude(2) > ZCode(3)；weak：CN 内置 Max(1) > ZCode(2) >
 Claude(3) > 国际 Max(4) > CodeBuddy DeepSeek(5) > 两 OpenCode(6) > CodeBuddy GLM(7) >
 两 Flash(8)。medium/weak 保留 Max 夜间门与 Claude 高峰门。
 2026-10-28 用户要求禁用 qodercn:Qwen-3.8-Max 新派；登记、历史和精确遗留 claim 保留。
 历史「CN 自定义 Max 恢复/三路 Max」的新派口径已被本次禁用覆盖。
 
-BW-SONUS-REENABLE-20261028（用户明确指令，当前权威）：**恢复启用** `qoder:Sonus`
-的新派发——`SONUS_TEMP_DISABLED = False`，完整回到 BW-STRONG-SONUS-20261024 三档常态
-口径（strong 专属、层=1 全档第一、独立 1 槽、无时段门；medium/weak 显式 Sonus 一律
-mode_excluded）。
+BW-SONUS-TEMP-DISABLE-20261028-R2（用户明确指令，**当前权威**）：再次**暂时禁用**
+`qoder:Sonus` 的全部新派发——`SONUS_TEMP_DISABLED = True`，覆盖同日早些时候的
+BW-SONUS-REENABLE-20261028 恢复启用（该恢复及其之前的旧禁用均保留为历史）。禁用
+语义与 BW-SONUS-TEMP-DISABLE-20261026 完全一致：Sonus 从**所有档位**（含 strong）
+的可新派集合排除——AUTO 不选它；显式 reserve / select-and-claim / consume /
+claim-due / 正式 qoder 入口一律 mode_excluded（sent=false、零新占位），文案明确
+「暂时禁用（用户指令）」，绝不伪装成额度、认证、时段、容量或永久退役。strong 新派
+实际 4 池/5 槽（ZCode > Claude > 两内置 Max，全无时段门）；medium 仍 4 池/5 槽、
+weak 仍 10 池/13 槽；物理总容量 16 与 Sonus 登记容量 1 不变。禁用前合法且仍
+reserved 的精确 Sonus claim 沿既有完整校验（token/task/workspace/PID/容量/权限）
+启动；其它 mode_excluded 池不继承该例外；已有 running/unknown 不追杀、不改派、
+不假释放。恢复 = 把开关改回 False。
+
+BW-SONUS-REENABLE-20261028（历史，已被 BW-SONUS-TEMP-DISABLE-20261028-R2 覆盖，
+不再生效）：曾**恢复启用** `qoder:Sonus` 的新派发——`SONUS_TEMP_DISABLED = False`，
+回到 BW-STRONG-SONUS-20261024 三档常态口径（strong 专属、层=1 全档第一、独立
+1 槽、无时段门；medium/weak 显式 Sonus 一律 mode_excluded）。
 
 BW-SONUS-TEMP-DISABLE-20261026（历史，已被 BW-SONUS-REENABLE-20261028 恢复覆盖，不再
 生效）：曾按用户明确指令**暂时禁用** `qoder:Sonus` 的新派发。`SONUS_TEMP_DISABLED = True`
@@ -30,7 +45,8 @@ select-and-claim / consume / claim-due / 正式 qoder 入口一律 mode_excluded
 16 与历史 attempt 全部保留；把 `SONUS_TEMP_DISABLED` 改回 False 即恢复原三档口径（本
 次恢复即如此操作）。禁用期间遗留的 reserved/running/unknown Sonus 不追杀、不假释放。
 
-BW-STRONG-SONUS-20261024（当前权威口径，2026-10-28 起重新生效）：`qoder:Sonus` 是国际 Qoder CLI
+BW-STRONG-SONUS-20261024（常态口径，当前被 BW-SONUS-TEMP-DISABLE-20261028-R2 暂时
+禁用覆盖）：`qoder:Sonus` 是国际 Qoder CLI
 `--list-models` 只读核验过的精确字面模型名（绝不改写/猜 ID），新增为 strong 专属的
 独立 1 槽正常池——strong 新派 Sonus 全档第一；medium/weak 显式 Sonus 一律 mode_excluded
 （sent=false、零新占位、绝不静默换模型）；Sonus 无时段门、不纳入任何 Max 限额/夜间门；
@@ -50,13 +66,13 @@ DEFAULT_MODE = 'weak'
 MODE_ENV_VAR = 'BRAIN_WORKER_DISPATCH_MODE_FILE'
 MODE_LABELS = {'strong': '强', 'medium': '中', 'weak': '弱'}
 MODE_NOTES = {
-    'strong': '强档 · Sonus／ZCode／Claude／两内置 Max · 全部无时段门',
+    'strong': '强档 · ZCode／Claude／两内置 Max · 全部无时段门（Sonus 暂时禁用）',
     'medium': '中档 · 仅 ZCode／Claude／两内置 Max · Max 夜间门 + Claude 高峰门',
     'weak': '弱档 · 10 个可新派池 · Max 夜间门 + Claude 高峰门',
 }
 # 每档可新派范围的纯文字描述（回执/浮窗文案用，绝不承载数字层号/容量，防漂移）。
 MODE_SCOPE_TEXT = {
-    'strong': 'Sonus／ZCode／Claude／两内置 Qwen3.8-Max（5 池）',
+    'strong': 'ZCode／Claude／两内置 Qwen3.8-Max（4 池；Sonus 暂时禁用（用户指令））',
     'medium': 'ZCode／Claude／两内置 Qwen3.8-Max（4 池）',
     'weak': '10 个可新派池（不含 Sonus 与 CN token plan Max）',
 }
@@ -81,12 +97,13 @@ QFLASH_CN_POOL_KEY = 'qodercn:Qwen3.8-Flash'
 # --list-models 核验字面名 `Sonus`）。strong 专属独立 1 槽；绝不能归入 MAX_POOL_KEYS
 # （不套任何夜间门）、不进 weak 全候选、也不是 legacy/未知池。
 SONUS_POOL_KEY = 'qoder:Sonus'
-# BW-SONUS-TEMP-DISABLE-20261026 唯一权威开关（BW-SONUS-REENABLE-20261028 起 False）：
+# BW-SONUS-TEMP-DISABLE-20261028-R2 唯一权威开关（当前 True；历史：20261026 首次
+# 禁用 → 20261028 早上恢复 False → 本次 R2 再禁用 True）：
 # True = 所有档位的可新派集合剔除 Sonus（复用 mode_excluded 硬门，文案明确为用户要求
 # 的临时禁用，相关特殊分支只在 True 时生效）；False = 完整恢复 BW-STRONG-SONUS-20261024
 # 三档口径（strong 专属、层=1、独立 1 槽、无时段门）。除本开关的读取外，Sonus 的一切
 # 登记/字面量/层号历史/容量/宿主递归排除保持原样。
-SONUS_TEMP_DISABLED = False
+SONUS_TEMP_DISABLED = True
 
 # 三个 Qwen3.8-Max（CN 自定义 + CN 内置 + 国际内置）。strong 全不设门；medium/weak 全部门。
 # Sonus 不在其中：它不是 Qwen3.8-Max，任何 Max 夜间门/限额标记都不得连坐到 Sonus。

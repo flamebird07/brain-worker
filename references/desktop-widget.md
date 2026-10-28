@@ -1,6 +1,8 @@
 # 桌面状态浮窗（只读牛马看板）
 
-**2026-10-28 当前覆盖（BW-QODERCN-TOKEN-MAX-DISABLE-20261028）**：用户要求从所有档位禁用 `qodercn:Qwen-3.8-Max`（Qoder CN／token plan／Qwen-3.8-Max）新派，不影响无连字符的 `qodercn:Qwen3.8-Max`。三档空闲时目标整行隐藏；存在真实 reserved/running/unknown 时整行保留，按真实状态和占用显示并标“已禁用（用户指令）”，直到真实终态后隐藏，不是假释放、不改派、不追杀。静态登记行与容量 2 保留，物理总容量 16 不变；strong/medium/weak 无遗留在途时可见 5/4/10 池，可新派槽数 6/5/13。汇总占用、PID 待核、在途判定、精简/展开规则不变。下文旧 6/5/11 池与“CN 自定义 Max 恢复/三路 Max”描述已被本次禁用覆盖，仅作历史。
+**2026-10-28 当前覆盖（BW-SONUS-TEMP-DISABLE-20261028-R2，另见 BW-QODERCN-TOKEN-MAX-DISABLE-20261028）**：用户要求**再次暂时禁用** `qoder:Sonus`（Qoder 国际／Sonus）全部新派（覆盖同日早些时候的 BW-SONUS-REENABLE-20261028 恢复启用）。三档空闲时 Sonus 整行隐藏（strong 也不例外，strong 无遗留在途时可见 4 池、可新派 5 槽；medium/weak 不变 4/10 池、5/13 槽）；存在禁用前遗留的真实 reserved/running/unknown Sonus 时整行保留，按真实状态和占用显示并标“暂时禁用（用户指令）”，直到真实终态后隐藏，不是假释放、不改派、不追杀，不是额度/认证/时段/容量/永久退役。静态登记行与容量 1、物理总容量 16 保留。恢复 = 把 `scripts/dispatch_mode.py` 的 `SONUS_TEMP_DISABLED` 改回 False。汇总占用、PID 待核、在途判定、精简/展开规则不变。下文“恢复启用/旧禁用/三档常态”Sonus 描述均已被本次禁用覆盖，仅作历史。
+
+**2026-10-28 当前覆盖（BW-QODERCN-TOKEN-MAX-DISABLE-20261028）**：用户要求从所有档位禁用 `qodercn:Qwen-3.8-Max`（Qoder CN／token plan／Qwen-3.8-Max）新派，不影响无连字符的 `qodercn:Qwen3.8-Max`。三档空闲时目标整行隐藏；存在真实 reserved/running/unknown 时整行保留，按真实状态和占用显示并标“已禁用（用户指令）”，直到真实终态后隐藏，不是假释放、不改派、不追杀。静态登记行与容量 2 保留，物理总容量 16 不变（Sonus 禁用期间 strong 无遗留在途时可见 4 池/5 槽）。汇总占用、PID 待核、在途判定、精简/展开规则不变。下文旧 6/5/11 池与“CN 自定义 Max 恢复/三路 Max”描述已被本次禁用覆盖，仅作历史。
 
 > 2026-10-19：Luna 已从 brain-worker 删除并强制禁用。浮窗生产 ROW_DEFS 为 12 个可派
 > 牛马组合行（11 个 weak 池 + strong 专属 `qoder:Sonus`，BW-STRONG-SONUS-20261024），
@@ -12,10 +14,12 @@ Python/Tk，无任何新依赖；不新增服务/HTTP/API，不查余额，不�
 不改共享库一个字节。** 默认是精简小卡片，只列有真实运行 attempt 的模型行；鼠标移入
 整个浮窗（含标题、行卡、按钮、checkbox、详情等子控件）即展开**当前快照可见行**
 （BW-WIDGET-LEGACY-VISIBILITY-20261023：行数不是固定 12 行——weak 显示全部当前
-11 个牛马池（Luna 已禁用，不计入行）；BW-SONUS-REENABLE-20261028：`qoder:Sonus`
-恢复启用——strong 空闲显示 Sonus 且排第一（strong 显示本档参与的 6 个池）；medium/weak
-空闲时 Sonus 整行隐藏；切档前遗留的 reserved/running/unknown Sonus 在 medium/weak
-整行临时保留，状态/占用照实并标「本档不参与」（strong 下正常参与），真实终态后消失。其它不参与但存在真实
+11 个牛马池（Luna 已禁用，不计入行）；BW-SONUS-TEMP-DISABLE-20261028-R2：`qoder:Sonus`
+全档暂时禁用——三档（含 strong）空闲时 Sonus 整行隐藏；禁用前遗留的
+reserved/running/unknown Sonus 在任何档位整行临时保留，状态/占用照实并标
+「暂时禁用（用户指令）」，真实终态后消失。（历史 BW-SONUS-REENABLE-20261028：
+恢复启用时 strong 空闲显示 Sonus 且排第一、medium/weak 隐藏、遗留在途标「本档不参与」。）
+其它不参与但存在真实
 ACTIVE_STATES attempt 的遗留池整行保留并标「本档不参与」。BW-OPENCODE-20261019-S3
 起两 OpenCode 免费模型行位于 ZCode 之后、CodeBuddy GLM（额度独立）之前），移出整个
 窗口边界约 200ms 后自动收回，不需要手动收起/展开按钮。
@@ -104,8 +108,8 @@ sidecar、绝不 migrate、绝不回落成空表冒充空闲。
   不会丢掉这些安全提示；历史池真有在途时以“其他在途 N”明示且不影响总占用计数。
   国内物理总槽 16（权威常量
   `DOMESTIC_TOTAL_CAPACITY`；BW-STRONG-SONUS-20261024 起含 strong 专属 `qoder:Sonus`
-  独立 1 槽——BW-SONUS-REENABLE-20261028 起 Sonus 恢复启用（strong 可新派、空闲整行显示），
-  容量登记与物理总 16 照旧；weak 可新派容量仍为原 15；
+  独立 1 槽——BW-SONUS-TEMP-DISABLE-20261028-R2 期间 Sonus 全档暂时禁用（三档空闲整行
+  隐藏、遗留标「暂时禁用（用户指令）」），容量登记与物理总 16 照旧；weak 可新派容量仍为原 15；
   此前 BW-OPENCODE-20261019-S3 含两个 OpenCode 免费模型各独立 1 槽）。CodeBuddy 两个模型（DeepSeek-V4.1-Flash 与低层补位
   GLM-5.3-Flash，额度独立、不再要求当轮 DeepSeek 限额证据——BW-LIMIT30-20261019-S3）**不共享名额、各自独立 1 槽**（BW-WORKER-WIDGET-20261018-S3 用户
   2026-10-18 最新明确；旧「共用同一物理 1 槽、总 13」口径作废），两行独立计数；
