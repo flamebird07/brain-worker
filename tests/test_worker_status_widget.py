@@ -1983,6 +1983,23 @@ class TestRealTkLayoutHeight(unittest.TestCase):
         self.assertEqual(self.frames['compact_idle'].winfo_manager(), 'pack')
         self.assertEqual(self.frames['empty'].winfo_manager(), 'pack')
 
+    def test_footer_only_packed_in_expanded_layout(self):
+        # BW-WIDGET-COMPACT-FOOTER-HIDE-20261029：精简态三种情况（无行/有运行行/空闲
+        # 倒计时代表读取失败同样精简）页脚都不参与布局；展开才 pack；往返恢复高度。
+        _, compact0 = self._apply(False, self._set_visible(0))
+        self.assertEqual(self.frames['footer'].winfo_manager(), '')
+        _, compact1 = self._apply(False, self._set_visible(1))
+        self.assertEqual(self.frames['footer'].winfo_manager(), '')
+        _, compact_idle = self._apply(False, self._set_visible(0), idle_compact=True)
+        self.assertEqual(self.frames['footer'].winfo_manager(), '')
+        _, expanded = self._apply(True, self._set_visible(12))
+        self.assertEqual(self.frames['footer'].winfo_manager(), 'pack')
+        self.assertGreater(expanded, compact0)
+        _, compact_after = self._apply(False, self._set_visible(0))
+        self.assertEqual(self.frames['footer'].winfo_manager(), '')
+        self.assertEqual(compact_after, compact0)
+        self.assertGreater(expanded, compact_after)
+
 
 class TestPollerDelivery(unittest.TestCase):
     def test_polling_delivers_transitions_and_safe_failure_every_two_seconds(self):
@@ -2231,7 +2248,9 @@ class TestGuiRefreshLifecycle(_ProductionGuiDriveMixin, _WidgetBase):
 
         self._drive_gui(exercise)
 
-    def test_actual_store_is_visible_in_compact_on_success_and_read_failure(self):
+    def test_actual_store_footer_hidden_in_compact_and_visible_expanded(self):
+        # BW-WIDGET-COMPACT-FOOTER-HIDE-20261029：精简态（成功/读取失败）页脚不参与布局，
+        # 但数据源文本仍保留；单击展开后完整页脚显示；再折叠页脚隐藏且高度精确恢复。
         idle, _, _ = self._transitions()
         failed = wsw._failure(self.store, T0, 'read_failed', 'synthetic-private-error')
 
@@ -2239,9 +2258,23 @@ class TestGuiRefreshLifecycle(_ProductionGuiDriveMixin, _WidgetBase):
             self.assertEqual(Path(poller._store), Path(self.store).resolve())
             for snap in (idle, failed):
                 tick(snap)
-                self.assertEqual(frames['footer'].winfo_manager(), 'pack')
+                self.assertEqual(frames['footer'].winfo_manager(), '')
                 self.assertIn(str(Path(self.store).resolve()), frames['footer'].cget('text'))
                 self.assertNotIn('synthetic-private-error', ' '.join(self._texts(self.root)))
+            shell = frames['summary'].master
+            compact_h = shell.winfo_reqheight()
+            # 明确单击标题栏展开：完整页脚（本地只读状态 + 数据源）进入布局。
+            self._click(self._find_label('牛马看板'))
+            self.assertTrue(self._is_expanded(frames))
+            self.assertEqual(frames['footer'].winfo_manager(), 'pack')
+            self.assertIn(str(Path(self.store).resolve()), frames['footer'].cget('text'))
+            expanded_h = shell.winfo_reqheight()
+            self.assertGreater(expanded_h, compact_h)
+            # 再单击折叠：页脚重新退出布局，高度回到展开前的精简值。
+            self._click(self._find_label('▾'))
+            self.assertFalse(self._is_expanded(frames))
+            self.assertEqual(frames['footer'].winfo_manager(), '')
+            self.assertEqual(shell.winfo_reqheight(), compact_h)
 
         self._drive_gui(exercise, use_default=True)
 

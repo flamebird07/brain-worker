@@ -30,7 +30,9 @@ BW-WORKER-WIDGET-20261018-S2 边界（必须遵守）：
   hover 自动展开/200ms 延迟回缩/刷新循环补偿路径已整体删除）。拖动超过 3px 阈值只移动
   窗口、绝不切换；置顶/关闭/档位按钮/空闲关机勾选/详情滚轮与点击均不冒泡触发折叠。
   精简/展开同宽 480（由 560 收窄）、动态高度并夹紧屏幕（贴底时整体上移、完整内容优先）；
-  最长牛马名称/状态/占用/按钮不截断。视图切换绝不勾选/停用/重置空闲关机 controller。
+  最长牛马名称/状态/占用/按钮不截断。底部两行页脚（本地只读状态 + 数据源）只在展开态
+  显示，精简态（含无行/有运行行/读取失败）不参与布局。视图切换绝不勾选/停用/重置空闲
+  关机 controller。
   真实运行中的行（含未知+运行混池）不展示历史限额，`prev_limited` 原始证据与 30 分钟
   计时保持不变。
 - 遗留牛马可见性（BW-WIDGET-LEGACY-VISIBILITY-20261023）：strong/medium 的展示快照
@@ -1020,6 +1022,9 @@ def apply_layout(frames, *, expanded, has_rows, idle_compact):
     显示全部。pack 顺序/参数与旧 `_apply_mode` 完全一致，只改「无行时不 pack rows_frame」。
     BW-MANUAL-THREE-MODE-20261023：新增可选的 `mode` 区块（三个手动档位按钮），排在
     摘要之后、行区之前；旧调用方不传该键时行为与之前完全一致。
+    BW-WIDGET-COMPACT-FOOTER-HIDE-20261029：底部两行页脚（本地只读状态 + 数据源）只在
+    展开态参与布局；精简态无论无行、有运行行还是读取失败都绝不 pack——页脚文本仍保留
+    在控件里，展开时原样显示，再次折叠随布局撤下并恢复精简高度。
     """
     order = ('summary', 'mode', 'rows', 'empty', 'compact_idle', 'idle', 'detail', 'footer')
     for key in order:
@@ -1036,9 +1041,10 @@ def apply_layout(frames, *, expanded, has_rows, idle_compact):
     if expanded:
         frames['idle'].pack(fill='x', pady=(6, 2))
         frames['detail'].pack(fill='x', pady=(5, 0))
+        # BW-WIDGET-COMPACT-FOOTER-HIDE-20261029：页脚只在展开态显示。
+        frames['footer'].pack(fill='x', pady=(4, 0))
     elif idle_compact:
         frames['compact_idle'].pack(fill='x', pady=(4, 0))
-    frames['footer'].pack(fill='x', pady=(4, 0))
 
 
 def run_gui(store_path=None, interval=2.0):
