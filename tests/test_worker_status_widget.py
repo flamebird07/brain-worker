@@ -15,6 +15,13 @@ BW-WIDGET-IDLE-20261018-S2：空闲自动关机——纯控制器注入 monotoni
 关机回调；真实 shutdown.exe 命令仅以 mock subprocess 验证参数，绝不真跑；覆盖默认
 关闭/1799-1800 边界/取消/在途与 Luna/退休占位/短调用漏采样/读取错误与陈旧快照/
 恢复重新 30 分/最终复核突然来任务/只触发一次/系统动作失败不循环。
+BW-WIDGET-CLICK-COMPACT-20261029：展开/折叠改为明确单击触发——离线 truth table
+（标题单击切换/拖动阈值不切换/精简点行展开+选中/展开点行只选中）+ 旧 hover 路径
+删除审计 + 480 宽常量；真实 Tk（生产 run_gui、透明+鼠标穿透映射窗口、event_generate
+合成 Enter/Leave/Button/Motion/MouseWheel）覆盖 Enter/Leave 零副作用、结构绑定审计
+（全树无 Enter/Leave 实例绑定、Button-1 只在标题/行卡）、标题单击切换与拖动不切换、
+行点击两态语义、档位/置顶/勾选/详情滚轮不切换、480 宽装下最坏内容（最长名称+三徽标
++两行时段外状态）不截断。
 """
 import io
 import json
@@ -1403,51 +1410,36 @@ class TestCompactViewHelpers(unittest.TestCase):
                          [dp.QMAX_POOL_KEY, dp.CODEBUDDY_POOL_KEY])
 
 
-class _FakeAfterRoot:
-    def __init__(self):
-        self.cancelled = []
+class TestClickToggleDecisions(unittest.TestCase):
+    """BW-WIDGET-CLICK-COMPACT-20261029：展开/折叠只由明确单击触发。纯决策函数
+    truth table + 旧 hover 路径删除审计，不启动 Tk；真实 Tk 点击语义由
+    TestClickExpandToggle 用生产 run_gui 驱动核验。"""
 
-    def after_cancel(self, after_id):
-        self.cancelled.append(after_id)
+    def test_title_click_toggles_and_drag_threshold_blocks(self):
+        # 真正单击：精简→展开、展开→折叠；拖动（超 3px 阈值后松开）一律无动作。
+        self.assertEqual(wsw.title_click_action(False, False), 'expand')
+        self.assertEqual(wsw.title_click_action(False, True), 'collapse')
+        self.assertEqual(wsw.title_click_action(True, False), 'none')
+        self.assertEqual(wsw.title_click_action(True, True), 'none')
 
+    def test_row_click_expands_selects_or_selects_only(self):
+        # 精简态单击运行行=展开并选中；展开态单击行=只选中详情绝不折叠；拖动无动作。
+        self.assertEqual(wsw.row_click_action(False, False), 'expand_select')
+        self.assertEqual(wsw.row_click_action(False, True), 'select')
+        self.assertEqual(wsw.row_click_action(True, False), 'none')
+        self.assertEqual(wsw.row_click_action(True, True), 'none')
 
-class TestHoverCollapsePolling(unittest.TestCase):
-    """BW-HOVER-REPAIR-20261019-S3：复用既有 150ms drain 循环核对真实指针边界，
-    不新增线程/独立定时器。纯决策函数 + 假 root，不启动 Tk：漏 Leave 也回缩、
-    重复刷新不重置 200ms 计时、重新移入取消、拖动不收缩、关闭清理待办。"""
+    def test_hover_auto_paths_fully_removed(self):
+        # 旧 hover 自动展开/200ms 延迟回缩/刷新循环补偿路径必须整体删除，绝不残留
+        # 可被误触发的入口（Enter/Leave 对展开状态零副作用的结构性保证）。
+        for name in ('hover_poll_action', 'hover_should_collapse', 'cancel_hover_after',
+                     '_HOVER_COLLAPSE_MS'):
+            self.assertFalse(hasattr(wsw, name), name)
 
-    def test_missed_leave_still_schedules_one_collapse(self):
-        # 进入展开后指针移到窗外且未收到 Leave：下一 tick 必须调度一次延迟回缩。
-        self.assertEqual(wsw.hover_poll_action(True, False, False, False), 'schedule')
-
-    def test_repeated_refresh_does_not_reset_collapse_timer(self):
-        # 已有一个待办时，后续每 150ms 的刷新只等待，绝不重新 after(200) 导致永不触发。
-        for _ in range(10):
-            self.assertEqual(wsw.hover_poll_action(True, False, False, True), 'wait')
-
-    def test_reenter_cancels_pending_collapse(self):
-        self.assertEqual(wsw.hover_poll_action(True, False, True, True), 'cancel')
-        self.assertEqual(wsw.hover_poll_action(True, False, True, False), 'none')
-
-    def test_dragging_never_collapses_even_outside(self):
-        self.assertEqual(wsw.hover_poll_action(True, True, False, False), 'none')
-        self.assertEqual(wsw.hover_poll_action(True, True, False, True), 'none')
-        self.assertFalse(wsw.hover_should_collapse(True, True, False))
-
-    def test_collapse_due_only_when_expanded_outside_and_not_dragging(self):
-        self.assertTrue(wsw.hover_should_collapse(True, False, False))
-        self.assertFalse(wsw.hover_should_collapse(True, False, True))
-        self.assertFalse(wsw.hover_should_collapse(False, False, False))
-
-    def test_close_clears_pending_after(self):
-        fake = _FakeAfterRoot()
-        hover = {'after': 'collapse-job-1'}
-        wsw.cancel_hover_after(fake, hover)
-        self.assertEqual(fake.cancelled, ['collapse-job-1'])
-        self.assertIsNone(hover['after'])
-        # 无待办时关闭绝不多调 after_cancel。
-        wsw.cancel_hover_after(fake, hover)
-        self.assertEqual(fake.cancelled, ['collapse-job-1'])
+    def test_compact_width_constant(self):
+        # 客户锁定目标：560 → 480（允许区间 460–500 内的稳定值），精简/展开同宽。
+        self.assertEqual(wsw._WIDTH, 480)
+        self.assertTrue(460 <= wsw._WIDTH <= 500)
 
 
 # ---------------------------------------------------------------- 空闲自动关机
@@ -2016,7 +2008,12 @@ class TestPollerDelivery(unittest.TestCase):
         self.assertTrue(out.empty())
 
 
-class TestGuiRefreshLifecycle(_WidgetBase):
+class _ProductionGuiDriveMixin:
+    """生产 run_gui 驱动基座：真实 Tk root（透明+鼠标穿透的映射窗口）+ mock
+    after/mainloop/poller，断言绝不连真实库写/真实探针/真实关机。
+    TestGuiRefreshLifecycle 与 TestClickExpandToggle（BW-WIDGET-CLICK-COMPACT-20261029
+    点击语义）共用。"""
+
     def setUp(self):
         super().setUp()
         try:
@@ -2025,8 +2022,24 @@ class TestGuiRefreshLifecycle(_WidgetBase):
         except Exception:
             self.skipTest('no display for production Tk refresh regression')
         self.tk = tk
-        self.root.withdraw()
-        self.addCleanup(self.root.destroy)
+        # event_generate 的指针事件只投递到已 map 的窗口：改用 alpha=0（完全透明）+
+        # disabled（真实鼠标点击穿透）的映射窗口驱动真实点击/拖动事件——对用户不可见
+        # 也不挡桌面；几何（winfo_x/reqheight）照常真实生效。
+        self.root.overrideredirect(True)
+        self.root.attributes('-topmost', True)
+        try:
+            self.root.attributes('-alpha', 0.0)
+            self.root.attributes('-disabled', True)
+        except Exception:  # noqa: BLE001 - 平台不支持透明属性时退化为普通映射
+            pass
+        self.root.update()
+        self.addCleanup(self._destroy_root)
+
+    def _destroy_root(self):
+        try:
+            self.root.destroy()
+        except Exception:  # noqa: BLE001
+            pass
 
     def _transitions(self):
         with closing(self._conn()):
@@ -2094,6 +2107,68 @@ class TestGuiRefreshLifecycle(_WidgetBase):
         for child in widget.winfo_children():
             texts.extend(self._texts(child))
         return texts
+
+    # ---------------- 点击/拖动驱动辅助（BW-WIDGET-CLICK-COMPACT-20261029）
+    def _walk(self, widget):
+        yield widget
+        for child in widget.winfo_children():
+            yield from self._walk(child)
+
+    def _find_label(self, text):
+        for w in self._walk(self.root):
+            if w.winfo_class() == 'Label' and w.cget('text') == text:
+                return w
+        raise AssertionError(f'label not found: {text!r}')
+
+    def _find_button(self, text):
+        for w in self._walk(self.root):
+            if w.winfo_class() == 'Button' and w.cget('text') == text:
+                return w
+        raise AssertionError(f'button not found: {text!r}')
+
+    def _find_checkbutton(self):
+        for w in self._walk(self.root):
+            if w.winfo_class() == 'Checkbutton':
+                return w
+        raise AssertionError('checkbutton not found')
+
+    def _is_expanded(self, frames):
+        # 展开态唯一权威布局信号：详情区进入 pack 布局（精简态必被 forget）。
+        return frames['detail'].winfo_manager() == 'pack'
+
+    def _detail_widget(self, frames):
+        return next(w for w in frames['detail'].winfo_children()
+                    if w.winfo_class() == 'Text')
+
+    def _detail_text(self, frames):
+        return self._detail_widget(frames).get('1.0', 'end-1c')
+
+    def _name_label(self, card, pk):
+        label = next(l for k, l, _n in wsw.ROW_DEFS if k == pk)
+        for w in self._walk(card):
+            if w.winfo_class() == 'Label' and w.cget('text') == label:
+                return w
+        raise AssertionError(f'name label not found for {pk}')
+
+    def _click(self, widget, x=4, y=4, x_root=600, y_root=400):
+        widget.event_generate('<Button-1>', when='now', x=x, y=y,
+                              rootx=x_root, rooty=y_root)
+        widget.event_generate('<ButtonRelease-1>', when='now', x=x, y=y,
+                              rootx=x_root, rooty=y_root)
+        # 合成的隐式抓取释放事件要到事件循环下一轮才稳定送达。
+        self.root.update()
+
+    def _drag(self, widget, dx, dy=0, x=4, y=4, x_root=600, y_root=400):
+        widget.event_generate('<Button-1>', when='now', x=x, y=y,
+                              rootx=x_root, rooty=y_root)
+        widget.event_generate('<B1-Motion>', when='now', x=x, y=y,
+                              rootx=x_root + dx, rooty=y_root + dy)
+        widget.event_generate('<ButtonRelease-1>', when='now', x=x, y=y,
+                              rootx=x_root + dx, rooty=y_root + dy)
+        self.root.update()
+
+
+class TestGuiRefreshLifecycle(_ProductionGuiDriveMixin, _WidgetBase):
 
     def test_claude_idle_running_finished_reaches_production_compact_layout(self):
         idle, running, finished = self._transitions()
@@ -2169,6 +2244,223 @@ class TestGuiRefreshLifecycle(_WidgetBase):
                 self.assertNotIn('synthetic-private-error', ' '.join(self._texts(self.root)))
 
         self._drive_gui(exercise, use_default=True)
+
+
+class TestClickExpandToggle(_ProductionGuiDriveMixin, _WidgetBase):
+    """BW-WIDGET-CLICK-COMPACT-20261029 真实 Tk 点击语义回归：生产 run_gui + 真实事件
+    （event_generate Button-1/B1-Motion/ButtonRelease-1/Enter/Leave/MouseWheel）驱动。
+    覆盖：Enter/Leave 及子控件移动零副作用、标题栏单击切换/拖动不切换、精简态点行
+    展开+选中、展开态点行只选中、档位/置顶/关机勾选/详情滚动点击不切换、480 宽装下
+    最坏内容不截断。关闭按钮不真实点击（会销毁 root），由结构性绑定审计覆盖。
+    无显示环境整体跳过，不伪报通过。"""
+
+    def _peak_snapshots(self):
+        """PEAK（北京周四 10:00，默认 weak 档）下的最坏内容快照对：
+        - running：CN 自定义 Max（最长名称、用户禁用池）插两条在途——一条活 PID 真
+          running + 一条死 PID running → 主行「待核实」+「含运行」+「已禁用（用户指令）」
+          双徽标（名称+徽标最坏组合）；claude/QMax 空闲行显示两行「时段外」富标签
+          （状态列最宽文本）。
+        - idle：全部在途落终态后的空闲快照（零运行）。"""
+        probe = _probe({4321: {'pid': 4321, 'state': 'alive', 'created': '111'}})
+        with closing(self._conn()) as conn:
+            self._insert(conn, 'cn-run', dp.CN_CUSTOM_MAX_POOL_KEY, 'running',
+                         child_pid=4321, child_created='111',
+                         started=PEAK - timedelta(seconds=90))
+            self._insert(conn, 'cn-dead', dp.CN_CUSTOM_MAX_POOL_KEY, 'running',
+                         child_pid=5150, child_created='222',
+                         started=PEAK - timedelta(seconds=60))
+        running = self._snap(now=PEAK, probe=probe)
+        with closing(self._conn()) as conn:
+            conn.execute("UPDATE attempts SET state='finished', terminal='finished', "
+                         "success=1, ended_at_utc=? "
+                         "WHERE token IN ('cn-run','cn-dead')", (_iso(PEAK),))
+        idle = self._snap(now=PEAK, probe=probe)
+        return idle, running
+
+    def test_enter_leave_never_change_expansion(self):
+        idle, running = self._peak_snapshots()
+
+        def exercise(tick, frames, cards, poller, pending):
+            tick(running)
+            self.assertFalse(self._is_expanded(frames))
+            title = self._find_label('牛马看板')
+            card = cards[dp.CN_CUSTOM_MAX_POOL_KEY]
+            # 精简态：整窗/标题/行卡/摘要/页脚 Enter+Leave 全打一遍——绝不展开。
+            for widget in (self.root, title, card, frames['summary'], frames['footer']):
+                widget.event_generate('<Enter>', when='now')
+                widget.event_generate('<Leave>', when='now')
+            self.root.update()
+            self.assertFalse(self._is_expanded(frames))
+            # 只剩下一个 150ms drain 重排待办：没有任何回缩/展开 after 被调度。
+            self.assertEqual(len(pending), 1)
+            # 展开态：移入/移出（含进入详情区）绝不折叠。
+            self._click(title)
+            self.assertTrue(self._is_expanded(frames))
+            for widget in (self.root, title, card, frames['detail']):
+                widget.event_generate('<Enter>', when='now')
+                widget.event_generate('<Leave>', when='now')
+            self.root.update()
+            self.assertTrue(self._is_expanded(frames))
+            self.assertEqual(len(pending), 1)
+
+        self._drive_gui(exercise)
+
+    def test_no_enter_leave_bindings_and_button1_only_on_title_and_rows(self):
+        idle, _running = self._peak_snapshots()
+
+        def exercise(tick, frames, cards, poller, pending):
+            tick(idle)
+            # 整棵控件树绝不挂任何实例级 Enter/Leave 回调（class 级 hover 视觉不受影响）。
+            for widget in self._walk(self.root):
+                self.assertEqual(widget.bind('<Enter>'), '', str(widget))
+                self.assertEqual(widget.bind('<Leave>'), '', str(widget))
+            # Button-1 拖动/单击绑定只允许在标题栏区与行卡部件（Frame/Label）上；
+            # 置顶/关闭/档位按钮、关机勾选、详情文本绝不挂 → 点击不会冒泡成切换/拖动。
+            for widget in self._walk(self.root):
+                if widget.bind('<Button-1>'):
+                    self.assertIn(widget.winfo_class(), ('Frame', 'Label'),
+                                  str(widget))
+
+        self._drive_gui(exercise)
+
+    def test_title_click_toggles_and_drag_moves_without_toggle(self):
+        _idle, running = self._peak_snapshots()
+
+        def exercise(tick, frames, cards, poller, pending):
+            tick(running)
+            self.assertFalse(self._is_expanded(frames))
+            title = self._find_label('牛马看板')
+            arrow = self._find_label('▸')
+            shell = frames['summary'].master
+            # 精简态单击标题栏 → 展开：详情/关机勾选进入布局，全部可见行在场，箭头翻下。
+            self._click(title)
+            self.assertTrue(self._is_expanded(frames))
+            self.assertEqual(self._find_label('▾').cget('fg'), wsw._FG)
+            visible = [c for c in cards.values() if c.winfo_manager() == 'pack']
+            self.assertEqual(len(visible), len(running['rows']))
+            expanded_h = shell.winfo_reqheight()
+            # 再单击 → 折叠回精简：只剩真运行行，高度回落，箭头复原。
+            self._click(title)
+            self.assertFalse(self._is_expanded(frames))
+            packed = [pk for pk, c in cards.items() if c.winfo_manager() == 'pack']
+            self.assertEqual(packed, [dp.CN_CUSTOM_MAX_POOL_KEY])
+            self.assertLess(shell.winfo_reqheight(), expanded_h)
+            self.assertEqual(self._find_label('▸').cget('text'), '▸')
+            # 精简态拖标题 >3px：窗口移动、绝不展开。
+            x0 = self.root.winfo_x()
+            self._drag(title, 14)
+            self.assertFalse(self._is_expanded(frames))
+            self.assertEqual(self.root.winfo_x(), x0 + 14)
+            # 展开态拖箭头（同属标题区）：移动但不折叠。
+            self._click(title)
+            self.assertTrue(self._is_expanded(frames))
+            x1 = self.root.winfo_x()
+            self._drag(arrow, -18)
+            self.assertTrue(self._is_expanded(frames))
+            self.assertEqual(self.root.winfo_x(), max(0, x1 - 18))
+
+        self._drive_gui(exercise)
+
+    def test_row_click_expands_and_selects_without_collapse(self):
+        _idle, running = self._peak_snapshots()
+
+        def exercise(tick, frames, cards, poller, pending):
+            tick(running)
+            card = cards[dp.CN_CUSTOM_MAX_POOL_KEY]
+            zcode = cards[dp.ZCODE_POOL_KEY]
+            self.assertEqual(card.winfo_manager(), 'pack')   # 精简态唯一可见运行行
+            self.assertEqual(zcode.winfo_manager(), '')
+            # 精简态单击运行行：展开 + 选中该行（详情=该行任务、行卡高亮、行详情保留）。
+            self._click(card)
+            self.assertTrue(self._is_expanded(frames))
+            self.assertEqual(card.cget('highlightbackground'), wsw._BORDER_SEL)
+            self.assertIn('Qoder CN／token plan／Qwen-3.8-Max', self._detail_text(frames))
+            self.assertEqual(zcode.winfo_manager(), 'pack')  # 展开后全部可见行在场
+            # 展开态单击另一行：只切换详情选中，绝不折叠。
+            self._click(zcode)
+            self.assertTrue(self._is_expanded(frames))
+            self.assertEqual(zcode.cget('highlightbackground'), wsw._BORDER_SEL)
+            self.assertEqual(card.cget('highlightbackground'), wsw._BORDER)
+            self.assertIn('ZCode／GLM-5.3', self._detail_text(frames))
+            # 展开态拖动行卡：移动窗口、不折叠、不改选中。
+            x0 = self.root.winfo_x()
+            self._drag(card, 12)
+            self.assertTrue(self._is_expanded(frames))
+            self.assertEqual(zcode.cget('highlightbackground'), wsw._BORDER_SEL)
+            self.assertEqual(self.root.winfo_x(), x0 + 12)
+
+        self._drive_gui(exercise)
+
+    def test_pin_mode_checkbox_wheel_and_detail_click_never_toggle(self):
+        _idle, running = self._peak_snapshots()
+
+        def exercise(tick, frames, cards, poller, pending):
+            tick(running)
+            # 精简态：档位按钮点击确实到达按钮 command（save_mode 被调），但绝不展开。
+            # 按钮用 invoke() 驱动 command：测试窗口 -disabled 属性会拦下 Button 激活，
+            # 而按钮不挂任何 Button-1 实例绑定已由结构性用例证明——点击不可能进入
+            # 拖动/切换路径。
+            with mock.patch.object(wsw.dmode, 'save_mode') as m_save:
+                self._find_button('弱').invoke()
+            self.assertTrue(m_save.called)
+            self.assertFalse(self._is_expanded(frames))
+            # 置顶：command 生效（文字翻转）且不展开；再点复位。
+            pin = self._find_button('置顶:开')
+            pin.invoke()
+            self.assertEqual(pin.cget('text'), '置顶:关')
+            self.assertFalse(self._is_expanded(frames))
+            pin.invoke()
+            self.assertEqual(pin.cget('text'), '置顶:开')
+            # 空闲关机勾选：勾上/取消都不切换展开。
+            chk = self._find_checkbutton()
+            chk.invoke()
+            self.assertFalse(self._is_expanded(frames))
+            chk.invoke()
+            self.assertFalse(self._is_expanded(frames))
+            # 展开态：详情滚轮、详情单击、档位按钮、置顶、勾选都绝不折叠。
+            self._click(self._find_label('牛马看板'))
+            self.assertTrue(self._is_expanded(frames))
+            detail = self._detail_widget(frames)
+            detail.event_generate('<MouseWheel>', delta=-120, when='now')
+            self._click(detail)
+            with mock.patch.object(wsw.dmode, 'save_mode'):
+                self._find_button('中').invoke()
+            self._find_button('置顶:开').invoke()
+            self._find_checkbutton().invoke()
+            self.assertTrue(self._is_expanded(frames))
+
+        self._drive_gui(exercise)
+
+    def test_compact_width_fits_widest_content_without_truncation(self):
+        _idle, running = self._peak_snapshots()
+
+        def exercise(tick, frames, cards, poller, pending):
+            tick(running)
+            self._click(self._find_label('牛马看板'))  # 展开：全部可见行在场
+            self.root.update_idletasks()
+            avail = wsw._WIDTH - 2 * wsw._SHELL_PADX  # 行卡可用内容宽（shell 内边距外）
+            # 每张可见行卡的请求宽度都装得下：最长名称（CN 自定义 Max）+ 双徽标
+            # （含运行+已禁用）+ 两行「时段外」富标签 + 占用数，绝不溢出/截断。
+            name_heights = {}
+            for pk, card in cards.items():
+                if card.winfo_manager() != 'pack':
+                    continue
+                self.assertLessEqual(card.winfo_reqwidth(), avail, (pk, card.winfo_reqwidth()))
+                name_heights[pk] = self._name_label(card, pk).winfo_reqheight()
+            self.assertEqual(len(name_heights), len(running['rows']))
+            # 名称标签同为单行高（无一处被迫换行折行）。
+            self.assertEqual(max(name_heights.values()) - min(name_heights.values()), 0,
+                             name_heights)
+            # 标题栏（标题/只读/箭头/置顶/关闭按钮）与档位行同样装得下内容宽。
+            # （页脚数据源路径是无空格长词，560 时代就超出 wraplength 不换行，
+            # 不属于本阶段收窄引入的截断，见报告边界说明。）
+            title_bar = self._find_label('牛马看板').master
+            self.assertLessEqual(title_bar.winfo_reqwidth(), avail,
+                                 title_bar.winfo_reqwidth())
+            self.assertLessEqual(frames['mode'].winfo_reqwidth(), avail,
+                                 frames['mode'].winfo_reqwidth())
+
+        self._drive_gui(exercise)
 
 
 class LunaDisabledWidgetTests(unittest.TestCase):

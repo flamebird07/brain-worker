@@ -23,11 +23,16 @@ BW-WORKER-WIDGET-20261018-S2 边界（必须遵守）：
 - 空闲自动关机（BW-WIDGET-IDLE-20261018-S2）：默认不勾选、不持久化；勾选后连续
   30 分钟“有效空闲”才由 GUI 路径经 finalize 复核触发系统既有
   `shutdown.exe /s /t 0`（不加 /f、不重启）；import/--once/未勾选/关闭绝不触发。
-- 桌面交互（BW-WIDGET-HOVER-20261019-S1/S2）：默认精简只列 `display_state=running`
-  的行；hover 整窗展开全部 11 行，移出边界约 200ms 收回；精简/展开同宽 560、动态高度
-  并夹紧屏幕（贴底时整体上移、完整内容优先）；无手动收起/展开按钮；hover 只切视图，
-  绝不勾选/停用/重置空闲关机 controller。真实运行中的行（含未知+运行混池）不展示历史
-  限额，`prev_limited` 原始证据与 30 分钟计时保持不变。
+- 桌面交互（BW-WIDGET-HOVER-20261019-S1/S2 历史；BW-WIDGET-CLICK-COMPACT-20261029
+  起改为点击触发）：默认精简只列 `display_state=running` 的行；**展开/折叠只由明确单击
+  触发**——标题栏非按钮区（含小箭头指示）单击切换，精简态单击运行行=展开并选中该行，
+  展开态单击行=只更新详情不折叠；鼠标 Enter/Leave 与子控件间移动绝不改变展开状态（旧
+  hover 自动展开/200ms 延迟回缩/刷新循环补偿路径已整体删除）。拖动超过 3px 阈值只移动
+  窗口、绝不切换；置顶/关闭/档位按钮/空闲关机勾选/详情滚轮与点击均不冒泡触发折叠。
+  精简/展开同宽 480（由 560 收窄）、动态高度并夹紧屏幕（贴底时整体上移、完整内容优先）；
+  最长牛马名称/状态/占用/按钮不截断。视图切换绝不勾选/停用/重置空闲关机 controller。
+  真实运行中的行（含未知+运行混池）不展示历史限额，`prev_limited` 原始证据与 30 分钟
+  计时保持不变。
 - 遗留牛马可见性（BW-WIDGET-LEGACY-VISIBILITY-20261023）：strong/medium 的展示快照
   只列本档参与的五个池；被本档排除且 attempts 无任何在途（reserved/running/unknown）
   的池整行隐藏。切档前已在途的遗留牛马即使新档不参与也整行保留——真实状态/占用/
@@ -36,9 +41,9 @@ BW-WORKER-WIDGET-20261018-S2 边界（必须遵守）：
   过滤只影响 rows 展示，不改汇总/容量/activity 签名与在途释放语义。
 - 收回高度恢复（BW-HOVER-REPAIR-20261019-S6）：`apply_layout` 统一决定各区块 pack；
   紧凑且无可见行时绝不 pack `rows_frame`（空/残留 rows_frame 会保留展开时的请求高度，
-  导致鼠标移出后外框收不回），改由 empty_card 顶上，使窗口高度恢复到紧凑内容需要的高度；
+  导致收起后外框收不回），改由 empty_card 顶上，使窗口高度恢复到紧凑内容需要的高度；
   有运行行时 rows_frame 参与并按真实行数缩高，展开仍显示全部。仅改布局 pack 决策，
-  不动 hover 事件、数据、调度、关机或模型顺序。
+  不动点击事件、数据、调度、关机或模型顺序。
 """
 import argparse
 import json
@@ -874,13 +879,19 @@ _BADGE_RUN_BG = '#173126'
 _BADGE_RUN_FG = _GREEN
 _BADGE_WINDOW_BG = '#17263b'
 _BADGE_WINDOW_FG = '#7f9bc4'
-# 精简/展开同宽 560：完整放下最长名称 + 组合状态/徽标 + 占用数，关闭按钮不追鼠标。
-_WIDTH = 560
+# 精简/展开同宽 480（BW-WIDGET-CLICK-COMPACT-20261029：由 560 收窄）：完整放下最长
+# 名称 + 组合状态/徽标 + 占用数，关闭按钮不追鼠标；配套缩小标题字号与 shell/行卡
+# padding，绝不靠截断文本或隐藏必要信息换尺寸。
+_WIDTH = 480
+# shell 内边距（同批收窄 12/10 → 8/7）；行卡可用内容宽 = _WIDTH - 2*_SHELL_PADX。
+_SHELL_PADX = 8
+_SHELL_PADY = 7
 _MIN_H = 96
-_HOVER_COLLAPSE_MS = 200
 # 状态列最大换行像素（BW-OPENCODE-MERGE-20261019-S3）：时段外释义括号在语义边界另起
 # 一行后，仍需足够宽以整段放下最长的时间段（含跨日/跨月），绝不把“09:00”按像素拆开。
-_STATE_WRAPLENGTH = 200
+# BW-WIDGET-CLICK-COMPACT-20261029：随 560→480 收窄同步从 200 收到 170，仍整段放下
+# 最长的「（工作日高峰 09–12／14–18）」。
+_STATE_WRAPLENGTH = 170
 
 
 def row_has_true_running(row):
@@ -980,35 +991,23 @@ def state_color(row):
     return _STATE_COLORS.get(row.get('state'), _SUB)
 
 
-def hover_poll_action(expanded, dragging, pointer_inside, pending):
-    """既有 150ms drain 循环的 hover 决策（纯函数，离线可测）：
-    - 拖动中一律不动作；
-    - 真实指针在窗内：有待收回计时则取消（重新移入/假 Leave 兜底）；
-    - 展开且真实指针在窗外：无待办才调度一次延迟回缩，重复刷新只等待、绝不重置计时；
-    - 其余无动作。"""
-    if dragging:
+# BW-WIDGET-CLICK-COMPACT-20261029：展开/折叠的唯一触发是用户明确单击（纯决策函数，
+# 离线可测）。旧 hover 自动展开/200ms 延迟回缩/150ms 刷新循环补偿路径已整体删除——
+# Enter/Leave 与子控件间移动不再挂任何回调，绝无展开副作用。
+def title_click_action(moved, expanded):
+    """标题栏非按钮区（含小箭头指示）单击的纯决策：移动超过 3px 拖动阈值后松开只算
+    拖动、绝不切换；真正单击在展开时折叠、精简时展开。"""
+    if moved:
         return 'none'
-    if pointer_inside:
-        return 'cancel' if pending else 'none'
-    if expanded:
-        return 'wait' if pending else 'schedule'
-    return 'none'
+    return 'collapse' if expanded else 'expand'
 
 
-def hover_should_collapse(expanded, dragging, pointer_inside):
-    """延迟回缩到点后的纯判定：仅在展开、非拖动且真实指针在窗外时收回。"""
-    return bool(expanded and not dragging and not pointer_inside)
-
-
-def cancel_hover_after(root, hover):
-    """取消待执行的回缩 after（重新移入/关闭共用），绝不让待办在窗口销毁后触发。"""
-    after_id = hover.get('after')
-    if after_id is not None:
-        try:
-            root.after_cancel(after_id)
-        except Exception:
-            pass
-        hover['after'] = None
+def row_click_action(moved, expanded):
+    """行卡单击的纯决策：拖动后松开只算拖动、绝不切换；精简态单击运行行=展开并选中
+    该行；展开态单击行=只更新详情选中，绝不折叠。"""
+    if moved:
+        return 'none'
+    return 'select' if expanded else 'expand_select'
 
 
 def apply_layout(frames, *, expanded, has_rows, idle_compact):
@@ -1029,17 +1028,17 @@ def apply_layout(frames, *, expanded, has_rows, idle_compact):
             widget.pack_forget()
     frames['summary'].pack(fill='x')
     if frames.get('mode') is not None:
-        frames['mode'].pack(fill='x', pady=(6, 0))
+        frames['mode'].pack(fill='x', pady=(4, 0))
     if has_rows:
-        frames['rows'].pack(fill='x', pady=(8, 0))
+        frames['rows'].pack(fill='x', pady=(6, 0))
     else:
-        frames['empty'].pack(fill='x', pady=(8, 0))
+        frames['empty'].pack(fill='x', pady=(6, 0))
     if expanded:
-        frames['idle'].pack(fill='x', pady=(8, 2))
-        frames['detail'].pack(fill='x', pady=(6, 0))
+        frames['idle'].pack(fill='x', pady=(6, 2))
+        frames['detail'].pack(fill='x', pady=(5, 0))
     elif idle_compact:
-        frames['compact_idle'].pack(fill='x', pady=(6, 0))
-    frames['footer'].pack(fill='x', pady=(6, 0))
+        frames['compact_idle'].pack(fill='x', pady=(4, 0))
+    frames['footer'].pack(fill='x', pady=(4, 0))
 
 
 def run_gui(store_path=None, interval=2.0):
@@ -1048,9 +1047,10 @@ def run_gui(store_path=None, interval=2.0):
     store_source = ('--store' if store_path else '环境变量'
                     if os.environ.get('BRAIN_WORKER_DISPATCH_STORE') else '默认')
     store_path = Path(store_path or dp.default_store_path()).resolve()
+    # BW-WIDGET-CLICK-COMPACT-20261029：正文/小字保持原尺寸保可读，标题 11→10、关闭 12→11。
     font = ('Microsoft YaHei UI', 9)
     font_bold = ('Microsoft YaHei UI', 9, 'bold')
-    font_title = ('Microsoft YaHei UI', 11, 'bold')
+    font_title = ('Microsoft YaHei UI', 10, 'bold')
     font_small = ('Microsoft YaHei UI', 8)
     font_badge = ('Microsoft YaHei UI', 8)
 
@@ -1065,22 +1065,28 @@ def run_gui(store_path=None, interval=2.0):
     start_y = max(0, min(24, sh - _MIN_H - 24))
     root.geometry(f'{width}x{_MIN_H}+{start_x}+{start_y}')
 
-    shell = tk.Frame(root, bg=_BG, padx=12, pady=10)
+    shell = tk.Frame(root, bg=_BG, padx=_SHELL_PADX, pady=_SHELL_PADY)
     shell.pack(fill='both', expand=True)
 
-    # --- 标题栏：标题/圆点/只读标签为拖动区；置顶与关闭在精简/展开两种模式都保留。
+    # --- 标题栏：标题/圆点/只读标签/小箭头为拖动+单击切换区；置顶与关闭在精简/展开
+    # 两种模式都保留，且绝不参与切换（tk.Button 自有 command，不挂 Button-1 拖动绑定）。
     title_bar = tk.Frame(shell, bg=_BG, cursor='fleur')
     title_bar.pack(fill='x')
     dot = tk.Label(title_bar, text='●', bg=_BG, fg=_DIM, font=font_small, cursor='fleur')
-    dot.pack(side='left', padx=(0, 6))
+    dot.pack(side='left', padx=(0, 5))
     title_lbl = tk.Label(title_bar, text='牛马看板', bg=_BG, fg=_TITLE,
                          font=font_title, cursor='fleur')
     title_lbl.pack(side='left')
     readonly_lbl = tk.Label(title_bar, text='只读', bg=_BG, fg=_DIM,
                             font=font_small, cursor='fleur')
-    readonly_lbl.pack(side='left', padx=(8, 0), pady=(3, 0))
+    readonly_lbl.pack(side='left', padx=(7, 0), pady=(2, 0))
+    # 小箭头展开状态指示（BW-WIDGET-CLICK-COMPACT-20261029）：▸ 精简 / ▾ 展开；很小、
+    # 不占空间，单击与标题栏同义（拖动阈值同样生效）。
+    expand_lbl = tk.Label(title_bar, text='▸', bg=_BG, fg=_DIM, font=font_small,
+                          cursor='hand2')
+    expand_lbl.pack(side='left', padx=(7, 0))
     btn_close = tk.Button(title_bar, text='×', bg=_BG, fg=_SUB,
-                          font=('Microsoft YaHei UI', 12, 'bold'), relief='flat', bd=0,
+                          font=('Microsoft YaHei UI', 11, 'bold'), relief='flat', bd=0,
                           activebackground=_BG, activeforeground=_RED, cursor='hand2',
                           padx=4, pady=0)
     btn_close.pack(side='right')
@@ -1089,7 +1095,7 @@ def run_gui(store_path=None, interval=2.0):
                         cursor='hand2', padx=2)
     btn_pin.pack(side='right', padx=(0, 4))
 
-    tk.Frame(shell, bg=_BORDER, height=1).pack(fill='x', pady=(8, 6))
+    tk.Frame(shell, bg=_BORDER, height=1).pack(fill='x', pady=(6, 4))
 
     # --- 摘要：总占用/16 与运行数常驻；待核/预留/限额/Luna/其他在途只在非零时出现，
     # 顺序固定，动态切换不留多余分隔点，零项不再占位。
@@ -1110,12 +1116,10 @@ def run_gui(store_path=None, interval=2.0):
             if i:
                 sep = tk.Label(summary_frame, text='·', bg=_BG, fg=_DIM,
                                font=font_small)
-                sep.pack(side='left', padx=5)
-                _bind_hover(sep)
+                sep.pack(side='left', padx=4)
                 summary_widgets.append(sep)
             lbl = tk.Label(summary_frame, text=text, bg=_BG, fg=fg, font=font_small)
             lbl.pack(side='left')
-            _bind_hover(lbl)
             summary_widgets.append(lbl)
 
     rows_frame = tk.Frame(shell, bg=_BG)
@@ -1126,14 +1130,14 @@ def run_gui(store_path=None, interval=2.0):
     # 任何在途 attempt；这不是自动档，不增加任何计时切换。
     mode_frame = tk.Frame(shell, bg=_BG)
     mode_title = tk.Label(mode_frame, text='派发档位', bg=_BG, fg=_DIM, font=font_small)
-    mode_title.pack(side='left', padx=(0, 8))
+    mode_title.pack(side='left', padx=(0, 6))
     mode_state = {'current': None, 'note': None}
     mode_btns = {}
     for _value, _label in MODE_BUTTONS:
         _btn = tk.Button(mode_frame, text=_label, font=font_bold, relief='flat', bd=0,
-                         padx=10, pady=1, cursor='hand2', bg=_CARD, fg=_SUB,
+                         padx=7, pady=1, cursor='hand2', bg=_CARD, fg=_SUB,
                          activebackground=_CARD_SEL, activeforeground=_FG)
-        _btn.pack(side='left', padx=(0, 6))
+        _btn.pack(side='left', padx=(0, 5))
         mode_btns[_value] = _btn
     mode_note_lbl = tk.Label(mode_frame, text='', bg=_BG, fg=_DIM, font=font_small,
                              anchor='e')
@@ -1171,14 +1175,14 @@ def run_gui(store_path=None, interval=2.0):
                           highlightthickness=1)
     empty_lbl = tk.Label(empty_card, text='正在读取本地只读快照…', bg=_CARD, fg=_SUB,
                          font=font, anchor='w', justify='left')
-    empty_lbl.pack(fill='x', padx=12, pady=10)
+    empty_lbl.pack(fill='x', padx=10, pady=8)
 
     compact_idle_var = tk.StringVar(value='')
     compact_idle_lbl = tk.Label(shell, textvariable=compact_idle_var, bg=_BG, fg=_SUB,
                                 font=font_small, anchor='e')
 
     # --- 空闲自动关机（BW-WIDGET-IDLE-20261018-S2）：默认不勾选、不持久化；
-    # hover 只切视图，绝不勾选/停用/重置 controller；精简仍显示已开启的计时。
+    # 展开/折叠只切视图，绝不勾选/停用/重置 controller；精简仍显示已开启的计时。
     idle_ctl = IdleShutdownController(shutdown=_system_shutdown)
     shutdown_var = tk.BooleanVar(value=False)
     idle_frame = tk.Frame(shell, bg=_BG)
@@ -1197,7 +1201,7 @@ def run_gui(store_path=None, interval=2.0):
     # 未选中行时只占 2 行高，选中后 6 行并可滚轮，避免大块空白。
     detail_txt = tk.Text(detail_frame, height=2, wrap='word', bg=_CARD, fg=_SUB,
                          font=font_small, relief='flat', bd=0, highlightthickness=0,
-                         padx=10, pady=8, insertbackground=_FG, cursor='arrow',
+                         padx=8, pady=6, insertbackground=_FG, cursor='arrow',
                          spacing1=1, spacing3=1)
     detail_txt.pack(fill='both', expand=True)
     detail_txt.configure(state='disabled')
@@ -1218,28 +1222,32 @@ def run_gui(store_path=None, interval=2.0):
         accent = tk.Frame(card, bg=_DIM, width=3, cursor='hand2')
         accent.pack(side='left', fill='y')
         inner = tk.Frame(card, bg=_CARD, cursor='hand2')
-        inner.pack(side='left', fill='both', expand=True, padx=10, pady=6)
+        inner.pack(side='left', fill='both', expand=True, padx=7, pady=4)
         inner.columnconfigure(0, weight=1)
-        inner.columnconfigure(2, minsize=80)
-        inner.columnconfigure(3, minsize=42)
+        inner.columnconfigure(1, minsize=80)
+        inner.columnconfigure(2, minsize=42)
+        # wraplength 只在极窄屏被挤时兜底换行（≥最长名称宽度，正常一整行显示），
+        # 绝不截断文本。
         name = tk.Label(inner, text=label, bg=_CARD, fg=_FG, font=font, anchor='w',
-                        cursor='hand2')
+                        wraplength=250, cursor='hand2')
         name.grid(row=0, column=0, sticky='w')
+        # 徽标独占第二行（BW-WIDGET-CLICK-COMPACT-20261029）：最长名称（237px）与最宽
+        # 两行状态（174px）同排 + 占用数在任何组合下都装进 480 宽，无需挤占/换行；
+        # 徽标行只在有徽标时参与布局（无徽标 grid_forget，不占高度）。
         badges = tk.Frame(inner, bg=_CARD, cursor='hand2')
-        badges.grid(row=0, column=1, sticky='e', padx=(6, 6))
         state = tk.Label(inner, text='', bg=_CARD, fg=_SUB, font=font_bold, anchor='e',
                          wraplength=_STATE_WRAPLENGTH, justify='right', cursor='hand2')
-        state.grid(row=0, column=2, sticky='e')
+        state.grid(row=0, column=1, sticky='e')
         occ = tk.Label(inner, text='', bg=_CARD, fg=_SUB, font=font, anchor='e',
                        cursor='hand2')
-        occ.grid(row=0, column=3, sticky='e', padx=(6, 0))
+        occ.grid(row=0, column=2, sticky='e', padx=(5, 0))
         badge_widgets = {}
         for key, fg, bg in (('run', _BADGE_RUN_FG, _BADGE_RUN_BG),
                             ('mode', _DIM, _BADGE_MODE_BG),
                             ('window', _BADGE_WINDOW_FG, _BADGE_WINDOW_BG),
                             ('limit', _QUOTA_LIMIT_COLOR, _BADGE_LIMIT_BG)):
             badge_widgets[key] = tk.Label(badges, text='', bg=bg, fg=fg,
-                                          font=font_badge, padx=5, pady=1,
+                                          font=font_badge, padx=4, pady=1,
                                           cursor='hand2')
         row_widgets[pk] = {'card': card, 'accent': accent, 'inner': inner,
                            'name': name, 'state': state, 'occ': occ,
@@ -1251,7 +1259,9 @@ def run_gui(store_path=None, interval=2.0):
     view_state = {'visible': ()}
     layout_state = {'sig': None}
     pre_expand = {'x': None, 'y': None}
-    hover = {'expanded': False, 'after': None, 'dragging': False}
+    # BW-WIDGET-CLICK-COMPACT-20261029：展开状态只由明确单击切换（旧 hover 待办/拖动
+    # 标志全部移除；拖动状态只在 drag 里，由拖动阈值判定消费）。
+    ui = {'expanded': False}
     drag = {'active': False, 'moved': False, 'dx': 0, 'dy': 0, 'pk': None,
             'start_x': 0, 'start_y': 0}
 
@@ -1270,11 +1280,11 @@ def run_gui(store_path=None, interval=2.0):
         for w in row_widgets.values():
             w['card'].pack_forget()
         for pk in visible:
-            row_widgets[pk]['card'].pack(fill='x', pady=2)
+            row_widgets[pk]['card'].pack(fill='x', pady=1)
         view_state['visible'] = visible
 
     def _apply_mode():
-        mode = 'expanded' if hover['expanded'] else 'compact'
+        mode = 'expanded' if ui['expanded'] else 'compact'
         has_rows = bool(view_state['visible'])
         idle_compact = bool(compact_idle_var.get()) and mode == 'compact'
         sig = (mode, has_rows, idle_compact)
@@ -1300,19 +1310,21 @@ def run_gui(store_path=None, interval=2.0):
         root.geometry(f'{width}x{height}+{cx}+{cy}')
 
     def _fit_window(cx=None, cy=None):
-        if hover['dragging']:
+        if drag['active']:
             return
         root.update_idletasks()
         _place(shell.winfo_reqheight(), cx, cy)
 
     def _set_expanded(on):
         on = bool(on)
-        if hover['expanded'] == on:
+        if ui['expanded'] == on:
             return
         if on:
             pre_expand['x'] = root.winfo_x()
             pre_expand['y'] = root.winfo_y()
-        hover['expanded'] = on
+        ui['expanded'] = on
+        expand_lbl.configure(text='▾' if on else '▸',
+                             fg=_FG if on else _DIM)
         snap = last_snap['snap']
         if snap is None:
             pks = []
@@ -1327,44 +1339,11 @@ def run_gui(store_path=None, interval=2.0):
         else:
             _fit_window()
 
-    def _pointer_inside():
-        px, py = root.winfo_pointerxy()
-        x0, y0 = root.winfo_rootx(), root.winfo_rooty()
-        return (x0 <= px < x0 + root.winfo_width()
-                and y0 <= py < y0 + root.winfo_height())
-
-    def _cancel_collapse():
-        cancel_hover_after(root, hover)
-
-    def _on_enter(_event=None):
-        if hover['dragging']:
-            return
-        # 控件重建/几何重排会合成 Enter：只有真实指针在窗内才展开或取消回缩。
-        if not _pointer_inside():
-            return
-        _cancel_collapse()
-        if not hover['expanded']:
-            _set_expanded(True)
-
-    def _on_leave(_event=None):
-        if hover['dragging']:
-            return
-        _cancel_collapse()
-        hover['after'] = root.after(_HOVER_COLLAPSE_MS, _maybe_collapse)
-
-    def _maybe_collapse():
-        hover['after'] = None
-        if hover_should_collapse(hover['expanded'], hover['dragging'],
-                                 _pointer_inside()):
-            _set_expanded(False)
-
     def _drag_start(event, pk=None):
         drag.update(active=True, moved=False,
                     dx=event.x_root - root.winfo_x(),
                     dy=event.y_root - root.winfo_y(),
                     start_x=event.x_root, start_y=event.y_root, pk=pk)
-        hover['dragging'] = True
-        _cancel_collapse()
 
     def _drag_move(event):
         if not drag['active']:
@@ -1382,23 +1361,26 @@ def run_gui(store_path=None, interval=2.0):
         root.geometry(f'+{nx}+{ny}')
 
     def _drag_end(_event=None):
+        # BW-WIDGET-CLICK-COMPACT-20261029：松开时按纯决策函数消费这次按压——超过
+        # 3px 阈值只算拖动（绝不切换展开状态）；真正单击才按来源（标题栏/行卡）
+        # 决定切换或选中。指针在不在窗内不再影响任何展开语义。
         if not drag['active']:
             return
-        was_click = not drag['moved']
+        moved = drag['moved']
         pk = drag['pk']
         drag.update(active=False, moved=False, pk=None)
-        hover['dragging'] = False
-        if hover['expanded']:
+        if ui['expanded']:
             pre_expand['x'] = root.winfo_x()
             pre_expand['y'] = root.winfo_y()
-        if was_click and pk:
+        action = (row_click_action(moved, ui['expanded']) if pk is not None
+                  else title_click_action(moved, ui['expanded']))
+        if action in ('expand', 'expand_select'):
+            _set_expanded(True)
+        elif action == 'collapse':
+            _set_expanded(False)
+        if action in ('select', 'expand_select'):
             _select(pk)
         _fit_window()
-        if _pointer_inside():
-            if not hover['expanded']:
-                _set_expanded(True)
-        else:
-            _on_leave()
 
     def _select(pk):
         selected['pk'] = pk
@@ -1416,7 +1398,7 @@ def run_gui(store_path=None, interval=2.0):
             _set_detail('本地只读快照暂不可用（缺库/锁定/解析失败均如实待核，'
                         '绝不显示成空闲）。')
         else:
-            _set_detail('悬停展开全部模型 · 点击行查看任务详情')
+            _set_detail('点击标题栏展开全部模型 · 点击行查看任务详情')
 
     def _refresh_idle_text():
         st = idle_ctl.status()
@@ -1475,6 +1457,7 @@ def run_gui(store_path=None, interval=2.0):
                 w['card'].configure(highlightbackground=_BORDER)
                 for badge in w['badge_widgets'].values():
                     badge.pack_forget()
+                w['badges'].grid_forget()
                 w['badge_sig'] = ()
             selected['pk'] = None
             selected['rows'] = []
@@ -1482,7 +1465,7 @@ def run_gui(store_path=None, interval=2.0):
             _set_detail('本地只读快照暂不可用（缺库/锁定/解析失败均如实待核，'
                         '绝不显示成空闲）。')
             empty_lbl.configure(text=f'{failure_label} · 待核', fg=_RED)
-            _set_rows(list(row_widgets) if hover['expanded'] else [])
+            _set_rows(list(row_widgets) if ui['expanded'] else [])
             _set_footer(f'本地只读 · {failure_label} · 下轮自动重试')
             return
 
@@ -1541,16 +1524,22 @@ def run_gui(store_path=None, interval=2.0):
             if w['badge_sig'] != badge_sig:
                 for badge in w['badge_widgets'].values():
                     badge.pack_forget()
-                for key in badge_sig:
-                    badge = w['badge_widgets'][key]
-                    badge.configure(text=badge_map[key])
-                    badge.pack(side='left', padx=(0, 4))
+                if badge_sig:
+                    for key in badge_sig:
+                        badge = w['badge_widgets'][key]
+                        badge.configure(text=badge_map[key])
+                        badge.pack(side='left', padx=(0, 4))
+                    # 徽标行只在有徽标时参与布局；无徽标整行收起，不占任何高度。
+                    w['badges'].grid(row=1, column=0, columnspan=3,
+                                     sticky='w', pady=(2, 0))
+                else:
+                    w['badges'].grid_forget()
                 w['badge_sig'] = badge_sig
             else:
                 for key in badge_sig:
                     w['badge_widgets'][key].configure(text=badge_map[key])
 
-        _set_rows([r['pool_key'] for r in view_rows(snap, expanded=hover['expanded'])])
+        _set_rows([r['pool_key'] for r in view_rows(snap, expanded=ui['expanded'])])
         if counts['running']:
             empty_lbl.configure(text='', fg=_DIM)
         else:
@@ -1562,13 +1551,13 @@ def run_gui(store_path=None, interval=2.0):
             if counts['retired']:
                 extra.append(f"其他在途 {counts['retired']}")
             suffix = (' · ' + ' · '.join(extra)) if extra else ''
-            empty_lbl.configure(text=f'当前没有运行中的牛马{suffix} · 悬停展开全部',
+            empty_lbl.configure(text=f'当前没有运行中的牛马{suffix} · 点击标题栏展开',
                                 fg=_SUB)
         if selected['pk']:
             _select(selected['pk'])
         else:
             detail_txt.configure(height=2)
-            _set_detail('悬停展开全部模型 · 点击行查看任务详情')
+            _set_detail('点击标题栏展开全部模型 · 点击行查看任务详情')
         _set_footer(f"本地只读 · 每 {max(1, int(interval))} 秒轮询 · "
                     f"已应用 {datetime.now().strftime('%H:%M:%S')}")
 
@@ -1587,7 +1576,6 @@ def run_gui(store_path=None, interval=2.0):
     poller = _Poller(queue.Queue(), store_path=store_path, interval=interval)
 
     def _on_close():
-        _cancel_collapse()
         poller.stop()
         _release_single_instance()
         root.destroy()
@@ -1602,8 +1590,9 @@ def run_gui(store_path=None, interval=2.0):
     btn_close.configure(command=_on_close)
     btn_pin.configure(command=_toggle_pin)
 
-    # --- 拖动：标题栏与整张行卡都可拖；按下到松开之间不触发收缩。
-    for widget in (title_bar, title_lbl, dot, readonly_lbl):
+    # --- 拖动 + 单击切换：标题栏（标题/圆点/只读/小箭头）与整张行卡都可拖，超过 3px
+    # 阈值只拖动；未超过阈值的单击按来源切换展开/折叠或选中行（见 _drag_end）。
+    for widget in (title_bar, title_lbl, dot, readonly_lbl, expand_lbl):
         widget.bind('<Button-1>', _drag_start)
         widget.bind('<B1-Motion>', _drag_move)
         widget.bind('<ButtonRelease-1>', _drag_end)
@@ -1619,14 +1608,9 @@ def run_gui(store_path=None, interval=2.0):
             badge.bind('<B1-Motion>', _drag_move)
             badge.bind('<ButtonRelease-1>', _drag_end)
 
-    # --- 整窗/所有子控件统一 Enter/Leave；200ms 后按真实指针边界复核，避免子控件间闪烁。
-    def _bind_hover(widget):
-        widget.bind('<Enter>', _on_enter, add='+')
-        widget.bind('<Leave>', _on_leave, add='+')
-        for child in widget.winfo_children():
-            _bind_hover(child)
-
-    _bind_hover(root)
+    # BW-WIDGET-CLICK-COMPACT-20261029：不再给任何控件挂 Enter/Leave 回调——鼠标移入/
+    # 移出与子控件间移动对展开状态零副作用；tk.Button/Checkbutton 自身的 class 级
+    # hover 视觉（active 色）不受影响。
 
     _render_summary([('loading', '正在读取本地只读快照…', _SUB)])
     # 首帧就按真实读回的档位画按钮（读失败按回落档显示并标注来源），绝不留空选中态。
@@ -1635,7 +1619,7 @@ def run_gui(store_path=None, interval=2.0):
                          MODE_SOURCE_LABELS.get(_boot_mode['source'], ''),
                          _boot_mode['error'])
     _set_footer(f'本地只读 · 每 {max(1, int(interval))} 秒轮询 · 等待快照')
-    _set_detail('悬停展开全部模型 · 点击行查看任务详情')
+    _set_detail('点击标题栏展开全部模型 · 点击行查看任务详情')
     _refresh_idle_text()
     _set_rows([])
     _apply_mode()
@@ -1653,12 +1637,6 @@ def run_gui(store_path=None, interval=2.0):
                 pass
             if latest is not None:
                 _render(latest)
-            action = hover_poll_action(hover['expanded'], hover['dragging'],
-                                       _pointer_inside(), hover['after'] is not None)
-            if action == 'schedule':
-                hover['after'] = root.after(_HOVER_COLLAPSE_MS, _maybe_collapse)
-            elif action == 'cancel':
-                _cancel_collapse()
         except Exception:
             layout_state['sig'] = None
             _render(_failure(store_path, dp.utcnow(), 'render_failed',
