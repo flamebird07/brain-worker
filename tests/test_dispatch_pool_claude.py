@@ -212,13 +212,13 @@ class CapacityAndRouting(_ClaudeBase):
         # BW-MANUAL-THREE-MODE-20261023：**strong 档**解除 claude 工作日高峰门——AUTO 的
         # claude 入口在高峰绝不返回 `main_force_window_closed`。strong 常态层序 Sonus(1) >
         # ZCode(2) > claude(3) > 三个 Max(4)，占满 ZCode 后 claude 即最优先可用候选。
-        # BW-SONUS-TEMP-DISABLE-20261028-R2：Sonus 全档暂时禁用——strong 显式 reserve
-        # 如实 mode_excluded（零占位），占满 ZCode 后 claude 即第一候选，断言强度不变。
+        # BW-SONUS-REENABLE-20261029-R3：Sonus 恢复常态新派——显式 reserve 如实占用
+        # 其独立 1 槽；占满 Sonus 与 ZCode 后 claude 即第一候选，断言强度不变。
         with dispatch_mode('strong'):
-            refused = self._reserve('hi0', 'qoder', 'Sonus', 'qoder',
-                                    PEAK_WEEKDAY)
-            self.assertFalse(refused.get('allowed'), refused)
-            self.assertEqual(refused.get('reason'), 'mode_excluded', refused)
+            sonus = self._reserve('hi0', 'qoder', 'Sonus', 'qoder',
+                                  PEAK_WEEKDAY)
+            self.assertTrue(sonus.get('allowed'), sonus)
+            self.assertEqual(sonus.get('pool_key'), dp.SONUS_POOL_KEY, sonus)
             self.assertTrue(self._reserve('hi1', 'zcode', 'GLM-5.3', 'zcode',
                                           PEAK_WEEKDAY).get('allowed'))
             r = self.claim_claude('apc', now=PEAK_WEEKDAY, executor='auto')

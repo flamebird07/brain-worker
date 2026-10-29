@@ -131,8 +131,8 @@ class TestModuleDiscipline(_WidgetBase):
         # BW-STRONG-SONUS-20261024：静态 ROW_DEFS = Sonus（strong 第一） + weak 11 行，
         # 共 12 行；Luna 已删除，不得再出现任何 Luna 行。各档实际空闲可见行由 read_snapshot
         # 动态过滤：strong 6（Sonus + 五窄池）、medium 5（无 Sonus）、weak 11（无 Sonus）。
-        # BW-SONUS-TEMP-DISABLE-20261026：Sonus 被用户要求暂时禁用——三档空闲时整行都
-        # 隐藏，strong 空闲也只剩五窄池；STRONG_PRIORITY 里的 Sonus=1 保留为历史层号。
+        # BW-SONUS-REENABLE-20261029-R3：Sonus 恢复常态新派——strong 空闲显示 Sonus
+        # 且排第一；medium/weak 空闲隐藏（Sonus 仍为 strong 专属）。
         self.assertEqual(order[:12], [
             dp.SONUS_POOL_KEY,
             dp.CN_CUSTOM_MAX_POOL_KEY, dp.CN_MAX_POOL_KEY, dp.ZCODE_POOL_KEY,
@@ -162,17 +162,16 @@ class TestModuleDiscipline(_WidgetBase):
         with dispatch_mode('strong'):
             strong_snap = self._snap()
         self.assertTrue(strong_snap['ok'])
-        # BW-SONUS-TEMP-DISABLE-20261028-R2：Sonus 全档暂时禁用——strong 空闲也整行
-        # 隐藏 Sonus，只剩四窄池（ZCode/Claude/CN Max/国际 Max），层号保持历史值
-        # 2/3/4/4 不重编号（STRONG_PRIORITY 里的 Sonus=1 保留为历史层号）。
+        # BW-SONUS-REENABLE-20261029-R3：Sonus 恢复常态新派——strong 空闲显示
+        # Sonus 且排第一，完整 5 行 = Sonus(1)/ZCode(2)/Claude(3)/CN Max(4)/国际 Max(4)。
         strong_rows = [r for r in strong_snap['rows']
                        if r['pool_key'] != dp.LUNA_KEY]
         self.assertEqual([r['pool_key'] for r in strong_rows], [
-            dp.ZCODE_POOL_KEY, dp.CLAUDE_POOL_KEY,
+            dp.SONUS_POOL_KEY, dp.ZCODE_POOL_KEY, dp.CLAUDE_POOL_KEY,
             dp.CN_MAX_POOL_KEY, dp.QMAX_POOL_KEY])
         strong_prios = [r['priority'] for r in strong_rows]
         self.assertEqual(strong_prios, sorted(strong_prios), strong_prios)
-        self.assertEqual(strong_prios, [2, 3, 4, 4])
+        self.assertEqual(strong_prios, [1, 2, 3, 4, 4])
         # 其余 11 行与 weak 权威整表逐行一致。
         weak_prios = [dp.POOL_PRIORITY[pk] for pk in prod_order[1:]]
         self.assertEqual(weak_prios, sorted(weak_prios), weak_prios)
@@ -534,13 +533,19 @@ class TestModeExcludedRowVisibility(_WidgetBase):
                 snap = self._snap()
                 self.assertTrue(snap['ok'], mode)
                 shown = {r['pool_key'] for r in snap['rows']}
-                # BW-SONUS-TEMP-DISABLE-20261028-R2：Sonus 全档暂时禁用——三档空闲
-                # 时整行隐藏（strong 也不例外），档位允许池同样不含 Sonus。
-                expected = self.NARROW | {dp.LUNA_KEY}
-                allowed = set(self.NARROW)
-                self.assertNotIn(dp.SONUS_POOL_KEY, shown, mode)
-                self.assertNotIn(dp.SONUS_POOL_KEY,
-                                 set(snap['dispatch_mode_allowed_pools']), mode)
+                # BW-SONUS-REENABLE-20261029-R3：strong 空闲显示 Sonus 且排第一；
+                # medium 空闲仍隐藏 Sonus（strong 专属）。
+                allowed = (set(self.NARROW) | {dp.SONUS_POOL_KEY}
+                           if mode == 'strong' else set(self.NARROW))
+                expected = allowed | {dp.LUNA_KEY}
+                if mode == 'strong':
+                    self.assertIn(dp.SONUS_POOL_KEY, shown, mode)
+                    self.assertIn(dp.SONUS_POOL_KEY,
+                                  set(snap['dispatch_mode_allowed_pools']), mode)
+                else:
+                    self.assertNotIn(dp.SONUS_POOL_KEY, shown, mode)
+                    self.assertNotIn(dp.SONUS_POOL_KEY,
+                                     set(snap['dispatch_mode_allowed_pools']), mode)
                 self.assertEqual(shown, expected, mode)
                 for pk in self.EXCLUDED:
                     self.assertNotIn(pk, shown, (mode, pk))
@@ -626,16 +631,22 @@ class TestModeExcludedRowVisibility(_WidgetBase):
             self.assertEqual(self._row(snap, dp.CODEBUDDY_POOL_KEY)['state'], 'running')
             self.assertEqual(snap['domestic_active'], 1)
 
-    def test_sonus_hidden_all_modes_and_legacy_in_flight_labeled_disabled(self):
-        """BW-SONUS-TEMP-DISABLE-20261028-R2：Sonus 全档暂时禁用——三档（含 strong）
-        空闲整行隐藏；禁用前遗留的 reserved/running/unknown Sonus 在**任何档位**整行
-        保留、真实状态与占用照常、标「暂时禁用（用户指令）」直到真实终态；物理总
-        容量仍 16。"""
+    def test_sonus_strong_first_medium_weak_hidden_and_legacy_labeled_not_participating(self):
+        """BW-SONUS-REENABLE-20261029-R3：Sonus 恢复常态新派——strong 空闲显示 Sonus
+        且排第一；medium/weak 空闲隐藏；切档前遗留在 medium/weak 保留整行、按真实状态
+        显示并标「本档不参与」直到真实终态；物理总容量仍 16。"""
         probe = _probe({4321: {'pid': 4321, 'state': 'alive', 'created': '111'}})
         with closing(self._conn()):
             pass  # 建库（缺库快照 ok=False，绝不冒充空闲）
-        # 三档空闲：Sonus 整行隐藏（strong 也不例外）。
-        for mode in dm.MODES:
+        # 空闲：strong 显示 Sonus 且第一；medium/weak 隐藏。
+        with dispatch_mode('strong'):
+            snap = self._snap(probe=probe)
+            sonus = self._row(snap, dp.SONUS_POOL_KEY)
+            self.assertEqual(snap['rows'][0]['pool_key'], dp.SONUS_POOL_KEY)
+            self.assertTrue(sonus['participates'])
+            self.assertFalse(sonus['mode_excluded'])
+            self.assertEqual(sonus['state'], 'idle')
+        for mode in ('medium', 'weak'):
             with dispatch_mode(mode):
                 snap = self._snap(probe=probe)
                 self.assertNotIn(dp.SONUS_POOL_KEY,
@@ -643,30 +654,39 @@ class TestModeExcludedRowVisibility(_WidgetBase):
         with closing(self._conn()) as conn:
             self._insert(conn, 's1', dp.SONUS_POOL_KEY, 'reserved',
                          reserved=T0 - timedelta(seconds=120))
-        # 三档遗留在途：整行保留 + 专属「暂时禁用（用户指令）」标签（绝不冒充
-        # 「本档不参与」/失败/限额/退役），真实状态/占用照常。
-        for mode in dm.MODES:
+        # 遗留在途：strong 参与、真实状态照常；medium/weak 整行保留并标「本档不参与」。
+        with dispatch_mode('strong'):
+            snap = self._snap(probe=probe)
+            sonus = self._row(snap, dp.SONUS_POOL_KEY)
+            self.assertTrue(sonus['participates'])
+            self.assertFalse(sonus['mode_excluded'])
+            self.assertEqual(sonus['state'], 'reserved')
+            self.assertEqual(sonus['active'], 1)
+            self.assertEqual(snap['domestic_active'], 1)
+            self.assertEqual(snap['domestic_total_capacity'], 16)
+        for mode in ('medium', 'weak'):
             with dispatch_mode(mode):
                 snap = self._snap(probe=probe)
-                shown = {r['pool_key'] for r in snap['rows']}
-                self.assertIn(dp.SONUS_POOL_KEY, shown, mode)
                 sonus = self._row(snap, dp.SONUS_POOL_KEY)
                 self.assertTrue(sonus['mode_excluded'], mode)
                 self.assertFalse(sonus['participates'], mode)
                 self.assertEqual(sonus['mode_excluded_label'],
-                                 wsw.SONUS_TEMP_DISABLED_LABEL, mode)
+                                 wsw.STATE_LABELS['mode_excluded'], mode)
                 self.assertEqual(sonus['state'], 'reserved')
                 self.assertEqual(sonus['active'], 1)
                 detail = wsw.detail_text(sonus)
-                self.assertIn('暂时禁用（用户指令）', detail)
-                self.assertIn('已在途', detail)
+                self.assertIn('本档不参与', detail)
                 self.assertEqual(snap['domestic_active'], 1, mode)
                 self.assertEqual(snap['domestic_total_capacity'], 16, mode)
-        # 真实终态后：三档空闲均不再显示 Sonus 行。
+        # 真实终态后：strong 回到空闲 Sonus 第一；medium/weak 不再显示 Sonus 行。
         with closing(self._conn()) as conn:
             conn.execute("UPDATE attempts SET state='finished', terminal='finished', "
                          "success=1, ended_at_utc=? WHERE token='s1'", (_iso(T0),))
-        for mode in dm.MODES:
+        with dispatch_mode('strong'):
+            snap = self._snap(probe=probe)
+            self.assertEqual(snap['rows'][0]['pool_key'], dp.SONUS_POOL_KEY)
+            self.assertEqual(snap['rows'][0]['state'], 'idle')
+        for mode in ('medium', 'weak'):
             with dispatch_mode(mode):
                 snap = self._snap(probe=probe)
                 self.assertNotIn(dp.SONUS_POOL_KEY,

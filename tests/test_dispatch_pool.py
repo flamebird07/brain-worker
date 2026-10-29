@@ -1534,16 +1534,15 @@ class BeijingMainForceWindowTests(_PoolBase):
         # BW-MANUAL-THREE-MODE-20261023：**strong 档**六个可派池全部无时段门——白天（北京
         # 12:00）AUTO 请求国际内置 Max 直接 claim 该池，绝不因时段门改派到别池。
         # strong 层序 Sonus(1) > ZCode(2) > claude(3) > 三个 Max(4)，故先占满上方
-        # ZCode、claude 各槽。BW-SONUS-TEMP-DISABLE-20261028-R2：Sonus 全档暂时禁用
-        # ——显式 reserve 如实 mode_excluded（零占位），无需占其槽，目标断言强度不变。
+        # Sonus、ZCode、claude 各槽。BW-SONUS-REENABLE-20261029-R3：Sonus 恢复常态
+        # 新派，显式 reserve 如实占用其独立 1 槽。
         with dispatch_mode('strong'):
             occupied = dp.reserve(self.store, task_id='s0x', runtime='qoder',
                                   model='Sonus', workspace=str(self._ws_for('s0x')),
                                   prompt_sha256='p', executor='qoder', now=self.NOON,
                                   _preclaim=False)
-            self.assertFalse(occupied['allowed'], occupied)
-            self.assertEqual(occupied['reason'], 'mode_excluded', occupied)
-            self.assertIn('temporarily disabled', occupied['reasons'][0], occupied)
+            self.assertTrue(occupied['allowed'], occupied)
+            self.assertEqual(occupied['pool_key'], dp.SONUS_POOL_KEY, occupied)
             self.reserve_exec('z0', 'zcode', 'GLM-5.3', 'zcode', pk='zcode:GLM-5.3')
             self.reserve_exec('c1', 'claude', 'deepseek-flash', 'claude',
                               pk=dp.CLAUDE_POOL_KEY)
@@ -1604,15 +1603,15 @@ class BeijingMainForceWindowTests(_PoolBase):
     def test_auto_daytime_never_falls_to_cn_max_in_strong_mode(self):
         # strong 档三个 Max 同层且无门；占满上方 ZCode 与 claude 后，AUTO 请求
         # 国际 Max 时由「请求组合优先」命中国际 Max，绝不落到 CN 自定义或 CN 内置 Max。
-        # BW-SONUS-TEMP-DISABLE-20261028-R2：Sonus 全档暂时禁用——显式 reserve 如实
-        # mode_excluded（零占位），无需占其槽。
+        # BW-SONUS-REENABLE-20261029-R3：Sonus 恢复常态新派——显式 reserve 如实占用
+        # 其独立 1 槽，保持「占满上方层后由请求组合命中」的断言强度。
         with dispatch_mode('strong'):
             r0 = dp.reserve(self.store, task_id='s0', runtime='qoder',
                             model='Sonus', workspace=str(self._ws_for('s0')),
                             prompt_sha256='p', executor='qoder', now=self.NOON,
                             _preclaim=False)
-            self.assertFalse(r0['allowed'], r0)
-            self.assertEqual(r0['reason'], 'mode_excluded', r0)
+            self.assertTrue(r0['allowed'], r0)
+            self.assertEqual(r0['pool_key'], dp.SONUS_POOL_KEY, r0)
             self.reserve_exec('z0', 'zcode', 'GLM-5.3', 'zcode', pk='zcode:GLM-5.3')
             self.reserve_exec('c1', 'claude', 'deepseek-flash', 'claude',
                               pk=dp.CLAUDE_POOL_KEY)

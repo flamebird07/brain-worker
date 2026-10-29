@@ -158,15 +158,16 @@ class ModePolicyTests(unittest.TestCase):
             self.assertEqual(dm.normalize_mode(bad), 'weak', repr(bad))
 
     def test_allowed_sets_per_mode(self):
-        # BW-SONUS-TEMP-DISABLE-20261028-R2：Sonus 全档暂时禁用——strong 新派也是
-        # 四池（五窄池去 CN 自定义 Max）；STRONG_POOL_KEYS 常量表仍保留 Sonus 历史。
+        # BW-SONUS-REENABLE-20261029-R3：Sonus 恢复常态新派——只参与 strong（五窄池
+        # 去 CN 自定义 Max 再加 Sonus）；medium/weak 仍不含 Sonus。
         self.assertEqual(set(dm.allowed_pools_for_mode('strong')),
-                         FIVE_POOLS - {dm.QMAX_CN_CUSTOM_POOL_KEY})
+                         SIX_POOLS - {dm.QMAX_CN_CUSTOM_POOL_KEY})
         self.assertEqual(set(dm.allowed_pools_for_mode('medium')),
                          FIVE_POOLS - {dm.QMAX_CN_CUSTOM_POOL_KEY})
         self.assertEqual(set(dm.allowed_pools_for_mode('weak')),
                          ELEVEN_POOLS - {dm.QMAX_CN_CUSTOM_POOL_KEY})
-        for m in ('strong', 'medium', 'weak'):
+        self.assertIn(SONUS_KEY, dm.allowed_pools_for_mode('strong'))
+        for m in ('medium', 'weak'):
             self.assertNotIn(SONUS_KEY, dm.allowed_pools_for_mode(m), m)
         # 非法档位按默认 weak 口径给全表；缺省读当前档（conftest 隔离下 weak）。
         self.assertEqual(set(dm.allowed_pools_for_mode('ultra')),
@@ -510,7 +511,16 @@ class SonusTempDisabledR2Tests(_AdjudicationBase):
     （sent=false、零新占位、文案明确「temporarily disabled」）；strong 新派 4 池/5 槽；
     容量登记/优先级表历史层号/物理总容量 16/历史 attempt 全部保留；禁用前合法且仍
     reserved 的精确 Sonus claim 照常 consume/mark running；其它 mode_excluded 池不继承
-    该例外。"""
+    该例外。
+
+    BW-SONUS-REENABLE-20261029-R3 起模块默认开关已恢复 False；本类在 setUp 中显式把
+    开关钉回 True，保留「未来再次置 True 时仍能正确工作」的历史回归能力。"""
+
+    def setUp(self):
+        super().setUp()
+        patcher = unittest.mock.patch.object(dm, 'SONUS_TEMP_DISABLED', True)
+        patcher.start()
+        self.addCleanup(patcher.stop)
 
     def test_flag_and_registration_facts(self):
         self.assertTrue(dm.SONUS_TEMP_DISABLED)
@@ -615,6 +625,128 @@ class SonusTempDisabledR2Tests(_AdjudicationBase):
             state = conn.execute('SELECT state FROM attempts WHERE token=?',
                                  (tok,)).fetchone()['state']
         self.assertEqual(state, 'start_failed', state)
+
+
+class SonusReenabledR3Tests(_AdjudicationBase):
+    """BW-SONUS-REENABLE-20261029-R3：`qoder:Sonus` 恢复常态新派资格的离线回归。
+
+    口径：SONUS_TEMP_DISABLED=False——strong 5 池/6 槽（Sonus=1 最前、无时段门）、
+    medium 4 池/5 槽、weak 10 池/13 槽；strong AUTO/显式 reserve/consume/claim-due
+    恢复既有正常路径；medium/weak 显式 Sonus 继续 mode_excluded（通用档位文案，不再
+    出现「temporarily disabled」）；容量满如实 capacity_full；Sonus 不吃 Max 限额。"""
+
+    def test_flag_and_normal_counts(self):
+        self.assertFalse(dm.SONUS_TEMP_DISABLED)
+        self.assertEqual(dm.SONUS_POOL_KEY, 'qoder:Sonus')
+        self.assertEqual(dp.capacity_for(SONUS_KEY), 1)
+        self.assertEqual(dm.STRONG_PRIORITY[SONUS_KEY], 1)
+        self.assertNotIn(SONUS_KEY, dp.LEGACY_RETIRED_POOL_KEYS)
+        self.assertEqual(dp.DOMESTIC_TOTAL_CAPACITY, 16)
+        for mode, count, slots in (('strong', 5, 6), ('medium', 4, 5),
+                                   ('weak', 10, 13)):
+            pools = dm.allowed_pools_for_mode(mode)
+            self.assertEqual(len(pools), count, mode)
+            self.assertEqual(sum(dp.capacity_for(k) for k in pools), slots, mode)
+            self.assertNotIn(dm.QMAX_CN_CUSTOM_POOL_KEY, pools, mode)
+        self.assertIn(SONUS_KEY, dm.allowed_pools_for_mode('strong'))
+        self.assertNotIn(SONUS_KEY, dm.allowed_pools_for_mode('medium'))
+        self.assertNotIn(SONUS_KEY, dm.allowed_pools_for_mode('weak'))
+        # Sonus 不属于 Qwen Max：不套夜间门、不纳入 Max 限额标记。
+        self.assertNotIn(SONUS_KEY, dm.MAX_POOL_KEYS)
+        self.assertNotIn(SONUS_KEY, dp.QUOTA_LIMIT_WINDOW_POOLS)
+        for now in (PEAK_AM, T0, WEEKEND):
+            self.assertFalse(dm.window_blocks_for_mode(SONUS_KEY, now, 'strong'))
+
+    def test_strong_auto_prefers_sonus(self):
+        with dispatch_mode('strong'):
+            r = dp.select_and_claim(self.store, task_id='a1', runtime='qoder',
+                                    model='Qwen3.8-Max',
+                                    workspace=str(self._ws('a1')),
+                                    prompt_sha256='p', now=T0, _preclaim=False)
+        self.assertTrue(r.get('routing_required'), r)
+        self.assertEqual(r['selected']['pool_key'], SONUS_KEY, r)
+
+    def test_explicit_sonus_claims_in_strong(self):
+        with dispatch_mode('strong'):
+            r = dp.reserve(self.store, task_id='se1', runtime='qoder',
+                           model='Sonus', workspace=str(self._ws('se1')),
+                           prompt_sha256='p', executor='qoder', now=T0,
+                           _preclaim=False)
+        self.assertTrue(r.get('allowed'), r)
+        self.assertEqual(r.get('pool_key'), SONUS_KEY, r)
+        self.assertTrue(r.get('token'), r)
+
+    def test_medium_and_weak_explicit_sonus_refused(self):
+        for m in ('medium', 'weak'):
+            with dispatch_mode(m):
+                r = dp.reserve(self.store, task_id=f'x-{m}', runtime='qoder',
+                               model='Sonus', workspace=str(self._ws(f'x-{m}')),
+                               prompt_sha256='p', executor='qoder', now=T0,
+                               _preclaim=False)
+            self.assertFalse(r.get('allowed'), (m, r))
+            self.assertFalse(r.get('sent'), (m, r))
+            self.assertIsNone(r.get('token'), (m, r))
+            self.assertEqual(r.get('reason'), 'mode_excluded', (m, r))
+            reason = r['reasons'][0]
+            self.assertIn('not part of the', reason, (m, r))
+            self.assertNotIn('temporarily disabled', reason, (m, r))
+            with closing(dp.connect(self.store)) as conn:
+                n = conn.execute('SELECT COUNT(*) AS n FROM attempts').fetchone()['n']
+            self.assertEqual(n, 0, (m, n))
+
+    def test_strong_capacity_full_is_honest(self):
+        with dispatch_mode('strong'):
+            first = dp.reserve(self.store, task_id='f1', runtime='qoder',
+                               model='Sonus', workspace=str(self._ws('f1')),
+                               prompt_sha256='p', executor='qoder', now=T0,
+                               _preclaim=False)
+            second = dp.reserve(self.store, task_id='f2', runtime='qoder',
+                                model='Sonus', workspace=str(self._ws('f2')),
+                                prompt_sha256='p', executor='qoder', now=T0,
+                                _preclaim=False)
+        self.assertTrue(first.get('allowed'), first)
+        self.assertFalse(second.get('allowed'), second)
+        self.assertEqual(second.get('reason'), 'capacity_full', second)
+        self.assertFalse(second.get('sent', True), second)
+
+    def test_strong_claim_due_reclaims_sonus(self):
+        import json
+        scope = {'task_id': 'cd', 'stage': 's', 'chat_id': 'c',
+                 'workspace': str(self._ws('cd')), 'prompt_sha256': 'p' * 64,
+                 'allowed_candidates': [SONUS_KEY]}
+        with closing(dp.connect(self.store)) as conn:
+            conn.execute('INSERT INTO luna_tickets(task_id, scope, state, '
+                         'asked_at_utc, deadline_utc, updated_at_utc) '
+                         'VALUES(?,?,?,?,?,?)',
+                         ('cd', json.dumps(scope, sort_keys=True), 'pending',
+                          dp._iso(T0), dp._iso(T0), dp._iso(T0)))
+        with dispatch_mode('strong'), \
+                unittest.mock.patch.object(dp, 'LUNA_DISABLED', False):
+            out = dp.claim_due(self.store, task_id='cd', now=T0, _preclaim=False)
+        self.assertTrue(out.get('claimed'), out)
+        self.assertEqual(out.get('mode'), 'domestic_reclaim', out)
+        self.assertEqual(out.get('pool_key'), SONUS_KEY, out)
+
+    def test_legacy_reserved_sonus_consumes_after_reenable(self):
+        with dispatch_mode('strong'):
+            r = dp.reserve(self.store, task_id='lc1', runtime='qoder',
+                           model='Sonus', workspace=str(self._ws('lc1')),
+                           prompt_sha256='p', executor='qoder', now=T0,
+                           _preclaim=False)
+            self.assertTrue(r.get('allowed'), r)
+            tok = r['token']
+            out = dp.consume_for_entry(self.store, task_id='lc1', runtime='qoder',
+                                       model='Sonus',
+                                       workspace=str(self._ws('lc1')),
+                                       prompt_sha256='p', claim_token=tok,
+                                       wrapper_pid=4321, wrapper_created='w1',
+                                       now=T0)
+        self.assertTrue(out.get('allowed'), out)
+        self.assertEqual(out.get('token'), tok, out)
+        with closing(dp.connect(self.store)) as conn:
+            state = conn.execute('SELECT state FROM attempts WHERE token=?',
+                                 (tok,)).fetchone()['state']
+        self.assertEqual(state, 'running', state)
 
 
 if __name__ == '__main__':

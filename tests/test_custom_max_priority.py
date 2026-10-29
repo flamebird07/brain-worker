@@ -161,17 +161,18 @@ class CustomMaxPriorityTests(_Base):
 
     def test_day_max_all_day_in_strong_mode(self):
         # strong 档：可派池全部无时段门——白天三个 Max 与 claude 都在候选，常态层序
-        # Sonus(1) > ZCode(2) > claude(3) > 三个 Max(4)。BW-SONUS-TEMP-DISABLE-20261028-R2：
-        # Sonus 全档暂时禁用——不在 strong 候选、AUTO 绝不选它；原目标（强档白天无
-        # 时段门 + 层序）断言强度不变：ZCode → claude → 国际 Max → CN 自定义 Max。
+        # Sonus(1) > ZCode(2) > claude(3) > 三个 Max(4)。BW-SONUS-REENABLE-20261029-R3：
+        # Sonus 恢复常态新派，先占满其唯一槽后按原层序验证：ZCode → claude →
+        # 国际 Max → CN 自定义 Max。
         with dispatch_mode('strong'):
             self.fill_codebuddy()
             with closing(dp.connect(self.store)) as conn:
                 elig = dp._eligible_main_forces(conn, False, DAY)
             self.assertNotIn(CN_CUSTOM_MAX, elig)
-            self.assertNotIn(dp.SONUS_POOL_KEY, elig)
+            self.assertIn(dp.SONUS_POOL_KEY, elig)
             for pk in (CN_MAX, QMAX, ZCODE, CLAUDE):
                 self.assertIn(pk, elig)
+            self.seed(dp.SONUS_POOL_KEY, 1)
             self.assertEqual(self.select(ZCODE, DAY)[0], ZCODE)
             self.seed(ZCODE, 1)
             self.assertEqual(self.select(ZCODE, DAY)[0], CLAUDE)
@@ -252,8 +253,9 @@ class UserDisabledCustomMaxTests(_Base):
         self.assertEqual(dp.DOMESTIC_TOTAL_CAPACITY, 16)
         import install_desktop_skill as installer
         self.assertIn(CN_CUSTOM_MAX, installer.HOST_EXCLUDED['qoder'])
-        # BW-SONUS-TEMP-DISABLE-20261028-R2：Sonus 全档暂时禁用——strong 也是 4 池/5 槽。
-        for mode, count, slots in (('strong', 4, 5), ('medium', 4, 5), ('weak', 10, 13)):
+        # BW-SONUS-REENABLE-20261029-R3：Sonus 恢复常态——strong 5 池/6 槽；
+        # medium/weak 仍不含 Sonus，分别 4 池/5 槽、10 池/13 槽。
+        for mode, count, slots in (('strong', 5, 6), ('medium', 4, 5), ('weak', 10, 13)):
             pools = dm.allowed_pools_for_mode(mode)
             self.assertEqual(len(pools), count)
             self.assertEqual(sum(dp.capacity_for(pk) for pk in pools), slots)
