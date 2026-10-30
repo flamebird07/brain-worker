@@ -47,11 +47,33 @@
 - **时间口径**：`request.json` 同时记录真实 `started_at_utc`（Popen 前）与 `finished_at_utc`
   （communicate 返回后）；显式注入 `now` 的离线用例两个时点都取注入值以保持确定性。终态
   `finish` 使用真实结束时钟，绝不把派工开始时间一直当结束时间。
-- **工具证据口径**：`execution_evidence` 公开 `tool_call_count`/`tool_result_count`/
-  `successful_tool_receipts`/`missing_tool_receipts`/`execution_evidence_ok`。它只证明原始
-  tool_use 有同 ID 成功 tool_result；**不是**业务验收，也不证明真实文件系统结果。零工具纯
-  文本任务仍可合法通过传输（`protocol_success`/`report_bound` 语义不变），但格式合格的零工具
-  “工程报告”没有工程执行证据，绝不据此宣称已实施；`business_verified` 恒 false。
+- **工程证据门（BW-ENGINE-EVIDENCE-GATE-20261030 / S1）**：`execution_evidence` 保留原始
+  `tool_call_count`/`tool_result_count`、`successful_tool_receipts`/`missing_tool_receipts`，
+  增加 `failed_tool_receipts` 与 `failure_reasons`。至少一次调用且每次都有同 ID 成功回执才有
+  `execution_evidence_ok=true`；两个精确模型的顶层 `passed` 必须经过此门，不按报告文字推断执行。
+  零工具仍可 `protocol_success=true`、`report_bound=true`，但 `engineering_success=false`、
+  `passed=false`、CLI 退出 3；缺失/失败回执同样不能通过。
+- `engineering_success` = 协议成功 + 报告绑定 + 无超时 + 工具证据门通过；最终 `passed` 还要求
+  留证成功、自身子进程身份核验与真实终态释放。释放后写入的 `summary.json` 同时保存最终
+  `passed`、`engineering_success`、`execution_evidence_gate`（required/passed/failure_reasons）、
+  顶层 `failure_reasons` 和 `capacity_release`，不能只读取进程返回对象。工具原因码包括
+  `no_tool_calls`、`missing_tool_receipts`、`failed_tool_receipts`；summary 写入失败不能返回成功。
+- **MAINIMG-FIX-1 现场教训**：格式合格、协议成功、报告绑定并不能证明工程实施。此门只防
+  零工具/缺回执/失败回执假成功，不是业务验收或独立文件系统真相；`business_verified` 恒 false。
+  入口没有可信 baseline 时不伪造“磁盘 diff 已验证”，主脑必须独立对照本轮授权范围、基线、磁盘
+  diff/产物和必要测试完成业务验收。额度、网络与工具调用文本化属于外部通道，不用改提示词或
+  重试伪装修复；不改变其它运行时或池优先级/容量/时段/重试/额度规则。
+- **task-id 交接**：公开 `codebuddy_direct.py` 在 wrapper 层显式解析并校验恰好一个非空白
+  `--task-id`，然后将规范化 argv 交给 live，任务 ID 值原样保留（不 trim、不从阶段/路径/时间
+  生成）。缺失、无值、空白或重复均由 wrapper 输出 `source=codebuddy_direct`、
+  `reason=task_id_required`、退出 2；不进入 live，不读取配置/提示词、不建目录、不认领或派发。
+
+当前公开入口示例（task-id 必须来自主脑本轮授权；工具清单按授权填写）：
+
+```text
+python scripts/codebuddy_direct.py --model deepseek-v4.1-flash --task-id <本轮任务标识> --workspace <项目绝对路径> --prompt-file <UTF-8提示词绝对路径> --output-dir <不存在的新证据目录> --stage <阶段编号> --tools <本轮已授权工具逗号清单>
+python scripts/codebuddy_direct.py --model glm-5.3-flash --task-id <本轮任务标识> --workspace <项目绝对路径> --prompt-file <UTF-8提示词绝对路径> --output-dir <不存在的新证据目录> --stage <阶段编号> --tools <本轮已授权工具逗号清单>
+```
 
 ## 历史人工转交方式（旧模型/WorkBuddy 仍适用）
 
@@ -70,12 +92,12 @@
 参数见该入口 `--help`），其它模型仍被生产入口固定拒绝。历史形状只作解析档案：
 
 ```text
-# 当前精确模型经 codebuddy_live 承接；其它模型仍固定拒绝。
+# 旧模型历史形状；当前两个精确模型须使用上方带 task-id 的正式示例。
 python scripts/codebuddy_direct.py --workspace <项目绝对路径> --prompt-file <UTF-8提示词文件> --output-dir <不存在的新证据目录> --stage <非空阶段编号> --model <模型ID>
 ```
 
 `--model` 在历史入口必填、无 auto/fallback；当前 `codebuddy_live` 缺省即精确模型
-`deepseek-v4.1-flash`，GLM 必须显式指定并同时给当轮证据；任何其它值仍在任何 IO 前拒绝。
+`deepseek-v4.1-flash`，GLM 必须显式指定，无当轮额度证据前提；任何其它值仍在任何 IO 前拒绝。
 `--resume-session-id` 在历史入口可选（内部传官方 `--resume`），当前恢复入口**拒绝**
 session resume（接续不等于授权）。
 不自动重装、登录、重试、后台取消或通知；主脑不开第二个 CLI 主脑。
@@ -259,11 +281,13 @@ stdout 为 stream-json JSONL，逐字以字节保存 `stdout.jsonl`（stderr 同
 
 ## 证据与退出码
 
-输出目录含 `request.json`（argv、提示词 UTF-8 字节哈希、stage、cwd、模型、工具规则；
-不含提示词正文）、`process.json`（pid、状态、真实退出码）、`stdout.jsonl`、`stderr.log`、
-`response.md`（result 原文字节，不 trim 不删前言）、`report-state.json`（九节正文
-核对 + 最终绑定）、`summary.json`。preflight 校验错误退出码 2 且证据目录零创建；
-协议成功且报告绑定均为真才退出 0；其余失败退出 3。失败证据同样完整保存，原件不删改。
+当前 `codebuddy_live` 输出目录含 `request.json`（argv、提示词 UTF-8 字节哈希、task_id、
+stage、cwd、模型、工具规则及真实起止时间；不含提示词正文）、`stdout.jsonl`、`stderr.log`、
+`sent-payload-stdin.bin`、有报告时的 `response.md`（原文字节，不 trim 不删前言）、
+`report-state.json`（正文核对与绑定）及释放后保存的最终 `summary.json`（含 `passed`、工程
+判定、工具证据门与失败原因）。`process.json` 属历史 harness 产物，不是当前 live 必需项。
+wrapper task-id/派工前校验失败退出 2，零派发；已派发只有协议、绑定、工具证据、留证与终态
+释放等全部通过才退出 0，其余退出 3。正常留证时失败原件同样保留；磁盘写入失败不伪报成功。
 
 官方文档：https://www.codebuddy.cn/docs/cli/cli-reference 、
 https://www.codebuddy.cn/docs/cli/iam 。字段若与真实 CLI 回读不同，以主脑真实

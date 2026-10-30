@@ -38,11 +38,11 @@ CodeBuddy 精确模型执行正式 Popen 的生产入口，且只服务两个组
 - 超时口径：普通新派发**没有**默认墙钟限制（不新增 30 分钟/2 小时上限），只有调用方显式
   给出正数 `timeout_seconds` 才生效；`<=0` 在任何副作用之前诚实拒绝。显式超时仍 kill 子
   进程、回收、按失败结算并保留释放/unknown 保护。
-- 工具证据：`execution_evidence` 只公开原始 tool_use/tool_result 数量、成功匹配回执与缺失
-  回执，`execution_evidence_ok` 仅作工具证据口径；零工具纯文本任务仍可合法通过传输，
-  但格式合格且零工具的“工程报告”不具备工程执行证据，绝不据此宣称业务已验收。
+- 工具证据：`execution_evidence_ok` 是两个精确模型工程成功的必要条件；零工具、缺回执、
+  失败回执均不能 passed。协议与报告绑定独立保真，最终 passed 与证据门在释放后写入 summary。
+  工具证据不是业务验收或独立磁盘事实；缺可信 baseline 不声明 diff 已验证。
 - 退出码：未派发（模型不符/预检/凭据/容量门）→ 2；已派发但失败（协议/绑定/执行）→ 3；
-  已派发且 `passed`（协议绿灯 + 报告绑定 + 真实终态释放）→ 0。
+  已派发且 `passed`（协议绿灯 + 报告绑定 + 工具证据 + 留证成功 + 真实终态释放）→ 0。
 
 离线自测通过注入 `popen_factory`（可移植 synthetic stub）完成，不产生真实 OS 子进程、不联网、
 不调真实模型；真实小任务现场验收由主脑用既有私有登录态另行完成。
@@ -112,7 +112,7 @@ def execution_evidence(parsed: dict) -> dict:
             result_by_id[rid] = result
     failed_ids = {f.get('tool_use_id') for f in (parsed.get('tool_failures') or [])
                   if isinstance(f.get('tool_use_id'), str) and f.get('tool_use_id')}
-    successful, missing = [], []
+    successful, missing, failed = [], [], []
     for use in uses:
         uid = use.get('id')
         result = result_by_id.get(uid) if isinstance(uid, str) and uid else None
@@ -120,12 +120,22 @@ def execution_evidence(parsed: dict) -> dict:
             missing.append(uid)
         elif result.get('is_error') is not True and uid not in failed_ids:
             successful.append(uid)
+        else:
+            failed.append(uid)
+    failure_reasons = []
+    if not uses:
+        failure_reasons.append('no_tool_calls')
+    if missing:
+        failure_reasons.append('missing_tool_receipts')
+    if failed:
+        failure_reasons.append('failed_tool_receipts')
     return {'tool_call_count': len(uses),
             'tool_result_count': len(results),
             'successful_tool_receipts': successful,
             'missing_tool_receipts': missing,
-            'execution_evidence_ok': bool(uses) and not missing
-            and len(successful) == len(uses),
+            'failed_tool_receipts': failed,
+            'execution_evidence_ok': not failure_reasons,
+            'failure_reasons': failure_reasons,
             'evidence_scope': ('tool receipts only; not business acceptance and not '
                                'independent file-system truth')}
 
@@ -338,6 +348,7 @@ def run(cfg, *, workspace, prompt_file, out_dir, stage, task_id, model, tools_it
     parsed = {}
     ev_files = {}
     evidence = {}
+    summary = {}
     failure_facts = None
     main_force_limit_rec = None
     try:
@@ -407,8 +418,6 @@ def run(cfg, *, workspace, prompt_file, out_dir, stage, task_id, model, tools_it
             'model_backend_identity_verified': False,
             'usage_billing_basis': 'unknown; raw usage saved without interpretation',
             'output_dir': str(out)}
-        (out / 'summary.json').write_bytes(json.dumps(
-            summary, ensure_ascii=False, indent=2).encode('utf-8'))
         (out / 'request.json').write_bytes(json.dumps(
             {'started_at_utc': started_at_utc.isoformat(),
              'finished_at_utc': finished_at_utc.isoformat(),
@@ -461,8 +470,15 @@ def run(cfg, *, workspace, prompt_file, out_dir, stage, task_id, model, tools_it
             main_force_limit_rec = {'recorded': False, 'pool_key': pool_key,
                                     'error': type(rec_exc).__name__}
 
-    execution_success = bool(parsed.get('protocol_success') and ec_exit == 0 and not timed_out)
-    success = bool(execution_success and binding.get('bound'))
+    protocol_success = bool(parsed.get('protocol_success') and ec_exit == 0)
+    evidence_ok = evidence.get('execution_evidence_ok') is True
+    evidence_gate = {
+        'required': True, 'passed': evidence_ok,
+        'failure_reasons': (evidence.get('failure_reasons', []) if evidence
+                            else ['execution_evidence_unavailable'])}
+    engineering_success = bool(protocol_success and not timed_out
+                               and binding.get('bound') and evidence_ok)
+    success = bool(engineering_success and not facts.get('downstream_error'))
     try:
         release = dp.finish(dispatch_store, claim, terminal='finished', success=success,
                             now=finished_at_utc, prober=child_prober)
@@ -470,23 +486,44 @@ def run(cfg, *, workspace, prompt_file, out_dir, stage, task_id, model, tools_it
         release = {'released': False, 'error': type(fexc).__name__}
     bind_ok = child_verified if bind_child_pid else True
     release_ok = bool(isinstance(release, dict) and release.get('released') is True)
-    passed = bool(success and not facts.get('downstream_error') and bind_ok and release_ok)
-    return {'sent': True, 'dispatched': True, 'started': started,
-            'child_verified': child_verified, 'token': claim, 'exit_code': exit_code,
-            'pool_key': pool_key, 'codebuddy_glm_allowed': glm_allowed,
-            'codebuddy_quota_evidence': (_evidence_summary(quota_evidence)
-                                         if quota_evidence else None),
-            'protocol_success': bool(parsed.get('protocol_success') and ec_exit == 0),
-            'report_bound': bool(binding.get('bound')), 'timed_out': timed_out,
-            'evidence': ev_files, 'launched': True, 'capacity_release': release,
-            'execution_evidence': evidence,
-            'started_at_utc': started_at_utc.isoformat(),
-            'finished_at_utc': finished_at_utc.isoformat(),
-            'passed': passed, 'business_verified': False,
-            'main_force_limit': main_force_limit_rec,
-            'usage': parsed.get('usage'), 'model_usage': parsed.get('model_usage'),
-            'observed_models': parsed.get('observed_models'),
-            'report_text_sha256': _sha(report_text.encode('utf-8')) if report_text else None}
+    failure_reasons = list(evidence_gate['failure_reasons'])
+    for failed, reason in (
+            (not protocol_success, 'protocol_failed'),
+            (not binding.get('bound'), 'report_unbound'),
+            (timed_out, 'timed_out'),
+            (bool(facts.get('downstream_error')), 'evidence_processing_failed'),
+            (not bind_ok, 'child_identity_unverified'),
+            (not release_ok, 'capacity_not_released')):
+        if failed:
+            failure_reasons.append(reason)
+    passed = bool(success and bind_ok and release_ok)
+    result = {'sent': True, 'dispatched': True, 'started': started,
+              'child_verified': child_verified, 'token': claim, 'exit_code': exit_code,
+              'pool_key': pool_key, 'codebuddy_glm_allowed': glm_allowed,
+              'codebuddy_quota_evidence': (_evidence_summary(quota_evidence)
+                                           if quota_evidence else None),
+              'protocol_success': protocol_success,
+              'report_bound': bool(binding.get('bound')), 'timed_out': timed_out,
+              'evidence': ev_files, 'launched': True, 'capacity_release': release,
+              'execution_evidence': evidence, 'execution_evidence_gate': evidence_gate,
+              'engineering_success': engineering_success,
+              'failure_reasons': failure_reasons,
+              'started_at_utc': started_at_utc.isoformat(),
+              'finished_at_utc': finished_at_utc.isoformat(),
+              'passed': passed, 'business_verified': False,
+              'main_force_limit': main_force_limit_rec,
+              'usage': parsed.get('usage'), 'model_usage': parsed.get('model_usage'),
+              'observed_models': parsed.get('observed_models'),
+              'report_text_sha256': _sha(report_text.encode('utf-8')) if report_text else None}
+    summary.update(result)
+    try:
+        (out / 'summary.json').write_bytes(json.dumps(
+            summary, ensure_ascii=False, indent=2).encode('utf-8'))
+    except OSError as exc:
+        result['passed'] = False
+        result['failure_reasons'].append('summary_write_failed')
+        result['summary_error'] = type(exc).__name__
+    return result
 
 
 def build_parser():

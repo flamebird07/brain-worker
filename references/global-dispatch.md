@@ -366,9 +366,19 @@ CodeBuddy 其它旧模型（含其它旧 GLM 组合）仍 human-relay；用户�
   `bind_child`/`finish` 生命周期、MCP 空/hooks 禁用/无 fallback、真实起止时间、显式超时可选）。
   BW-LIMIT30-20261019-S3 起 GLM **不再有待派发前的当轮证据门**：`--codebuddy-quota-evidence`
   仅兼容保留、缺省照常进入正常授权/容量/工作区/真实权限流程。
-  生产 `codebuddy_direct.main()` 只对这两个精确模型移交 live。
-- 工具证据：`execution_evidence_ok` 只表示原始工具调用有成功匹配回执，不代表业务验收；零工具
-  纯文本传输可合法通过，但零工具工程报告没有工程执行证据。
+  生产 `codebuddy_direct.main()` 只对这两个精确模型移交 live；wrapper 显式校验恰好一个非空白
+  `--task-id`，规范化 argv 后原样传递 ID，缺失/空白/重复在包装层退出 2，零配置/提示词读取、
+  零目录创建/容量认领/派发，不从阶段、路径或时间推断稳定任务标识。
+- **工程成功门（BW-ENGINE-EVIDENCE-GATE-20261030 / S1）**：两个精确模型的顶层 `passed`
+  必须要求 `execution_evidence.execution_evidence_ok=true`，并保留协议、报告绑定、无超时、
+  留证成功、自身子进程身份核验与真实终态释放条件。零工具、缺失或失败回执使
+  `engineering_success=false`、`passed=false`、CLI 退出 3；即便 `protocol_success=true`、
+  `report_bound=true` 也不能通过。释放后落盘的 `summary.json` 含最终 `passed`、
+  `engineering_success`、`execution_evidence_gate` 和 `failure_reasons`。
+- MAINIMG-FIX-1 的现场教训是“格式合格 + 报告绑定”不等于工程执行。工具门只防零工具/缺回执/
+  失败回执假成功，`business_verified` 恒 false；没有可信 baseline 不伪造磁盘 diff 核验。
+  主脑仍须独立对照授权范围、基线与实际磁盘 diff/产物验收，不能拿工具回执替代业务验收。
+  此门不修复额度、网络或工具调用文本化，不改其它运行时、池优先级/容量/时段/重试/额度规则。
 
 ## 执行器约束与 availability 资格过滤（BW-AVAILABILITY-20261009-B2）
 

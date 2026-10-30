@@ -52,8 +52,9 @@
 - 用量口径未知：usage/modelUsage 仅原样保存 raw 值；business_verified /
   free_quota_verified / model_backend_identity_verified 恒为 false；cost_usd=0
   不视为免费证据；缓存分项不得与 input_tokens 重复累加。
-退出码：0 仅当 protocol_success 且 report_bound 均为真；preflight 校验错误为 2
-且证据目录零创建；其余失败为 3。权限范围不是文件 sandbox，见 references/codebuddy-direct.md。
+当前精确模型退出码：0 必须同时具备协议成功、报告绑定、成功工具回执、留证与终态释放；
+缺失/空白 task-id 在包装层退出 2 且零派发，其余已派发失败为 3。
+权限范围不是文件 sandbox，见 references/codebuddy-direct.md。
 Windows 下 scoped Read/Edit/Write 文件规则在建目录与 Popen 前做派工前校验：只接受已证
 可靠的完整驱动器绝对单文件路径（推荐 C:/work/probe.txt），相对/根样式/UNC/
 ~ /通配等未验证形态退出 2 并给出该 workspace 绝对正斜杠示例，不静默转换；Bash 等命令规则
@@ -1048,13 +1049,25 @@ def main():
     本模块仍**不 import subprocess**、不携带可执行传输；真实传输只在 `codebuddy_live` 内，
     且只认这两个精确模型。历史诊断/纯解析函数（parse_stream/build_argv/权限契约/失败留证）
     继续留在本模块供离线单测与 codebuddy_live 复用。"""
-    probe = argparse.ArgumentParser(add_help=False)
+    probe = argparse.ArgumentParser(prog='codebuddy_direct', add_help=False,
+                                    allow_abbrev=False)
     probe.add_argument('--model', default=None)
-    probe_args, _unknown = probe.parse_known_args()
+    probe.add_argument('--task-id', action='append', nargs='?', const='', default=None)
+    probe_args, remaining = probe.parse_known_args()
     if probe_args.model in ('deepseek-v4.1-flash', 'glm-5.3-flash'):
-        # 精确恢复模型：移交正式生产传输入口（其它约束在 codebuddy_live 内继续强制）。
-        import codebuddy_live  # 惰性导入，避免与本模块的相互依赖
-        return codebuddy_live.main()
+        task_ids = probe_args.task_id or []
+        if len(task_ids) != 1 or not task_ids[0].strip():
+            print(json.dumps({
+                'dispatch_failed': True, 'sent': False, 'dispatched': False,
+                'reason': 'task_id_required', 'source': 'codebuddy_direct',
+                'reasons': ['Provide exactly one non-blank --task-id from the authorized '
+                            'task before dispatch; codebuddy_direct does not generate '
+                            'or infer a stable task ID.']}, ensure_ascii=False))
+            return 2
+        import codebuddy_live
+        normalized_argv = [*remaining, '--model', probe_args.model,
+                           '--task-id=' + task_ids[0]]
+        return codebuddy_live.main(normalized_argv)
     build_parser().parse_args()  # 参数解析（含 --help）正常，但非精确模型一律拒绝派发
     print(json.dumps({
         'manual_relay_only': True,
@@ -1062,8 +1075,8 @@ def main():
         'sent': False,
         'dispatch_refused': True,
         'reason': 'CodeBuddy/WorkBuddy direct dispatch retired for every model except the '
-                  'two reactivated exact models (deepseek-v4.1-flash; glm-5.3-flash only '
-                  'with current-round explicit DeepSeek quota evidence): emit a complete '
+                  'two reactivated exact models (deepseek-v4.1-flash; glm-5.3-flash; '
+                  'their quotas are independent and GLM needs no DeepSeek evidence): emit a complete '
                   'copy-paste prompt and hand it to an external agent by hand. No new '
                   'direct CodeBuddy call for any other model (other old GLM combinations '
                   'included) or WorkBuddy is submitted from the Skill/CLI/control plane. '

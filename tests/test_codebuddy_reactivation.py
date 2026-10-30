@@ -480,20 +480,33 @@ class TestLiveTransport(unittest.TestCase):
                          pc.sha256_hex(sent_contract.encode('utf-8')))
         self.assertEqual((outdir / 'response.md').read_text(encoding='utf-8'),
                          self.report)
+        self._assert_final_summary(out, 'out')
         # codebuddy slot released after confirmed exit.
         with closing(dp.connect(self.store)) as conn:
             self.assertEqual(dp._count_active(conn, CB), 0)
 
+    def _assert_final_summary(self, out, outname):
+        summary = json.loads((self.base / outname / 'summary.json').read_text(
+            encoding='utf-8'))
+        for key in ('passed', 'engineering_success', 'protocol_success', 'report_bound',
+                    'execution_evidence', 'execution_evidence_gate', 'failure_reasons',
+                    'capacity_release', 'business_verified'):
+            self.assertEqual(summary[key], out[key], key)
+        self.assertFalse(summary['business_verified'])
+        self.assertTrue(summary['execution_evidence_gate']['required'])
+        return summary
+
     def test_zero_tool_formatted_report_has_no_engineering_execution_evidence(self):
-        # 零工具、九节格式合格的“工程报告”仍可合法通过传输（protocol_success/report_bound
-        # 含义不变），但没有工具回执，绝不据此声称工程执行已证明或业务已验收。
         stream = _success_stream(self.report, tools=())
         out = self._run(stdout=stream, returncode=0, task='zero', outname='zero',
                         tools_items=[])
         self.assertTrue(out['dispatched'], out)
         self.assertTrue(out['protocol_success'], out)
         self.assertTrue(out['report_bound'], out)
-        self.assertTrue(out['passed'], out)
+        self.assertFalse(out['passed'], out)
+        self.assertFalse(out['engineering_success'], out)
+        self.assertEqual(out['failure_reasons'], ['no_tool_calls'])
+        self._assert_final_summary(out, 'zero')
         evidence = out['execution_evidence']
         self.assertEqual(evidence['tool_call_count'], 0, evidence)
         self.assertEqual(evidence['tool_result_count'], 0, evidence)
@@ -512,6 +525,10 @@ class TestLiveTransport(unittest.TestCase):
                         tools_items=['Read', 'Write'])
         self.assertTrue(out['protocol_success'], out)
         self.assertTrue(out['report_bound'], out)
+        self.assertFalse(out['passed'], out)
+        self.assertFalse(out['engineering_success'], out)
+        self.assertEqual(out['failure_reasons'], ['missing_tool_receipts'])
+        self._assert_final_summary(out, 'miss')
         evidence = out['execution_evidence']
         self.assertEqual(evidence['tool_call_count'], 2, evidence)
         self.assertEqual(evidence['tool_result_count'], 0, evidence)
@@ -519,6 +536,96 @@ class TestLiveTransport(unittest.TestCase):
                          evidence)
         self.assertFalse(evidence['execution_evidence_ok'], evidence)
         self.assertFalse(out['business_verified'])
+
+    def test_live_cli_engineering_evidence_gate_for_both_exact_models(self):
+        for model in cl.MODELS:
+            for case, reason in (('success', None), ('zero', 'no_tool_calls'),
+                                 ('missing', 'missing_tool_receipts'),
+                                 ('failed', 'failed_tool_receipts'),
+                                 ('failed_text', 'failed_tool_receipts')):
+                with self.subTest(model=model, case=case):
+                    events = [json.loads(line) for line in _success_stream(
+                        self.report, model=model, tools=() if case == 'zero'
+                        else ('Read', 'Write')).decode('utf-8').splitlines()]
+                    if case == 'missing':
+                        events = [event for event in events if event['type'] != 'user']
+                    elif case in ('failed', 'failed_text'):
+                        receipt = events[2]['message']['content'][1]
+                        receipt['is_error'] = case == 'failed'
+                        receipt['content'] = '<tool_use_error>write failed</tool_use_error>'
+                    stream = ('\n'.join(json.dumps(event, ensure_ascii=False)
+                                        for event in events) + '\n').encode('utf-8')
+                    outname = f'cli-{model}-{case}'
+                    argv = ['--model', model, '--workspace', str(self.work),
+                            '--prompt-file', str(self._prompt_file()),
+                            '--output-dir', str(self.base / outname),
+                            '--stage', self.stage, '--task-id', outname,
+                            '--dispatch-store', self.store, '--tools', 'Read,Write']
+                    real_run = cl.run
+                    factory = stub.make_popen_factory(stdout=stream)
+
+                    def offline_run(*args, **kwargs):
+                        return real_run(*args, **kwargs, popen_factory=factory,
+                                        child_prober=lambda pid: {'state': 'dead',
+                                                                   'created': None})
+
+                    buf = io.StringIO()
+                    with mock.patch.object(cb, 'load_entry_config', return_value=self.cfg), \
+                            mock.patch.object(cl, 'run', side_effect=offline_run), \
+                            redirect_stdout(buf):
+                        code = cl.main(argv)
+                    out = json.loads(buf.getvalue())
+                    self.assertEqual(code, 0 if case == 'success' else 3, out)
+                    self.assertTrue(out['protocol_success'], out)
+                    self.assertTrue(out['report_bound'], out)
+                    self.assertEqual(out['passed'], case == 'success', out)
+                    self.assertEqual(out['engineering_success'], case == 'success')
+                    self.assertEqual(out['execution_evidence_gate']['passed'],
+                                     case == 'success')
+                    self.assertEqual(out['failure_reasons'], [reason] if reason else [])
+                    self._assert_final_summary(out, outname)
+                    with closing(dp.connect(self.store)) as conn:
+                        row = conn.execute('SELECT success FROM attempts WHERE token=?',
+                                           (out['token'],)).fetchone()
+                    self.assertEqual(row['success'], int(case == 'success'))
+
+    def test_summary_records_release_failure_not_provisional_success(self):
+        with mock.patch.object(dp, 'finish', return_value={'released': False}):
+            out = self._run(stdout=_success_stream(self.report), outname='unreleased')
+        self.assertTrue(out['engineering_success'], out)
+        self.assertFalse(out['passed'], out)
+        self.assertEqual(out['failure_reasons'], ['capacity_not_released'])
+        self._assert_final_summary(out, 'unreleased')
+
+    def test_summary_records_evidence_write_failure_and_releases_slot(self):
+        write_bytes = Path.write_bytes
+
+        def fail_request(path, data):
+            if path.name == 'request.json':
+                raise OSError('synthetic request write failure')
+            return write_bytes(path, data)
+
+        with mock.patch.object(Path, 'write_bytes', fail_request):
+            out = self._run(stdout=_success_stream(self.report), outname='write-failure')
+        self.assertFalse(out['passed'], out)
+        self.assertEqual(out['failure_reasons'], ['evidence_processing_failed'])
+        self.assertTrue(out['capacity_release']['released'])
+        self._assert_final_summary(out, 'write-failure')
+
+    def test_summary_write_failure_never_returns_success(self):
+        write_bytes = Path.write_bytes
+
+        def fail_summary(path, data):
+            if path.name == 'summary.json':
+                raise OSError('synthetic summary write failure')
+            return write_bytes(path, data)
+
+        with mock.patch.object(Path, 'write_bytes', fail_summary):
+            out = self._run(stdout=_success_stream(self.report), outname='summary-failure')
+        self.assertFalse(out['passed'], out)
+        self.assertEqual(out['failure_reasons'], ['summary_write_failed'])
+        self.assertTrue(out['capacity_release']['released'])
+        self.assertFalse((self.base / 'summary-failure' / 'summary.json').exists())
 
     def test_omitted_timeout_adds_no_wall_clock_limit(self):
         stream = _success_stream(self.report)

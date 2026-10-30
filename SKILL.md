@@ -991,9 +991,19 @@ AGENT_CAPABILITY_RECORD_END
   子代理；`business_verified=false`。**普通新派发没有默认 30 分钟/2 小时限制**：省略
   `--timeout-seconds` 即无墙钟限制，只有显式正数生效、`<=0` 零副作用拒绝。`request.json`
   记录真实开始与结束时间（注入时钟的离线用例保持确定性）。
-- 工具证据只认原始 `tool_use` 与同 ID `tool_result`：`execution_evidence_ok` 仅表示工具有
-  成功回执，不是业务验收；零工具纯文本任务可合法通过传输，但零工具“工程报告”没有工程执行
-  证据，绝不声称已实施。
+- **工程证据门（BW-ENGINE-EVIDENCE-GATE-20261030 / S1）**：两个 CodeBuddy 精确模型的顶层
+  `passed` 必须同时满足协议成功、报告绑定、`execution_evidence.execution_evidence_ok=true`、
+  无超时、留证成功与自身子进程身份/终态释放核验。零工具仍可 `protocol_success=true`、
+  `report_bound=true`，但 `engineering_success=false`、`passed=false`、CLI 退出 3；缺失或失败
+  工具回执同样失败。`summary.json` 在释放后记录最终 `passed`、`engineering_success`、
+  `execution_evidence_gate` 与 `failure_reasons`，不能只读报告格式或 CLI 子进程 exit 0。
+- **现场教训**：MAINIMG-FIX-1 的零工具合格报告只能证明协议与绑定，不能证明工程实施。
+  工具门只防零工具/缺回执/失败回执假成功，不核验业务目标；`business_verified` 恒 false。
+  入口没有可信 baseline 时不伪造“磁盘 diff 已验证”，主脑仍须独立对照授权范围、基线、磁盘
+  diff/产物及必要测试验收。额度、网络及工具调用文本化是外部通道状态，不以改提示词或重试掩盖。
+- **公开入口 task-id**：`codebuddy_direct.py` 对两个精确模型先解析并校验恰好一个非空白
+  `--task-id`，再将规范化 argv 与原样 ID 交给 live；缺失/空白/重复在 wrapper 层明确拒绝，
+  退出 2、零配置/提示词读取、零输出目录/占位/派发，不从 stage、路径或时间伪造稳定 ID。
 - 旧模型/WorkBuddy 操作方式：用 `scripts/prompt_contract.py` 生成含完整九节契约 + 任务原文的
   可复制提示词，交给外部 Agent；执行 Agent 把 WORKER_REPORT 保存为 UTF-8 原始文件后按
   `human-relay` 流程回读验收（见上文 human-relay 一节）。
@@ -1016,12 +1026,14 @@ AGENT_CAPABILITY_RECORD_END
 }
 ```
 
-正式 GLM 入口示例（不再需要 `--codebuddy-quota-evidence`；BW-LIMIT30-20261019-S3）：
+正式公开入口示例（task-id 来自主脑本轮授权；DeepSeek 使用相同参数形状替换精确模型，
+GLM 不需要 `--codebuddy-quota-evidence`）：
 
 ```text
-python scripts/codebuddy_live.py --model glm-5.3-flash \
+python scripts/codebuddy_direct.py --model glm-5.3-flash \
   --workspace <项目绝对路径> --prompt-file <UTF-8提示词绝对路径> \
-  --output-dir <不存在的新证据目录> --stage <阶段编号> --task-id <任务标识>
+  --output-dir <不存在的新证据目录> --stage <阶段编号> --task-id <本轮任务标识> \
+  --tools <本轮已授权工具逗号清单>
 ```
 
 BW-LIMIT30-20261019-S3 覆盖旧门口径：GLM 不再依赖当轮 DeepSeek 限额证据；正常授权/容量/

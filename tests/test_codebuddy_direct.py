@@ -8,13 +8,16 @@ node <cli> 的 argv/stdin/stdout 形状，不需要安装 Node 或 CodeBuddy CLI
 """
 import base64
 import hashlib
+import io
 import json
 import os
 import subprocess
 import sys
 import tempfile
 import unittest
+from contextlib import redirect_stdout
 from pathlib import Path
+from unittest import mock
 
 REPO = Path(__file__).resolve().parent.parent
 ENTRY = REPO / 'scripts' / 'codebuddy_direct.py'
@@ -1338,6 +1341,80 @@ class CodeBuddyDirectTests(unittest.TestCase):
                              '--allowed-tools', rule)
         self.assertEqual(res['rc'], 0, res['proc'].stderr.decode('utf-8', 'replace'))
         self.assertIn(rule, res['record']['argv'])  # Bash 命令规则不当作文件规则校验
+
+
+class ExactModelWrapperTaskIdTests(unittest.TestCase):
+    def test_task_id_forwarded_verbatim_in_normalized_argv(self):
+        import codebuddy_live as cl
+
+        task_id = '  BW-原样_Task_001  '
+        for model in cl.MODELS:
+            for task_args in (['--task-id', task_id], ['--task-id=' + task_id]):
+                with self.subTest(model=model, task_args=task_args):
+                    remaining = ['--workspace', 'C:/synthetic/ws',
+                                 '--prompt-file', 'C:/synthetic/prompt.txt',
+                                 '--output-dir', 'C:/synthetic/out', '--stage', 'S1',
+                                 '--tools', 'Read,Write', '--allowed-tools', 'Read',
+                                 '--allowed-tools', 'Write', '--timeout-seconds', '60',
+                                 '--dispatch-store', 'C:/synthetic/store.sqlite3']
+                    argv = ['codebuddy_direct', '--model=' + model, *task_args,
+                            *remaining]
+                    with mock.patch.object(sys, 'argv', argv), \
+                            mock.patch.object(cl, 'main', return_value=3) as live_main:
+                        self.assertEqual(cb.main(), 3)
+                    normalized = [*remaining, '--model', model, '--task-id=' + task_id]
+                    live_main.assert_called_once_with(normalized)
+                    self.assertEqual(cl.build_parser().parse_args(normalized).task_id,
+                                     task_id)
+
+    def test_missing_blank_or_duplicate_task_id_refused_before_live_or_io(self):
+        import codebuddy_live as cl
+
+        for model in cl.MODELS:
+            for task_args in ([], ['--task-id'], ['--task-id', ''],
+                              ['--task-id='], ['--task-id', ' \t '],
+                              ['--task-id', 'T1', '--task-id', 'T2']):
+                with self.subTest(model=model, task_args=task_args):
+                    buf = io.StringIO()
+                    with mock.patch.object(sys, 'argv', ['codebuddy_direct',
+                                                        '--model', model, *task_args]), \
+                            mock.patch.object(cl, 'main') as live_main, \
+                            mock.patch.object(cb, 'load_entry_config') as load_config, \
+                            mock.patch.object(Path, 'read_bytes') as read_bytes, \
+                            mock.patch.object(cl.dp, 'consume_for_entry') as consume, \
+                            mock.patch.object(cl.subprocess, 'Popen') as popen, \
+                            redirect_stdout(buf):
+                        code = cb.main()
+                    self.assertEqual(code, 2)
+                    payload = json.loads(buf.getvalue())
+                    self.assertEqual(payload['source'], 'codebuddy_direct')
+                    self.assertEqual(payload['reason'], 'task_id_required')
+                    self.assertIn('--task-id', payload['reasons'][0])
+                    self.assertFalse(payload['sent'])
+                    self.assertFalse(payload['dispatched'])
+                    for boundary in (live_main, load_config, read_bytes, consume, popen):
+                        boundary.assert_not_called()
+
+    def test_public_cli_missing_task_id_refuses_with_zero_dispatch_artifacts(self):
+        with tempfile.TemporaryDirectory(prefix='bw-cb-wrapper-') as tmp:
+            base = Path(tmp)
+            for model in ('deepseek-v4.1-flash', 'glm-5.3-flash'):
+                out = base / model
+                store = base / 'dispatch.sqlite3'
+                proc = subprocess.run(
+                    [sys.executable, str(ENTRY), '--model', model,
+                     '--workspace', str(base), '--prompt-file', str(base / 'missing.txt'),
+                     '--config', str(base / 'missing.json'), '--output-dir', str(out),
+                     '--stage', 'S1', '--dispatch-store', str(store)],
+                    capture_output=True, cwd=tmp)
+                self.assertEqual(proc.returncode, 2)
+                self.assertEqual(proc.stderr, b'')
+                payload = json.loads(proc.stdout)
+                self.assertEqual(payload['reason'], 'task_id_required')
+                self.assertEqual(payload['source'], 'codebuddy_direct')
+                self.assertFalse(out.exists())
+                self.assertFalse(store.exists())
+                self.assertEqual(list(base.iterdir()), [])
 
 
 class WindowsScopedGrantPureTests(unittest.TestCase):
