@@ -1,26 +1,38 @@
 # 全局并发容量池与 1:1 路由（global-dispatch）
 
+**2026-11-08 当前权威：BW-STRONG-QMAX-SONUS-20261108**。strong 新派为 6 池/9 槽：`qoder:QoDuck` 与 `qodercn:QoDuck`（层=1，各 2 槽）> `zcode:GLM-5.3`（2）> `claude:deepseek-flash`（3）> 国际 `qoder:Qwen3.8-Max`（4，倒数第二）> CN 内置 `qodercn:Qwen3.8-Max`（5）。Sonus 不再参与 strong 新派，仅 medium/weak 保持原资格；已有 reserved/running/unknown 不追杀、不改派、不假释放。浮窗 strong 空闲不显示 Sonus，有真实在途才保留并标“本档不参与”。本规则只调整现有档位集合与层号，不新增开关、路由或宿主分支，覆盖下文旧 strong 层序、7 池/10 槽及“Sonus 参与 strong”的描述。
+
+**2026-11-08 当前权威：BW-SINGLE-SELECTION-CLAIM-20261108-R2**。普通工程派工只走 `stage_selection --claim --prompt-sha256 ...`：同一次调用按完整任务授权和权限需求选中组合，并直接取得与 task/stage/workspace/prompt 精确绑定、`origin=stage-selection` 的 claim。调用方不得再用 `reserve(executor=...)` 手工给靠后模型出票；正式入口遇普通 reserve claim 返回 `dispatch_claim_not_selected`、`sent=false` 并释放该 reserved 占位。缺 claim 仍返回 `dispatch_claim_required`。因此每个新 stage 都重新按当前档位和优先级选一次，入口自身不做第二次 AUTO。实现只复用现有 `stage_selection`、`reserve` 与 attempts.origin，不新增路由器、表、状态机或优先级副本。
+
+**2026-11-07 当前权威：BW-QODUCK-STRONG-20261107**。新增 `qoder:QoDuck` 与 `qodercn:QoDuck`，只参与 strong，处于 Sonus 后的同一优先级层，各自独立 2 槽、无时段门。strong 层序为国际 Max(1) > Sonus(2) > 两区 QoDuck(3) > ZCode(4) > Claude(5) > CN 内置 Max(6)，共 7 池/10 槽；medium 仍 5 池/6 槽，weak 仍 11 池/14 槽。物理总容量由 16 增至 20。正式国际/CN 入口均使用精确模型字面量 `QoDuck`；切档不追杀、不改派、不假释放既有任务。本段覆盖下文旧 strong 池数、槽数、层号与物理总容量叙述。
+
+**2026-11-06 历史：BW-ENTRY-GLOBAL-PRIORITY-20261106（已被顶部 BW-SINGLE-SELECTION-CLAIM-20261108 覆盖）**。当时口径：正式入口没有精确 dispatch claim 时，共享门禁忽略入口传入的固定 executor 并以 `auto` 重新裁决，非最高合格候选返回 `routing_required`。现行口径删除了这次二次裁决：正式入口缺 claim 固定 `dispatch_claim_required`、`sent=false`、零占位，只消费规划阶段产生的精确 claim；回执含 `priority_enforced`、`requested_executor`、`effective_executor=None`。
+
+**2026-10-30 当前权威：BW-SONUS-WEAK-20261030（Sonus 加入弱档，三档均正常可派）**。用户要求 Qoder 国际／Sonus 也加入**弱档**，位置在国际 Max 之后。唯一策略来源 `scripts/dispatch_mode.py`（AUTO／显式入口／规划／浮窗同一份共享策略，不是 UI 重排）：**strong 5 池/6 槽**——国际 `qoder:Qwen3.8-Max`(层=1) > `qoder:Sonus`(2) > `zcode:GLM-5.3`(3) > `claude:deepseek-flash`(4) > CN 内置 `qodercn:Qwen3.8-Max`(5)，全部无时段门；**medium 5 池/6 槽**——两内置 Max(1) > `qoder:Sonus`(2) > Claude(3) > ZCode(4)；**weak 11 池/14 槽**（原 10/13）——CN 内置 Max(1) > `zcode:GLM-5.3`(2) > `claude:deepseek-flash`(3) > 国际 `qoder:Qwen3.8-Max`(4) > `qoder:Sonus`(5) > CodeBuddy DeepSeek(6) > 两 OpenCode(7) > CodeBuddy GLM(8) > 两 Flash(9)。Max 夜间门与 Claude 高峰门原样保留，Sonus 三档均无时段门、独立 1 槽。物理总容量仍 **16**、Sonus 登记容量仍 1；CN token plan Max 全档禁用、Sonus 临时开关（为 True 时三档都拒绝）、真实在途/旧 claim 规则、宿主递归排除全部不变；Max 层内既有的同层公平规则（CN 自定义子优先、真实在途少者优先、平票 stable tie）原样保留（CN 同层仍可能排在国际 Max 之前，属既有公平规则，不因本次调整改变）。`ALL_POOL_KEYS` 已含 Sonus，`KNOWN_POLICY_POOL_KEYS` 直接复用同一元组（无重复键）。浮窗：strong 国际 Max 第一、Sonus 第二；medium 与 weak 的 Sonus 行都**紧接国际 Max 行**，三档空闲均显示。本段覆盖本文及 README／SKILL 中一切「Sonus 强档专属 / Sonus 全档第一 / medium 不含 Sonus / weak 不含 Sonus」的叙述。
+
+**2026-10-30 历史：BW-SONUS-MEDIUM-20261030（强／中档层序调整，Sonus 加入中档；其「weak 10 池/13 槽、weak 不含 Sonus」已被上方 BW-SONUS-WEAK-20261030 覆盖，strong/medium 段仍有效）**。当时要求浮窗强档把 Qoder 国际／Qwen3.8-Max 放到 Qoder 国际／Sonus 之前，并让 Sonus 加入中档：strong 层序 国际 Max(1) > Sonus(2) > ZCode(3) > Claude(4) > CN 内置 Max(5)、全部无时段门；medium 由 4 池/5 槽变 5 池/6 槽（两内置 Max > Sonus > Claude > ZCode）。
+
 **2026-10-28 当前权威：BW-QODERCN-TOKEN-MAX-DISABLE-20261028**。用户要求禁用 `qodercn:Qwen-3.8-Max`（Qoder CN／token plan／Qwen-3.8-Max）在所有档位的新派发；不影响 `qodercn:Qwen3.8-Max`。AUTO 跳过，显式 reserve/select-and-claim、无 claim 的正式 CN 入口及 claim-due 国内回收均不新建目标池占位，`mode_excluded` 明确写“用户要求禁用”，不是额度、认证、时段、容量或永久退役；Luna 原有总禁用门保留。遗留 reserved/running/unknown 不追杀、不假释放、不改派；禁用前合法取得且仍 reserved 的精确 claim 可继续既有生命周期，工作区、PID、容量、token、权限、时段校验不放宽，例外不泛化。精确 key/模型名、容量登记 2、历史 attempts、宿主递归排除与物理总容量 16 不变，绝不加入 retired/legacy。浮窗三档空闲隐藏目标；遗留在途按真实状态/占用整行保留并标“已禁用（用户指令）”，真实终态后隐藏。
 
-本文所有“CN 自定义 Max 恢复”“三路 Max”、旧新派池数/槽数及子优先的历史描述，凡授予目标池新派资格者，均被 2026-10-28 本次禁用覆盖，不构成现行授权；容量/限额历史登记继续有效。当前 strong/medium/weak 可新派常态 **5/4/10 池、6/5/13 槽**（BW-SONUS-REENABLE-20261029-R3 起 Sonus 恢复使用，strong 常态 5 池/6 槽）；物理总容量始终 **16**。
+本文所有“CN 自定义 Max 恢复”“三路 Max”、旧新派池数/槽数及子优先的历史描述，凡授予目标池新派资格者，均被 2026-10-28 本次禁用覆盖，不构成现行授权；容量/限额历史登记继续有效。当前 strong/medium/weak 可新派常态 **5/5/11 池、6/6/14 槽**（BW-SONUS-WEAK-20261030）；物理总容量始终 **16**。
 
-**2026-10-29 当前权威：BW-SONUS-REENABLE-20261029-R3（Qoder 国际／Sonus 恢复使用）**。用户要求恢复 `qoder:Sonus` 的常态新派资格，唯一权威开关 `scripts/dispatch_mode.py` 的 `SONUS_TEMP_DISABLED = False`，明确覆盖 BW-SONUS-TEMP-DISABLE-20261028-R2 的全档临时禁用（R2、BW-SONUS-REENABLE-20261028 与 BW-SONUS-TEMP-DISABLE-20261026 均保留为历史，不再构成现行禁用）。Sonus 只参与 strong：新派优先级第一（层=1）、独立 1 槽、无时段门；strong **5 池/6 槽**（Sonus > ZCode > Claude > 两内置 Max）；medium 仍 4 池/5 槽、weak 仍 10 池/13 槽，medium/weak 显式 Sonus 继续 `mode_excluded`（sent=false、零新占位、绝不静默换模型）。strong 下 AUTO、显式 reserve/select-and-claim、consume、claim-due 与正式 Qoder `--model Sonus` 恢复既有正常路径；容量满如实 `capacity_full`，绝不伪装为额度/认证/时段问题；Sonus 不属于 Qwen Max，不吃 Max 限额标记。恢复只影响之后的新派发：既有 reserved/running/unknown 不追杀、不改派、不假释放；R2 的「全档临时禁用」专项例外实现保留，只在开关再次为 True 时生效。浮窗：strong 空闲显示 Sonus 且排第一；medium/weak 空闲隐藏；切档前遗留在 medium/weak 保留整行、显示真实状态并标「本档不参与」直到真实终态。容量登记、模型字面量、优先级历史、宿主递归排除、物理总容量 16 与历史 attempt 全部保留。
+**2026-10-29 历史：BW-SONUS-REENABLE-20261029-R3（Qoder 国际／Sonus 恢复使用；档位归属已被顶部 2026-10-30 段覆盖）**。用户要求恢复 `qoder:Sonus` 的常态新派资格，唯一权威开关 `scripts/dispatch_mode.py` 的 `SONUS_TEMP_DISABLED = False`，明确覆盖 BW-SONUS-TEMP-DISABLE-20261028-R2 的全档临时禁用（R2、BW-SONUS-REENABLE-20261028 与 BW-SONUS-TEMP-DISABLE-20261026 均保留为历史，不再构成现行禁用）。恢复当时 Sonus 只参与 strong（层=1）；2026-10-30 起 strong 层=2、medium 层=2。strong 下 AUTO、显式 reserve/select-and-claim、consume、claim-due 与正式 Qoder `--model Sonus` 走既有正常路径；容量满如实 `capacity_full`，绝不伪装为额度/认证/时段问题；Sonus 不属于 Qwen Max，不吃 Max 限额标记。恢复只影响之后的新派发：既有 reserved/running/unknown 不追杀、不改派、不假释放；R2 的「全档临时禁用」专项例外实现保留，只在开关再次为 True 时生效。容量登记、模型字面量、优先级历史、宿主递归排除、物理总容量 16 与历史 attempt 全部保留。
 
 ## 当前权威覆盖：手动三档共享派发（BW-MANUAL-THREE-MODE-DOCS-20261023）
 
 用户 2026-10-23 明确指令，**本节优先于本文其余全部层序/时段/允许池叙述（含下方「Claude 全天」「国际 Max 全天」两节旧覆盖）**：
 
 - **档位机制**：全宿主共享的手动三档 strong（强）／medium（中）／weak（弱），**默认 weak**。唯一策略来源 `scripts/dispatch_mode.py`：档位持久化在 `~/.brain-worker/dispatch-mode.json`（`BRAIN_WORKER_DISPATCH_MODE_FILE` 可覆盖），`dispatch_pool`/`stage_selection`/浮窗每次裁决现读同一份，绝不 import 时缓存。浮窗手动切换原子保存（同目录临时文件 + `os.replace`），**只影响之后的新派发**：在途 attempt（reserved/running/unknown）绝不追杀、不假释放、不改派，自然结束。缺文件→默认 weak；畸形 JSON/非对象/非法值/不可读→**安全回落 weak** 并如实回报 `source`/`error` 短码，绝不把错误冒充用户选择。Claude 时段门依赖 `deepseek_offpeak` 加载/运行异常一律 **fail-closed**（当作窗口关闭），绝不 fail-open。单次 `reserve`/`select_and_claim`/`consume_for_entry`/`claim_due` 事务内档位**只读一次**并全程一致，切档只影响下一次裁决。
-- **strong（强档）**：常态 5 池、6 槽；Sonus（层=1，1 槽，BW-SONUS-REENABLE-20261029-R3 起恢复使用）> ZCode（层=2，1 槽）> Claude（层=3，2 槽）> 两内置 Max（层=4，各 1 槽），全部无时段门。CN token plan Max 按用户禁用排除；其它非本档池仍 `mode_excluded`（sent=false、零新占位，不跨档兜底）。
-- **medium（中档）**：4 池、5 槽；两内置 Max（层=1，各 1 槽）> Claude（层=2，2 槽）> ZCode（层=3，1 槽），不含 Sonus 和 CN token plan Max。两内置 Max 仅北京时间 22:00（含）–次日 08:00（不含）可新派；Claude 保留工作日高峰门，ZCode 无时段门。
-- **weak（弱档，默认）**：10 池、13 槽，不含 Sonus 和 CN token plan Max。CN 内置 Max=1 > ZCode=2 > Claude=3 > 国际内置 Max=4 > CodeBuddy DeepSeek=5 > 两 OpenCode=6 > CodeBuddy GLM=7 > 两 Flash=8。两内置 Max 夜间门和 Claude 工作日高峰门保留，其余无时段门。
+- **strong（强档）**：常态 5 池、6 槽；国际 `qoder:Qwen3.8-Max`（层=1，1 槽）> `qoder:Sonus`（层=2，1 槽）> ZCode（层=3，1 槽）> Claude（层=4，2 槽）> CN 内置 `qodercn:Qwen3.8-Max`（层=5，1 槽），全部无时段门。CN token plan Max 按用户禁用排除；其它非本档池仍 `mode_excluded`（sent=false、零新占位，不跨档兜底）。
+- **medium（中档）**：5 池、6 槽；两内置 Max（层=1，各 1 槽）> `qoder:Sonus`（层=2，1 槽）> Claude（层=3，2 槽）> ZCode（层=4，1 槽），不含 CN token plan Max。两内置 Max 仅北京时间 22:00（含）–次日 08:00（不含）可新派；Claude 保留工作日高峰门；Sonus 与 ZCode 无时段门。
+- **weak（弱档，默认）**：11 池、14 槽，不含 CN token plan Max（BW-SONUS-WEAK-20261030 起含 Sonus）。CN 内置 Max=1 > ZCode=2 > Claude=3 > 国际内置 Max=4 > Sonus=5 > CodeBuddy DeepSeek=6 > 两 OpenCode=7 > CodeBuddy GLM=8 > 两 Flash=9。两内置 Max 夜间门和 Claude 工作日高峰门保留，Sonus 及其余池无时段门。
 - **未改动**：各池容量、总额、1800 秒真实限额短窗、层内公平规则（真实在途少者优先、CN 自定义 Max 子优先、平票 stable tie）、工作区单写、权限门、失败轮转、Luna 禁用、ZCode availability。浮窗行序与**当前档**层序一致。本文下方所有「Claude 全天可派」「国际 Max 全天可派」「单一静态 `POOL_PRIORITY`」叙述均被本节覆盖，仅作档案。
 - **Sonus 再次暂时禁用（BW-SONUS-TEMP-DISABLE-20261028-R2，用户明确指令，历史档案，已被 2026-10-29 BW-SONUS-REENABLE-20261029-R3 恢复使用覆盖）**：`qoder:Sonus` 从 strong/medium/weak **所有档位**的可新派集合中剔除，唯一权威开关 `scripts/dispatch_mode.py` 的 `SONUS_TEMP_DISABLED = True`（可逆：改回 False 即完整恢复三档常态口径）。AUTO 不选它（strong AUTO 首选变为 ZCode=2，strong 实际 4 池/5 槽）；显式 reserve/select-and-claim/consume/claim-due/正式 qoder 入口一律 `mode_excluded`（sent=false、零新占位、绝不静默换模型），文案明确「暂时禁用（用户指令）」，绝不伪装成额度、认证、时段、容量或永久退役。容量登记（独立 1 槽）、模型字面量、优先级表历史层号（STRONG_PRIORITY 仍记 Sonus=1）、宿主递归排除、物理总容量 16 与历史 attempt 全部保留；绝不加入 legacy/retired、绝不清理旧记录。浮窗：三档空闲时 Sonus 整行隐藏；遗留 reserved/running/unknown Sonus 整行保留、真实状态与占用照常，并标「暂时禁用（用户指令）」直到真实终态。禁用只针对**新派发**——禁用前合法取得且仍 reserved 的精确 Sonus claim 沿既有完整校验（token/task/workspace/PID/容量/权限）继续启动/结束（`dispatch_pool` 内 Sonus 专项最小例外，置于精确 claim 校验之后），例外绝不泛化到其它 mode_excluded 池（其它被排除池 consume 仍按既有语义把本 token reserved 释放为 start_failed 并拒绝）；已有 running/unknown 不追杀、不改派、不假释放。下方恢复启用与旧禁用段均为历史档案。
-- **强档专属 Sonus（BW-STRONG-SONUS-20261024，用户明确指令，常态口径；BW-SONUS-REENABLE-20261029-R3 起恢复生效）**：`qoder:Sonus` 是国际 Qoder CLI `--list-models` 只读核验过的精确字面模型名，新增为 **strong 专属**独立 1 槽正常主力池（`MAIN_FORCE_CAPACITY['qoder:Sonus']=1`）。它使 `DOMESTIC_TOTAL_CAPACITY` 由 15 升为物理 **16**（`MAIN_FORCE` 12 + `OVERFLOW` 4，由求和自动得出）；weak/medium 可新派容量仍为原 **15**（Sonus 永不进其候选，全局总守卫 16 只在 strong 派出的 Sonus 真实在途时才被占到第 16 个）。Sonus 无时段门、**不属于** Qwen Max（绝不套 Max 夜间门、绝不纳入 `QUOTA_LIMITABLE_POOLS` 限额标记），也不是 legacy/未知池。国际 Qoder 入口以精确 `--model Sonus` 绑定/消费 `qoder:Sonus` claim：strong 有空即 claim、满即如实 `capacity_full`，绝不 fallback 到 Flash/ZCode/任何其它模型；medium/weak 显式 Sonus 一律 `mode_excluded`（sent=false、零新占位、绝不静默换模型）。Qoder 桌面宿主排除集另加 `qoder:Sonus`（宿主绝不递归自派），ZCode 宿主排除范围不扩大，`install`/`check` 的 G1/G3 守卫覆盖该键。medium/weak 的既有五池/11 池排序、其它池容量、额度/轮转/Luna/权限语义一律不变。
+- **Sonus 引入与登记（BW-STRONG-SONUS-20261024，用户明确指令，历史档案：登记/容量/字面量仍有效，其中「strong 专属、medium/weak 一律 mode_excluded」的档位归属已被 2026-10-30 BW-SONUS-MEDIUM/WEAK-20261030 覆盖——三档现均正常参与）**：`qoder:Sonus` 是国际 Qoder CLI `--list-models` 只读核验过的精确字面模型名，新增为独立 1 槽正常主力池（`MAIN_FORCE_CAPACITY['qoder:Sonus']=1`）。它使 `DOMESTIC_TOTAL_CAPACITY` 由 15 升为物理 **16**（`MAIN_FORCE` 12 + `OVERFLOW` 4，由求和自动得出）。Sonus 无时段门、**不属于** Qwen Max（绝不套 Max 夜间门、绝不纳入 `QUOTA_LIMITABLE_POOLS` 限额标记），也不是 legacy/未知池。国际 Qoder 入口以精确 `--model Sonus` 绑定/消费 `qoder:Sonus` claim：有空即 claim、满即如实 `capacity_full`，绝不 fallback 到 Flash/ZCode/任何其它模型。Qoder 桌面宿主排除集另加 `qoder:Sonus`（宿主绝不递归自派），ZCode 宿主排除范围不扩大，`install`/`check` 的 G1/G3 守卫覆盖该键。
 - **Sonus 恢复启用（BW-SONUS-REENABLE-20261028，用户明确指令，历史档案，已被上方 BW-SONUS-TEMP-DISABLE-20261028-R2 再次禁用覆盖）**：`qoder:Sonus` 恢复原有三档口径——strong 专属、优先级第一（层=1）、独立 1 槽、无时段限制；strong AUTO 在 Sonus 合格且有容量时首选 Sonus；medium/weak 仍不参与新派发，显式请求如实 `mode_excluded`。唯一权威开关 `scripts/dispatch_mode.py` 的 `SONUS_TEMP_DISABLED = False`（True 时的全档禁用特殊分支一律只在 True 时生效）。物理总容量仍 16、容量登记/优先级表/宿主递归排除/历史 attempt 全部保留不变。浮窗：strong 空闲显示 Sonus 且排第一；medium/weak 空闲不显示；切档前遗留在途仍按既有规则整行保留（strong 参与、medium/weak 标「本档不参与」）直到真实终态。2026-10-26 禁用段为历史档案，不再覆盖当前策略。
 - **Sonus 暂时禁用（BW-SONUS-TEMP-DISABLE-20261026，用户明确指令，历史档案，语义已被 BW-SONUS-TEMP-DISABLE-20261028-R2 按原文重新启用）**：用户要求**暂时禁用** `qoder:Sonus` 参与任何新派发。唯一权威开关是 `scripts/dispatch_mode.py` 的 `SONUS_TEMP_DISABLED = True`（可逆：改回 False 即完整恢复三档原口径）——Sonus 从 strong/medium/weak **所有档位**的可新派集合中剔除：AUTO 不选它（strong AUTO 首选变为 ZCode=2）；显式 reserve/select-and-claim/consume/claim-due/正式 qoder 入口一律 `mode_excluded`（sent=false、零新占位、绝不静默换模型），拒绝文案明确写「用户要求的临时禁用」，绝不伪装成额度、认证、时段或永久退役。strong 其余五池优先级/无时段门不变（ZCode=2 > Claude=3 > 三路 Max=4，不重编号）。Sonus 的容量登记（独立 1 槽）、模型字面量、优先级表历史层号、宿主递归排除、物理总容量 **16**（不降为 15，以容纳禁用前遗留的在途 Sonus）与历史 attempt 全部保留；绝不加入 legacy/retired、绝不清理旧记录。浮窗：三档空闲时 Sonus 整行隐藏；遗留 reserved/running/unknown Sonus 整行保留、真实状态与占用照常，并标「暂时禁用（用户指令）」直到真实终态（不是失败、不是限额）。遗留生命周期（S2 收紧）：禁用只针对**新派发**——禁用前已合法取得 claim、仍为 reserved 的旧 Sonus token 仍可经 `consume_for_entry` 继续启动/mark running（`dispatch_pool` 内 Sonus 专项最小例外，置于精确 claim 校验之后、工作区/容量/PID/限额等门全部照旧）；新 reserve/select/claim-due 一律零占位拒绝，该例外绝不泛化到其它 mode_excluded 池（其它被排除池 consume 仍按既有语义把本 token reserved 释放为 start_failed 并拒绝）。
-- **浮窗遗留牛马可见性（BW-WIDGET-LEGACY-VISIBILITY-20261023）**：strong 的展示快照只显示本档参与的 5 个池（Sonus 第一）、medium 只显示 4 个池（不含 Sonus 和 CN token plan Max）；被本档排除且 attempts 无任何在途（reserved/running/unknown）的池整行不显示；切档前已在途的遗留牛马即使新档不参与也整行保留，按真实状态/占用显示并标「本档不参与」（mode_excluded=true、participates=false）直到真实终态——在途判定只复用 attempts ACTIVE_STATES 权威读取，绝不按历史失败/最后结果/时间推断。weak 仍显示全部行（BW-STRONG-SONUS-20261024：不含空闲的 Sonus 行；strong 遗留 Sonus 在途时照常保留并标「本档不参与」）。BW-SONUS-TEMP-DISABLE-20261028-R2 期间 Sonus 全档暂时禁用（三档空闲整行隐藏、遗留在途标「暂时禁用（用户指令）」；常态恢复后回到 strong 空闲显示且第一、medium/weak 空闲隐藏、遗留在途标「本档不参与」）。过滤只影响展示 rows：domestic_active/retired_active/activity 签名与在途释放语义、新派发排除规则全部不变。
-- **浮窗遗留牛马可见性（BW-WIDGET-LEGACY-VISIBILITY-20261023）**：strong 的展示快照只显示本档参与的 5 个池（Sonus 第一）、medium 只显示 4 个池（不含 Sonus 和 CN token plan Max）；被本档排除且 attempts 无任何在途（reserved/running/unknown）的池整行不显示；切档前已在途的遗留牛马即使新档不参与也整行保留，按真实状态/占用显示并标「本档不参与」（mode_excluded=true、participates=false）直到真实终态——在途判定只复用 attempts ACTIVE_STATES 权威读取，绝不按历史失败/最后结果/时间推断。weak 仍显示全部行（BW-STRONG-SONUS-20261024：不含空闲的 Sonus 行；strong 遗留 Sonus 在途时照常保留并标「本档不参与」）。过滤只影响展示 rows：domestic_active/retired_active/activity 签名与在途释放语义、新派发排除规则全部不变。
+- **浮窗遗留牛马可见性（BW-WIDGET-LEGACY-VISIBILITY-20261023）**：strong 的展示快照只显示本档参与的 5 个池（国际 Max 第一、Sonus 第二）、medium 只显示 5 个池、weak 显示 11 个池（BW-SONUS-WEAK-20261030：medium/weak 的 Sonus 行都紧跟国际 Max 行）；被本档排除且 attempts 无任何在途（reserved/running/unknown）的池整行不显示；切档前已在途的遗留牛马即使新档不参与也整行保留，按真实状态/占用显示并标「本档不参与」（mode_excluded=true、participates=false）直到真实终态——在途判定只复用 attempts ACTIVE_STATES 权威读取，绝不按历史失败/最后结果/时间推断。BW-SONUS-TEMP-DISABLE-20261028-R2 期间 Sonus 全档暂时禁用（三档空闲整行隐藏、遗留在途标「暂时禁用（用户指令）」；常态恢复后三档都正常显示，Sonus 紧接国际 Max）。过滤只影响展示 rows：domestic_active/retired_active/activity 签名与在途释放语义、新派发排除规则全部不变。
+- **浮窗遗留牛马可见性（BW-WIDGET-LEGACY-VISIBILITY-20261023）**：strong 的展示快照只显示本档参与的 5 个池（国际 Max 第一、Sonus 第二）、medium 只显示 5 个池（两内置 Max 之后紧接 Sonus 行）；被本档排除且 attempts 无任何在途（reserved/running/unknown）的池整行不显示；切档前已在途的遗留牛马即使新档不参与也整行保留，按真实状态/占用显示并标「本档不参与」（mode_excluded=true、participates=false）直到真实终态——在途判定只复用 attempts ACTIVE_STATES 权威读取，绝不按历史失败/最后结果/时间推断。weak 仍显示全部行（BW-SONUS-MEDIUM-20261030：weak 不含空闲的 Sonus 行；Sonus 遗留在 weak 在途时照常保留并标「本档不参与」）。过滤只影响展示 rows：domestic_active/retired_active/activity 签名与在途释放语义、新派发排除规则全部不变。
 
 ## 历史档案：Claude 全天 + 国际 Qoder Max 紧随其后（BW-CLAUDE-ALLDAY-QMAX-AFTER-20261023，已被上方三档覆盖）
 
@@ -462,11 +474,14 @@ CodeBuddy 其它旧模型（含其它旧 GLM 组合）仍 human-relay；用户�
   - 给了 `--dispatch-claim <token>` → 同一 `BEGIN IMMEDIATE` 事务内先精确校验（task/runtime/
     model/workspace/prompt_sha256/stage/chat_id 任一漂移即拒），通过则 CAS `reserved→running`
     并持有名额；重复/并发消费同一 token 只有一个 `allowed`（一槽绝不双 Popen）；
-  - 没给 claim → `select_and_claim` 原子**自动**路由（统一国内策略：主力优先级排序 + 溢出 + 容量 +
-    任务防重）；非被选中组合 → `routing_required`。
+  - 正式入口（`priority_enforced=True`）没给 claim → 在任何 DB 写入前拒绝：
+    `dispatch_claim_required`、`sent=false`、零占位、零 Popen，**绝不再次 AUTO 重选**
+    （BW-SINGLE-SELECTION-CLAIM-20261108）；
+  - 未开启 `priority_enforced` 的内部调用没给 claim → 保留既有 `select_and_claim` 原子
+    **自动**路由（统一国内策略：主力优先级排序 + 溢出 + 容量 + 任务防重）；非被选中组合
+    → `routing_required`。
 - `--dispatch-plan` 只用于 `execution_control.preflight` 的权限/工作区/依赖快照核验，**绝不**
-  作为绕过主力优先级排序或溢出改道的“确切组合”后门；携带计划者仍走同一条 `select_and_claim` 原子
-  路由（旧的 `exact_combo` 旁路已废弃移除）。
+  作为绕过容量门或 claim 精确绑定的“确切组合”后门（旧的 `exact_combo` 旁路已废弃移除）。
 - 任何非放行结果（`allowed=false`）→ 入口打印 `capacity_gate_rejected`/`sent:false`/
   `exit_code:2`（含 `routing_required` 与被选中组合），**零证据目录创建、零 Popen、不计轮次**。
 - 路由选择**绝不把权限拒绝/登录缺失/额度限流伪装成容量溢出**：容量门只管并发名额；权限与
@@ -477,8 +492,9 @@ CodeBuddy 其它旧模型（含其它旧 GLM 组合）仍 human-relay；用户�
 `reserve` 供主脑/测试为**确切** `(runtime, model)` 预留一个确定 token，再交给对应入口用
 `--dispatch-claim` 精确消费。`reserve` 与 `select_and_claim` 共用统一国内策略（主力优先级排序、溢出
 改道、容量上限、任务防重、真实 workspace 单写入守卫），**不绕过统一排序**：请求组合非选中组合
-时同样 `routing_required`。生产入口正常路径不带 `reserve` 语义——它只消费/校验或走
-`select_and_claim`。
+时同样 `routing_required`。正式入口正常路径只消费/校验规划阶段产生的精确 claim，缺 claim 即
+`dispatch_claim_required` 拒绝；`select_and_claim` 只服务规划/预留与未开启 `priority_enforced`
+的内部调用。
 
 ## 生命周期与释放口径
 
@@ -965,5 +981,7 @@ S5 增加 Qoder Max 池的**明确限额**闭环（BW-MAX-WINDOW-20261010-S2 把
 `stage_selection` 的每次只读回执必须列出选中层级、全部合格候选、逐候选排除原因、所有更高优先级排除项和下一候选。AUTO 选择有机械不变量：选中项必须是合格集合中的最小优先级编号；不满足就以 `selection_priority_invariant_failed` 拒绝，不能静默越级。
 
 授权 JSON 可携带 `dispatch_round={id,started_at_utc}` 和 `round_failed_candidates`。当某个本轮失败候选存在真实结构化限额记录，且 1800 秒短窗恰好到期或已经到期，同时当前 task/workspace 没有在途，规划器自动产生 `round_transition`，轮号加一并清空旧轮失败集合，再从最高优先级选择。它不删除限额记录、不查询余额、不证明服务已恢复；真实调用仍可能再次返回限额。调用方必须保存回执中的新轮号和 `effective_round_failed_candidates`，不能继续复制旧轮输入。
+
+授权 JSON 还可选携带顶层字符串字段 `task_profile`（PROMO-VERIFY-A1 2026-11-09）：`'exploratory'` 表示命令集不可预知的探查型任务。`stage_selection` 只回显该字段（`receipt.task_profile`），并在授权候选含任何 `qodercn:` 前缀时附 `task_profile_note` 错配提示；不排除候选、不影响裁决顺序与容量。非字符串值按畸形拒绝（`invalid_task_profile`）；无该字段时回执不出现任何新键。
 
 Qoder/Qoder CN 被选中且任务提供 `task_scope` 时，回执同时给出 `qoder_permission_plan`，正式入口用 `--task-scope` 消费同一 scope，在首次 Popen 前生成精确文件和命令规则。OpenCode 的 1800 秒总墙钟之外另有默认 300 秒无有效 JSON 事件看门狗；触发后分类为 `stalled_no_progress`，不冒充额度、认证或业务失败。

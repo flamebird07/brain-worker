@@ -3,7 +3,8 @@
 输入是一个明确的 scope JSON，只有三个键（缺省视为空列表）：
 
 - ``edits``: 工作区根相对的具体文件列表（``scripts/foo.py`` / ``scripts\\foo.py``）；
-- ``bash``: 完整、原样的单条命令字符串列表；
+- ``bash``: 完整、原样的单条命令字符串列表；第一个 token 必须是可执行名，自然语言描述
+  会被拒绝（PROMO-VERIFY-A1 2026-11-09），参数位置的中文路径照常放行；
 - ``read_dirs``: 已经授权的只读目录列表（原样传递）。
 
 输出是可直接交给主脑构造 Qoder plan/argv 的数据：
@@ -86,6 +87,19 @@ def _validate_bash(command, index) -> str:
     if any(ord(ch) < 0x20 or ch == '\x7f' for ch in command):
         raise ValueError(f'scope.bash[{index}] must be one line without control '
                          f'characters: {command!r}')
+    # PROMO-VERIFY-A1 2026-11-09（预防修复，本轮未实际触发）：首 token 应是可执行名。
+    # 自然语言描述（如「只读查看进程与端口（tasklist/netstat）」）永远匹配不到真实 Bash
+    # 规则、运行时必拒。只查首 token 的非 ASCII/ASCII 圆括号；参数位置的中文路径照常放行。
+    first = command.split()[0]
+    if len(first) >= 2 and first.startswith('"') and first.endswith('"'):
+        first = first[1:-1]
+    if any(ord(ch) > 0x7e for ch in first) or '(' in first or ')' in first:
+        raise ValueError(
+            f'scope.bash[{index}] must be a complete verbatim command whose first token '
+            f'is an executable name; got {command!r}. Natural-language descriptions '
+            f'(e.g. "只读查看进程与端口（tasklist/netstat）") never match a real Bash '
+            f'permission rule and are always denied at runtime; rewrite as exact '
+            f'verbatim commands, one per entry. PROMO-VERIFY-A1 2026-11-09.')
     return command
 
 

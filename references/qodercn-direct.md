@@ -1,5 +1,7 @@
 # Qoder CN 本机原生直连（qodercn）
 
+> **2026-11-07 当前权威：QoDuck**。CN 原生入口把精确 `--model QoDuck` 作为内置模型字面量原样下发，对应 `qodercn:QoDuck`；无需 `model_ids` 私有映射。该池只参与 strong，位于 Sonus 后，与国际 QoDuck 同层，独立 2 槽、无时段门；medium/weak 由共享档位门拒绝。
+
 > **现行口径（BW-QODERCN-TOKEN-MAX-DISABLE-20261028，权威，覆盖本文件旧文）**：用户明确
 > 要求 `Qoder CN / token plan / Qwen-3.8-Max`（精确池 `qodercn:Qwen-3.8-Max`，短横线友好名）
 > **从所有档位禁用新派发**：`USER_DISABLED_POOL_KEYS={qodercn:Qwen-3.8-Max}`；AUTO、显式
@@ -11,6 +13,11 @@
 > 排除池的 consume 语义不变。绝不误伤内置名 `qodercn:Qwen3.8-Max`（无短横线，仍正常可派）。
 > 本文件下文（含六池 10 槽分配、`Qwen-3.8-Max` 参与新派/时段门/限额复用等描述）均为**历史
 > 覆盖前的记录**，涉及该池"当前可新派"的语句一律以此引文为准。
+
+> **档位补充（BW-SONUS-WEAK-20261030，仅影响 Sonus 归属，不改 CN 池）**：`qoder:Sonus` 三档
+> 均正常可派（strong 层=2、medium 层=2、weak 层=5）；CN 内置 `qodercn:Qwen3.8-Max` 仍是
+> **weak 层=1**（weak 11 池/14 槽），其夜间门、容量 1 与既有公平规则不变。CN 池本文件其余
+> 口径不受影响。
 
 > 运行时 `runtime='qodercn'`：本机已登录的 Qoder CN **原生 CLI**（EXE），与既有国际
 > `qoder`（node + `qodercli.js` bundle）**并存、互不覆盖**。本轮落实最小可验收改动：
@@ -209,6 +216,12 @@ CN 接续**至少拒绝把国际原件/session 当作 CN 续用**：无 `--resum
   行为**；`--session-id` 官方支持、真实拒绝文案全集与监视时延由主脑独立真实验收。本阶段（S3）
   修正的路径/字段层级/固定文案锚定已通过离线回归并由主脑原件回放，但**尚未最终现场验收**，
   本文件不宣称真实通过。
+
+探查型/命令集不可穷举的任务与本入口的逐命令授权门结构性错配（PROMO-VERIFY-A1 2026-11-09 第 2 轮：
+模型组合了未登记的 `wc -l "..." 2>&1` 变体，首个真实 permission-rule 拒绝即被监视器 terminate child，
+烧掉一轮真实失败，模型无自我修正机会）。这类任务不要给本入口造逐命令 scope；应在 `stage_selection`
+的 authorization 声明 `task_profile=exploratory`（回执会给出错配提示 `task_profile_note`），并改派国际
+`qoder` 池或其它适用池。
 
 ## ZCode 限额自动跳过（复用，不改额度系统）
 

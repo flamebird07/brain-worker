@@ -10,11 +10,13 @@ import subprocess
 import sys
 import tempfile
 import unittest
+from datetime import datetime, timezone
 from pathlib import Path
 
 REPO = Path(__file__).resolve().parent.parent
 sys.path.insert(0, str(REPO / 'scripts'))
 import execution_control as ec  # noqa: E402
+import dispatch_pool as dp  # noqa: E402
 import zcode_file_scope as zfs  # noqa: E402
 
 STUB_QODER = REPO / 'tests' / 'stub_qodercli.py'
@@ -774,8 +776,9 @@ class AdapterDispatchPlanTests(unittest.TestCase):
 
     def _plan_for(self, prompt, allowed=('Read',)):
         p = self.ws / 'plan.json'
-        # 入口未传 --tools（默认空）→ visible_tools 空；--allowed-tools 逐项进 allowed_tools。
-        g = _grants(rules=allowed, tools=())
+        # 夹具补传非空 --tools（Read 可见），因入口已拒绝空可见性+非空规则的矛盾组合
+        # （PROMO-VERIFY-A1 2026-11-09 / BW-PROMO-VERIFY-FIX S1）；--allowed-tools 逐项进 allowed_tools。
+        g = _grants(rules=allowed, tools=('Read',))
         plan = {
             'task_id': 'TP', 'stage': self.stage, 'runtime': 'qoder',
             'model': 'Qwen3.8-Max', 'workspace': str(self.ws), 'cwd': str(self.ws),
@@ -796,10 +799,21 @@ class AdapterDispatchPlanTests(unittest.TestCase):
         # 跨会话并发容量池隔离：每个测试方法用 self.ws 下的临时 store，绝不读写真实
         # ~/.brain-worker 池，也不继承全局 BRAIN_WORKER_DISPATCH_STORE 的在途名额。
         env['BRAIN_WORKER_DISPATCH_STORE'] = str(self.ws / 'dispatch-pool.sqlite3')
+        plan = json.loads(Path(plan_path).read_text(encoding='utf-8'))
+        claim = dp.reserve(
+            env['BRAIN_WORKER_DISPATCH_STORE'], task_id=plan['task_id'],
+            runtime=plan['runtime'], model=plan['model'], workspace=plan['workspace'],
+            prompt_sha256=_sha(self._prompt.read_bytes()), stage=plan['stage'],
+            executor=plan['runtime'], origin='stage-selection',
+            now=datetime(2026, 10, 8, 15, 0, 0, tzinfo=timezone.utc),
+            _preclaim=False)
+        self.assertTrue(claim.get('allowed'), claim)
         cmd = [sys.executable, str(self.runner),
                '--workspace', str(self.ws), '--prompt-file', str(self._prompt),
                '--output-dir', str(out_dir), '--stage', self.stage,
-               '--config', str(self.entry), '--dispatch-plan', str(plan_path)]
+               '--config', str(self.entry), '--tools', 'Read',
+               '--dispatch-plan', str(plan_path),
+               '--dispatch-claim', claim['token']]
         for rule in allowed:
             cmd += ['--allowed-tools', rule]
         return subprocess.run(cmd, capture_output=True, env=env, timeout=120,

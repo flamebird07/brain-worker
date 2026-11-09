@@ -532,6 +532,22 @@ def plan_stage_selection(authorization, *, previous=None, store_path=None, quota
     except ValueError as exc:
         return _refuse('invalid_task_scope', str(exc))
     receipt['task_scope'] = norm_scope
+    # PROMO-VERIFY-A1 2026-11-09：可选顶层 task_profile 只回显与提示，不做候选排除、不改
+    # 裁决顺序与容量。非字符串畸形拒绝；'exploratory' 且授权候选含 qodercn 时附错配提示。
+    # 无该字段时回执不出现任何新键（既有消费者零影响）。
+    task_profile = auth.get('task_profile')
+    if task_profile is not None and not isinstance(task_profile, str):
+        return _refuse('invalid_task_profile', repr(task_profile))
+    if task_profile is not None:
+        receipt['task_profile'] = task_profile
+        if task_profile == 'exploratory' and any(
+                isinstance(pk, str) and pk.startswith('qodercn:')
+                for pk in (auth.get('allowed_candidates') or [])):
+            receipt['task_profile_note'] = (
+                '探查型/命令集不可穷举的任务与 qodercn 逐命令授权门结构性错配——CN 监视器对未登记'
+                '命令变体的首个真实权限拒绝即 terminate child、模型无自我修正机会'
+                '（PROMO-VERIFY-A1 2026-11-09 第 2 轮证据）；此类任务建议从本轮候选排除 qodercn '
+                '或改派国际 qoder 池。')
     # 权限需求严格直查：畸形输入拒绝、不猜测；与授权对象完全分开。
     try:
         req_grants = _normalize_permission_grants(permission_grants)
@@ -921,6 +937,46 @@ def plan_stage_selection(authorization, *, previous=None, store_path=None, quota
         conn.close()
 
 
+def plan_and_claim_stage(authorization, *, prompt_sha256, previous=None,
+                         store_path=None, quota_store=None, task_id, stage,
+                         workspace, permission_grants=None, task_scope=None,
+                         now=None):
+    """按一次权威选择结果直接取得正式入口 claim。
+
+    普通 AUTO 仍由 dispatch_pool 的同一套优先级原子复核；用户明确点名的 fixed/executor
+    只有在 stage_selection 已核验 user_direct_selection 后才按指定执行器预留。正式入口
+    以 origin=stage-selection 区分这条唯一正常派工路径，避免调用方绕过规划直接给靠后模型
+    签发普通 reserve claim。
+    """
+    receipt = plan_stage_selection(
+        authorization, previous=previous, store_path=store_path,
+        quota_store=quota_store, task_id=task_id, stage=stage,
+        workspace=workspace, permission_grants=permission_grants,
+        task_scope=task_scope, now=now)
+    selected = receipt.get('selected')
+    if not selected:
+        receipt['dispatch_claim'] = None
+        return receipt
+
+    # 规划已在授权集合内完成唯一一次优先级裁决；这里按回执精确预留，不能再用全池 AUTO
+    # 做第二次选择（否则会越过 allowed_candidates 或制造“规划 A、执行 B”冲突）。
+    executor = selected['runtime']
+    claim = dp.reserve(
+        store_path, task_id=task_id, runtime=selected['runtime'],
+        model=selected['model'], workspace=workspace,
+        prompt_sha256=prompt_sha256, stage=stage, now=now,
+        origin='stage-selection', executor=executor,
+        quota_store=quota_store)
+    receipt['dispatch_claim'] = claim
+    if not claim.get('allowed'):
+        # 原子复核时状态变化就诚实返回失败；不进行第二次选型或偷偷改派。
+        receipt['selected'] = None
+        receipt['selected_reason'] = None
+        receipt['refused'] = True
+        receipt['refusal_reason'] = claim.get('reason') or 'claim_failed'
+    return receipt
+
+
 def _load_json_arg(raw):
     if not raw:
         return None
@@ -943,17 +999,31 @@ def main(argv=None) -> int:
     ap.add_argument('--workspace', required=True)
     ap.add_argument('--store', default=None)
     ap.add_argument('--quota-store', dest='quota_store', default=None)
+    ap.add_argument('--claim', action='store_true',
+                    help='atomically reserve the selected worker for formal dispatch')
+    ap.add_argument('--prompt-sha256', dest='prompt_sha256', default=None,
+                    help='required with --claim; binds the formal entry prompt bytes')
     args = ap.parse_args(argv)
 
-    receipt = plan_stage_selection(
-        _load_json_arg(args.authorization_json),
+    common = dict(
         previous=_load_json_arg(args.previous_json),
         store_path=args.store, quota_store=args.quota_store,
         task_id=args.task_id, stage=args.stage, workspace=args.workspace,
         permission_grants=_load_json_arg(args.permission_grants_json),
         task_scope=_load_json_arg(args.task_scope_json))
+    authorization = _load_json_arg(args.authorization_json)
+    if args.claim:
+        if not args.prompt_sha256:
+            ap.error('--prompt-sha256 is required with --claim')
+        receipt = plan_and_claim_stage(
+            authorization, prompt_sha256=args.prompt_sha256, **common)
+    else:
+        receipt = plan_stage_selection(authorization, **common)
     print(json.dumps(receipt, ensure_ascii=False, indent=2))
-    return 0 if receipt.get('selected') is not None else 2
+    ok = receipt.get('selected') is not None
+    if args.claim:
+        ok = ok and bool((receipt.get('dispatch_claim') or {}).get('allowed'))
+    return 0 if ok else 2
 
 
 if __name__ == '__main__':

@@ -36,7 +36,7 @@ from pathlib import Path
 
 FAILURE_TYPES = ('quota_429', 'permission_rule_denied', 'permission_client_missing',
                  'protocol_parse_failure', 'model_execution_failure',
-                 'authentication_failure', 'test_failure')
+                 'authentication_failure', 'tools_channel_disabled', 'test_failure')
 
 # 各运行时的真实能力：fine_grained 表示能否表达逐文件 Edit(/原样 Bash()) 规则；
 # read_dirs 表示是否有外部只读目录 grant。ZCode 只有整工具开关，不能假称细粒度文件权限。
@@ -631,6 +631,10 @@ def diagnose(facts) -> dict:
     # 也不凭 401/403/429 数字或取消退出码推断认证失败。
     if facts.get('authentication_failure'):
         types.append('authentication_failure')
+    # PROMO-VERIFY-A1 2026-11-09：工具通道禁用空转可出现在 protocol_success=true 的终态
+    # （假成功），与既有失败终态分型并存；标记由调用方从结构化事实传入。
+    if facts.get('tools_channel_disabled'):
+        types.append('tools_channel_disabled')
     # 两个业务证据分类：只接受调用方从结构化执行证据门禁结果（如
     # zcode_execution_evidence 的 status）传入的布尔标记，不从提示/报告文本推断。
     if facts.get('no_required_execution'):

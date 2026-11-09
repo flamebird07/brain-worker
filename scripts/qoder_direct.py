@@ -42,11 +42,53 @@ import execution_control as ec  # noqa: E402 任务级控制面（同目录，�
 import prompt_contract as pc  # noqa: E402 三入口共享九节契约（标准库，不反向导入本模块）
 import dispatch_pool as dp  # noqa: E402 跨会话并发容量池（同目录，标准库 sqlite3）
 import dispatch_mode as dmode  # noqa: E402 档位/用户禁用开关（同目录，标准库）
+import install_desktop_skill as ids  # noqa: E402 仅复用引擎根约定做缺省配置发现
 import qoder_permission_watch as qpw  # noqa: E402 CN 会话权限拒绝监视（同目录，标准库）
 import qoder_permissions as qp  # noqa: E402 从任务 scope 生成首次派发的精确规则
 
 DEFAULT_CONFIG = _SCRIPTS_DIR / 'local-entry.json'
 DEFAULT_CN_CONFIG = _SCRIPTS_DIR / 'local-entry-cn.json'
+# BW-ENTRY-CONFIG-FALLBACK-20261103：三入口统一的配置来源标记（回执/内部元数据只记
+# resolved path 与 source，绝不带配置内容）。
+CONFIG_SOURCE_EXPLICIT = 'explicit'
+CONFIG_SOURCE_REPOSITORY_DEFAULT = 'repository_default'
+CONFIG_SOURCE_INSTALLED_ENGINE = 'installed_engine'
+
+
+def installed_engine_scripts_dir() -> Path:
+    """本用户已安装 brain-worker 引擎（复用 install_desktop_skill 既有引擎根约定，
+    含 BRAIN_WORKER_HOME 覆盖）下的 scripts 目录。由 env/Path.home() 推导，绝不硬编码
+    当前用户名或机器绝对路径；只用于缺省配置发现回退，只消费路径存在性与加载器的
+    解析结果，绝不复制或回显私有配置内容。"""
+    return ids._default_engine_root() / 'scripts'
+
+
+def installed_engine_config() -> Path:
+    return installed_engine_scripts_dir() / DEFAULT_CONFIG.name
+
+
+def installed_engine_cn_config() -> Path:
+    return installed_engine_scripts_dir() / DEFAULT_CN_CONFIG.name
+
+
+def discover_entry_config(explicit, repo_default: Path, installed_fn):
+    """统一缺省配置发现链（explicit → 仓库旁默认 → 已安装引擎），返回 (path, source)。
+
+    - explicit 非 None 时只使用该路径（source='explicit'）；缺失/非法由加载器原样
+      抛错，绝不回落任何候选；
+    - 未显式传参时：仓库旁默认 repo_default 存在即优先（source='repository_default'）；
+    - 仅当旁默认缺失时才查 installed_fn()（source='installed_engine'）；该候选存在
+      但非法时同样原样抛错，绝不继续猜 PATH 或其它路径；
+    - 两处都不存在 → 返回 repo_default，由加载器如实报缺省路径缺失。
+    发现只判路径存在性：不复制配置、不自动生成、不自动登录、不输出配置正文。"""
+    if explicit is not None:
+        return Path(explicit), CONFIG_SOURCE_EXPLICIT
+    if Path(repo_default).is_file():
+        return Path(repo_default), CONFIG_SOURCE_REPOSITORY_DEFAULT
+    engine = installed_fn()
+    if Path(engine).is_file():
+        return Path(engine), CONFIG_SOURCE_INSTALLED_ENGINE
+    return Path(repo_default), CONFIG_SOURCE_REPOSITORY_DEFAULT
 # 运行时名称（报告/池/预检共用口径）：国际 Node-bundle = 'qoder'；本机原生 CN = 'qodercn'。
 RUNTIME_INTERNATIONAL = 'qoder'
 RUNTIME_CN = 'qodercn'
@@ -59,7 +101,7 @@ CN_MODEL = 'Qwen3.8-Max'
 # CN 内置官方 Qwen 白名单：argv `--model` 直接使用这两个字面串（不查 model_ids、绝不
 # 猜 UUID、也不把自定义名当成内置）。任何其它 CN 名字必须走 config.model_ids 映射，映射
 # 缺失即拒绝启动（零 Popen）。
-CN_BUILTIN_MODELS = ('Qwen3.8-Max', 'Qwen3.8-Flash')
+CN_BUILTIN_MODELS = ('Qwen3.8-Max', 'Qwen3.8-Flash', 'QoDuck')
 # argparse 缺省模型 = 并发容量池指定的 qoder 主力组合 Qwen3.8-Max（每会话持久 1:1 两名）。
 # 不传 --model 的自主派工即请求主力 Max；Qwen3.8-Flash 在池里是溢出组合，仅当主力满员时
 # 由容量池按溢出策略改道。控制面回归 tests/test_execution_control.py 的 fixture 已同步为
@@ -76,7 +118,12 @@ SECTION_HEADERS = pc.SECTION_HEADERS
 
 
 def load_entry_config(path=None) -> dict:
-    cfg_path = Path(path) if path else DEFAULT_CONFIG
+    """国际 Node-bundle 入口配置。缺省发现链见 discover_entry_config：显式路径缺失
+    即原样失败；未显式传参时仓库旁 local-entry.json 优先，缺失才回退已安装引擎副本
+    （存在但非法同样原样失败）。cfg 内注入的 `_entry_config_path`/`_entry_config_source`
+    是非敏感元数据（仅路径与来源标记），绝不携带配置内容。"""
+    cfg_path, source = discover_entry_config(path, DEFAULT_CONFIG,
+                                             installed_engine_config)
     if not cfg_path.is_absolute():
         raise ValueError(f'entry config path must be absolute: {cfg_path}')
     if not cfg_path.is_file():
@@ -91,6 +138,8 @@ def load_entry_config(path=None) -> dict:
         p = Path(cfg[key])
         if not p.is_absolute() or not p.is_file():
             raise FileNotFoundError(f'entry config {key!r} must be an existing absolute file: {p}')
+    cfg['_entry_config_path'] = str(cfg_path)
+    cfg['_entry_config_source'] = source
     return cfg
 
 
@@ -100,8 +149,11 @@ def load_cn_config(path=None) -> dict:
     - `config_dir`：绝对且存在的配置目录（显式 --config-dir 可覆盖）；
     - `model_ids`：友好名→真实模型 ID 的映射（缺映射即拒绝启动，绝不回退同名的
       内建/Qwen 模型，也不把友好名当 ID）。
-    配置只留占位示例、绝不含真实登录态或凭据。"""
-    cfg_path = Path(path) if path else DEFAULT_CN_CONFIG
+    配置只留占位示例、绝不含真实登录态或凭据。缺省发现链见 discover_entry_config：
+    显式路径缺失即原样失败；未显式传参时仓库旁 local-entry-cn.json 优先，缺失才回退
+    已安装引擎副本（存在但非法同样原样失败，不继续猜其它路径）。"""
+    cfg_path, source = discover_entry_config(path, DEFAULT_CN_CONFIG,
+                                             installed_engine_cn_config)
     if not cfg_path.is_absolute():
         raise ValueError(f'CN entry config path must be absolute: {cfg_path}')
     if not cfg_path.is_file():
@@ -129,13 +181,16 @@ def load_cn_config(path=None) -> dict:
                 or not mid.strip():
             raise ValueError(f'CN entry config model_ids entries must be non-empty '
                              f'strings: {name!r}->{mid!r}')
+    cfg['_entry_config_path'] = str(cfg_path)
+    cfg['_entry_config_source'] = source
     return cfg
 
 
 def resolve_cn_model_id(cfg: dict, model: str):
     """返回要下发给原生 CN EXE 的 `--model` 值；两种合法来源，任一不满足返回 None（调用
     方拒绝启动、零 Popen）：
-    - **内置官方 Qwen 白名单**（`CN_BUILTIN_MODELS`：Qwen3.8-Max / Qwen3.8-Flash）：
+    - **内置官方模型白名单**（`CN_BUILTIN_MODELS`：Qwen3.8-Max / Qwen3.8-Flash /
+      QoDuck）：
       字面串直接作为 argv 值（官方 CLI `--list-models` 精确显示该名，SDK 直传合法），
       不查 model_ids、不猜 UUID、不把内置名当成自定义；
     - **自定义 Token Plan**：必须走 config.model_ids 映射到真实服务端 ID；缺映射返回
@@ -188,17 +243,31 @@ def _expand_tools_to_rules(tools) -> list[str]:
 
 
 def effective_permission_rules(tools=None, allowed_tools=None,
-                               disallowed_tools=None, add_dirs=None) -> dict:
+                               disallowed_tools=None, add_dirs=None, *,
+                               require_visible_tools=True) -> dict:
     """计算实际下发给 Qoder CLI 的权限规则与目录列表。
 
     - --tools 只影响可见性；未显式给出 allowed_tools 时才按 tools 逗号逐项回退；
     - 显式 allowed_tools（包括空列表）完全替代回退，不追加 Write/Edit/Bash 等默认；
     - 规则、目录按原样保留：不按逗号拆分，不做去空白，非字符串/空/仅空白项一律拒绝；
-    - 无 shell 拼接：调用方拿到的是最终 argv 的逐元素值。"""
+    - 无 shell 拼接：调用方拿到的是最终 argv 的逐元素值。
+    - require_visible_tools=True（默认）：空 tools 可见性与非空授权规则矛盾即拒绝
+      （PROMO-VERIFY-A1 2026-11-09）；纯 argv 构造器 build_argv/build_cn_argv 传 False
+      保持忠实构造（其形状由既有离线回归钉死），矛盾防御在 main() 入口调用处生效。"""
     if allowed_tools is None:
         allowed = _expand_tools_to_rules(tools)
     else:
         allowed = _validate_rule_list(allowed_tools, field='allowed_tools') or []
+    # PROMO-VERIFY-A1 2026-11-09：空 --tools 等于禁用全部工具可见性，与非空 allowed_tools
+    # 授权规则矛盾——模型只能把工具调用写成正文、任务必然零工具执行空转。tools='' 且
+    # allowed 为空（含显式空列表的零授权只读聊天）合法；task-scope 生成的 tools 恒非空。
+    if require_visible_tools and tools == '' and allowed:
+        raise ValueError(
+            f'empty --tools (Empty disables tools visibility) contradicts '
+            f'{len(allowed)} allowed_tools authorization rule(s): the model can only '
+            f'write tool calls as plain text and the task spins with zero tool '
+            f'execution. Pass a non-empty --tools (visible_tools joined by commas) '
+            f'alongside the rules, or use --task-scope instead.')
     disallowed = _validate_rule_list(disallowed_tools, field='disallowed_tools') or []
     dirs = _validate_rule_list(add_dirs, field='add_dirs') or []
     return {'allowed_tools': allowed,
@@ -217,8 +286,11 @@ def build_argv(cfg: dict, workspace: str, model: str, tools: str,
     时才按 tools 逗号列表逐项回退为 --allowed-tools；显式列表（含空列表）完全替代
     回退，不会偷偷附加 Write/Edit/Bash 默认权限。permission-mode 固定 dont_ask，
     永不启用 bypass_permissions。"""
+    # 纯 argv 构造器保持忠实构造（形状由既有离线回归钉死）；空 tools 可见性与非空规则
+    # 的矛盾防御在 main() 入口的 effective_permission_rules 默认调用处生效（PROMO-VERIFY-A1）。
     perms = effective_permission_rules(tools, allowed_tools,
-                                        disallowed_tools, add_dirs)
+                                        disallowed_tools, add_dirs,
+                                        require_visible_tools=False)
     argv = [cfg['node'], cfg['qodercli'],
             '--cwd', workspace, '--model', model,
             '--tools', tools, '--permission-mode', 'dont_ask',
@@ -334,8 +406,11 @@ def build_cn_argv(cfg: dict, config_dir: str, model_id: str, workspace: str, too
     （validate_cn_allow_rule_shapes，BW-CN-PERMISSION-STOP-S1）。session_id 走官方
     `--resume`；新会话可经 session_uuid 传官方 `--session-id <UUID>`（主脑已核对官方
     help 支持该参数；本阶段未联网复验），供会话权限拒绝监视精确定位本会话 jsonl。"""
+    # 与国际 build_argv 同口径：纯构造器忠实构造，空 tools 可见性矛盾防御在 main() 入口
+    # 生效（PROMO-VERIFY-A1 2026-11-09）；CN 另有下方两个静态规则门。
     perms = effective_permission_rules(tools, allowed_tools,
-                                        disallowed_tools, add_dirs)
+                                        disallowed_tools, add_dirs,
+                                        require_visible_tools=False)
     validate_cn_permission_rules(perms['allowed_tools'], perms['disallowed_tools'])
     validate_cn_allow_rule_shapes(perms['allowed_tools'])
     argv = [cfg['cli'], '--config-dir', config_dir,
@@ -542,7 +617,10 @@ def _qoder_failure_facts(summary: dict) -> dict:
     """把 Qoder 终态结构映射为 failure_types 事实；只读协议/解析/拒绝/错误结构，
     不扫描报告正文，不因报告格式失败算代码失败。真实结构化错误里有明确 429 时提取
     quota_429；已知 quota/permission/parse 来源不泛化为模型差，model_execution_failure
-    只用于剩余未分型的执行失败。"""
+    只用于剩余未分型的执行失败。
+
+    PROMO-VERIFY-A1 2026-11-09：tools_channel_disabled 是「不扫描报告正文」原则的一处受限
+    例外，仅核对模型工具调用序列化标签是否出现在正文（完整依据见下方 PROMO-VERIFY-A1 注释）。"""
     parse_failure = bool(summary.get('parse_error'))
     perms = summary.get('permission_denials')
     permission_denied = isinstance(perms, (list, dict)) and bool(perms)
@@ -561,14 +639,24 @@ def _qoder_failure_facts(summary: dict) -> dict:
     model_execution = (not summary.get('protocol_success')
                        and not parse_failure and not permission_denied
                        and not quota_429 and not auth_failure)
+    # PROMO-VERIFY-A1 2026-11-09：工具通道禁用的假成功空转，是「不扫描报告正文」原则的
+    # 一处受限例外。字面子串 '<tool_call>' 是模型侧工具调用序列化标记（非九节报告格式），
+    # envelope 无工具执行计数字段；num_turns<=2 + end_turn 假成功 + 该字面标记三者合起来
+    # 即工具通道被禁用（空 --tools）的结构化等价证据。只认这一精确字面标签，不做其它正文推断。
+    num_turns = summary.get('num_turns')
+    tools_channel_disabled = (bool(summary.get('protocol_success'))
+                              and isinstance(num_turns, int) and num_turns <= 2
+                              and bool(summary.get('model_emitted_toolcall_text')))
     return {'quota_429': quota_429,
             'protocol_parse_failure': parse_failure,
             'permission_rule_denied': permission_denied,
             'model_execution_failure': bool(model_execution),
             'authentication_failure': bool(auth_failure),
+            'tools_channel_disabled': tools_channel_disabled,
             'reset_hint': ec.extract_reset_hint(summary.get('result_errors'),
                                                 summary.get('result_errors_info')),
             'evidence': {'stop_reason': summary.get('stop_reason'),
+                         'num_turns': num_turns,
                          'permission_denials': perms,
                          'parse_error': summary.get('parse_error'),
                          'result_errors': summary.get('result_errors'),
@@ -710,16 +798,22 @@ def main():
                          'may not be mixed with it.')
     ap.add_argument('--resume-session-id', '--session-id', dest='session_id', default=None,
                     help='Resume a known Qoder session using the official --resume flag.')
-    ap.add_argument('--config', default=str(DEFAULT_CONFIG),
+    ap.add_argument('--config', default=None,
                     help='Local entry config JSON with absolute node/qodercli paths '
-                         '(international runtime=qoder).')
+                         '(international runtime=qoder). An explicit path must exist '
+                         'and is never fallen back from; when omitted the entry '
+                         'discovers scripts/local-entry.json next to this script '
+                         'first, else the installed brain-worker engine copy.')
     ap.add_argument('--runtime', default=RUNTIME_INTERNATIONAL,
                     choices=[RUNTIME_INTERNATIONAL, RUNTIME_CN],
                     help='Executor runtime. "qoder" = existing international Node-bundle '
                          'config (unchanged). "qodercn" = local Qoder CN native EXE via a '
                          'separate CN config (cli/config_dir/model_ids).')
-    ap.add_argument('--cn-config', default=str(DEFAULT_CN_CONFIG),
-                    help='Qoder CN native entry config JSON (runtime=qodercn only).')
+    ap.add_argument('--cn-config', default=None,
+                    help='Qoder CN native entry config JSON (runtime=qodercn only). '
+                         'An explicit path must exist and is never fallen back from; '
+                         'when omitted the entry discovers scripts/local-entry-cn.json '
+                         'next to this script first, else the installed engine copy.')
     ap.add_argument('--config-dir', dest='config_dir', default=None,
                     help='Explicit Qoder CN config dir override (runtime=qodercn only); '
                          'otherwise the CN config config_dir is used.')
@@ -892,8 +986,19 @@ def main():
             'sha256': hashlib.sha256(scope_bytes).hexdigest(),
             'generated': generated,
         }
-    perms = effective_permission_rules(args.tools, args.allowed_tools,
-                                        args.disallowed_tools, args.add_dirs)
+    # PROMO-VERIFY-A1 2026-11-09：入口矛盾参数防御（空 --tools 可见性 + 非空授权规则等
+    # ValueError）在容量 claim、建证据目录、Popen 之前受控拒绝（sent=false、rc=2、零 Popen、
+    # 零输出目录），绝不把崩溃 traceback 留给调用方。调用顺序不变，仅就地包裹。
+    try:
+        perms = effective_permission_rules(args.tools, args.allowed_tools,
+                                            args.disallowed_tools, args.add_dirs)
+    except ValueError as exc:
+        print(json.dumps({'permission_args_rejected': True, 'sent': False,
+                          'exit_code': 2, 'runtime': args.runtime,
+                          'tools': args.tools,
+                          'allowed_tools': args.allowed_tools,
+                          'reasons': [str(exc)]}, ensure_ascii=False))
+        return 2
     if is_cn:
         # 规则门在容量 claim、建证据目录、Popen 之前：不兼容即受控未派发（sent=false、rc=2、
         # 零 Popen、零输出目录），绝不把崩溃 traceback 留给调用方，也不放宽权限重试。
@@ -985,7 +1090,8 @@ def main():
         workspace=str(work), prompt_sha256=prompt_sha256, stage=args.stage,
         chat_id=args.chat_id, claim_token=args.dispatch_claim,
         wrapper_pid=wrapper_pid, wrapper_created=wrapper_created,
-        executor=args.runtime, quota_store=quota_store, quota_routes=args.quota_routes)
+        executor=args.runtime, quota_store=quota_store, quota_routes=args.quota_routes,
+        priority_enforced=True)
     if not pool_gate['allowed']:
         print(json.dumps({'capacity_gate_rejected': True, 'sent': False, 'exit_code': 2,
                           'routing_required': bool(pool_gate.get('routing_required')),
@@ -1079,7 +1185,10 @@ def main():
                        'older_identity_does_not_override': True,
                        'contract_sha256': hashlib.sha256(
                            contract.encode('utf-8')).hexdigest()},
-                   'entry_config': str(Path(args.cn_config if is_cn else args.config).resolve()),
+                   # 非敏感配置元数据：只记 resolved path 与发现来源
+                   # （explicit/repository_default/installed_engine），绝不带配置内容。
+                   'entry_config': cfg.get('_entry_config_path'),
+                   'entry_config_source': cfg.get('_entry_config_source'),
                    'runtime': ({'cli': cfg['cli'], 'config_dir': cn_config_dir} if is_cn
                                else {'node': cfg['node'], 'qodercli': cfg['qodercli']}),
                    'argv': argv}
@@ -1240,6 +1349,8 @@ def main():
                                              and result.get('subtype') == 'success' and result.get('is_error') is False
                                              and result.get('stop_reason') == 'end_turn'),
                            session_id=result.get('session_id'), stop_reason=result.get('stop_reason'),
+                           # PROMO-VERIFY-A1 2026-11-09：留 envelope 轮数供工具通道禁用空转分型。
+                           num_turns=result.get('num_turns'),
                            total_credits=result.get('total_credits'), model_usage=result.get('modelUsage'),
                            permission_denials=result.get('permission_denials'),
                            result_errors=result.get('errors'),
@@ -1260,6 +1371,10 @@ def main():
                 summary['cn_session_identity'] = cn_identity
             response = result.get('result')
             if isinstance(response, str):
+                # PROMO-VERIFY-A1 2026-11-09：仅文本 result 分支记录模型是否把工具调用写成
+                # 正文（<tool_call> 字面标记）；非文本 result 不设该键。这是工具通道禁用空转
+                # 分型的窄例外输入，不做任何其它正文推断。
+                summary['model_emitted_toolcall_text'] = '<tool_call>' in response
                 (out / 'response.md').write_bytes(response.encode('utf-8'))
                 disk = (out / 'response.md').read_bytes()
                 digest = hashlib.sha256(disk).hexdigest()
