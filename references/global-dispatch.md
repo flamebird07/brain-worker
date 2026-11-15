@@ -1,5 +1,7 @@
 # 全局并发容量池与 1:1 路由（global-dispatch）
 
+**强档优先级（2026-11-15）**：Qoder 国际和 CN 内置 `Qwen4-Max-Preview` 并列第一，其次 Claude，最后 ZCode。强档派发与浮窗行序使用这套共享策略。
+
 **2026-11-15 当前权威：BW-QWEN4-SONUS-REMOVE-20261115**。`qoder:Sonus` 从 strong/medium/weak **所有档位**去除新派（`SONUS_TEMP_DISABLED = True` 持久事实；AUTO/显式 reserve/select/consume/claim-due/正式入口一律 `mode_excluded`；遗留 reserved 不再放行 consume，安全释放 start_failed；running/unknown 在途不追杀、不假释放，继续安全计数与结算；浮窗三档空闲整行隐藏）。两个 Qoder 内置 Max 官方显示名改为 **Qwen4-Max-Preview**（`qoder:Qwen4-Max-Preview` / `qodercn:Qwen4-Max-Preview`，SDK argv 与池键同字面串）；旧池键 `qoder:Qwen3.8-Max` / `qodercn:Qwen3.8-Max` 以 0 容量降为 legacy-retired（不接新派、绝不映射到新池，在途照常计数与自然终态结算）。带短横线的 `qodercn:Qwen-3.8-Max` 仍为独立已禁用自定义池，历史身份与禁用语义不变。本段覆盖本文及更早各段中一切 Sonus 新派资格与「Qwen3.8-Max（经 2026-11-15 批量改名同步显示为 Qwen4-Max-Preview）」的现行表述；历史段落仅作存档。
 
 **2026-11-08 当前权威：BW-STRONG-QMAX-SONUS-20261108**。strong 新派为 6 池/9 槽：`qoder:QoDuck` 与 `qodercn:QoDuck`（层=1，各 2 槽）> `zcode:GLM-5.3`（2）> `claude:deepseek-flash`（3）> 国际 `qoder:Qwen4-Max-Preview`（4，倒数第二）> CN 内置 `qodercn:Qwen4-Max-Preview`（5）。Sonus 不再参与 strong 新派，仅 medium/weak 保持原资格；已有 reserved/running/unknown 不追杀、不改派、不假释放。浮窗 strong 空闲不显示 Sonus，有真实在途才保留并标“本档不参与”。本规则只调整现有档位集合与层号，不新增开关、路由或宿主分支，覆盖下文旧 strong 层序、7 池/10 槽及“Sonus 参与 strong”的描述。

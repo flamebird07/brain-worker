@@ -6,6 +6,8 @@ macOS 版沿用同一共享派发数据库。标题栏省去右上角关闭叉�
 正式派工和浮窗使用同一个共享调度库。可以把代码放到隔离副本中执行，
 正式派工仍沿用主机共享库，临时调度库用于离线测试。
 
+**强档优先级（2026-11-15）**：Qoder 国际和 CN 内置 `Qwen4-Max-Preview` 并列第一，其次 Claude，最后 ZCode。强档派发与浮窗行序使用这套共享策略。
+
 **2026-11-15 当前权威：BW-QWEN4-SONUS-REMOVE-20261115**。`qoder:Sonus` 从 strong/medium/weak **所有档位**去除新派（`SONUS_TEMP_DISABLED = True` 持久事实；AUTO/显式 reserve/select/consume/claim-due/正式入口一律 `mode_excluded`；遗留 reserved 不再放行 consume，安全释放 start_failed；running/unknown 在途不追杀、不假释放，继续安全计数与结算；浮窗三档空闲整行隐藏）。两个 Qoder 内置 Max 官方显示名改为 **Qwen4-Max-Preview**（`qoder:Qwen4-Max-Preview` / `qodercn:Qwen4-Max-Preview`，SDK argv 与池键同字面串）；旧池键 `qoder:Qwen3.8-Max` / `qodercn:Qwen3.8-Max` 以 0 容量降为 legacy-retired（不接新派、绝不映射到新池，在途照常计数与自然终态结算）。带短横线的 `qodercn:Qwen-3.8-Max` 仍为独立已禁用自定义池，历史身份与禁用语义不变。本段覆盖本文及更早各段中一切 Sonus 新派资格与「Qwen3.8-Max（经 2026-11-15 批量改名同步显示为 Qwen4-Max-Preview）」的现行表述；历史段落仅作存档。
 
 **2026-10-29 当前覆盖（BW-SONUS-REENABLE-20261029-R3，另见 BW-QODERCN-TOKEN-MAX-DISABLE-20261028）**：用户要求**恢复使用** `qoder:Sonus`（Qoder 国际／Sonus）的常态新派，唯一权威开关 `scripts/dispatch_mode.py` 的 `SONUS_TEMP_DISABLED = False`，覆盖 BW-SONUS-TEMP-DISABLE-20261028-R2 的全档临时禁用（R2 及更早的恢复/禁用均保留为历史）。strong 空闲显示 Sonus 且排第一（可见 5 池、可新派 6 槽）；medium/weak 空闲隐藏 Sonus（4/10 池、5/13 槽）；切档前遗留的真实 reserved/running/unknown Sonus 在 medium/weak 整行保留，按真实状态和占用显示并标“本档不参与”，直到真实终态后隐藏，不是假释放、不改派、不追杀。静态登记行与容量 1、物理总容量 16 保留。“暂时禁用（用户指令）”展示只在开关再次为 True 时生效。汇总占用、PID 待核、在途判定、精简/展开规则不变。

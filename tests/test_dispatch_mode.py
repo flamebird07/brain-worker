@@ -175,14 +175,14 @@ class ModePolicyTests(unittest.TestCase):
                          ELEVEN_POOLS - {dm.QMAX_CN_CUSTOM_POOL_KEY})
 
     def test_strong_priority_table(self):
-        # BW-STRONG-SONUS-20261024：Sonus=1 全档最前，ZCode=2、Claude=3、三个 Max=4。
+        # 强档新派：两路内置 Max 并列第一，Claude 第二，ZCode 最后。
         self.assertEqual(dm.priority_map_for_mode('strong'), {
             SONUS_KEY: 1,
-            'zcode:GLM-5.3': 2,
-            'claude:deepseek-flash': 3,
-            'qoder:Qwen4-Max-Preview': 4,
-            'qodercn:Qwen4-Max-Preview': 4,
-            'qodercn:Qwen-3.8-Max': 4,
+            'zcode:GLM-5.3': 3,
+            'claude:deepseek-flash': 2,
+            'qoder:Qwen4-Max-Preview': 1,
+            'qodercn:Qwen4-Max-Preview': 1,
+            'qodercn:Qwen-3.8-Max': 1,
         })
         # medium/weak 层表完全不含 Sonus（档位排除，绝不给层号）。
         self.assertNotIn(SONUS_KEY, dm.priority_map_for_mode('medium'))
@@ -530,12 +530,12 @@ class SonusRemoved20261115Tests(_AdjudicationBase):
         self.assertEqual(len(dm.allowed_pools_for_mode('strong')), 4)
         self.assertEqual(len(dm.allowed_pools_for_mode('medium')), 4)
         self.assertEqual(len(dm.allowed_pools_for_mode('weak')), 10)
-        # 层号/无时段门口径不变（层表仍含 Sonus 历史层号 1，但集合已排除、永不选用）。
+        # 强档无时段门。Sonus 的历史层号不参与派发。
         strong = dm.priority_map_for_mode('strong')
         self.assertEqual(strong[SONUS_KEY], 1)
-        self.assertEqual(strong['zcode:GLM-5.3'], 2)
-        self.assertEqual(strong['claude:deepseek-flash'], 3)
-        self.assertEqual({strong[k] for k in dm.MAX_POOL_KEYS}, {4})
+        self.assertEqual(strong['zcode:GLM-5.3'], 3)
+        self.assertEqual(strong['claude:deepseek-flash'], 2)
+        self.assertEqual({strong[k] for k in dm.MAX_POOL_KEYS}, {1})
         self.assertEqual(tuple(dm.window_gated_pools_for_mode('strong')), ())
         for m in ('strong', 'medium', 'weak'):
             self.assertNotIn(SONUS_KEY, dm.allowed_pools_for_mode(m), m)
@@ -558,15 +558,15 @@ class SonusRemoved20261115Tests(_AdjudicationBase):
                 n = conn.execute('SELECT COUNT(*) AS n FROM attempts').fetchone()['n']
             self.assertEqual(n, 0, (m, n))
 
-    def test_strong_auto_never_selects_sonus_first_is_zcode(self):
-        # strong AUTO：Sonus 去除后绝不入选；第一可用落 ZCode(2)。
+    def test_strong_auto_routes_zcode_to_available_qwen4(self):
+        # 强档 AUTO 应把 ZCode 入口的请求路由给空闲的内置 Qwen4。
         with dispatch_mode('strong'):
-            r = dp.select_and_claim(self.store, task_id='a1', runtime='qoder',
-                                    model='Qwen4-Max-Preview',
+            r = dp.select_and_claim(self.store, task_id='a1', runtime='zcode',
+                                    model='GLM-5.3',
                                     workspace=str(self._ws('a1')),
                                     prompt_sha256='p', now=T0, _preclaim=False)
         self.assertTrue(r.get('routing_required'), r)
-        self.assertEqual(r['selected']['pool_key'], 'zcode:GLM-5.3', r)
+        self.assertIn(r['selected']['pool_key'], {dm.QMAX_INTL_POOL_KEY, dm.QMAX_CN_POOL_KEY}, r)
 
     def test_legacy_reserved_sonus_claim_released_not_consumed(self):
         # 去除前合法取得且仍 reserved 的精确 Sonus claim：consume 不再放行（BW-QWEN4-

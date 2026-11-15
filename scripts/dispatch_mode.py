@@ -9,7 +9,7 @@ BW-MANUAL-THREE-MODE-20261023（用户明确指令，当前权威）：
   `source` / `error`），绝不把错误冒充成用户选过的 strong/medium。
 
 三档常态新派池数 strong/medium/weak=4/4/10，槽数=5/5/13；物理登记仍为 16。
-strong 常态：ZCode(2) > Claude(3) > 两内置 Qwen4-Max-Preview(4)，全部无时段门。
+strong 常态：两内置 Qwen4-Max-Preview(1) > Claude(2) > ZCode(3)，全部无时段门。
 
 BW-QWEN4-SONUS-REMOVE-20261115（用户明确指令，**当前权威**）：
 - Sonus（qoder:Sonus）从**所有档位**（含 strong）去除新派资格——`SONUS_TEMP_DISABLED
@@ -91,14 +91,14 @@ DEFAULT_MODE = 'weak'
 MODE_ENV_VAR = 'BRAIN_WORKER_DISPATCH_MODE_FILE'
 MODE_LABELS = {'strong': '强', 'medium': '中', 'weak': '弱'}
 MODE_NOTES = {
-    'strong': '强档 · ZCode／Claude／两内置 Qwen4-Max-Preview · 全部无时段门',
+    'strong': '强档 · 两内置 Qwen4-Max-Preview／Claude／ZCode · 全部无时段门',
     'medium': '中档 · 仅 ZCode／Claude／两内置 Qwen4-Max-Preview · Max 夜间门 + Claude 高峰门',
     'weak': '弱档 · 10 个可新派池 · Max 夜间门 + Claude 高峰门',
 }
 # 每档可新派范围的纯文字描述（回执/浮窗文案用，绝不承载数字层号/容量，防漂移）。
 # BW-QWEN4-SONUS-REMOVE-20261115：Sonus 已从所有档位去除；两内置 Max 改为 Qwen4-Max-Preview。
 MODE_SCOPE_TEXT = {
-    'strong': 'ZCode／Claude／两内置 Qwen4-Max-Preview（4 池）',
+    'strong': '两内置 Qwen4-Max-Preview／Claude／ZCode（4 池）',
     'medium': 'ZCode／Claude／两内置 Qwen4-Max-Preview（4 池）',
     'weak': '10 个可新派池（不含 Sonus 与 CN token plan Max）',
 }
@@ -166,11 +166,11 @@ KNOWN_POLICY_POOL_KEYS = ALL_POOL_KEYS + STRONG_ONLY_POOL_KEYS
 # tie）仍由 dispatch_pool._select_main_force 统一实现，本模块只给层号。
 STRONG_PRIORITY = {
     SONUS_POOL_KEY: 1,
-    ZCODE_POOL_KEY: 2,
-    CLAUDE_POOL_KEY: 3,
-    QMAX_INTL_POOL_KEY: 4,
-    QMAX_CN_POOL_KEY: 4,
-    QMAX_CN_CUSTOM_POOL_KEY: 4,
+    QMAX_INTL_POOL_KEY: 1,
+    QMAX_CN_POOL_KEY: 1,
+    QMAX_CN_CUSTOM_POOL_KEY: 1,
+    CLAUDE_POOL_KEY: 2,
+    ZCODE_POOL_KEY: 3,
 }
 MEDIUM_PRIORITY = {
     QMAX_CN_CUSTOM_POOL_KEY: 1,

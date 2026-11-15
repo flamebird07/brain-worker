@@ -160,9 +160,7 @@ class CustomMaxPriorityTests(_Base):
         self.assertIn(self.select(ZCODE, DAY)[0], dp.OPENCODE_POOL_KEYS)
 
     def test_day_max_all_day_in_strong_mode(self):
-        # strong 档：可派池全部无时段门——白天三个 Max 与 claude 都在候选，常态层序
-        # ZCode(2) > claude(3) > 三个 Max(4)。BW-QWEN4-SONUS-REMOVE-20261115：Sonus 已
-        # 从所有档位去除，绝不入选；按原层序验证：ZCode → claude → 国际 Max → CN Max。
+        # 强档白天仍按两个内置 Max、Claude、ZCode 的顺序择优。
         with dispatch_mode('strong'):
             self.fill_codebuddy()
             with closing(dp.connect(self.store)) as conn:
@@ -171,13 +169,15 @@ class CustomMaxPriorityTests(_Base):
             self.assertNotIn(dp.SONUS_POOL_KEY, elig)
             for pk in (CN_MAX, QMAX, ZCODE, CLAUDE):
                 self.assertIn(pk, elig)
-            self.assertEqual(self.select(ZCODE, DAY)[0], ZCODE)
-            self.seed(ZCODE, 1)
+            first = self.select(ZCODE, DAY)[0]
+            self.assertIn(first, (QMAX, CN_MAX))
+            second = CN_MAX if first == QMAX else QMAX
+            self.seed(first, 1)
+            self.assertEqual(self.select(ZCODE, DAY)[0], second)
+            self.seed(second, 1)
             self.assertEqual(self.select(ZCODE, DAY)[0], CLAUDE)
             self.seed(CLAUDE, 2)
-            self.assertEqual(self.select(ZCODE, DAY)[0], QMAX)
-            self.seed(QMAX, 1)
-            self.assertEqual(self.select(ZCODE, DAY)[0], CN_MAX)
+            self.assertEqual(self.select(ZCODE, DAY)[0], ZCODE)
 
     def test_explicit_builtin_selection_not_rewritten(self):
         r = self.reserve('qm', 'qoder', 'Qwen4-Max-Preview', executor='qoder')

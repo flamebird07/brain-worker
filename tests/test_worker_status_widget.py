@@ -155,14 +155,11 @@ class TestModuleDiscipline(_WidgetBase):
         self.assertEqual(prod_order.count(dp.SONUS_POOL_KEY), 1)
         self.assertEqual(prod_order.count(dp.ZCODE_POOL_KEY), 1)
         self.assertEqual(prod_order[0], dp.SONUS_POOL_KEY)
-        # BW-STRONG-SONUS-20261024：静态 ROW_DEFS = Sonus + weak 11 行基准序，其前六行
-        # **不是** strong 动态层序，绝不得对静态前六行要求 STRONG_PRIORITY 单调。真实
-        # strong 排序由 read_snapshot 动态生成：Sonus(1)、ZCode(2)、Claude(3)、三个
-        # Max(4,4,4，按基准序 stable tie)——用真实 strong 快照核验动态顺序。
+        # 强档按共享优先级动态排序，两个 Max 同层时沿用基准顺序。
         self.assertEqual(dm.STRONG_PRIORITY[dp.SONUS_POOL_KEY], 1)
-        self.assertEqual(dm.STRONG_PRIORITY[dp.ZCODE_POOL_KEY], 2)
-        self.assertEqual(dm.STRONG_PRIORITY[dp.CLAUDE_POOL_KEY], 3)
-        self.assertEqual({dm.STRONG_PRIORITY[pk] for pk in dm.MAX_POOL_KEYS}, {4})
+        self.assertEqual(dm.STRONG_PRIORITY[dp.ZCODE_POOL_KEY], 3)
+        self.assertEqual(dm.STRONG_PRIORITY[dp.CLAUDE_POOL_KEY], 2)
+        self.assertEqual({dm.STRONG_PRIORITY[pk] for pk in dm.MAX_POOL_KEYS}, {1})
         self.assertNotIn(dp.LUNA_KEY, prod_order)
         with closing(self._conn()):
             pass
@@ -170,16 +167,16 @@ class TestModuleDiscipline(_WidgetBase):
             strong_snap = self._snap()
         self.assertTrue(strong_snap['ok'])
         # BW-QWEN4-SONUS-REMOVE-20261115：Sonus 从所有档位去除——strong 空闲也不显示
-        # Sonus 行，完整 4 行 = ZCode(2)/Claude(3)/CN Max(4)/国际 Max(4)。
+        # Sonus 行，完整 4 行 = CN Max(1)/国际 Max(1)/Claude(2)/ZCode(3)。
         strong_rows = [r for r in strong_snap['rows']
                        if r['pool_key'] != dp.LUNA_KEY]
         self.assertNotIn(dp.SONUS_POOL_KEY, [r['pool_key'] for r in strong_rows])
         self.assertEqual([r['pool_key'] for r in strong_rows], [
-            dp.ZCODE_POOL_KEY, dp.CLAUDE_POOL_KEY,
-            dp.CN_MAX_POOL_KEY, dp.QMAX_POOL_KEY])
+            dp.CN_MAX_POOL_KEY, dp.QMAX_POOL_KEY,
+            dp.CLAUDE_POOL_KEY, dp.ZCODE_POOL_KEY])
         strong_prios = [r['priority'] for r in strong_rows]
         self.assertEqual(strong_prios, sorted(strong_prios), strong_prios)
-        self.assertEqual(strong_prios, [2, 3, 4, 4])
+        self.assertEqual(strong_prios, [1, 1, 2, 3])
         # 其余 11 行与 weak 权威整表逐行一致。
         weak_prios = [dp.POOL_PRIORITY[pk] for pk in prod_order[1:]]
         self.assertEqual(weak_prios, sorted(weak_prios), weak_prios)

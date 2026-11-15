@@ -209,18 +209,15 @@ class CapacityAndRouting(_ClaudeBase):
         self.assertEqual(r['selected']['pool_key'], dp.CN_MAX_POOL_KEY, r)
 
     def test_auto_claude_entry_peak_now_claims_in_strong_mode(self):
-        # BW-MANUAL-THREE-MODE-20261023：**strong 档**解除 claude 工作日高峰门——AUTO 的
-        # claude 入口在高峰绝不返回 `main_force_window_closed`。strong 常态层序 ZCode(2) >
-        # claude(3) > 三个 Max(4)，占满 ZCode 后 claude 即最优先可用候选。
-        # BW-QWEN4-SONUS-REMOVE-20261115：Sonus 从所有档位去除——显式 reserve 一律
-        # mode_excluded（零占位）；占满 ZCode 后 claude 即第一候选，断言强度不变。
+        # 两个 Max 槽都满后，高峰时段强档仍优先选 Claude，再考虑 ZCode。
         with dispatch_mode('strong'):
             sonus = self._reserve('hi0', 'qoder', 'Sonus', 'qoder',
                                   PEAK_WEEKDAY)
             self.assertFalse(sonus.get('allowed'), sonus)
             self.assertEqual(sonus.get('reason'), 'mode_excluded', sonus)
-            self.assertTrue(self._reserve('hi1', 'zcode', 'GLM-5.3', 'zcode',
-                                          PEAK_WEEKDAY).get('allowed'))
+            for runtime in ('qoder', 'qodercn'):
+                self.assertTrue(self._reserve(f'hi-{runtime}', runtime, 'Qwen4-Max-Preview',
+                                              runtime, PEAK_WEEKDAY).get('allowed'))
             r = self.claim_claude('apc', now=PEAK_WEEKDAY, executor='auto')
             self.assertTrue(r.get('allowed'), r)
             self.assertEqual(r['pool_key'], CLAUDE, r)
