@@ -92,21 +92,26 @@ def discover_entry_config(explicit, repo_default: Path, installed_fn):
 # 运行时名称（报告/池/预检共用口径）：国际 Node-bundle = 'qoder'；本机原生 CN = 'qodercn'。
 RUNTIME_INTERNATIONAL = 'qoder'
 RUNTIME_CN = 'qodercn'
-# CN 池友好名（BW-POOL-SPLIT-20261010-S2）：正常池新组合是 **内置** Qwen3.8-Max /
+# BW-QWEN4-SONUS-REMOVE-20261115：两个 Qoder 内置 Max 官方显示名改为 Qwen4-Max-Preview
+# ——SDK argv `--model` 与池键使用同一字面串（qoder:Qwen4-Max-Preview / qodercn:Qwen4-
+# Max-Preview），`--list-models` 核验字面名一致；旧名 Qwen3.8-Max 的池键在 dispatch_pool
+# 已降为 legacy-retired（0 容量、在途照常计数结算、绝不新派、绝不映射到新池）。带短横线
+# 的 qodercn:Qwen-3.8-Max 仍是独立已禁用自定义池，不受本次改名影响。
+# CN 池友好名（BW-POOL-SPLIT-20261010-S2，历史表述）：正常池新组合是 **内置** Qwen4-Max-Preview /
 # Qwen3.8-Flash，官方 CLI `--list-models` 显示字面串与 SDK 直接下发的 `--model` 值一致，
-# 是内置模型而非自定义 Token Plan。为兼容既有引用名 CN_MODEL 指向主力组合 Qwen3.8-Max；
+# 是内置模型而非自定义 Token Plan。为兼容既有引用名 CN_MODEL 指向主力组合 Qwen4-Max-Preview；
 # 自定义 DeepSeek-Flash 从正常池 retired（不再 AUTO/新点单派工），但保留客户端本机自定义
 # model_ids 映射，用于人工/显式已授权的历史任务，绝不删除配置。
-CN_MODEL = 'Qwen3.8-Max'
+CN_MODEL = 'Qwen4-Max-Preview'
 # CN 内置官方 Qwen 白名单：argv `--model` 直接使用这两个字面串（不查 model_ids、绝不
 # 猜 UUID、也不把自定义名当成内置）。任何其它 CN 名字必须走 config.model_ids 映射，映射
 # 缺失即拒绝启动（零 Popen）。
-CN_BUILTIN_MODELS = ('Qwen3.8-Max', 'Qwen3.8-Flash', 'QoDuck')
-# argparse 缺省模型 = 并发容量池指定的 qoder 主力组合 Qwen3.8-Max（每会话持久 1:1 两名）。
+CN_BUILTIN_MODELS = ('Qwen4-Max-Preview', 'Qwen3.8-Flash', 'QoDuck')
+# argparse 缺省模型 = 并发容量池指定的 qoder 主力组合 Qwen4-Max-Preview（每会话持久 1:1 两名）。
 # 不传 --model 的自主派工即请求主力 Max；Qwen3.8-Flash 在池里是溢出组合，仅当主力满员时
 # 由容量池按溢出策略改道。控制面回归 tests/test_execution_control.py 的 fixture 已同步为
 # Max（该文件在本轮编辑白名单内），dispatch-plan 的 model 逐项比对与缺省一致。
-DEFAULT_MODEL = 'Qwen3.8-Max'
+DEFAULT_MODEL = 'Qwen4-Max-Preview'
 # 契约单点定义在 prompt_contract；此处再导出同名常量，保持既有引用（analyze_report、
 # codebuddy/zcode 复用本模块的分析器）与 test_parallel_execution 的 qd.SECTION_HEADERS 不变。
 REPORT_START = pc.REPORT_START
@@ -189,7 +194,7 @@ def load_cn_config(path=None) -> dict:
 def resolve_cn_model_id(cfg: dict, model: str):
     """返回要下发给原生 CN EXE 的 `--model` 值；两种合法来源，任一不满足返回 None（调用
     方拒绝启动、零 Popen）：
-    - **内置官方模型白名单**（`CN_BUILTIN_MODELS`：Qwen3.8-Max / Qwen3.8-Flash /
+    - **内置官方模型白名单**（`CN_BUILTIN_MODELS`：Qwen4-Max-Preview / Qwen3.8-Flash /
       QoDuck）：
       字面串直接作为 argv 值（官方 CLI `--list-models` 精确显示该名，SDK 直传合法），
       不查 model_ids、不猜 UUID、不把内置名当成自定义；
@@ -667,7 +672,7 @@ def _qoder_failure_facts(summary: dict) -> dict:
 # BW-POOL-SPLIT-20261010-S3：三个 Qoder Max 主力“明确限额”最小标记的判定与落标。
 # 只有真实终态的**结构化失败载体**（result_errors / errors_info）明确命中硬限额才落标；
 # 绝不扫描报告正文，绝不把 permission 拒绝 / 解析失败 / 取消退出码(4294967295) / 普通报告
-# 正文里的 429 / 单独 quota 标签误作限额。两个内置 Max（qoder/qodercn:Qwen3.8-Max）与 CN
+# 正文里的 429 / 单独 quota 标签误作限额。两个内置 Max（qoder/qodercn:Qwen4-Max-Preview）与 CN
 # 自定义 Max（qodercn:Qwen-3.8-Max）各自独立落标、互不连坐；Flash、ZCode、国际自定义名
 # 永不落标（不误挡 Flash、不动 ZCode 既有 availability 口径、不把自定义映射到内置池）。
 _QUOTA_HARD_LIMIT_MARKERS = (
@@ -684,11 +689,11 @@ def _qoder_max_pool_key(runtime, model):
     Max）与 CN 自定义 Max（qodercn:Qwen-3.8-Max，短横线友好名）。其它 runtime/model（含任一
     Flash、ZCode、国际自定义名）一律 None。绝不偷偷给 Flash/ZCode 落标；自定义名只有 CN
     runtime 才成池，绝不把自定义误映射到内置池或反之。"""
-    if model == 'Qwen3.8-Max':
+    if model == 'Qwen4-Max-Preview':
         if runtime == RUNTIME_INTERNATIONAL:
-            return 'qoder:Qwen3.8-Max'
+            return 'qoder:Qwen4-Max-Preview'
         if runtime == RUNTIME_CN:
-            return 'qodercn:Qwen3.8-Max'
+            return 'qodercn:Qwen4-Max-Preview'
         return None
     if model == 'Qwen-3.8-Max' and runtime == RUNTIME_CN:
         # CN 自定义友好名（短横线）→ CN 自定义 Max 池；国际侧无此池，绝不误映射。
@@ -877,7 +882,7 @@ def main():
     # （sent=false、零占位、零证据目录）。带 --dispatch-claim 的请求不走本早门：禁用前
     # 合法遗留的精确 reserved claim 仍由下方 consume_for_entry 完整校验
     # （claim/config/model/token/workspace/权限/容量/时段），漂移照旧拒绝；其它被排除池
-    # 的 consume 语义不变。绝不误伤 qodercn:Qwen3.8-Max（内置名，短横线才是禁用目标）。
+    # 的 consume 语义不变。绝不误伤 qodercn:Qwen4-Max-Preview（内置名，短横线才是禁用目标）。
     entry_pk = dp.pool_key(args.runtime, args.model)
     if args.runtime == RUNTIME_CN and not args.dispatch_claim \
             and entry_pk in dmode.USER_DISABLED_POOL_KEYS:
@@ -1082,7 +1087,7 @@ def main():
     # 参数释放本 owner 尚未启动/未知的名额。全程复用同一身份，绝不伪造。
     wrapper_pid = os.getpid()
     wrapper_created = dp.process_identity(wrapper_pid).get('created')
-    # executor='qoder'：可信主脑显式指定 Qoder 入口——有空位的 Qwen3.8-Max 一律直接 claim，
+    # executor='qoder'：可信主脑显式指定 Qoder 入口——有空位的 Qwen4-Max-Preview 一律直接 claim，
     # 绝不因历史 committed 计数被 1:1 改派到 ZCode；同一持久 ZCode availability 状态只用于
     # 保证不会被绕回不可用的 ZCode。
     pool_gate = dp.consume_for_entry(
@@ -1090,8 +1095,7 @@ def main():
         workspace=str(work), prompt_sha256=prompt_sha256, stage=args.stage,
         chat_id=args.chat_id, claim_token=args.dispatch_claim,
         wrapper_pid=wrapper_pid, wrapper_created=wrapper_created,
-        executor=args.runtime, quota_store=quota_store, quota_routes=args.quota_routes,
-        priority_enforced=True)
+        executor=args.runtime, quota_store=quota_store, quota_routes=args.quota_routes)
     if not pool_gate['allowed']:
         print(json.dumps({'capacity_gate_rejected': True, 'sent': False, 'exit_code': 2,
                           'routing_required': bool(pool_gate.get('routing_required')),

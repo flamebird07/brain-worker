@@ -44,8 +44,8 @@ try:
 except Exception:  # noqa: BLE001 - 隔离树无 quota_control 时该用例自动跳过
     qc = None
 
-QMAX = 'qoder:Qwen3.8-Max'
-CN_MAX = 'qodercn:Qwen3.8-Max'
+QMAX = 'qoder:Qwen4-Max-Preview'
+CN_MAX = 'qodercn:Qwen4-Max-Preview'
 CN_CUSTOM_MAX = 'qodercn:Qwen-3.8-Max'
 CN_FLASH = 'qodercn:Qwen3.8-Flash'
 OC_DS = dp.OPENCODE_DEEPSEEK_POOL_KEY
@@ -412,7 +412,7 @@ class ZcodeEntryPassesUnderHardHoldTests(_Base):
         #    dp.consume_for_entry 消费成功，同一 dispatch 临时库上证明正式入口不再被
         #    consume_for_entry 里的 availability/main_force_limit 复核挡回（携带的
         #    quota_store 历史 hard_hold 只作诊断，绝不拦现役池）。
-        r = dp.reserve(self.store, task_id='entry-z', runtime='qoder', model='Qwen3.8-Max',
+        r = dp.reserve(self.store, task_id='entry-z', runtime='qoder', model='Qwen4-Max-Preview',
                        workspace=self.ws('entry-z'), prompt_sha256='p', stage='s',
                        chat_id='c', executor='qoder', quota_store=self.quota,
                        now=T_NIGHT, _preclaim=False)
@@ -421,7 +421,7 @@ class ZcodeEntryPassesUnderHardHoldTests(_Base):
         tok = r['token']
 
         c = dp.consume_for_entry(self.store, task_id='entry-z', runtime='qoder',
-                                 model='Qwen3.8-Max', workspace=self.ws('entry-z'),
+                                 model='Qwen4-Max-Preview', workspace=self.ws('entry-z'),
                                  prompt_sha256='p', stage='s', chat_id='c',
                                  claim_token=tok, executor='qoder',
                                  quota_store=self.quota, now=T_NIGHT)

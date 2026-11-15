@@ -6,7 +6,7 @@
 
 ## 接入范围与选择
 
-这是 brain-worker 的可选原生执行端指导，不是新增本机 CLI、自动调度器或统一执行器适配代码。Luna 使用所在云环境提供的原生子 Agent 工具；模型标识为 `gpt-6-luna`。本机未另行指定时按可用主力 `zcode:GLM-5.3`/`qoder:Qwen3.8-Max` 的 1:1 轮换、明确 executor+model 授权组合优先，主力不可用时改用溢出 Flash 或已授权接续；各直连入口沿用其既有配置（不再表述为“ZCode 默认优先、Qoder 唯一模型”）。Luna 只救援、非容量类 Luna 需明确授权、绝不凭超时自动接替。广告任务原有执行选择继续有效，在途任务不因登记 Luna 被替换或重复派发。
+这是 brain-worker 的可选原生执行端指导，不是新增本机 CLI、自动调度器或统一执行器适配代码。Luna 使用所在云环境提供的原生子 Agent 工具；模型标识为 `gpt-6-luna`。本机未另行指定时按可用主力 `zcode:GLM-5.3`/`qoder:Qwen4-Max-Preview` 的 1:1 轮换、明确 executor+model 授权组合优先，主力不可用时改用溢出 Flash 或已授权接续；各直连入口沿用其既有配置（不再表述为“ZCode 默认优先、Qoder 唯一模型”）。Luna 只救援、非容量类 Luna 需明确授权、绝不凭超时自动接替。广告任务原有执行选择继续有效，在途任务不因登记 Luna 被替换或重复派发。
 
 ## 在并发容量池中的角色：只救援、无上限、绝不自动启动
 
@@ -15,7 +15,7 @@ Luna 是**救援**通道（组合 `luna:native`），**无数量上限**，但**
 `select_and_claim` 对 Luna 请求一律 `luna_requires_ticket` 拒绝。只有满足全部条件才可由**宿主原生
 调用**：
 
-1. 六个国内名额（主力 `zcode:GLM-5.3`/`qoder:Qwen3.8-Max` 各 2 + 溢出 `qoder:Qwen3.8-Flash` 2）
+1. 六个国内名额（主力 `zcode:GLM-5.3`/`qoder:Qwen4-Max-Preview` 各 2 + 溢出 `qoder:Qwen3.8-Flash` 2）
    **确实全满**；
 2. 宿主**真的问过用户**“外部 agent 还是 Luna”，并用 `ask_record` 落库票据、开始 **300 秒**计时
    （Python 只落库，绝不谎称已问或已派生 Luna）；

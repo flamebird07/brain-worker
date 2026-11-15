@@ -19,8 +19,8 @@ from dispatch_mode_support import dispatch_mode  # noqa: E402
 import stage_selection as ss  # noqa: E402
 
 CODEBUDDY = 'codebuddy:deepseek-v4.1-flash'
-QMAX = 'qoder:Qwen3.8-Max'
-CN_MAX = 'qodercn:Qwen3.8-Max'
+QMAX = 'qoder:Qwen4-Max-Preview'
+CN_MAX = 'qodercn:Qwen4-Max-Preview'
 CN_CUSTOM_MAX = 'qodercn:Qwen-3.8-Max'
 CLAUDE = 'claude:deepseek-flash'
 ZCODE = 'zcode:GLM-5.3'  # BW-ZCODE-RESTORE-1-20261022：恢复可派主力（容量 1、层=2）
@@ -161,18 +161,16 @@ class CustomMaxPriorityTests(_Base):
 
     def test_day_max_all_day_in_strong_mode(self):
         # strong 档：可派池全部无时段门——白天三个 Max 与 claude 都在候选，常态层序
-        # Sonus(1) > ZCode(2) > claude(3) > 三个 Max(4)。BW-SONUS-REENABLE-20261029-R3：
-        # Sonus 恢复常态新派，先占满其唯一槽后按原层序验证：ZCode → claude →
-        # 国际 Max → CN 自定义 Max。
+        # ZCode(2) > claude(3) > 三个 Max(4)。BW-QWEN4-SONUS-REMOVE-20261115：Sonus 已
+        # 从所有档位去除，绝不入选；按原层序验证：ZCode → claude → 国际 Max → CN Max。
         with dispatch_mode('strong'):
             self.fill_codebuddy()
             with closing(dp.connect(self.store)) as conn:
                 elig = dp._eligible_main_forces(conn, False, DAY)
             self.assertNotIn(CN_CUSTOM_MAX, elig)
-            self.assertIn(dp.SONUS_POOL_KEY, elig)
+            self.assertNotIn(dp.SONUS_POOL_KEY, elig)
             for pk in (CN_MAX, QMAX, ZCODE, CLAUDE):
                 self.assertIn(pk, elig)
-            self.seed(dp.SONUS_POOL_KEY, 1)
             self.assertEqual(self.select(ZCODE, DAY)[0], ZCODE)
             self.seed(ZCODE, 1)
             self.assertEqual(self.select(ZCODE, DAY)[0], CLAUDE)
@@ -182,10 +180,10 @@ class CustomMaxPriorityTests(_Base):
             self.assertEqual(self.select(ZCODE, DAY)[0], CN_MAX)
 
     def test_explicit_builtin_selection_not_rewritten(self):
-        r = self.reserve('qm', 'qoder', 'Qwen3.8-Max', executor='qoder')
+        r = self.reserve('qm', 'qoder', 'Qwen4-Max-Preview', executor='qoder')
         self.assertTrue(r.get('allowed'), r)
         self.assertEqual(r['pool_key'], QMAX)
-        r = self.reserve('cm', 'qodercn', 'Qwen3.8-Max', executor='qodercn')
+        r = self.reserve('cm', 'qodercn', 'Qwen4-Max-Preview', executor='qodercn')
         self.assertTrue(r.get('allowed'), r)
         self.assertEqual(r['pool_key'], CN_MAX)
 
@@ -253,9 +251,9 @@ class UserDisabledCustomMaxTests(_Base):
         self.assertEqual(dp.DOMESTIC_TOTAL_CAPACITY, 16)
         import install_desktop_skill as installer
         self.assertIn(CN_CUSTOM_MAX, installer.HOST_EXCLUDED['qoder'])
-        # BW-SONUS-REENABLE-20261029-R3：Sonus 恢复常态——strong 5 池/6 槽；
-        # medium/weak 仍不含 Sonus，分别 4 池/5 槽、10 池/13 槽。
-        for mode, count, slots in (('strong', 5, 6), ('medium', 4, 5), ('weak', 10, 13)):
+        # BW-QWEN4-SONUS-REMOVE-20261115：Sonus 从所有档位去除——strong/medium 4 池/5 槽、
+        # weak 10 池/13 槽。
+        for mode, count, slots in (('strong', 4, 5), ('medium', 4, 5), ('weak', 10, 13)):
             pools = dm.allowed_pools_for_mode(mode)
             self.assertEqual(len(pools), count)
             self.assertEqual(sum(dp.capacity_for(pk) for pk in pools), slots)
@@ -317,13 +315,13 @@ class UserDisabledCustomMaxTests(_Base):
     def test_legacy_claim_drift_and_workspace_guard_remain(self):
         token = self.legacy_claim('old')
         for drift in ({'task_id': 'wrong'}, {'runtime': 'qoder'},
-                      {'model': 'Qwen3.8-Max'}, {'workspace': self.ws('wrong')},
+                      {'model': 'Qwen4-Max-Preview'}, {'workspace': self.ws('wrong')},
                       {'prompt_sha256': 'wrong'}, {'stage': 'wrong'}, {'chat_id': 'wrong'}):
             out = self.consume('old', token, **drift)
             self.assertEqual(out['reason'], 'claim_invalid', out)
         with closing(dp.connect(self.store)) as conn:
             dp._insert_claim(conn, task_id='other', stage='s', chat_id=None,
-                             runtime='qodercn', model='Qwen3.8-Max', pk=CN_MAX,
+                             runtime='qodercn', model='Qwen4-Max-Preview', pk=CN_MAX,
                              workspace=self.ws('old'), prompt_sha256=SHA,
                              token=None, now=NIGHT, origin='offline-legacy-fixture')
         out = self.consume('old', token)
@@ -387,7 +385,7 @@ class UserDisabledCustomMaxTests(_Base):
                              (task_id, json.dumps(scope, sort_keys=True), 'pending',
                               dp._iso(NIGHT), dp._iso(NIGHT), dp._iso(NIGHT)))
         _ticket('ticket-default', 'Qwen-3.8-Max')
-        _ticket('ticket-builtin', 'Qwen3.8-Max')
+        _ticket('ticket-builtin', 'Qwen4-Max-Preview')
         # 显式钉住生产默认 True（其它测试模块可能全局改写 dp.LUNA_DISABLED，这里不依赖
         # 全局状态，只验证 True 时的默认路径顺序）。
         with mock.patch.object(dp, 'LUNA_DISABLED', True):
@@ -405,7 +403,7 @@ class UserDisabledCustomMaxTests(_Base):
         # S2 生产缺口 2：无 --dispatch-claim 的正式 CN 入口请求精确目标时，必须在读取
         # 私有 CN 配置/模型映射之前拒绝——用不存在的 CN 配置路径反证顺序：若先读配置
         # 会打印 cn_entry_rejected，本用例要求打印用户禁用拒绝（mode_excluded）。内置
-        # 名 Qwen3.8-Max 同路径必须仍是配置错误（不误伤）。
+        # 名 Qwen4-Max-Preview 同路径必须仍是配置错误（不误伤）。
         import io
         import json
         import qoder_direct as qd
@@ -432,7 +430,7 @@ class UserDisabledCustomMaxTests(_Base):
         self.assertIn('用户要求禁用', ' '.join(receipt['reasons']))
         popen.assert_not_called()
         self.assertFalse(output.exists())
-        code2, receipt2, _popen2, output2 = _run('Qwen3.8-Max')
+        code2, receipt2, _popen2, output2 = _run('Qwen4-Max-Preview')
         self.assertEqual(code2, 2)
         self.assertTrue(receipt2['cn_entry_rejected'], receipt2)
         self.assertFalse(output2.exists())

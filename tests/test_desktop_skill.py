@@ -186,7 +186,7 @@ class GuardOnePoolKeyRealityTests(DesktopSkillTestBase):
         # 是引擎真实可派键（G1 由上面的 dispatchable 用例兜住）。
         self.assertEqual(installer.HOST_EXCLUDED["zcode"], ("zcode:GLM-5.3",))
         self.assertIn("zcode:GLM-5.3", installer.HOST_EXCLUDED["qoder"])
-        self.assertIn("qoder:Qwen3.8-Max", installer.HOST_EXCLUDED["qoder"])
+        self.assertIn("qoder:Qwen4-Max-Preview", installer.HOST_EXCLUDED["qoder"])
         self.assertIn("zcode:GLM-5.3", dp.CAPACITY)
 
     def test_sonus_excluded_by_qoder_host_only(self):

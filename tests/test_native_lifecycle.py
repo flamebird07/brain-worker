@@ -76,8 +76,8 @@ class NativeLifecycleTests(unittest.TestCase):
         plan = [('codebuddy', 'deepseek-v4.1-flash', 'codebuddy'),
                 ('codebuddy', 'glm-5.3-flash', 'codebuddy'),
                 ('zcode', 'GLM-5.3', 'zcode'),
-                ('qoder', 'Qwen3.8-Max', 'qoder'),
-                ('qodercn', 'Qwen3.8-Max', 'qodercn'),
+                ('qoder', 'Qwen4-Max-Preview', 'qoder'),
+                ('qodercn', 'Qwen4-Max-Preview', 'qodercn'),
                 ('qodercn', 'Qwen-3.8-Max', 'qodercn'),
                 ('qodercn', 'Qwen-3.8-Max', 'qodercn'),
                 ('qoder', 'Qwen3.8-Flash', 'qoder'),
@@ -162,12 +162,12 @@ class NativeLifecycleTests(unittest.TestCase):
         self.assertIsNone(conflict, conflict)
         # task 已释放：腾一个现役 qoder Max 名额后，同 task 可重新 claim（不被旧 attempt 挡）。
         # 本例验的是原生结算后的生命周期释放，不是 AUTO 优先级；BW-ZCODE-RETIRE-20261020：
-        # zcode 组合在授权门即 unknown_pool，夹具改用释放 qoder:Qwen3.8-Max 行并以显式
+        # zcode 组合在授权门即 unknown_pool，夹具改用释放 qoder:Qwen4-Max-Preview 行并以显式
         # executor='qoder' 重新 claim 同一组合（该池容量 1，释放后必空；AUTO 会被改派）。
         dp.finish(self.store, self._qmax_token(), terminal='cancelled',
                   now=T0 + timedelta(seconds=901))
         out2 = dp.reserve(self.store, task_id='task-luna', runtime='qoder',
-                          model='Qwen3.8-Max', workspace='ws-luna',
+                          model='Qwen4-Max-Preview', workspace='ws-luna',
                           prompt_sha256='f' * 64, executor='qoder',
                           now=T0 + timedelta(seconds=902))
         self.assertTrue(out2.get('token'), out2)
@@ -176,7 +176,7 @@ class NativeLifecycleTests(unittest.TestCase):
         with dp.closing(dp.connect(self.store)) as conn:
             row = conn.execute(
                 "SELECT token FROM attempts WHERE origin='reserve' "
-                "AND pool_key='qoder:Qwen3.8-Max' AND state IN ('reserved','running') "
+                "AND pool_key='qoder:Qwen4-Max-Preview' AND state IN ('reserved','running') "
                 "ORDER BY rowid LIMIT 1").fetchone()
         self.assertIsNotNone(row)
         return row['token']
@@ -336,7 +336,7 @@ class NativeLifecycleTests(unittest.TestCase):
         dp.finish(self.store, self._qmax_token(), terminal='cancelled',
                   now=T0 + timedelta(seconds=901))
         out = dp.reserve(self.store, task_id='dom-n', runtime='qoder',
-                         model='Qwen3.8-Max', workspace='ws-n', prompt_sha256='a' * 64,
+                         model='Qwen4-Max-Preview', workspace='ws-n', prompt_sha256='a' * 64,
                          executor='qoder', now=T0 + timedelta(seconds=902))
         self.assertTrue(out.get('token'), out)
         dom_tok = out['token']
@@ -426,7 +426,7 @@ class NativeLifecycleTests(unittest.TestCase):
         # （BW-MAIN-PRIORITY-S1 + BW-ZCODE-RETIRE-20261020：原借退役 zcode 组合已失效）；
         # 国内旧 finish 边界断言原样保留。
         out = dp.reserve(self.store, task_id='dom-x', runtime='qoder',
-                         model='Qwen3.8-Max', workspace='ws-x', prompt_sha256='a' * 64,
+                         model='Qwen4-Max-Preview', workspace='ws-x', prompt_sha256='a' * 64,
                          executor='qoder', now=T0)
         self.assertTrue(out.get('allowed') and out.get('token'), out)
         tok = out['token']

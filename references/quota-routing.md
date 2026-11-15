@@ -1,5 +1,7 @@
 # Quota Routing & Persistent Cooldown（BW-QUOTA-20261008-S1，S2/S3 修订）
 
+**2026-11-15 当前权威：BW-QWEN4-SONUS-REMOVE-20261115**。`qoder:Sonus` 从 strong/medium/weak **所有档位**去除新派（`SONUS_TEMP_DISABLED = True` 持久事实；AUTO/显式 reserve/select/consume/claim-due/正式入口一律 `mode_excluded`；遗留 reserved 不再放行 consume，安全释放 start_failed；running/unknown 在途不追杀、不假释放，继续安全计数与结算；浮窗三档空闲整行隐藏）。两个 Qoder 内置 Max 官方显示名改为 **Qwen4-Max-Preview**（`qoder:Qwen4-Max-Preview` / `qodercn:Qwen4-Max-Preview`，SDK argv 与池键同字面串）；旧池键 `qoder:Qwen3.8-Max` / `qodercn:Qwen3.8-Max` 以 0 容量降为 legacy-retired（不接新派、绝不映射到新池，在途照常计数与自然终态结算）。带短横线的 `qodercn:Qwen-3.8-Max` 仍为独立已禁用自定义池，历史身份与禁用语义不变。本段覆盖本文及更早各段中一切 Sonus 新派资格与「Qwen3.8-Max（经 2026-11-15 批量改名同步显示为 Qwen4-Max-Preview）」的现行表述；历史段落仅作存档。
+
 > **最新权威覆盖（BW-SONUS-REENABLE-20261029-R3，优先于下文一切旧覆盖）：**
 > 用户明确要求 `qoder:Sonus`（Qoder 国际／Sonus）**恢复常态新派资格**（唯一权威开关
 > `scripts/dispatch_mode.py` 的 `SONUS_TEMP_DISABLED = False`；明确覆盖
@@ -22,7 +24,7 @@
 > `luna_disabled` 遮蔽）、无 claim 的正式 CN 入口（在读取私有 CN 配置/模型映射、建目录、
 > Popen 之前）一律 `mode_excluded`、拒绝原因如实为「用户要求禁用」。禁用前合法取得且仍
 > reserved 的精确 claim 继续经完整校验启动；遗留在途不追杀、不假释放；额度/限额标记语义
-> 不变、不查余额。绝不误伤内置名 `qodercn:Qwen3.8-Max`（无短横线，照常可派）。下文
+> 不变、不查余额。绝不误伤内置名 `qodercn:Qwen4-Max-Preview`（无短横线，照常可派）。下文
 > 「三路 Max/自定义 Max 当前可新派/参与候选」的叙述均为历史覆盖前记录，涉及该池现行可派
 > 性时以此段为准。
 
@@ -31,7 +33,7 @@
 > 派发档位是全宿主共享的**手动三档** strong／medium／weak，**默认 weak**，唯一策略来源
 > `scripts/dispatch_mode.py`（`~/.brain-worker/dispatch-mode.json`，`BRAIN_WORKER_DISPATCH_MODE_FILE`
 > 可覆盖；切档原子保存、**只影响新派发**，在途任务不中断；缺文件/畸形/非法/不可读一律**安全回落
-> weak**）。strong 仅 5 个精确池（ZCode > Claude > 三路 Qwen3.8-Max，全部无时段门）；medium 同
+> weak**）。strong 仅 5 个精确池（ZCode > Claude > 三路 Qwen4-Max-Preview，全部无时段门）；medium 同
 > 5 池但层序为 三 Max > Claude > ZCode（三 Max 夜间门 + Claude 工作日高峰门）；weak（默认）才有
 > 全部 11 池（两个 CN Max > ZCode > Claude > 国际 Max > CodeBuddy DeepSeek > 两 OpenCode >
 > CodeBuddy GLM > 两 Flash），三 Max 夜间门 + Claude 高峰门照旧；层序权威数字见
@@ -42,11 +44,11 @@
 > （当作窗口关闭）。下方「Claude 全天可派」「国际 Max 全天可派」两段旧覆盖一律归档，已被本段取代。
 
 > 【历史档案，已被上方 BW-MANUAL-THREE-MODE-DOCS-20261023 覆盖】**旧覆盖（BW-CLAUDE-ALLDAY-QMAX-AFTER-20261023）：**
-> `claude:deepseek-flash` 曾解除全部派发时段限制、全天可派；国际 `qoder:Qwen3.8-Max` 曾全天可派
+> `claude:deepseek-flash` 曾解除全部派发时段限制、全天可派；国际 `qoder:Qwen4-Max-Preview` 曾全天可派
 > 且层序排 Claude 紧邻之后。额度语义当时不变、现在也不变。
 
 > 【历史档案，已被上方 BW-MANUAL-THREE-MODE-DOCS-20261023 覆盖】**旧覆盖（BW-QODER-INTL-MAX-ALLDAY-20261023）：**
-> 国际 Qoder Max `qoder:Qwen3.8-Max` 曾解除北京时间 22:00–08:00 时段限制、全天可参与 AUTO、显式
+> 国际 Qoder Max `qoder:Qwen4-Max-Preview` 曾解除北京时间 22:00–08:00 时段限制、全天可参与 AUTO、显式
 > `reserve`/`select`/`consume`/`claim-due`，时段门权威集合当时只剩两个 CN Max。额度语义不变。
 
 > **最新政策覆盖（BW-SIMPLE-PRIORITY-RETRY-S3，优先于下文旧叙述）：** 用户决定「反复试不是
@@ -69,7 +71,7 @@
 > Qwen3.8-Flash（8）之前。
 > ZCode 恢复为正常可派主力：`zcode:GLM-5.3` 最近一次真实结构化限额在 1800 秒内仍须从新
 > 派发候选过滤，恰满 1800 秒自动恢复原优先级；availability 诊断照旧保留、绝不伪造额度健康。
-> BW-QWEN-MAX-LIMIT15-20261028：两个 Qoder 内置 Max（`qoder:Qwen3.8-Max`、`qodercn:Qwen3.8-Max`）的真实限额标记改走 **900 秒（15 分钟）只读短窗**——窗口内 AUTO/显式 reserve/select-and-claim/consume/claim-due 与浮窗同口径拒绝并显示“上轮限额”，恰满 900 秒自动消退、按原优先级重新可选；不删 `main_force_limits` 证据、不宣称额度恢复。原三池（ZCode/Claude/CodeBuddy deepseek）仍为 1800 秒；带短横线的 `qodercn:Qwen-3.8-Max` 不进短窗（维持全档禁用现状），`qoder:Sonus` 不吃任何 Max 限额标记。
+> BW-QWEN-MAX-LIMIT15-20261028：两个 Qoder 内置 Max（`qoder:Qwen4-Max-Preview`、`qodercn:Qwen4-Max-Preview`）的真实限额标记改走 **900 秒（15 分钟）只读短窗**——窗口内 AUTO/显式 reserve/select-and-claim/consume/claim-due 与浮窗同口径拒绝并显示“上轮限额”，恰满 900 秒自动消退、按原优先级重新可选；不删 `main_force_limits` 证据、不宣称额度恢复。原三池（ZCode/Claude/CodeBuddy deepseek）仍为 1800 秒；带短横线的 `qodercn:Qwen-3.8-Max` 不进短窗（维持全档禁用现状），`qoder:Sonus` 不吃任何 Max 限额标记。
 > 两个 CodeBuddy 精确模型**额度独立、不共享名额，各自独立 1 槽**（现行总 15）；
 > 不套时段门。GLM **不再要求当轮 DeepSeek 明确限额证据**（旧证据门自
 > BW-LIMIT30-20261019-S3 起撤销，`--codebuddy-quota-evidence` 仅作兼容参数保留、缺失不拒绝）。

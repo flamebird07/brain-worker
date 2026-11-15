@@ -346,6 +346,7 @@ def main() -> int:
     proc, summary, state = run_transport(tag, mode='ok', extra=['--preflight-only'])
     facts = [proc.returncode == 0, summary['preflight_only'] is True,
              summary['submitted'] is False, submit_count(tag) == 0,
+             summary['quota_settlement']['terminal_state'] == 'no_attempt',
              not (tag / 'response.md').exists(), state['bound'] is False,
              'preflight-only' in json.dumps(state['reasons'], ensure_ascii=False)]
     check('preflight-only checks selectability only and submits nothing',

@@ -14,6 +14,7 @@
     "builtin_provider_config / personal_provider_config 会被注入为官方环境变量 ZCODE_BUILTIN_PROVIDER_CONFIG_FILE 与 ZCODE_PERSONAL_PROVIDER_CONFIG_FILE（两者必须同时提供）。",
     "environment 是可选的字符串到字符串映射，只放明确需要透传给官方运行时的变量；不要写凭据值。",
     "version 可选，只作为官方 createZCodeApp 的构建标识透传；已验证的同进程调用曾传 0.16.9。缺省时由官方默认值决定，若官方要求该值会按失败保留证据，不静默猜测。",
-    "node_args 与 runner 是可选的高级覆盖项，仅供离线测试替换执行载体；真实派工不要设置，缺省等价于 ['--import', <tsx_loader 的 fileURL>]。"
+    "node_args 与 runner 是可选的高级覆盖项，仅供离线测试替换执行载体；真实派工不要设置，缺省等价于 ['--import', <tsx_loader 的 fileURL>]。",
+    "BW-MAC-COMPAT-20261114-S1：macOS 上桌面端自带的 ~/.local/share/zcode-cli/zcode.cjs 可作 `zcode app-server` 传输载体（scripts/zcode_appserver_direct.py），实测不能作为本入口的 bootstrap 模块导入；SDK 直连在 macOS 与 Windows 同法，需官方源码树构建 bootstrap/dist 与 tsx loader。Mac 可用 BRAIN_WORKER_ZCODE_SOURCE 指定源码目录后运行 python3 scripts/zcode_direct.py --suggest-config（只读，绝不代写配置）。"
   ]
 }

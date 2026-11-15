@@ -192,15 +192,15 @@ class AuthorizationTests(_Base):
         # 强档白天：可派池全部无时段门，常态层序 Sonus(1) → ZCode(2) → claude(3) →
         # 三 Max(4)；回执层号与排除原因随档位切换，绝不沿用弱档表。CodeBuddy 不在强档
         # 硬集合内，即便带真实限额标记也先报 mode_excluded（档位排除先于限额原因，
-        # 绝不冒充 main_force_limited）。BW-SONUS-REENABLE-20261029-R3：Sonus 恢复
-        # 常态新派——strong 规划首选 Sonus(1)，下一候选 ZCode(2)。
+        # 绝不冒充 main_force_limited）。BW-QWEN4-SONUS-REMOVE-20261115：Sonus 已从
+        # 所有档位去除——strong 规划首选 ZCode(2)（Sonus 绝不入选），下一候选 claude(3)。
         with dispatch_mode('strong'):
             r = self.plan(self.auth('auto', 'T', 's2', allowed), now=T_DAY)
             self.assertEqual(r['dispatch_mode'], 'strong', r)
-            self.assertEqual(r['selected_priority'], 1, r)
-            self.assertEqual(r['selected']['pool_key'], dp.SONUS_POOL_KEY, r)
+            self.assertEqual(r['selected_priority'], 2, r)
+            self.assertEqual(r['selected']['pool_key'], dp.ZCODE_POOL_KEY, r)
             eligible = {x['pool_key']: x for x in r['eligible_candidates']}
-            self.assertEqual(eligible[dp.SONUS_POOL_KEY]['priority'], 1)
+            self.assertNotIn(dp.SONUS_POOL_KEY, eligible)
             self.assertEqual(eligible[dp.ZCODE_POOL_KEY]['priority'], 2)
             self.assertEqual(eligible[dp.CLAUDE_POOL_KEY]['priority'], 3)
             self.assertEqual(eligible[dp.CLAUDE_POOL_KEY]['capacity'], 2)
@@ -211,8 +211,8 @@ class AuthorizationTests(_Base):
                              'mode_excluded')
             self.assertEqual(excluded[dp.OPENCODE_DEEPSEEK_POOL_KEY]['reason'],
                              'mode_excluded')
-            self.assertEqual(r['next_candidate']['priority'], 2)
-            self.assertEqual(r['next_candidate']['pool_key'], dp.ZCODE_POOL_KEY)
+            self.assertEqual(r['next_candidate']['priority'], 3)
+            self.assertEqual(r['next_candidate']['pool_key'], dp.CLAUDE_POOL_KEY)
 
     def test_expired_structured_limit_opens_new_round_and_restores_priority(self):
         self.build_store()
@@ -278,7 +278,7 @@ class AuthorizationTests(_Base):
             conn.execute('PRAGMA journal_mode=DELETE')
         # BW-QODER-INTL-MAX-ALLDAY-20261023：国际 Max 白天可派，先占满其唯一名额，
         # 层=2 的 ZCode 才是最高可用层（两个 CN Max 仍被夜间门挡下）。
-        self.reserve('im', 'qoder', 'Qwen3.8-Max', executor='qoder')
+        self.reserve('im', 'qoder', 'Qwen4-Max-Preview', executor='qoder')
         r = self.plan(self.auth('auto', 'T', 's2', ALL_MAINS + ALL_FLASH), now=T_DAY)
         self.assertIsNone(r['refused'], r)
         self.assertEqual(r['candidate_filters'][dp.CODEBUDDY_POOL_KEY],
@@ -305,13 +305,13 @@ class AuthorizationTests(_Base):
         self.assertEqual(r['candidate_filters'][dp.OPENCODE_DEEPSEEK_POOL_KEY],
                          'not_authorized')
         self.assertEqual(r['candidate_filters'][dp.ZCODE_POOL_KEY], 'not_authorized')
-        self.assertEqual(r['candidate_filters']['qoder:Qwen3.8-Max'], 'not_authorized')
+        self.assertEqual(r['candidate_filters']['qoder:Qwen4-Max-Preview'], 'not_authorized')
 
     def test_executor_falls_to_own_flash_never_cross(self):
         self.build_store()
         # 白天国际 Max 名额占满（BW-QODER-INTL-MAX-ALLDAY-20261023 起它全天可派）→
         # executor='qoder' 落到同区 Flash；绝不落到 CN。
-        self.reserve('im', 'qoder', 'Qwen3.8-Max', executor='qoder')
+        self.reserve('im', 'qoder', 'Qwen4-Max-Preview', executor='qoder')
         auth = self.auth('executor', 'T', 's2', ALL_MAINS + ALL_FLASH, executor='qoder')
         r = self.plan(auth, now=T_DAY)
         self.assertEqual(r['selected_reason'], 'executor_region_flash', r)
@@ -349,7 +349,7 @@ class AuthorizationTests(_Base):
         self.assertEqual(r['refused'], None, r)
         self.assertEqual(r['selected_reason'], 'executor_region_main', r)
         self.assertIn(r['selected']['pool_key'], dp.OPENCODE_POOL_KEYS, r)
-        self.assertEqual(r['candidate_filters']['qoder:Qwen3.8-Max'], 'not_authorized')
+        self.assertEqual(r['candidate_filters']['qoder:Qwen4-Max-Preview'], 'not_authorized')
         # claude 与恢复枚举的 zcode 都如实不跨执行器（not_authorized）。
         self.assertEqual(r['candidate_filters'][dp.CLAUDE_POOL_KEY], 'not_authorized')
         self.assertEqual(r['candidate_filters'][dp.ZCODE_POOL_KEY], 'not_authorized')
@@ -630,7 +630,7 @@ class WindowAndLimitTests(_Base):
         self.build_store()
         r = self.plan(self.auth('auto', 'T', 's2', LEGACY_MAINS + ALL_FLASH), now=T_DAY)
         self.assertEqual(r['selected']['pool_key'], dp.ZCODE_POOL_KEY, r)
-        self.assertEqual(r['candidate_filters']['qoder:Qwen3.8-Max'], 'window_closed')
+        self.assertEqual(r['candidate_filters']['qoder:Qwen4-Max-Preview'], 'window_closed')
         self.assertEqual(r['candidate_filters'][dp.CN_MAX_POOL_KEY], 'window_closed')
         self.assertEqual(r['candidate_filters'][dp.CN_CUSTOM_MAX_POOL_KEY],
                          'mode_excluded')
@@ -647,7 +647,7 @@ class WindowAndLimitTests(_Base):
     def test_night_admits_gated_max_and_keeps_fairness(self):
         self.build_store()
         r = self.plan(self.auth('auto', 'T', 's2', ALL_MAINS + ALL_FLASH), now=T_NIGHT)
-        self.assertEqual(r['candidate_filters']['qoder:Qwen3.8-Max'], 'eligible')
+        self.assertEqual(r['candidate_filters']['qoder:Qwen4-Max-Preview'], 'eligible')
         self.assertEqual(r['candidate_filters'][dp.CLAUDE_POOL_KEY], 'eligible')
         # BW-ZCODE-RESTORE-1-20261022：ZCode 恢复为逐候选枚举的现役候选（夜间亦然）。
         self.assertEqual(r['candidate_filters'][dp.ZCODE_POOL_KEY], 'eligible')
@@ -657,9 +657,9 @@ class WindowAndLimitTests(_Base):
         真实尝试——QMAX 带限额标记在本轮仍 eligible，绝不因历史标记永久/到期后剔除；
         真实 429/失败才落诊断、成功/失败 CAS 结算不变。"""
         self.build_store()
-        self.set_limit('qoder:Qwen3.8-Max')
+        self.set_limit('qoder:Qwen4-Max-Preview')
         r = self.plan(self.auth('auto', 'T', 's2', ALL_MAINS + ALL_FLASH), now=T_NIGHT)
-        self.assertEqual(r['candidate_filters']['qoder:Qwen3.8-Max'], 'eligible')
+        self.assertEqual(r['candidate_filters']['qoder:Qwen4-Max-Preview'], 'eligible')
         self.assertNotEqual(r['selected']['pool_key'], None)
 
     def test_capacity_full_filter_and_fallback(self):
@@ -686,19 +686,19 @@ class NightAutoCustomMaxRegression(_Base):
         限额标记，本轮仍 eligible，绝不因历史标记把它们剔除；按既有 Max>Claude>Z 优先级
         选择最高优先层的空位池。allowed 全集与逐候选原因如实保留，不缩权、不假装撤权。"""
         self.build_store()
-        self.set_limit('qoder:Qwen3.8-Max')
-        self.set_limit('qodercn:Qwen3.8-Max')
+        self.set_limit('qoder:Qwen4-Max-Preview')
+        self.set_limit('qodercn:Qwen4-Max-Preview')
         allowed = LEGACY_MAINS + ALL_FLASH
         r = self.plan(self.auth('auto', 'T', 's2', allowed), now=T_NIGHT)
         self.assertEqual(r['refused'], None, r)
         self.assertEqual(sorted(r['allowed_candidates']), sorted(allowed))  # 不缩权
-        self.assertEqual(r['candidate_filters']['qoder:Qwen3.8-Max'], 'eligible')
-        self.assertEqual(r['candidate_filters']['qodercn:Qwen3.8-Max'], 'eligible')
+        self.assertEqual(r['candidate_filters']['qoder:Qwen4-Max-Preview'], 'eligible')
+        self.assertEqual(r['candidate_filters']['qodercn:Qwen4-Max-Preview'], 'eligible')
         self.assertEqual(r['candidate_filters'][dp.CN_CUSTOM_MAX_POOL_KEY], 'mode_excluded')
         self.assertNotIn('explicitly_limited', set(r['candidate_filters'].values()))
         # 最高优先层（三 Max）有空位即被选中，绝不下探 Claude/Flash/Z
-        self.assertIn(r['selected']['pool_key'], ['qoder:Qwen3.8-Max',
-                                                   'qodercn:Qwen3.8-Max',
+        self.assertIn(r['selected']['pool_key'], ['qoder:Qwen4-Max-Preview',
+                                                   'qodercn:Qwen4-Max-Preview',
                                                    dp.CN_CUSTOM_MAX_POOL_KEY], r)
         self.assertNotEqual(r['selected']['pool_key'], dp.CLAUDE_POOL_KEY)
         self.assertNotIn(r['selected']['pool_key'], ALL_FLASH)
@@ -712,7 +712,7 @@ class NightAutoCustomMaxRegression(_Base):
         self.assertEqual(r['refused'], None, r)
         self.assertEqual(sorted(r['allowed_candidates']), sorted(cn_scope))
         self.assertTrue(r['selected']['pool_key'].startswith('qodercn:'), r)
-        self.assertEqual(r['candidate_filters']['qoder:Qwen3.8-Max'], 'not_authorized')
+        self.assertEqual(r['candidate_filters']['qoder:Qwen4-Max-Preview'], 'not_authorized')
         self.assertEqual(r['candidate_filters'][dp.CLAUDE_POOL_KEY], 'not_authorized')
         # 别区 OpenCode 与 ZCode 都如实 not_authorized（不在本轮输入里≠用户撤权）。
         self.assertEqual(r['candidate_filters'][dp.OPENCODE_DEEPSEEK_POOL_KEY],
@@ -726,7 +726,7 @@ class NightAutoCustomMaxRegression(_Base):
         r = self.plan(self.auth('auto', 'T', 's2', [CN_FLASH]), now=T_NIGHT)
         self.assertEqual(r['refused'], None, r)
         self.assertEqual(r['selected']['pool_key'], CN_FLASH, r)
-        self.assertEqual(r['candidate_filters']['qoder:Qwen3.8-Max'], 'not_authorized')
+        self.assertEqual(r['candidate_filters']['qoder:Qwen4-Max-Preview'], 'not_authorized')
         self.assertEqual(r['candidate_filters'][dp.CN_CUSTOM_MAX_POOL_KEY], 'not_authorized')
 
 
@@ -743,14 +743,14 @@ class PreviousAndConflictTests(_Base):
     def test_task_in_flight_blocks_new_decision(self):
         self.build_store()
         # BW-ZCODE-RETIRE-20261020：在途守卫用例改用现役组合（qoder Max），语义不变。
-        self.reserve('T', 'qoder', 'Qwen3.8-Max', executor='qoder')
+        self.reserve('T', 'qoder', 'Qwen4-Max-Preview', executor='qoder')
         r = self.plan(self.auth('auto', 'T', 's2', ALL_MAINS + ALL_FLASH))
         self.assertEqual(r['refused'], 'task_in_flight')
 
     def test_workspace_conflict_rejects_whole_item(self):
         self.build_store()
         shared = self._ws('shared')
-        self.reserve('a', 'qoder', 'Qwen3.8-Max', ws=shared, executor='qoder')
+        self.reserve('a', 'qoder', 'Qwen4-Max-Preview', ws=shared, executor='qoder')
         r = self.plan(self.auth('auto', 'T', 's2', ALL_MAINS + ALL_FLASH), ws=shared)
         self.assertEqual(r['refused'], 'workspace_conflict')
 
@@ -827,7 +827,7 @@ class TemporaryFallbackTests(_Base):
     def test_expired_temp_parent_candidates_intersect_base(self):
         self.build_store()
         # 父授权只允许国际 Max，base 只授权 CN Flash → 交集空 → 拒绝（不扩权）
-        parent = self.auth('auto', 'T', 's2', ['qoder:Qwen3.8-Max'])
+        parent = self.auth('auto', 'T', 's2', ['qoder:Qwen4-Max-Preview'])
         auth = self.auth('temporary_fallback', 'T', 's1', [CN_FLASH],
                          fallback_scope={'task_id': 'T', 'stage': 's1'},
                          runtime='qodercn', model='Qwen3.8-Flash',
@@ -943,7 +943,7 @@ class ContextAndReadOnlyTests(_Base):
         writer = dp.connect(self.store)
         try:
             dp._rotation_row(writer)
-            r = dp.reserve(self.store, task_id='Q', runtime='qoder', model='Qwen3.8-Max',
+            r = dp.reserve(self.store, task_id='Q', runtime='qoder', model='Qwen4-Max-Preview',
                            workspace=self._ws('Q'), prompt_sha256='p', executor='qoder',
                            now=T_NIGHT, _preclaim=False)
             self.assertTrue(r.get('reserved') or r.get('allowed'), r)
@@ -1075,7 +1075,7 @@ class PermissionGrantsTests(_Base):
         BW-QODER-INTL-MAX-ALLDAY-20261023：国际 Max 白天也可派且层=1，故先占满其唯一
         名额后 ZCode 才是最高可用层。"""
         self.build_store()
-        self.reserve('im', 'qoder', 'Qwen3.8-Max', executor='qoder')
+        self.reserve('im', 'qoder', 'Qwen4-Max-Preview', executor='qoder')
         r = self.plan(self.auth('auto', 'T', 's2', LEGACY_MAINS + ALL_FLASH), now=T_DAY)
         self.assertEqual(r['selected']['pool_key'], dp.ZCODE_POOL_KEY, r)
         self.assertEqual(r['candidate_filters'][dp.ZCODE_POOL_KEY], 'eligible')
@@ -1165,7 +1165,7 @@ class PermissionGrantsTests(_Base):
         BW-ZCODE-RETIRE-20261020：在途占位改用现役 qoder Max 组合，守卫语义不变。"""
         self.build_store()
         shared = self._ws('shared')
-        self.reserve('a', 'qoder', 'Qwen3.8-Max', ws=shared, executor='qoder')
+        self.reserve('a', 'qoder', 'Qwen4-Max-Preview', ws=shared, executor='qoder')
         r = self.plan(self.auth('auto', 'T', 's2', ALL_MAINS + ALL_FLASH),
                       ws=shared, permission_grants=self.FINE)
         self.assertEqual(r['refused'], 'workspace_conflict')
@@ -1284,7 +1284,7 @@ class PermissionGrantsTests(_Base):
         的能力表。BW-QODER-INTL-MAX-ALLDAY-20261023：国际 Max 白天可派且能力兼容，故先
         占满其唯一名额，层=2 的 ZCode 才是最高可用层。"""
         self.build_store()
-        self.reserve('im', 'qoder', 'Qwen3.8-Max', executor='qoder')
+        self.reserve('im', 'qoder', 'Qwen4-Max-Preview', executor='qoder')
         r = self.plan(self.auth('auto', 'T', 's2', ALL_MAINS + ALL_FLASH), now=T_DAY,
                       permission_grants={'edits': ['Edit(C:/a.py)'], 'bash': [],
                                          'read_dirs': []})
@@ -1346,7 +1346,7 @@ class TaskScopeTests(_Base):
         只有两个 CN Max 窗关，国际 Max 可派且层=1，故先占满其唯一名额。"""
         self.build_store()
         self.set_limit(dp.CLAUDE_POOL_KEY)
-        self.reserve('im', 'qoder', 'Qwen3.8-Max', executor='qoder')
+        self.reserve('im', 'qoder', 'Qwen4-Max-Preview', executor='qoder')
         r = self.plan(self.auth('auto', 'T', 's2', LEGACY_MAINS + ALL_FLASH), now=T_DAY,
                       task_scope=self.SCOPE)
         self.assertEqual(r['refused'], None, r)
@@ -1412,7 +1412,7 @@ class TaskScopeTests(_Base):
         可选（层=2 直接选中）。BW-QODER-INTL-MAX-ALLDAY-20261023：国际 Max 白天可派且
         能力兼容，故先占满其唯一名额。"""
         self.build_store()
-        self.reserve('im', 'qoder', 'Qwen3.8-Max', executor='qoder')
+        self.reserve('im', 'qoder', 'Qwen4-Max-Preview', executor='qoder')
         r = self.plan(self.auth('auto', 'T', 's2', ALL_MAINS + ALL_FLASH), now=T_DAY,
                       permission_grants={'edits': ['Edit(source/f1.cjs)'], 'bash': [],
                                          'read_dirs': []},
@@ -1445,7 +1445,7 @@ class TaskScopeTests(_Base):
                           now=T_DAY, task_scope=self.SCOPE)
             self.assertEqual(r['zcode_blocked'], True)
             self.assertEqual(r['candidate_filters'][dp.ZCODE_POOL_KEY], 'eligible', r)
-        self.reserve('T', 'qoder', 'Qwen3.8-Max', executor='qoder')
+        self.reserve('T', 'qoder', 'Qwen4-Max-Preview', executor='qoder')
         r = self.plan(self.auth('auto', 'T', 's2', ALL_MAINS + ALL_FLASH),
                       task_scope=self.SCOPE)
         self.assertEqual(r['refused'], 'task_in_flight')

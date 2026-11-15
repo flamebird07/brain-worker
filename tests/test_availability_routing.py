@@ -35,7 +35,7 @@ T0 = datetime(2026, 10, 8, 15, 0, 0, tzinfo=timezone.utc)  # 北京时间 23:00�
 PROVIDER = 'account:bigmodel-individual-coding-plan'      # 受信任（含 bigmodel）
 UNTRUSTED = 'account:some-other-vendor-plan'              # 非受信任渠道
 ZCODE = 'zcode:GLM-5.3'
-QMAX = 'qoder:Qwen3.8-Max'
+QMAX = 'qoder:Qwen4-Max-Preview'
 QFLASH = 'qoder:Qwen3.8-Flash'
 SECTIONS = pc.SECTION_HEADERS
 CLOSING = pc.CLOSING_LINE
@@ -129,7 +129,7 @@ class _TmpBase(unittest.TestCase):
     def _fill_six_locked(self):
         toks = []
         combos = [('zcode', 'GLM-5.3'),
-                  ('qoder', 'Qwen3.8-Max'), ('qodercn', 'Qwen3.8-Max'),
+                  ('qoder', 'Qwen4-Max-Preview'), ('qodercn', 'Qwen4-Max-Preview'),
                   ('qodercn', 'Qwen-3.8-Max'), ('qodercn', 'Qwen-3.8-Max'),
                   ('qoder', 'Qwen3.8-Flash'), ('qoder', 'Qwen3.8-Flash'),
                   ('qodercn', 'Qwen3.8-Flash'), ('qodercn', 'Qwen3.8-Flash'),
@@ -380,7 +380,7 @@ class DispatchRoutingTests(_TmpBase):
         # 历史 committed_zcode 远高于 qoder，但显式 Qoder 入口有空位一律直接 claim Max。
         self._seed_rotation(5, 0)
         out = dp.consume_for_entry(self.dispatch, task_id='t2', runtime='qoder',
-                                   model='Qwen3.8-Max', workspace=str(self._ws_for('t2')),
+                                   model='Qwen4-Max-Preview', workspace=str(self._ws_for('t2')),
                                    prompt_sha256='p', stage='s1', chat_id='c1',
                                    executor='qoder', quota_store=self.quota, now=T0)
         self.assertTrue(out['allowed'], out)
@@ -482,12 +482,12 @@ class DispatchRoutingTests(_TmpBase):
             self.assertTrue(r.get('allowed') and r.get('token'), r)
             toks.append(r['token'])
         r = dp.reserve(self.dispatch, task_id='q0', runtime='qoder',
-                      model='Qwen3.8-Max', workspace=str(self._ws_for('q0')),
+                      model='Qwen4-Max-Preview', workspace=str(self._ws_for('q0')),
                       prompt_sha256='p', stage='s1', now=T0, executor='qoder')
         self.assertTrue(r.get('allowed') and r.get('token'), r)
         toks.append(r['token'])
         r = dp.reserve(self.dispatch, task_id='cq0', runtime='qodercn',
-                      model='Qwen3.8-Max', workspace=str(self._ws_for('cq0')),
+                      model='Qwen4-Max-Preview', workspace=str(self._ws_for('cq0')),
                       prompt_sha256='p', stage='s1', now=T0, executor='qodercn')
         self.assertTrue(r.get('allowed') and r.get('token'), r)
         toks.append(r['token'])
@@ -868,7 +868,7 @@ class LunaStateMachineTests(_TmpBase):
                       now=T0, degradation_reason='auth',
                       degradation_detail='executor auth failed this round',
                       quota_store=self.quota)
-        # combos[1] 是 (qoder, Qwen3.8-Max)：释放一个合格主力空位观察回收。
+        # combos[1] 是 (qoder, Qwen4-Max-Preview)：释放一个合格主力空位观察回收。
         self._free_slot(toks[1])
         out = dp.claim_due(self.dispatch, task_id='par',
                            now=T0 + timedelta(seconds=400), quota_store=self.quota)
@@ -1105,7 +1105,7 @@ class ZCodeEntryAvailabilityTests(_TmpBase):
         def spy_evaluate(baseline, work, copies_dir=None):
             # 冻结进行中：原 zcode attempt 仍 active → 同 workspace 的第二 writer 必须被拒。
             second = dp.select_and_claim(dispatch_store, task_id='second-writer',
-                                         runtime='qoder', model='Qwen3.8-Max',
+                                         runtime='qoder', model='Qwen4-Max-Preview',
                                          workspace=str(self.ws), prompt_sha256='x' * 64,
                                          stage='s2', executor='qoder', now=T0,
                                          _preclaim=False)
@@ -1151,7 +1151,7 @@ class ZCodeEntryAvailabilityTests(_TmpBase):
                          and summary.get('placeholders_retained'))
         # 释放后同 workspace 第二 writer 现可放行（守卫确已打开，名额最终归还）。
         after = dp.select_and_claim(dispatch_store, task_id='second-writer',
-                                    runtime='qoder', model='Qwen3.8-Max',
+                                    runtime='qoder', model='Qwen4-Max-Preview',
                                     workspace=str(self.ws), prompt_sha256='x' * 64,
                                     stage='s2', executor='qoder', now=T0,
                                     _preclaim=False)
@@ -1246,14 +1246,14 @@ class QoderEntryRoutingTests(_TmpBase):
         cmd = [sys.executable, self._runner(),
                '--workspace', str(work), '--prompt-file', str(prompt),
                '--output-dir', str(out), '--config', str(cfg), '--stage', stage,
-               '--model', 'Qwen3.8-Max', '--dispatch-store', str(self.dispatch),
+               '--model', 'Qwen4-Max-Preview', '--dispatch-store', str(self.dispatch),
                '--quota-store', str(self.quota), '--quota-routes', str(self.routes)]
         proc = subprocess.run(cmd, capture_output=True, env=env, timeout=120)
         self.assertEqual(proc.returncode, 0, proc.stdout.decode('utf-8', 'replace')
                           + proc.stderr.decode('utf-8', 'replace'))
         summary = json.loads((out / 'summary.json').read_text(encoding='utf-8'))
         self.assertTrue(summary['protocol_success'], summary)
-        # 落库 attempt 必须是 qoder:Qwen3.8-Max，绝无 ZCode attempt。
+        # 落库 attempt 必须是 qoder:Qwen4-Max-Preview，绝无 ZCode attempt。
         # 只取本测试任务（task_id=stage）自己的行：setUp 占住 CodeBuddy 名额的真实 fixture
         # 行同样在 attempts 内，不能把整表都当成 Qoder 入口提交的行。
         with contextlib.closing(dp.connect(self.dispatch)) as conn:
@@ -1485,12 +1485,12 @@ class B4LunaReplyAndConstraintTests(_TmpBase):
     def test_reclaim_honors_scope_qoder_executor(self):
         # 缺陷 7 + B4 combo：scope 声明 qoder/Max 时，即便 ZCode 有空位也绝不改派 ZCode。
         sc = self._scope('qe')
-        sc = {**sc, 'executor': 'qoder', 'runtime': 'qoder', 'model': 'Qwen3.8-Max'}
+        sc = {**sc, 'executor': 'qoder', 'runtime': 'qoder', 'model': 'Qwen4-Max-Preview'}
         # 占满 QMax 两席 + Flash 两席以正当化 capacity 降级。
         toks = []
         for i in range(2):
             r = dp.reserve(self.dispatch, task_id=f'a{i}', runtime='qoder',
-                           model='Qwen3.8-Max', workspace=str(self._ws_for(f'a{i}')),
+                           model='Qwen4-Max-Preview', workspace=str(self._ws_for(f'a{i}')),
                            prompt_sha256='p', stage='s1', now=T0, executor='qoder')
             toks.append(r['token'])
         for i in range(2):
@@ -1545,7 +1545,7 @@ class B4ComboExplicitTests(_TmpBase):
             conn.execute("INSERT INTO rotation(pool_group, committed_zcode, committed_qoder, "
                          "updated_at_utc) VALUES('main',0,5,?)", (qc._iso(T0),))
         out = dp.consume_for_entry(self.dispatch, task_id='nq', runtime='qoder',
-                                   model='Qwen3.8-Max', workspace=str(self._ws_for('nq')),
+                                   model='Qwen4-Max-Preview', workspace=str(self._ws_for('nq')),
                                    prompt_sha256='p', stage='s1', chat_id='c1',
                                    executor='qoder', quota_store=self.quota, now=T0)
         self.assertTrue(out['allowed'], out)
@@ -1817,8 +1817,8 @@ class B5ScopeComboTests(_TmpBase):
 
     def test_combo_without_runtime_reclaims_only_flash_never_max(self):
         sc = {**self._scope('fl'), 'executor': 'qoder', 'model': 'Qwen3.8-Flash'}
-        # BW-POOL-SPLIT-20261010-S3：国际 Qwen3.8-Max 只有 1 槽；填 1 Max + 2 Flash。
-        max_toks = [self._reserve(0, 'qoder', 'Qwen3.8-Max', 'qoder')]
+        # BW-POOL-SPLIT-20261010-S3：国际 Qwen4-Max-Preview 只有 1 槽；填 1 Max + 2 Flash。
+        max_toks = [self._reserve(0, 'qoder', 'Qwen4-Max-Preview', 'qoder')]
         flash_toks = [self._reserve(i, 'qoder', 'Qwen3.8-Flash', 'qoder') for i in range(2)]
         ask = dp.ask_record(self.dispatch, task_id='fl', scope=sc, ask_message_id='m1',
                             now=T0, degradation_reason='capacity',
@@ -1833,7 +1833,7 @@ class B5ScopeComboTests(_TmpBase):
 
     def test_combo_without_runtime_reclaims_flash_when_flash_frees(self):
         sc = {**self._scope('fr'), 'executor': 'qoder', 'model': 'Qwen3.8-Flash'}
-        self._reserve(0, 'qoder', 'Qwen3.8-Max', 'qoder')
+        self._reserve(0, 'qoder', 'Qwen4-Max-Preview', 'qoder')
         flash_toks = [self._reserve(i, 'qoder', 'Qwen3.8-Flash', 'qoder') for i in range(2)]
         ask = dp.ask_record(self.dispatch, task_id='fr', scope=sc, ask_message_id='m1',
                             now=T0, degradation_reason='capacity',
@@ -2097,7 +2097,7 @@ class PreauthRoundFailureContinuationTests(_TmpBase):
 
     # ---- BW-CONTINUE-20261019-S8 收口：allowed_candidates 单候选正/负例 + quota 耗尽正例 ----
     def test_allowed_candidates_single_full_exhausted_luna_at_301(self):
-        # 单候选正例：allowed_candidates 只授权 qoder:Qwen3.8-Max 且该候选客观全满时，
+        # 单候选正例：allowed_candidates 只授权 qoder:Qwen4-Max-Preview 且该候选客观全满时，
         # auth 降级 + 预授权经耗尽核验可记录；299 秒仍 not_due，301 秒按原单 Luna 单赢家。
         self._fill_six()
         sc = self._pa_scope('ac-one', allowed_candidates=[QMAX])
@@ -2131,7 +2131,7 @@ class PreauthRoundFailureContinuationTests(_TmpBase):
                             degradation_detail='the only authorized candidate is full',
                             quota_store=self.quota)
         self.assertTrue(ask['recorded'], ask)
-        self._finish_token(toks[1])  # qoder:Qwen3.8-Max 腾出真实空位
+        self._finish_token(toks[1])  # qoder:Qwen4-Max-Preview 腾出真实空位
         out = dp.claim_due(self.dispatch, task_id='ac-free',
                            now=T0 + timedelta(seconds=299), quota_store=self.quota)
         self.assertTrue(out['claimed'], out)
@@ -2144,7 +2144,7 @@ class PreauthRoundFailureContinuationTests(_TmpBase):
         # 绝不猜候选、绝不把空/未知授权当作耗尽；票据不存在，无任何 Luna 副作用。
         self._fill_six()
         for i, bad in enumerate(([], 'not-a-list', ['bogus:model'], [dp.LUNA_KEY],
-                                 [''], ['qoder:Qwen3.8-Max', ''])):
+                                 [''], ['qoder:Qwen4-Max-Preview', ''])):
             with self.subTest(bad=bad):
                 tid = f'ac-bad{i}'
                 sc = self._pa_scope(tid, allowed_candidates=bad)

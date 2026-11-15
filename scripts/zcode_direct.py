@@ -16,6 +16,7 @@ import hashlib
 import json
 import os
 import re
+import shutil
 import subprocess
 import sys
 from datetime import datetime, timezone
@@ -115,6 +116,72 @@ def _derive_embedded_search_backend_entry(bootstrap_path):
 
 def _now() -> str:
     return datetime.now(timezone.utc).isoformat()
+
+
+# ---- BW-MAC-COMPAT-20261114-S1：--suggest-config 本机运行时探测（只读 doctor） ----
+# 只收集路径、只报告事实，绝不写入/修改任何文件，绝不替用户落 zcode-entry.json。
+
+_SUGGEST_NOTES = (
+    '本探测只检查本地文件路径，不读取凭据，也不写入入口配置。',
+    'SDK 入口需要源码构建的 bootstrap/dist/index.js 与 tsx loader；桌面 CLI 不导出 SDK 接口。',
+    '可通过 BRAIN_WORKER_ZCODE_SOURCE 指定官方源码目录，或分别指定 '
+    'BRAIN_WORKER_ZCODE_BOOTSTRAP 与 BRAIN_WORKER_ZCODE_TSX_LOADER。',
+    '配置骨架仍需通过 --preflight-only 验证账户授权及模型选择。',
+)
+
+
+def default_runtime_candidates(home=None):
+    """Collect local SDK paths without opening provider configuration files."""
+    home = Path(home) if home else Path.home()
+    apps = [root / 'ZCode.app' / 'Contents' / 'Resources'
+            for root in (home / 'Applications', Path('/Applications'))]
+    source_value = os.environ.get('BRAIN_WORKER_ZCODE_SOURCE')
+    source = Path(source_value).expanduser().resolve() if source_value else None
+    bootstrap = os.environ.get('BRAIN_WORKER_ZCODE_BOOTSTRAP')
+    loader = os.environ.get('BRAIN_WORKER_ZCODE_TSX_LOADER')
+    node = shutil.which('node')
+    return {
+        'node': [node] if node else [],
+        'bootstrap': ([bootstrap] if bootstrap else []) + (
+            [source / 'apps/zcode-cli/packages/bootstrap/dist/index.js'] if source else []),
+        'tsx_loader': ([loader] if loader else []) + (
+            [source / 'node_modules/tsx/dist/loader.mjs'] if source else []),
+        'builtin_provider_config': [
+            app / 'config/provider/zcode-builtin.json' for app in apps
+        ] if sys.platform == 'darwin' else [],
+        'personal_provider_config': [home / '.zcode/v2/provider_config.json'],
+    }
+
+
+def suggest_entry_config(candidates):
+    """Return a configuration skeleton only when all required files exist."""
+    checks = []
+    chosen = {}
+    for kind in CONFIG_FILE_KEYS:
+        cands = [str(Path(candidate).expanduser().absolute())
+                 for candidate in candidates.get(kind, ()) if candidate]
+        hit = next((candidate for candidate in cands if Path(candidate).is_file()), None)
+        checks.append({'kind': kind, 'status': 'present' if hit else 'missing',
+                       'candidates': cands, 'chosen': hit})
+        if hit:
+            chosen[kind] = hit
+    all_present = len(chosen) == len(CONFIG_FILE_KEYS)
+    return {
+        'status': 'complete' if all_present else 'incomplete',
+        'all_present': all_present,
+        'checks': checks,
+        'skeleton': chosen if all_present else None,
+        'notes': list(_SUGGEST_NOTES),
+    }
+
+
+def run_suggest_config():
+    """--suggest-config：打印本机探测结果 JSON；探测本身成功即退出 0，
+    完备与否由 status 字段如实表达（doctor 不是派发，不走 2/3 退出码）。"""
+    result = suggest_entry_config(default_runtime_candidates())
+    result['machine_platform'] = sys.platform
+    print(json.dumps(result, ensure_ascii=False, indent=2))
+    return 0
 
 
 def load_zcode_config(path=None) -> dict:
@@ -581,6 +648,10 @@ def _zcode_failure_facts(summary: dict, envelope, events: list,
 
 
 def main():
+    # BW-MAC-COMPAT-20261114-S1：只读 doctor 早于 argparse（--workspace 等必填参数
+    # 不适用于纯探测），探测结果只打印、零写入。
+    if '--suggest-config' in sys.argv[1:]:
+        return run_suggest_config()
     ap = argparse.ArgumentParser(description=__doc__)
     ap.add_argument('--workspace', required=True)
     ap.add_argument('--prompt-file', required=True)
@@ -1069,13 +1140,21 @@ def main():
             return {'settled': False, 'released': False, 'token': claim_token,
                     'terminal': terminal, 'error': str(exc)}
 
-    quota_gate = qc.gate_dispatch(
-        quota_store, runtime='zcode',
-        identity={'provider': args.provider},
-        workspace=str(work),
-        purpose='probe' if args.quota_probe else 'dispatch',
-        routes_path=args.quota_routes,
-        verified_pool_claim=quota_verified_claim)
+    quota_gate = {'allowed': True, 'purpose': 'registry_preflight'}
+    if not args.preflight_only:
+        quota_gate = qc.gate_dispatch(
+            quota_store, runtime='zcode',
+            identity={'provider': args.provider},
+            workspace=str(work),
+            purpose='probe' if args.quota_probe else 'dispatch',
+            routes_path=args.quota_routes,
+            verified_pool_claim=quota_verified_claim)
+
+    def _settle_quota(**kwargs):
+        if args.preflight_only:
+            return {'settled': False, 'released': False, 'terminal_state': 'no_attempt'}
+        return qc.settle_attempt(quota_store, quota_gate, **kwargs)
+
     if not quota_gate['allowed']:
         # 额度门拒绝：释放刚拿到的容量名额（若有，带 owner 身份）+ 归还 availability probe
         # 资格（executed=False，从未真实提交），零输出目录、零 Popen。
@@ -1094,8 +1173,7 @@ def main():
     # 零 Popen。用一个局部收口函数，避免各提前 return 泄漏占位或泄漏容量名额。
     def _abort_before_start(payload, code):
         payload = dict(payload)
-        payload['quota_settlement'] = qc.settle_attempt(
-            quota_store, quota_gate, terminal='start_failed')
+        payload['quota_settlement'] = _settle_quota(terminal='start_failed')
         # Popen 前失败：availability probe 从未真实执行 → 只归还 probe 资格（executed=False）。
         payload['zcode_availability_settled'] = _settle_availability(executed=False)
         if claim_token is not None:
@@ -1325,7 +1403,7 @@ def main():
                     # 启动且存活未知——只标 unknown 继续占容量与占位，绝不释放、绝不误抢、
                     # 绝不杀其它任务，交 reconcile/人工核验；如实上报，不谎称成功或已释放。
                     dp.mark_unknown(dispatch_store, claim_token)
-                    qc.settle_attempt(quota_store, quota_gate, terminal='unknown')
+                    _settle_quota(terminal='unknown')
                     print(json.dumps({'dispatch_failed': True, 'sent': True,
                                       'terminal_state': 'unknown', 'capacity_held': True,
                                       'reasons': [f'could not bind child to claim: '
@@ -1344,6 +1422,8 @@ def main():
                         timed_out = True
                         child.kill()
                         child.communicate()
+                elif args.preflight_only:
+                    child.wait(timeout=90)
                 else:
                     child.wait()
             except subprocess.TimeoutExpired:
@@ -1354,7 +1434,7 @@ def main():
         # 中断时子进程存活未知：只标 unknown 继续占容量与占位，绝不释放、绝不误抢，交由 reconcile。
         if claim_token is not None:
             dp.mark_unknown(dispatch_store, claim_token)
-        qc.settle_attempt(quota_store, quota_gate, terminal='unknown')
+        _settle_quota(terminal='unknown')
         raise
     except Exception as exc:
         if child is None:
@@ -1365,8 +1445,7 @@ def main():
             # 绝不留 active、绝不假称恢复；无子进程不算真实失败，也不消耗该代际唯一一次资格。
             _settle_availability(executed=False)
             rel = _release_capacity('start_failed')
-            settlement = qc.settle_attempt(quota_store, quota_gate,
-                                          terminal='start_failed')
+            settlement = _settle_quota(terminal='start_failed')
             print(json.dumps({'dispatch_failed': True, 'sent': False,
                               'capacity_released': bool(rel.get('released')),
                               'availability_settled_unexecuted': True,
@@ -1375,7 +1454,7 @@ def main():
             return 3
         if claim_token is not None:
             dp.mark_unknown(dispatch_store, claim_token)
-        settlement = qc.settle_attempt(quota_store, quota_gate, terminal='unknown')
+        settlement = _settle_quota(terminal='unknown')
         print(json.dumps({'dispatch_failed': True, 'sent': True,
                           'terminal_state': 'unknown',
                           'reasons': [f'subprocess terminal state could not be '
@@ -1710,7 +1789,7 @@ def main():
         except Exception as exc:
             # 保全失败：保留真实错误 + 在途占位（settle unknown，不释放），不先释放再假装保全。
             summary['continuation_persist_failed'] = str(exc)
-            settlement = qc.settle_attempt(quota_store, quota_gate, terminal='unknown')
+            settlement = _settle_quota(terminal='unknown')
             summary['quota_settlement'] = {
                 'settled': settlement.get('settled'), 'released': settlement.get('released'),
                 'terminal_state': settlement.get('terminal_state'),
@@ -1733,8 +1812,8 @@ def main():
     summary['capacity_terminal'] = capacity_release.get('terminal')
     # 额度终态结算（缺陷 C/E/F）：确认终态 → 同一事务原子写冷却/清除 + 释放占位。非 429
     # 失败/取消/probe 超时 → 只结算占位，既不写冷却也绝不写 healthy。迟到成功不得覆盖新冷却。
-    settlement = qc.settle_attempt(
-        quota_store, quota_gate, terminal='confirmed_exit',
+    settlement = _settle_quota(
+        terminal='confirmed_exit',
         success=bool(summary['protocol_success'] is True and not args.preflight_only),
         classification=classification,
         source='zcode_direct terminal envelope (exit '
@@ -1752,7 +1831,8 @@ def main():
         executed=True,
         success=bool(summary['protocol_success'] is True and not args.preflight_only))
     if timed_out:
-        summary['quota_probe_timed_out'] = True
+        timeout_field = 'preflight_timed_out' if args.preflight_only else 'quota_probe_timed_out'
+        summary[timeout_field] = True
     if wrapper is not None:
         # 保留原始引用与来源 SHA（脱敏白名单，不含 headers），不猜时区、不自动重派。
         summary['quota_wrapper_reference'] = {

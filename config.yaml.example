@@ -2,8 +2,9 @@
 # config.yaml 已加入 .gitignore，只存本地，不进仓库。
 #
 # 使用场景：
-# - GPT 桌面（Windows）原有人工转发用法不需要本文件：GPT 做主脑，直接按
-#   human-relay 生成提示词，由用户转发外部桌面 Agent 并上传原始报告。
+# - GPT 桌面（Windows）与 ChatGPT 桌面（Mac，BW-MAC-COMPAT-20261114）原有人工转发
+#   用法不需要本文件：GPT 做主脑，直接按 human-relay 生成提示词，由用户转发外部
+#   桌面 Agent 并上传原始报告。
 # - Linux 场景分别记录宿主/运行环境与主脑驱动；二者可以形成嵌套架构，例如
 #   在 muse 宿主环境中调用 codex-cli 作为主脑驱动。本仓库不假定宿主的厂商、
 #   安装命令或专有 API。

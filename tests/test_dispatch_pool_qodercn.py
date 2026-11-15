@@ -4,7 +4,7 @@
 
 BW-POOL-SPLIT-20261010-S3 五池真实布局：CN 不再走 DeepSeek-Flash（该池已从正常候选
 退出，capacity=0，仅保留池名让真实旧在途到达终态释放）。CN 内置候选改为
-qodercn:Qwen3.8-Max（主力，1 槽）与 qodercn:Qwen3.8-Flash（同级兜底，2 槽）。
+qodercn:Qwen4-Max-Preview（主力，1 槽）与 qodercn:Qwen3.8-Flash（同级兜底，2 槽）。
 覆盖任务书明确要求、且**只有这些**新行为：
 1. CN 内置 Max=1、CN Flash=2、国内总容量 15（BW-ZCODE-RESTORE-1-20261022：ZCode 恢复为
    正常可派主力、严格 1 槽）；国际 Max=1、国际 Flash=2。CN 组合既可经显式 executor=
@@ -48,10 +48,10 @@ except Exception:  # noqa: BLE001 - 隔离树无 quota_control 时跳过 Z-hold 
 
 T0 = datetime(2026, 10, 8, 15, 0, 0, tzinfo=timezone.utc)  # 北京时间 23:00（主力时段内）
 CN = 'qodercn:DeepSeek-Flash'  # 已 retired：capacity=0，任何新派一律 unknown_pool
-CN_MAX = 'qodercn:Qwen3.8-Max'
+CN_MAX = 'qodercn:Qwen4-Max-Preview'
 CN_FLASH = 'qodercn:Qwen3.8-Flash'
 ZCODE = 'zcode:GLM-5.3'  # BW-ZCODE-RESTORE-1-20261022：恢复可派主力（严格 1 槽、层=2）
-QMAX = 'qoder:Qwen3.8-Max'
+QMAX = 'qoder:Qwen4-Max-Preview'
 QFLASH = 'qoder:Qwen3.8-Flash'
 PROVIDER = 'account:bigmodel-individual-coding-plan'
 
@@ -104,9 +104,9 @@ class _Store(unittest.TestCase):
         return str(d)
 
     def cn(self, task, workspace=None):
-        """CN 内置主力 qodercn:Qwen3.8-Max（capacity=1）。"""
+        """CN 内置主力 qodercn:Qwen4-Max-Preview（capacity=1）。"""
         return dp.select_and_claim(self.store, task_id=task, runtime='qodercn',
-                                   model='Qwen3.8-Max',
+                                   model='Qwen4-Max-Preview',
                                    workspace=workspace or self.ws(task),
                                    prompt_sha256='c' * 64, executor='qodercn',
                                    now=T0, _preclaim=False)
@@ -178,8 +178,8 @@ class CapacityAndRotationTests(_Store):
         # + claude 2 + 两区 Flash 各 2 + 两 OpenCode 免费槽各 1）+ setUp 的 CodeBuddy
         # deepseek 1 与 GLM 1 → 总 15。
         fill = [('z0', 'zcode', 'GLM-5.3', 'zcode'),
-                ('q0', 'qoder', 'Qwen3.8-Max', 'qoder'),
-                ('c0', 'qodercn', 'Qwen3.8-Max', 'qodercn'),
+                ('q0', 'qoder', 'Qwen4-Max-Preview', 'qoder'),
+                ('c0', 'qodercn', 'Qwen4-Max-Preview', 'qodercn'),
                 ('cu0', 'qodercn', 'Qwen-3.8-Max', 'qodercn'),
                 ('cu1', 'qodercn', 'Qwen-3.8-Max', 'qodercn'),
                 ('cl0', 'claude', 'deepseek-flash', 'claude'),
@@ -239,7 +239,7 @@ class CapacityAndRotationTests(_Store):
                                     _preclaim=False)
         self.assertTrue(draft['allowed'], draft)
         draft = dp.select_and_claim(self.store, task_id='r-q', runtime='qoder',
-                                    model='Qwen3.8-Max', workspace=self.ws('r-q'),
+                                    model='Qwen4-Max-Preview', workspace=self.ws('r-q'),
                                     prompt_sha256='p', executor='qoder', now=T0,
                                     _preclaim=False)
         self.assertTrue(draft['allowed'], draft)
@@ -253,7 +253,7 @@ class CapacityAndRotationTests(_Store):
 class CrossRegionParallelTests(_Store):
     def test_cn_and_international_parallel_different_workspace(self):
         intl = dp.select_and_claim(self.store, task_id='i1', runtime='qoder',
-                                    model='Qwen3.8-Max', workspace=self.ws('i1'),
+                                    model='Qwen4-Max-Preview', workspace=self.ws('i1'),
                                     prompt_sha256='p', executor='qoder', now=T0,
                                     _preclaim=False)
         cnr = self.cn('n1')
@@ -268,7 +268,7 @@ class CrossRegionParallelTests(_Store):
     def test_same_workspace_single_writer_across_runtimes(self):
         shared = self.ws('shared')
         intl = dp.select_and_claim(self.store, task_id='sw-i', runtime='qoder',
-                                   model='Qwen3.8-Max', workspace=shared,
+                                   model='Qwen4-Max-Preview', workspace=shared,
                                    prompt_sha256='p', executor='qoder', now=T0,
                                    _preclaim=False)
         self.assertTrue(intl['allowed'], intl)
@@ -283,7 +283,7 @@ class CrossRuntimeClaimTests(_Store):
         cnr = self.cn('cr')
         tok = cnr['token']
         out = dp.consume_for_entry(self.store, task_id='cr', runtime='qoder',
-                                   model='Qwen3.8-Max', workspace=self.ws('cr'),
+                                   model='Qwen4-Max-Preview', workspace=self.ws('cr'),
                                    prompt_sha256='c' * 64, claim_token=tok,
                                    wrapper_pid=4321, wrapper_created='w', now=T0,
                                    executor='qoder')
@@ -293,11 +293,11 @@ class CrossRuntimeClaimTests(_Store):
         self.assertEqual(dp.status(self.store, now=T0)['pools'][CN_MAX]['active'], 1)
 
     def test_international_token_rejected_by_cn_entry(self):
-        intl = dp.reserve(self.store, task_id='ic', runtime='qoder', model='Qwen3.8-Max',
+        intl = dp.reserve(self.store, task_id='ic', runtime='qoder', model='Qwen4-Max-Preview',
                           workspace=self.ws('ic'), prompt_sha256='i' * 64,
                           now=T0, executor='qoder', _preclaim=False)
         out = dp.consume_for_entry(self.store, task_id='ic', runtime='qodercn',
-                                   model='Qwen3.8-Max', workspace=self.ws('ic'),
+                                   model='Qwen4-Max-Preview', workspace=self.ws('ic'),
                                    prompt_sha256='i' * 64, claim_token=intl['token'],
                                    wrapper_pid=4321, wrapper_created='w', now=T0,
                                    executor='qodercn')
@@ -320,8 +320,8 @@ class TerminalReleaseTests(_Store):
         # 再补 CN 自定义 Max 2 + 两 CN Flash + 两 OpenCode 免费槽 → 其余 13 满，加上
         # setUp 真实占住的 CodeBuddy deepseek 1 与 GLM 1 → 总 15 满；Luna 阈值随总 15 更新
         # （9/15 不算 full，15/15 才满）。
-        fill = [('f0', 'zcode', 'GLM-5.3', 'zcode'), ('f1', 'qoder', 'Qwen3.8-Max', 'qoder'),
-                ('f3', 'qodercn', 'Qwen3.8-Max', 'qodercn'),
+        fill = [('f0', 'zcode', 'GLM-5.3', 'zcode'), ('f1', 'qoder', 'Qwen4-Max-Preview', 'qoder'),
+                ('f3', 'qodercn', 'Qwen4-Max-Preview', 'qodercn'),
                 ('f4', 'claude', 'deepseek-flash', 'claude'),
                 ('f5', 'claude', 'deepseek-flash', 'claude'),
                 ('f6', 'qoder', 'Qwen3.8-Flash', 'qoder'),
@@ -369,8 +369,8 @@ class DomesticReclaimTests(_Store):
         # 名额 → 国内恢复空位 → claim_due 原子 domestic_reclaim 复用既有候选顺序选中该
         # CN Flash，绝不因未满而错误升级 Luna。
         fill = [('r0', 'zcode', 'GLM-5.3', 'zcode'),
-                ('r2', 'qoder', 'Qwen3.8-Max', 'qoder'),
-                ('r3', 'qodercn', 'Qwen3.8-Max', 'qodercn'),
+                ('r2', 'qoder', 'Qwen4-Max-Preview', 'qoder'),
+                ('r3', 'qodercn', 'Qwen4-Max-Preview', 'qodercn'),
                 ('r3a', 'qodercn', 'Qwen-3.8-Max', 'qodercn'),
                 ('r3b', 'qodercn', 'Qwen-3.8-Max', 'qodercn'),
                 ('r3c', 'claude', 'deepseek-flash', 'claude'),

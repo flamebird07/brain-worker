@@ -72,24 +72,21 @@ import dispatch_mode as dmode  # noqa: E402  手动三档（strong/medium/weak�
 # dispatch_mode.priority_map_for_mode 重排），本表只定名称/注释与 stable-tie 基准序
 # （weak 档层序：两个 CN Max(1) > ZCode(2) > Claude(3) > 国际 Qoder Max(4) > CodeBuddy
 # DeepSeek(5) > 两 OpenCode(6) > CodeBuddy GLM(7) > 两区 Flash(8)；Sonus 不参与 weak）。
-# BW-SONUS-REENABLE-20261029-R3（当前权威）：Sonus 恢复常态新派——strong 空闲显示
-# 且排第一；medium/weak 空闲隐藏；切档前遗留在 medium/weak 整行保留并标「本档不参与」
-# 直到真实终态。暂时禁用展示（三档空闲整行隐藏、遗留标「暂时禁用（用户指令）」）只在
-# dmode.SONUS_TEMP_DISABLED=True 时生效。历史：20261026 首次禁用 → 20261028 早上
-# BW-SONUS-REENABLE-20261028 恢复启用 → 20261028 R2 再禁用 → 20261029 R3 恢复。
-# BW-STRONG-SONUS-20261024（常态口径，R3 起恢复生效）：qoder:Sonus 是
-# strong 专属行（strong 档排第一）；medium/weak 空闲时整行隐藏，strong 启动后在途切档
-# 仍保留显示并标「本档不参与」。
+# BW-QWEN4-SONUS-REMOVE-20261115（当前权威）：Sonus 从所有档位去除新派——三档空闲一律
+# 整行隐藏（绝不显示可派行）；真实在途（reserved/running/unknown 遗留）整行保留并标
+# 「不接新派（用户指令）」直到真实终态；遗留 reserved 不放行启动（安全释放 start_failed）。
+# 历史：BW-STRONG-SONUS-20261024 曾为 strong 专属行 → 20261026 首次禁用 → 20261028
+# 早上恢复启用 → 20261028 R2 再禁用 → 20261029 R3 恢复 → 20261115 从所有档位去除。
 # BW-LUNA-DISABLED-20261019：Luna 已从牛马删除，绝不显示可派行；旧记录只按退休历史审计。
 # 退休池（qodercn:DeepSeek-Flash、WorkBuddy 等）不显示成可派，但其真实在途仍计入总占用
 # （见 retired_active）；zcode:GLM-5.3 已按 BW-ZCODE-RESTORE-1-20261022 恢复为可派行。
 ROW_DEFS = (
     (dp.SONUS_POOL_KEY, 'Qoder 国际／Sonus', '强档独占 · 独立 1 槽 · 无时段门'),
     (dp.CN_CUSTOM_MAX_POOL_KEY, 'Qoder CN／token plan／Qwen-3.8-Max', '主力 Max · 夜间窗'),
-    (dp.CN_MAX_POOL_KEY, 'Qoder CN／Qwen3.8-Max', '主力 Max · 夜间窗'),
+    (dp.CN_MAX_POOL_KEY, 'Qoder CN／Qwen4-Max-Preview', '主力 Max · 夜间窗'),
     (dp.ZCODE_POOL_KEY, 'ZCode／GLM-5.3', '主力 · 全天'),
     (dp.CLAUDE_POOL_KEY, 'Claude Code／deepseek-flash', '主力 · 全天 · 无时段门'),
-    (dp.QMAX_POOL_KEY, 'Qoder 国际／Qwen3.8-Max', '主力 Max · 国际内置 · 全天'),
+    (dp.QMAX_POOL_KEY, 'Qoder 国际／Qwen4-Max-Preview', '主力 Max · 国际内置 · 全天'),
     (dp.CODEBUDDY_POOL_KEY, 'CodeBuddy 国际／Deepseek-V4.1-Flash', '主力 · 无时段门'),
     (dp.OPENCODE_DEEPSEEK_POOL_KEY, 'OpenCode／deepseek-v4.1-flash-free',
      '主力 · 独立 1 槽 · 无时段门'),
@@ -104,14 +101,13 @@ ROW_DEFS = (
 STATE_LABELS = {'running': '运行中', 'unknown': '待核实', 'reserved': '已预留',
                 'idle': '空闲', 'window_closed': '时段外', 'read_failed': '读取失败',
                 'mode_excluded': '本档不参与'}
-# BW-SONUS-TEMP-DISABLE-20261026（历史；R2 20261028 曾再度生效；R3 20261029 恢复后
-# 不生效）：Sonus 排除行的专属标签——只在 dmode.SONUS_TEMP_DISABLED=True（全档暂时
-# 禁用）期间用于 Sonus 行，绝不冒充失败/限额/永久退役；只影响展示文案，不改任何判定。
-SONUS_TEMP_DISABLED_LABEL = '暂时禁用（用户指令）'
+# BW-QWEN4-SONUS-REMOVE-20261115：Sonus 去除后排除行的专属标签——Sonus 有真实在途
+# 遗留时用于 Sonus 行，绝不冒充失败/限额/永久退役；只影响展示文案，不改任何判定。
+SONUS_TEMP_DISABLED_LABEL = '不接新派（用户指令）'
 
 
 def _sonus_temp_disabled() -> bool:
-    """Sonus「暂时禁用」展示分支的唯一权威门：直读 dispatch_mode 开关，绝不复制副本。"""
+    """Sonus「不接新派」展示分支的唯一权威门：直读 dispatch_mode 开关，绝不复制副本。"""
     return bool(getattr(dmode, 'SONUS_TEMP_DISABLED', False))
 
 # BW-MANUAL-THREE-MODE-20261023（用户明确指令）：浮窗顶部三个手动档位按钮「强 / 中 / 弱」，
@@ -182,7 +178,7 @@ PREV_LIMIT_LABEL = '上轮限额'
 QUOTA_LIMIT_WINDOW_SECONDS = 1800
 # BW-LIMIT30-20261019-S3：浮窗 30 分钟窗口覆盖 CodeBuddy/deepseek、ZCode/GLM-5.3 与
 # Claude/deepseek-flash 三个精确池；其它池（Qoder Max 等）保持原有 token 规则。
-# BW-QWEN-MAX-LIMIT15-20261028：两个 Qoder 内置 Max（qoder:Qwen3.8-Max / qodercn:Qwen3.8-Max）
+# BW-QWEN-MAX-LIMIT15-20261028：两个 Qoder 内置 Max（qoder:Qwen4-Max-Preview / qodercn:Qwen4-Max-Preview）
 # 加入同一权威映射并改走 **900 秒（15 分钟）展示短窗**；原三池仍 1800 秒。窗口秒数一律取
 # dispatch_pool.QUOTA_LIMIT_WINDOW_BY_POOL（派发门与浮窗同口径），不在本文件另设数字。
 WINDOW_LIMIT_POOLS = tuple(dp.QUOTA_LIMIT_WINDOW_BY_POOL)
@@ -739,11 +735,11 @@ def detail_text(row):
         if row['pool_key'] in dmode.USER_DISABLED_POOL_KEYS:
             lines.append('已禁用（用户指令）：' + dmode.mode_excluded_reason(row['pool_key']))
         elif row['pool_key'] == dp.SONUS_POOL_KEY and _sonus_temp_disabled():
-            lines.append('暂时禁用（用户指令）：qoder:Sonus 当前不参与任何档位的新派发'
-                         '（可逆临时禁用，不是额度/认证/时段问题，也不是永久退役）；'
+            lines.append('不接新派（用户指令）：qoder:Sonus 已从所有档位去除新派'
+                         '（不是额度/认证/时段问题）；'
                          '新 reserve/select/consume/claim-due 一律 mode_excluded'
-                         '（sent=false、零占位）。已在途 attempt 照原状态自然结束，'
-                         '绝不中断、释放或改派')
+                         '（sent=false、零占位）。真实在途 attempt 照原状态自然结束，'
+                         '绝不中断、假释放或改派；遗留 reserved 安全释放为 start_failed')
         else:
             lines.append('本档不参与：当前档位只允许 '
                          + dmode.MODE_SCOPE_TEXT[dmode.load_mode()['mode']]
@@ -788,15 +784,69 @@ def detail_text(row):
 # ------------------------------------------------------------------ 单实例
 _MUTEX_NAME = 'BW-WorkerStatusWidget-SingleInstance'
 _mutex_handle = None
+# BW-MAC-COMPAT-20261114-S1：POSIX 分支的 flock 句柄（('held'|'degraded', fd|None)）。
+_posix_handle = None
+
+
+def _posix_single_instance_lock_path():
+    """POSIX 单实例锁文件：与共享调度池同一状态目录（~/.brain-worker）。"""
+    return Path.home() / '.brain-worker' / 'widget-instance.lock'
+
+
+def _acquire_posix_single_instance(lock_path=None):
+    """POSIX flock 单实例闸（BW-MAC-COMPAT-20261114-S1，mac/Linux 对等 Windows mutex）：
+    返回 ('held', fd)=本实例持锁；None=已有实例持锁（单实例拒绝）；
+    ('degraded', None)=目录不可写/flock 不可用等无法建闸——诚实降级放行，
+    与 Windows 分支失败放行的既有姿态一致，绝不伪称已验证。绝不阻塞等待。"""
+    try:
+        import fcntl
+    except ImportError:
+        return ('degraded', None)
+    path = Path(lock_path) if lock_path else _posix_single_instance_lock_path()
+    try:
+        path.parent.mkdir(parents=True, exist_ok=True)
+        fd = os.open(path, os.O_RDWR | os.O_CREAT, 0o600)
+    except OSError:
+        return ('degraded', None)
+    try:
+        fcntl.flock(fd, fcntl.LOCK_EX | fcntl.LOCK_NB)
+    except OSError:
+        os.close(fd)
+        return None
+    try:
+        os.ftruncate(fd, 0)
+        os.write(fd, str(os.getpid()).encode('ascii'))
+    except OSError:
+        pass  # 诊断内容写不进去不影响闸语义，锁本身已持有。
+    return ('held', fd)
+
+
+def _release_posix_single_instance(handle):
+    """幂等释放 flock：关 fd 即释锁（锁文件本身保留，防止释放/重建竞态）。"""
+    if not handle:
+        return
+    kind, fd = handle
+    if kind == 'held' and fd is not None:
+        try:
+            import fcntl
+            fcntl.flock(fd, fcntl.LOCK_UN)
+        except (OSError, ImportError):
+            pass
+        try:
+            os.close(fd)
+        except OSError:
+            pass
 
 
 def _acquire_single_instance():
-    """Windows 命名 mutex 单实例；非 Windows 或创建失败时诚实降级放行（不加第二道闸）。
+    """单实例闸：Windows 命名 mutex；POSIX（mac/Linux）flock
+    （BW-MAC-COMPAT-20261114-S1）；其余或创建失败时诚实降级放行（不加第二道闸）。
     ctypes 必须显式声明 64 位指针宽度的返回/参数类型，否则 HANDLE 会被默认 c_int
     截断（句柄值失真、CloseHandle 关错或泄漏）。失败如实返回，绝不伪称已验证。"""
-    global _mutex_handle
+    global _mutex_handle, _posix_handle
     if not sys.platform.startswith('win'):
-        return True
+        _posix_handle = _acquire_posix_single_instance()
+        return _posix_handle is not None
     try:
         import ctypes
         kernel32 = ctypes.WinDLL('kernel32', use_last_error=True)
@@ -817,7 +867,9 @@ def _acquire_single_instance():
 
 
 def _release_single_instance():
-    global _mutex_handle
+    global _mutex_handle, _posix_handle
+    _release_posix_single_instance(_posix_handle)
+    _posix_handle = None
     if _mutex_handle is not None and sys.platform.startswith('win'):
         try:
             import ctypes
@@ -1039,7 +1091,8 @@ def apply_layout(frames, *, expanded, has_rows, idle_compact):
     else:
         frames['empty'].pack(fill='x', pady=(6, 0))
     if expanded:
-        frames['idle'].pack(fill='x', pady=(6, 2))
+        if frames.get('idle') is not None:
+            frames['idle'].pack(fill='x', pady=(6, 2))
         frames['detail'].pack(fill='x', pady=(5, 0))
         # BW-WIDGET-COMPACT-FOOTER-HIDE-20261029：页脚只在展开态显示。
         frames['footer'].pack(fill='x', pady=(4, 0))
@@ -1049,6 +1102,8 @@ def apply_layout(frames, *, expanded, has_rows, idle_compact):
 
 def run_gui(store_path=None, interval=2.0):
     import tkinter as tk
+
+    is_mac = sys.platform == 'darwin'
 
     store_source = ('--store' if store_path else '环境变量'
                     if os.environ.get('BRAIN_WORKER_DISPATCH_STORE') else '默认')
@@ -1091,11 +1146,13 @@ def run_gui(store_path=None, interval=2.0):
     expand_lbl = tk.Label(title_bar, text='▸', bg=_BG, fg=_DIM, font=font_small,
                           cursor='hand2')
     expand_lbl.pack(side='left', padx=(7, 0))
-    btn_close = tk.Button(title_bar, text='×', bg=_BG, fg=_SUB,
-                          font=('Microsoft YaHei UI', 11, 'bold'), relief='flat', bd=0,
-                          activebackground=_BG, activeforeground=_RED, cursor='hand2',
-                          padx=4, pady=0)
-    btn_close.pack(side='right')
+    btn_close = None
+    if not is_mac:
+        btn_close = tk.Button(title_bar, text='×', bg=_BG, fg=_SUB,
+                              font=('Microsoft YaHei UI', 11, 'bold'), relief='flat', bd=0,
+                              activebackground=_BG, activeforeground=_RED, cursor='hand2',
+                              padx=4, pady=0)
+        btn_close.pack(side='right')
     btn_pin = tk.Button(title_bar, text='置顶:开', bg=_BG, fg=_DIM, font=font_small,
                         relief='flat', bd=0, activebackground=_BG, activeforeground=_FG,
                         cursor='hand2', padx=2)
@@ -1140,9 +1197,17 @@ def run_gui(store_path=None, interval=2.0):
     mode_state = {'current': None, 'note': None}
     mode_btns = {}
     for _value, _label in MODE_BUTTONS:
-        _btn = tk.Button(mode_frame, text=_label, font=font_bold, relief='flat', bd=0,
-                         padx=7, pady=1, cursor='hand2', bg=_CARD, fg=_SUB,
-                         activebackground=_CARD_SEL, activeforeground=_FG)
+        if is_mac:
+            # Aqua buttons can ignore the requested background. Use a themed
+            # label with explicit colors and mouse/keyboard bindings.
+            _btn = tk.Label(mode_frame, text=_label, font=font_bold,
+                            padx=7, pady=1, cursor='hand2', bg=_CARD, fg=_TITLE,
+                            takefocus=True, highlightthickness=1,
+                            highlightbackground=_BG, highlightcolor=_TITLE)
+        else:
+            _btn = tk.Button(mode_frame, text=_label, font=font_bold, relief='flat', bd=0,
+                             padx=7, pady=1, cursor='hand2', bg=_CARD, fg=_SUB,
+                             activebackground=_CARD_SEL, activeforeground=_FG)
         _btn.pack(side='left', padx=(0, 5))
         mode_btns[_value] = _btn
     mode_note_lbl = tk.Label(mode_frame, text='', bg=_BG, fg=_DIM, font=font_small,
@@ -1153,9 +1218,9 @@ def run_gui(store_path=None, interval=2.0):
         """把当前档位画成明显选中态，并如实显示来源（已保存/默认/读取失败回落）。"""
         for value, btn in mode_btns.items():
             if value == mode:
-                btn.configure(bg=_BORDER_SEL, fg=_TITLE)
+                btn.configure(bg='#2456a1' if is_mac else _BORDER_SEL, fg=_TITLE)
             else:
-                btn.configure(bg=_CARD, fg=_SUB)
+                btn.configure(bg=_CARD, fg=_TITLE if is_mac else _SUB)
         note = f'{mode_note_text(mode, source_label, error)}'
         if mode_state['note'] != note:
             mode_state['note'] = note
@@ -1175,7 +1240,11 @@ def run_gui(store_path=None, interval=2.0):
         _fit_window()
 
     for _value, _btn in mode_btns.items():
-        _btn.configure(command=lambda v=_value: _on_mode_click(v))
+        if is_mac:
+            for event in ('<ButtonRelease-1>', '<Return>', '<space>'):
+                _btn.bind(event, lambda _, v=_value: _on_mode_click(v))
+        else:
+            _btn.configure(command=lambda v=_value: _on_mode_click(v))
 
     empty_card = tk.Frame(shell, bg=_CARD, highlightbackground=_BORDER,
                           highlightthickness=1)
@@ -1189,18 +1258,20 @@ def run_gui(store_path=None, interval=2.0):
 
     # --- 空闲自动关机（BW-WIDGET-IDLE-20261018-S2）：默认不勾选、不持久化；
     # 展开/折叠只切视图，绝不勾选/停用/重置 controller；精简仍显示已开启的计时。
-    idle_ctl = IdleShutdownController(shutdown=_system_shutdown)
-    shutdown_var = tk.BooleanVar(value=False)
-    idle_frame = tk.Frame(shell, bg=_BG)
-    idle_chk = tk.Checkbutton(idle_frame, text='空闲30分钟自动关机', variable=shutdown_var,
-                              bg=_BG, fg=_SUB, font=font_small, selectcolor=_CARD,
-                              activebackground=_BG, activeforeground=_FG,
-                              anchor='w', cursor='hand2', highlightthickness=0, bd=0)
-    idle_chk.pack(side='left')
-    idle_var = tk.StringVar(value='')
-    idle_lbl = tk.Label(idle_frame, textvariable=idle_var, bg=_BG, fg=_SUB,
-                        font=font_small, anchor='e')
-    idle_lbl.pack(side='right')
+    idle_ctl = idle_frame = None
+    if not is_mac:
+        idle_ctl = IdleShutdownController(shutdown=_system_shutdown)
+        shutdown_var = tk.BooleanVar(value=False)
+        idle_frame = tk.Frame(shell, bg=_BG)
+        idle_chk = tk.Checkbutton(idle_frame, text='空闲30分钟自动关机', variable=shutdown_var,
+                                  bg=_BG, fg=_SUB, font=font_small, selectcolor=_CARD,
+                                  activebackground=_BG, activeforeground=_FG,
+                                  anchor='w', cursor='hand2', highlightthickness=0, bd=0)
+        idle_chk.pack(side='left')
+        idle_var = tk.StringVar(value='')
+        idle_lbl = tk.Label(idle_frame, textvariable=idle_var, bg=_BG, fg=_SUB,
+                            font=font_small, anchor='e')
+        idle_lbl.pack(side='right')
 
     detail_frame = tk.Frame(shell, bg=_CARD, highlightbackground=_BORDER,
                             highlightthickness=1)
@@ -1407,6 +1478,8 @@ def run_gui(store_path=None, interval=2.0):
             _set_detail('点击标题栏展开全部模型 · 点击行查看任务详情')
 
     def _refresh_idle_text():
+        if idle_ctl is None:
+            return
         st = idle_ctl.status()
         idle_var.set(idle_status_text(st))
         idle_lbl.configure(fg=_RED if st['failed'] else _SUB)
@@ -1432,7 +1505,8 @@ def run_gui(store_path=None, interval=2.0):
         _apply_mode()
         _fit_window()
 
-    idle_chk.configure(command=_on_idle_toggle)
+    if idle_ctl is not None:
+        idle_chk.configure(command=_on_idle_toggle)
 
     def _on_detail_wheel(event):
         detail_txt.yview_scroll(-1 if event.delta > 0 else 1, 'units')
@@ -1571,9 +1645,9 @@ def run_gui(store_path=None, interval=2.0):
         _render_snapshot(snap)
         # 空闲计时只消费快照；真实关机动作仅在勾选到期且 finalize 同步复核
         # 一份新只读快照（无在途、签名未变）通过后由此 GUI 路径发出。
-        idle_ctl.observe(snap)
-        if idle_ctl.due:
-            if idle_ctl.finalize(read_snapshot(store_path)) == 'failed':
+        if idle_ctl is not None:
+            idle_ctl.observe(snap)
+            if idle_ctl.due and idle_ctl.finalize(read_snapshot(store_path)) == 'failed':
                 shutdown_var.set(False)  # 显著失败并解除勾选，绝不逐轮重试
         _refresh_idle_text()
         _apply_mode()
@@ -1593,7 +1667,10 @@ def run_gui(store_path=None, interval=2.0):
         btn_pin.configure(text='置顶:开' if topmost else '置顶:关',
                           fg=_SUB if topmost else _DIM)
 
-    btn_close.configure(command=_on_close)
+    if btn_close is not None:
+        btn_close.configure(command=_on_close)
+    else:
+        root.bind('<Command-q>', lambda _: _on_close())
     btn_pin.configure(command=_toggle_pin)
 
     # --- 拖动 + 单击切换：标题栏（标题/圆点/只读/小箭头）与整张行卡都可拖，超过 3px

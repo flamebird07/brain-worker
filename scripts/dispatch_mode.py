@@ -8,15 +8,29 @@ BW-MANUAL-THREE-MODE-20261023（用户明确指令，当前权威）：
 - 缺文件 / 畸形 / 读失败一律**安全回落 weak**，并把真实来源与读取错误如实回报（
   `source` / `error`），绝不把错误冒充成用户选过的 strong/medium。
 
-三档常态新派池数 strong/medium/weak=5/4/10，槽数=6/5/13；物理登记仍为 16。
-strong 常态：Sonus(1) > ZCode(2) > Claude(3) > 两内置 Max(4)，全部无时段门。
+三档常态新派池数 strong/medium/weak=4/4/10，槽数=5/5/13；物理登记仍为 16。
+strong 常态：ZCode(2) > Claude(3) > 两内置 Qwen4-Max-Preview(4)，全部无时段门。
+
+BW-QWEN4-SONUS-REMOVE-20261115（用户明确指令，**当前权威**）：
+- Sonus（qoder:Sonus）从**所有档位**（含 strong）去除新派资格——`SONUS_TEMP_DISABLED
+  = True`（本阶段口径下为持久事实）；遗留 reserved 的 Sonus 精确 claim 不再放行 consume
+  （dispatch_pool 的 sonus_legacy_reserved 例外已删除，reserved 被安全释放为
+  start_failed，真实释放、不泄漏容量）；已在途 running/unknown 不追杀、不假释放，按既有
+  安全语义自然结束。
+- 两个 Qoder 内置 Max 官方显示名改为 **Qwen4-Max-Preview**（qoder:Qwen4-Max-Preview /
+  qodercn:Qwen4-Max-Preview，SDK argv 与池键同一字面串）；旧池键 qoder:Qwen3.8-Max /
+  qodercn:Qwen3.8-Max 在 dispatch_pool 降为 legacy-retired：不再接任何新派，旧池在途
+  attempt 继续安全计数与结算，绝不丢失。
+- 带短横线的 qodercn:Qwen-3.8-Max 仍为独立**已禁用**自定义池：历史身份与禁用语义原样
+  保留，与 CN 内置新名 qodercn:Qwen4-Max-Preview 互不冲突、互不映射。
 medium：两内置 Max(1) > Claude(2) > ZCode(3)；weak：CN 内置 Max(1) > ZCode(2) >
 Claude(3) > 国际 Max(4) > CodeBuddy DeepSeek(5) > 两 OpenCode(6) > CodeBuddy GLM(7) >
 两 Flash(8)。medium/weak 保留 Max 夜间门与 Claude 高峰门。
 2026-10-28 用户要求禁用 qodercn:Qwen-3.8-Max 新派；登记、历史和精确遗留 claim 保留。
 历史「CN 自定义 Max 恢复/三路 Max」的新派口径已被该禁用覆盖。
 
-BW-SONUS-REENABLE-20261029-R3（用户明确指令，**当前权威**）：**恢复使用**
+BW-SONUS-REENABLE-20261029-R3（历史，已被 BW-QWEN4-SONUS-REMOVE-20261115 覆盖，
+不再生效）：曾**恢复使用**
 `qoder:Sonus` 的常态新派资格——`SONUS_TEMP_DISABLED = False`，覆盖
 BW-SONUS-TEMP-DISABLE-20261028-R2 的全档临时禁用（R2、BW-SONUS-REENABLE-20261028
 与 BW-SONUS-TEMP-DISABLE-20261026 全部保留为历史）。恢复后回到
@@ -77,14 +91,15 @@ DEFAULT_MODE = 'weak'
 MODE_ENV_VAR = 'BRAIN_WORKER_DISPATCH_MODE_FILE'
 MODE_LABELS = {'strong': '强', 'medium': '中', 'weak': '弱'}
 MODE_NOTES = {
-    'strong': '强档 · Sonus／ZCode／Claude／两内置 Max · 全部无时段门',
-    'medium': '中档 · 仅 ZCode／Claude／两内置 Max · Max 夜间门 + Claude 高峰门',
+    'strong': '强档 · ZCode／Claude／两内置 Qwen4-Max-Preview · 全部无时段门',
+    'medium': '中档 · 仅 ZCode／Claude／两内置 Qwen4-Max-Preview · Max 夜间门 + Claude 高峰门',
     'weak': '弱档 · 10 个可新派池 · Max 夜间门 + Claude 高峰门',
 }
 # 每档可新派范围的纯文字描述（回执/浮窗文案用，绝不承载数字层号/容量，防漂移）。
+# BW-QWEN4-SONUS-REMOVE-20261115：Sonus 已从所有档位去除；两内置 Max 改为 Qwen4-Max-Preview。
 MODE_SCOPE_TEXT = {
-    'strong': 'Sonus／ZCode／Claude／两内置 Qwen3.8-Max（5 池）',
-    'medium': 'ZCode／Claude／两内置 Qwen3.8-Max（4 池）',
+    'strong': 'ZCode／Claude／两内置 Qwen4-Max-Preview（4 池）',
+    'medium': 'ZCode／Claude／两内置 Qwen4-Max-Preview（4 池）',
     'weak': '10 个可新派池（不含 Sonus 与 CN token plan Max）',
 }
 
@@ -94,8 +109,15 @@ MODE_SCOPE_TEXT = {
 # `test_dispatch_mode.py` 共同兜住。
 ZCODE_POOL_KEY = 'zcode:GLM-5.3'
 CLAUDE_POOL_KEY = 'claude:deepseek-flash'
-QMAX_INTL_POOL_KEY = 'qoder:Qwen3.8-Max'
-QMAX_CN_POOL_KEY = 'qodercn:Qwen3.8-Max'
+# BW-QWEN4-SONUS-REMOVE-20261115：两个 Qoder 内置 Max 官方显示名 Qwen4-Max-Preview。
+# 旧池键（qoder:Qwen3.8-Max / qodercn:Qwen3.8-Max）在 dispatch_pool 以 0 容量
+# legacy-retired 登记，仅供旧池在途 attempt 继续安全计数与结算，不参与任何档位/新派。
+QMAX_INTL_POOL_KEY = 'qoder:Qwen4-Max-Preview'
+QMAX_CN_POOL_KEY = 'qodercn:Qwen4-Max-Preview'
+QMAX_INTL_LEGACY_POOL_KEY = 'qoder:Qwen3.8-Max'
+QMAX_CN_LEGACY_POOL_KEY = 'qodercn:Qwen3.8-Max'
+# 带短横线的 CN 自定义池：独立已禁用（BW-QODERCN-TOKEN-MAX-DISABLE-20261028），
+# 与 CN 内置新名 Qwen4-Max-Preview 是两个不同池，互不冲突、互不映射。
 QMAX_CN_CUSTOM_POOL_KEY = 'qodercn:Qwen-3.8-Max'
 USER_DISABLED_POOL_KEYS = frozenset((QMAX_CN_CUSTOM_POOL_KEY,))
 CODEBUDDY_DEEPSEEK_POOL_KEY = 'codebuddy:deepseek-v4.1-flash'
@@ -108,17 +130,18 @@ QFLASH_CN_POOL_KEY = 'qodercn:Qwen3.8-Flash'
 # --list-models 核验字面名 `Sonus`）。strong 专属独立 1 槽；绝不能归入 MAX_POOL_KEYS
 # （不套任何夜间门）、不进 weak 全候选、也不是 legacy/未知池。
 SONUS_POOL_KEY = 'qoder:Sonus'
-# BW-SONUS-REENABLE-20261029-R3 唯一权威开关（当前 False；历史：20261026 首次
-# 禁用 True → 20261028 早上恢复 False → 20261028 R2 再禁用 True → 本次 20261029
-# 恢复使用 False）：
-# True = 所有档位的可新派集合剔除 Sonus（复用 mode_excluded 硬门，文案明确为用户要求
-# 的临时禁用，相关特殊分支只在 True 时生效）；False = 完整恢复 BW-STRONG-SONUS-20261024
-# 三档口径（strong 专属、层=1、独立 1 槽、无时段门）。除本开关的读取外，Sonus 的一切
-# 登记/字面量/层号历史/容量/宿主递归排除保持原样。
-SONUS_TEMP_DISABLED = False
+# BW-QWEN4-SONUS-REMOVE-20261115 唯一权威开关（当前 True；历史：20261026 首次
+# 禁用 True → 20261028 早上恢复 False → 20261028 R2 再禁用 True → 20261029 R3 恢复
+# False → 20261115 用户指令从所有档位去除、恒为 True）：
+# True = 所有档位的可新派集合剔除 Sonus（复用 mode_excluded 硬门）；本阶段口径下
+# 这是持久事实（不是可逆临时禁用），遗留 reserved 的 Sonus claim 也不再放行 consume
+# （dispatch_pool 的 sonus_legacy_reserved 例外已删除）。除本开关的读取外，Sonus 的一切
+# 登记/字面量/层号历史/容量/宿主递归排除保持原样；已在途 running/unknown 按既有安全
+# 语义自然结束（不追杀、不假释放）。
+SONUS_TEMP_DISABLED = True
 
-# 三个 Qwen3.8-Max（CN 自定义 + CN 内置 + 国际内置）。strong 全不设门；medium/weak 全部门。
-# Sonus 不在其中：它不是 Qwen3.8-Max，任何 Max 夜间门/限额标记都不得连坐到 Sonus。
+# 三个 Qwen4-Max-Preview（CN 自定义 + CN 内置 + 国际内置）。strong 全不设门；medium/weak 全部门。
+# Sonus 不在其中：它不是 Qwen4-Max-Preview，任何 Max 夜间门/限额标记都不得连坐到 Sonus。
 MAX_POOL_KEYS = (QMAX_CN_CUSTOM_POOL_KEY, QMAX_CN_POOL_KEY, QMAX_INTL_POOL_KEY)
 # strong/medium 共用的五池**硬**可派集合（strong 在此之上再加 Sonus）。
 NARROW_POOL_KEYS = (ZCODE_POOL_KEY, CLAUDE_POOL_KEY,
@@ -368,7 +391,7 @@ def window_closed_reason(pk, now=None, mode=None) -> str:
     """人类可读的时段门原因（只用于回执/浮窗，不含任何秘密）。"""
     m = normalize_mode(mode) if mode is not None else current_mode()
     if pk in MAX_POOL_KEYS:
-        return (f'{pk!r} is a Qwen3.8-Max main force that the {m} dispatch mode only allows '
+        return (f'{pk!r} is a Qwen4-Max-Preview main force that the {m} dispatch mode only allows '
                 'to be newly dispatched during the Beijing-time window 22:00 (inclusive) '
                 'to 08:00 (exclusive); it is outside that window now, so a new dispatch is '
                 'honestly refused and never silently swapped to another model')
@@ -389,19 +412,18 @@ def mode_excluded_reason(pk, mode=None) -> str:
                 '遗留在途不追杀、不假释放；禁用前合法取得且仍 reserved 的精确 claim '
                 '可沿既有校验和生命周期启动、结束。')
     if pk == SONUS_POOL_KEY and SONUS_TEMP_DISABLED:
-        # 仅在开关为 True 时生效（20261026 首次禁用；20261028 R2 再度生效；20261029
-        # R3 恢复 False 后本分支保留、不生效）。用户明确要求的**临时禁用**——如实写明缘由，
-        # 绝不伪装成额度、认证、时段或永久退役；回执仍是 mode_excluded（sent=false、
-        # 零新占位、绝不静默换模型），在途 Sonus 不追杀、不假释放。恢复 = 把开关改回
-        # False（容量/字面量/层号历史/物理总容量 16 从未删除）。
-        return (f'{pk!r} is temporarily disabled from new dispatch in ALL modes by an '
-                'explicit user instruction (a reversible temporary disable, not a '
-                'quota/auth/time-window issue and not a permanent retirement); the '
-                'request is refused as mode_excluded with sent=false and zero new '
-                'placeholders, never silently swapped to another model. In-flight '
-                'attempts of this pool are untouched and keep running to their natural '
-                'end; its capacity registration and history are fully preserved for '
-                're-enable')
+        # BW-QWEN4-SONUS-REMOVE-20261115：用户明确要求 Sonus 从所有档位去除新派——
+        # 如实写明缘由，绝不伪装成额度、认证、时段问题；回执仍是 mode_excluded
+        # （sent=false、零新占位、绝不静默换模型）。已在途 running/unknown 不追杀、
+        # 不假释放；遗留 reserved 也不放行启动（由 dispatch_pool 安全释放为
+        # start_failed，真实释放、不泄漏容量）。
+        return (f'{pk!r} is removed from new dispatch in ALL modes by an explicit '
+                'user instruction (not a quota/auth/time-window issue); the request '
+                'is refused as mode_excluded with sent=false and zero new '
+                'placeholders, never silently swapped to another model. Real '
+                'in-flight attempts keep running to their natural end and keep '
+                'their safe accounting; a leftover reserved claim of this pool is '
+                'safely released to start_failed instead of starting')
     return (f'{pk!r} is not part of the {m} dispatch mode: this mode only allows new '
             f'dispatch to {MODE_SCOPE_TEXT[m]}, so the request is '
             'refused as mode_excluded with sent=false and zero new placeholders. In-flight '

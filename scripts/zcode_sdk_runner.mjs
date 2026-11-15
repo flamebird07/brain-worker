@@ -68,7 +68,18 @@ if (typeof bootstrap.startProcessProviderRegistryRuntime !== 'function'
   bail('bootstrap module lacks startProcessProviderRegistryRuntime/createZCodeApp');
 }
 
-const registry = await bootstrap.startProcessProviderRegistryRuntime(env, { standalone: {} });
+let accountInitializationError = null;
+const registry = await bootstrap.startProcessProviderRegistryRuntime(env, {
+  standalone: {
+    onAccountInitializationError(error) {
+      if (!accountInitializationError) {
+        const code = error?.code;
+        accountInitializationError = typeof code === 'string' && /^[A-Z][A-Z0-9_]{1,79}$/.test(code)
+          ? code : 'ACCOUNT_INITIALIZATION_FAILED';
+      }
+    },
+  },
+});
 const service = registry.runtime.registryService;
 let app;
 let preflight = { stage: request.stage, selection, phase: 'init' };
@@ -152,6 +163,7 @@ async function main() {
       registry_provider_found: Boolean(provider),
       registry_model_found: Boolean(registryModel),
       registry_validation: validation,
+      ...(accountInitializationError && { account_initialization_error: accountInitializationError }),
       checked_at_utc: new Date().toISOString(),
     };
 

@@ -35,7 +35,7 @@ def make_plan(output, edits=None):
         'task_id': 'T-QODER-PERMS-OFFLINE',
         'stage': 'BW-QODER-PERMISSIONS-20261018-S2',
         'runtime': 'qoder',
-        'model': 'Qwen3.8-Max',
+        'model': 'Qwen4-Max-Preview',
         'workspace': 'C:/synthetic/ws',
         'cwd': 'C:/synthetic/ws',
         'prompt_sha256': 'a' * 64,

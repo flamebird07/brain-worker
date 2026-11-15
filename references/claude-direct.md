@@ -59,7 +59,7 @@ python scripts/claude_direct.py \
 - **独立组 claude**：committed 由 attempts 真实提交历史
   `_count_committed_claude` 统计，**绝不污染** committed_zcode/committed_qoder；
   当前口径（BW-CLAUDE-ALLDAY-QMAX-AFTER-20261023）：两个 CN Max（层=1）>
-  `zcode:GLM-5.3`（层=2）> claude（层=3，**全天可派**）> `qoder:Qwen3.8-Max`（层=4，全天）>
+  `zcode:GLM-5.3`（层=2）> claude（层=3，**全天可派**）> `qoder:Qwen4-Max-Preview`（层=4，全天）>
   `codebuddy:deepseek-v4.1-flash`（层=5）；旧"三 Qoder Max 同层""codebuddy 层=0"与跨层
   1:1 属历史、已被覆盖，历史 committed 计数照旧保留记账但不再参与跨层竞争。
 - `AUTO` **可选** claude：AUTO 的 claude 入口请求**不绕过统一选择**，经同一权威 `_select_main_force`

@@ -396,7 +396,7 @@ class TestCodeBuddyIndependentOfWindow(_PoolBase):
         self.assertNotIn(GLM, dp.QUOTA_LIMIT_WINDOW_POOLS)
         # BW-QWEN-MAX-LIMIT15-20261028：两个 Qoder 内置 Max 追加进窗口表（900 秒）。
         self.assertEqual(dp.QUOTA_LIMIT_WINDOW_POOLS,
-                         (ZC, CL, CB, 'qoder:Qwen3.8-Max', 'qodercn:Qwen3.8-Max'))
+                         (ZC, CL, CB, 'qoder:Qwen4-Max-Preview', 'qodercn:Qwen4-Max-Preview'))
         self.assertEqual(dp.QUOTA_LIMIT_WINDOW_SECONDS, 1800)
 
 

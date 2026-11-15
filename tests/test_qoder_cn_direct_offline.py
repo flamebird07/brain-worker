@@ -130,14 +130,14 @@ class ResolveModelIdTests(_NoPopen):
         self.assertEqual(qd.resolve_cn_model_id(cfg, 'DeepSeek-Flash'), 'real-id-123')
         # CN 内置官方 Qwen 白名单：字面串直传即合法成功路径（不查 model_ids、不猜 UUID、
         # 不把内置名当自定义）。这是 S2/S3 的 CN 主力/兜底组合。
-        self.assertEqual(qd.resolve_cn_model_id(cfg, 'Qwen3.8-Max'), 'Qwen3.8-Max')
+        self.assertEqual(qd.resolve_cn_model_id(cfg, 'Qwen4-Max-Preview'), 'Qwen4-Max-Preview')
         self.assertEqual(qd.resolve_cn_model_id(cfg, 'Qwen3.8-Flash'), 'Qwen3.8-Flash')
         # BW-MAX-WINDOW-20261010-S2：自定义友好名 Qwen-3.8-Max（短横线）**不是**内置白名单，
         # 必须经私有 model_ids 映射到合成真实 ID；绝不因名字像 Qwen 就当内置直传。
         self.assertNotIn('Qwen-3.8-Max', qd.CN_BUILTIN_MODELS)
         self.assertEqual(qd.resolve_cn_model_id(cfg, 'Qwen-3.8-Max'),
                          'synthetic-cn-max-real-id')
-        # 缺映射时该自定义名一律 None（零 Popen），绝不回落到内置同名 Qwen3.8-Max 或猜 UUID。
+        # 缺映射时该自定义名一律 None（零 Popen），绝不回落到内置同名 Qwen4-Max-Preview 或猜 UUID。
         self.assertIsNone(qd.resolve_cn_model_id(
             {'cli': 'x', 'config_dir': 'y', 'model_ids': {}}, 'Qwen-3.8-Max'))
         # 未映射的非内置名仍拒绝（None → 调用方零 Popen），绝不猜同名内建/Qwen。
@@ -168,7 +168,7 @@ class CnMainRefusalTests(_NoPopen):
         self.assertFalse(out_dir.exists())  # 零证据目录
 
     def test_builtin_default_model_not_refused_at_mapping(self):
-        # CN 内置白名单：缺省 --model 是 Qwen3.8-Max，属 CN 内置官方组合，映射门**不得**再
+        # CN 内置白名单：缺省 --model 是 Qwen4-Max-Preview，属 CN 内置官方组合，映射门**不得**再
         # 以“无 model_ids 映射”拒绝（旧口径已改）。用记录型假 Popen 证明它通过映射门、消费了
         # CN claim、真正到达 Popen，且 --model 下发的是内置字面串（非友好名映射、非猜 UUID）。
         # 绝不真跑 CLI：假 Popen 立即抛哨兵，main 捕获后安全释放本占位（start_failed）。
@@ -194,11 +194,11 @@ class CnMainRefusalTests(_NoPopen):
                 '--output-dir', str(out_dir), '--stage', 'BW-CN-TEST'])
         finally:
             qd.dp.utcnow = real_utcnow
-        # 不是映射门拒绝（rc != 2）；确实到达 Popen；--model 为内置 Qwen3.8-Max 字面串。
+        # 不是映射门拒绝（rc != 2）；确实到达 Popen；--model 为内置 Qwen4-Max-Preview 字面串。
         self.assertNotEqual(rc, 2, rc)
         self.assertIn('argv', captured)
         argv = captured['argv']
-        self.assertEqual(qd.DEFAULT_MODEL, 'Qwen3.8-Max')
+        self.assertEqual(qd.DEFAULT_MODEL, 'Qwen4-Max-Preview')
         self.assertEqual(argv[argv.index('--model') + 1], qd.DEFAULT_MODEL)
 
     def test_builtin_default_model_daytime_capacity_gate_refuses_zero_popen(self):
@@ -594,10 +594,10 @@ class ExplicitQuotaLimitHitTests(unittest.TestCase):
         """只有三个 Qoder Max 主力池（两内置 + CN 自定义）可承载限额标记；非 Max 模型 /
         未知 runtime / 国际自定义名一律 None，绝不偷偷给 Flash/ZCode 落标、也不把自定义
         误映射到内置池。"""
-        self.assertEqual(qd._qoder_max_pool_key(qd.RUNTIME_INTERNATIONAL, 'Qwen3.8-Max'),
-                         'qoder:Qwen3.8-Max')
-        self.assertEqual(qd._qoder_max_pool_key(qd.RUNTIME_CN, 'Qwen3.8-Max'),
-                         'qodercn:Qwen3.8-Max')
+        self.assertEqual(qd._qoder_max_pool_key(qd.RUNTIME_INTERNATIONAL, 'Qwen4-Max-Preview'),
+                         'qoder:Qwen4-Max-Preview')
+        self.assertEqual(qd._qoder_max_pool_key(qd.RUNTIME_CN, 'Qwen4-Max-Preview'),
+                         'qodercn:Qwen4-Max-Preview')
         # CN 自定义友好名（短横线）→ CN 自定义 Max 池，独立于内置池。
         self.assertEqual(qd._qoder_max_pool_key(qd.RUNTIME_CN, 'Qwen-3.8-Max'),
                          'qodercn:Qwen-3.8-Max')
@@ -805,7 +805,7 @@ class MainForceLimitRealEntryTests(_NoPopen):
 
     # ---------- 1. CN 内置 Max 失败终态：只落它自己，且经真实 claim/bind/record/release ----------
     def test_main_records_builtin_cn_max_only_through_real_chain(self):
-        argv, out = self._cn_case('builtin-max', 'Qwen3.8-Max',
+        argv, out = self._cn_case('builtin-max', 'Qwen4-Max-Preview',
                                   {'DeepSeek-Flash': 'real-id-123'})
         rc, printed = self._run_main(
             argv, self._failure_envelope([_CN_LIMIT_TEXT],
@@ -827,20 +827,20 @@ class MainForceLimitRealEntryTests(_NoPopen):
 
         rec = summary['main_force_limit']
         self.assertTrue(rec['recorded'], rec)
-        self.assertEqual(rec['pool_key'], 'qodercn:Qwen3.8-Max')
+        self.assertEqual(rec['pool_key'], 'qodercn:Qwen4-Max-Preview')
         self.assertEqual(rec['evidence'], _CN_LIMIT_TEXT)
 
         limits = qd.dp.main_force_limits(self.store)
-        self.assertEqual(self._limited_pools(), ['qodercn:Qwen3.8-Max'])
-        row = limits['qodercn:Qwen3.8-Max']
+        self.assertEqual(self._limited_pools(), ['qodercn:Qwen4-Max-Preview'])
+        row = limits['qodercn:Qwen4-Max-Preview']
         # 绑定必须指向真实存在的 attempt / task / 证据文件与哈希，绝不凭空造标记。
         self.assertEqual(row['task_id'], 'T-builtin-max')
         attempt = self._attempt_by_task('T-builtin-max')
         self.assertIsNotNone(attempt)
         self.assertEqual(row['attempt_token'], attempt['token'])
-        self.assertEqual(attempt['pool_key'], 'qodercn:Qwen3.8-Max')
+        self.assertEqual(attempt['pool_key'], 'qodercn:Qwen4-Max-Preview')
         self.assertEqual(attempt['runtime'], qd.RUNTIME_CN)
-        self.assertEqual(attempt['model'], 'Qwen3.8-Max')
+        self.assertEqual(attempt['model'], 'Qwen4-Max-Preview')
         # 生产侧保存的是 .resolve() 后的长路径，而 tempfile 在 Windows 上可能给出
         # 8.3 短名别名（ADMINI~1），二者是同一真实文件；故两边同 resolve 后仍严格相等，
         # 并用 samefile 复核同一 inode/句柄，不放宽为结尾匹配。
@@ -860,18 +860,18 @@ class MainForceLimitRealEntryTests(_NoPopen):
         self.assertTrue(summary['capacity_released'], summary)
         self.assertEqual(summary['capacity_terminal'], 'finished')
         self.assertEqual(
-            qd.dp.status(self.store, now=self.night)['pools']['qodercn:Qwen3.8-Max']
+            qd.dp.status(self.store, now=self.night)['pools']['qodercn:Qwen4-Max-Preview']
             ['active'], 0)
 
         # 不连坐：CN 自定义 Max / 国际内置 Max 一律未被波及。
         self.assertFalse(qd.dp.main_force_limited(self.store, 'qodercn:Qwen-3.8-Max'))
-        self.assertFalse(qd.dp.main_force_limited(self.store, 'qoder:Qwen3.8-Max'))
+        self.assertFalse(qd.dp.main_force_limited(self.store, 'qoder:Qwen4-Max-Preview'))
         self.assertNotIn('qodercn:Qwen3.8-Flash', self._limited_pools())
         self.assertNotIn('qoder:Qwen3.8-Flash', self._limited_pools())
 
     # ---------- 2. CN 自定义 Max 失败：只落自己；内置 Max 随后仍能真实 claim 到 Popen ----------
     def test_main_records_custom_cn_max_without_touching_builtin(self):
-        # 自定义友好名 Qwen-3.8-Max 与内置 Qwen3.8-Max 的真实 config 映射口径不同：
+        # 自定义友好名 Qwen-3.8-Max 与内置 Qwen4-Max-Preview 的真实 config 映射口径不同：
         # 前者必须经 model_ids 映射成服务端 ID 才能下发，本例据此走独立池落标。
         # BW-QODERCN-TOKEN-MAX-DISABLE-20261028：目标池现行被用户禁用，无 claim 的正式
         # CN 入口在读 CN 配置/模型映射之前即 mode_excluded 拒绝；「自定义 Max 失败只落
@@ -890,12 +890,12 @@ class MainForceLimitRealEntryTests(_NoPopen):
             attempt = self._attempt_by_task('T-custom-max')
             self.assertEqual(attempt['pool_key'], 'qodercn:Qwen-3.8-Max')
             self.assertEqual(attempt['state'], 'finished')
-            self.assertFalse(qd.dp.main_force_limited(self.store, 'qodercn:Qwen3.8-Max'))
+            self.assertFalse(qd.dp.main_force_limited(self.store, 'qodercn:Qwen4-Max-Preview'))
 
         # 反证"不波及内置"：同一库、同一时段下，内置 Max 随后仍被真实容量门放行到 Popen，
         # 且它这次的非限额终态绝不新增任何标记（自定义标记也不得扩大到内置）。
         before_limited = list(self._limited_pools())
-        argv2, out2 = self._cn_case('builtin-after-custom', 'Qwen3.8-Max',
+        argv2, out2 = self._cn_case('builtin-after-custom', 'Qwen4-Max-Preview',
                                     {'DeepSeek-Flash': 'real-id-123'})
         rc2, _printed2 = self._run_main(
             argv2, self._failure_envelope(['No permission client configured for Bash'],
@@ -911,15 +911,15 @@ class MainForceLimitRealEntryTests(_NoPopen):
 
     # ---------- 3. 国际内置 Max 失败：只落国际自己那一个池 ----------
     def test_main_records_international_max_only(self):
-        argv, out = self._intl_case('intl-max', 'Qwen3.8-Max')
+        argv, out = self._intl_case('intl-max', 'Qwen4-Max-Preview')
         rc, _printed = self._run_main(argv, self._failure_envelope([_CN_LIMIT_TEXT]),
                                       exit_code=1)
         self.assertEqual(rc, 3, rc)
-        self.assertEqual(self._limited_pools(), ['qoder:Qwen3.8-Max'])
-        self.assertFalse(qd.dp.main_force_limited(self.store, 'qodercn:Qwen3.8-Max'))
+        self.assertEqual(self._limited_pools(), ['qoder:Qwen4-Max-Preview'])
+        self.assertFalse(qd.dp.main_force_limited(self.store, 'qodercn:Qwen4-Max-Preview'))
         self.assertFalse(qd.dp.main_force_limited(self.store, 'qodercn:Qwen-3.8-Max'))
         attempt = self._attempt_by_task('T-intl-max')
-        self.assertEqual(attempt['pool_key'], 'qoder:Qwen3.8-Max')
+        self.assertEqual(attempt['pool_key'], 'qoder:Qwen4-Max-Preview')
         self.assertEqual(attempt['runtime'], qd.RUNTIME_INTERNATIONAL)
         self.assertEqual(attempt['state'], 'finished')
         self.assertTrue(self._summary(out)['capacity_released'])
@@ -928,7 +928,7 @@ class MainForceLimitRealEntryTests(_NoPopen):
     def test_main_success_body_mentioning_limit_text_is_never_recorded(self):
         body = ('9. 建议下一步：继续。\n\n' + _CN_LIMIT_TEXT +
                 '\n（以上为正文里出现的一句话，不是错误载体）')
-        argv, out = self._cn_case('success-text', 'Qwen3.8-Max',
+        argv, out = self._cn_case('success-text', 'Qwen4-Max-Preview',
                                   {'DeepSeek-Flash': 'real-id-123'})
         rc, summary = self._run_main(argv, self._success_envelope(body), exit_code=0)
         self.assertEqual(rc, 0, rc)
@@ -952,7 +952,7 @@ class MainForceLimitRealEntryTests(_NoPopen):
              None, 4294967295))
         for tag, errors, denials, errors_info, exit_code in cases:
             with self.subTest(tag=tag):
-                argv, out = self._cn_case('terminal-' + tag, 'Qwen3.8-Max',
+                argv, out = self._cn_case('terminal-' + tag, 'Qwen4-Max-Preview',
                                           {'DeepSeek-Flash': 'real-id-123'})
                 rc, _printed = self._run_main(
                     argv, self._failure_envelope(errors, permission_denials=denials,
@@ -975,7 +975,7 @@ class MainForceLimitRealEntryTests(_NoPopen):
         self.assertNotIn('main_force_limit', summary)
         self.assertEqual(self._limited_pools(), [])
         self.assertEqual(summary['result_errors'], [_CN_LIMIT_TEXT])
-        self.assertTrue(qd.dp.main_force_limited(self.store, 'qodercn:Qwen3.8-Max')
+        self.assertTrue(qd.dp.main_force_limited(self.store, 'qodercn:Qwen4-Max-Preview')
                         is False)
         self.assertEqual(self._attempt_by_task('T-flash')['pool_key'],
                          'qodercn:Qwen3.8-Flash')

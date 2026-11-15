@@ -35,6 +35,7 @@ config.yaml
 scripts/local-entry.json
 scripts/local-entry-cn.json
 scripts/zcode-entry.json
+scripts/zcode-appserver-entry.json
 scripts/codebuddy-entry.json
 scripts/quota-routes.json
 # Claude Code CLI private entry (real config/DPAPI pointer; only the example is committed)

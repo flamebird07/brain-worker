@@ -169,16 +169,17 @@ class TestModuleDiscipline(_WidgetBase):
         with dispatch_mode('strong'):
             strong_snap = self._snap()
         self.assertTrue(strong_snap['ok'])
-        # BW-SONUS-REENABLE-20261029-R3：Sonus 恢复常态新派——strong 空闲显示
-        # Sonus 且排第一，完整 5 行 = Sonus(1)/ZCode(2)/Claude(3)/CN Max(4)/国际 Max(4)。
+        # BW-QWEN4-SONUS-REMOVE-20261115：Sonus 从所有档位去除——strong 空闲也不显示
+        # Sonus 行，完整 4 行 = ZCode(2)/Claude(3)/CN Max(4)/国际 Max(4)。
         strong_rows = [r for r in strong_snap['rows']
                        if r['pool_key'] != dp.LUNA_KEY]
+        self.assertNotIn(dp.SONUS_POOL_KEY, [r['pool_key'] for r in strong_rows])
         self.assertEqual([r['pool_key'] for r in strong_rows], [
-            dp.SONUS_POOL_KEY, dp.ZCODE_POOL_KEY, dp.CLAUDE_POOL_KEY,
+            dp.ZCODE_POOL_KEY, dp.CLAUDE_POOL_KEY,
             dp.CN_MAX_POOL_KEY, dp.QMAX_POOL_KEY])
         strong_prios = [r['priority'] for r in strong_rows]
         self.assertEqual(strong_prios, sorted(strong_prios), strong_prios)
-        self.assertEqual(strong_prios, [1, 2, 3, 4, 4])
+        self.assertEqual(strong_prios, [2, 3, 4, 4])
         # 其余 11 行与 weak 权威整表逐行一致。
         weak_prios = [dp.POOL_PRIORITY[pk] for pk in prod_order[1:]]
         self.assertEqual(weak_prios, sorted(weak_prios), weak_prios)
@@ -202,7 +203,7 @@ class TestModuleDiscipline(_WidgetBase):
         self.assertEqual(dp.MAIN_FORCE_CAPACITY[dp.OPENCODE_GLM_POOL_KEY], 1)
         # 用户明确要求的完整 CN 名称，绝不再写「CN 内置/CN 自定义」。
         labels = dict((pk, label) for pk, label, _ in wsw.ROW_DEFS)
-        self.assertEqual(labels[dp.CN_MAX_POOL_KEY], 'Qoder CN／Qwen3.8-Max')
+        self.assertEqual(labels[dp.CN_MAX_POOL_KEY], 'Qoder CN／Qwen4-Max-Preview')
         self.assertEqual(labels[dp.CN_CUSTOM_MAX_POOL_KEY],
                          'Qoder CN／token plan／Qwen-3.8-Max')
         # BW-HOVER-REPAIR-20261019-S7：CodeBuddy 使用国际账号，两个模型行可见名称
@@ -540,19 +541,14 @@ class TestModeExcludedRowVisibility(_WidgetBase):
                 snap = self._snap()
                 self.assertTrue(snap['ok'], mode)
                 shown = {r['pool_key'] for r in snap['rows']}
-                # BW-SONUS-REENABLE-20261029-R3：strong 空闲显示 Sonus 且排第一；
-                # medium 空闲仍隐藏 Sonus（strong 专属）。
-                allowed = (set(self.NARROW) | {dp.SONUS_POOL_KEY}
-                           if mode == 'strong' else set(self.NARROW))
+                # BW-QWEN4-SONUS-REMOVE-20261115：Sonus 从所有档位去除——三档空闲一律
+                # 整行隐藏，allowed_pools 也绝不含 Sonus。
+                allowed = set(self.NARROW)
                 expected = allowed | {dp.LUNA_KEY}
-                if mode == 'strong':
-                    self.assertIn(dp.SONUS_POOL_KEY, shown, mode)
-                    self.assertIn(dp.SONUS_POOL_KEY,
-                                  set(snap['dispatch_mode_allowed_pools']), mode)
-                else:
-                    self.assertNotIn(dp.SONUS_POOL_KEY, shown, mode)
+                for m_check in (mode,):
+                    self.assertNotIn(dp.SONUS_POOL_KEY, shown, m_check)
                     self.assertNotIn(dp.SONUS_POOL_KEY,
-                                     set(snap['dispatch_mode_allowed_pools']), mode)
+                                     set(snap['dispatch_mode_allowed_pools']), m_check)
                 self.assertEqual(shown, expected, mode)
                 for pk in self.EXCLUDED:
                     self.assertNotIn(pk, shown, (mode, pk))
@@ -638,62 +634,44 @@ class TestModeExcludedRowVisibility(_WidgetBase):
             self.assertEqual(self._row(snap, dp.CODEBUDDY_POOL_KEY)['state'], 'running')
             self.assertEqual(snap['domestic_active'], 1)
 
-    def test_sonus_strong_first_medium_weak_hidden_and_legacy_labeled_not_participating(self):
-        """BW-SONUS-REENABLE-20261029-R3：Sonus 恢复常态新派——strong 空闲显示 Sonus
-        且排第一；medium/weak 空闲隐藏；切档前遗留在 medium/weak 保留整行、按真实状态
-        显示并标「本档不参与」直到真实终态；物理总容量仍 16。"""
+    def test_sonus_hidden_when_idle_all_modes_legacy_in_flight_labeled(self):
+        """BW-QWEN4-SONUS-REMOVE-20261115：Sonus 从所有档位去除——strong/medium/weak 空闲
+        一律整行隐藏（绝不显示可派行）；真实在途遗留整行保留、按真实状态显示并标
+        「不接新派（用户指令）」直到真实终态；物理总容量仍 16。"""
         probe = _probe({4321: {'pid': 4321, 'state': 'alive', 'created': '111'}})
         with closing(self._conn()):
             pass  # 建库（缺库快照 ok=False，绝不冒充空闲）
-        # 空闲：strong 显示 Sonus 且第一；medium/weak 隐藏。
-        with dispatch_mode('strong'):
-            snap = self._snap(probe=probe)
-            sonus = self._row(snap, dp.SONUS_POOL_KEY)
-            self.assertEqual(snap['rows'][0]['pool_key'], dp.SONUS_POOL_KEY)
-            self.assertTrue(sonus['participates'])
-            self.assertFalse(sonus['mode_excluded'])
-            self.assertEqual(sonus['state'], 'idle')
-        for mode in ('medium', 'weak'):
+        # 空闲：三档全部隐藏 Sonus 行。
+        for mode in ('strong', 'medium', 'weak'):
             with dispatch_mode(mode):
                 snap = self._snap(probe=probe)
                 self.assertNotIn(dp.SONUS_POOL_KEY,
                                  {r['pool_key'] for r in snap['rows']}, mode)
+                self.assertNotIn(dp.SONUS_POOL_KEY,
+                                 set(snap['dispatch_mode_allowed_pools']), mode)
         with closing(self._conn()) as conn:
             self._insert(conn, 's1', dp.SONUS_POOL_KEY, 'reserved',
                          reserved=T0 - timedelta(seconds=120))
-        # 遗留在途：strong 参与、真实状态照常；medium/weak 整行保留并标「本档不参与」。
-        with dispatch_mode('strong'):
-            snap = self._snap(probe=probe)
-            sonus = self._row(snap, dp.SONUS_POOL_KEY)
-            self.assertTrue(sonus['participates'])
-            self.assertFalse(sonus['mode_excluded'])
-            self.assertEqual(sonus['state'], 'reserved')
-            self.assertEqual(sonus['active'], 1)
-            self.assertEqual(snap['domestic_active'], 1)
-            self.assertEqual(snap['domestic_total_capacity'], 16)
-        for mode in ('medium', 'weak'):
+        # 真实在途遗留：三档整行保留并标「不接新派（用户指令）」；占位照常计数。
+        for mode in ('strong', 'medium', 'weak'):
             with dispatch_mode(mode):
                 snap = self._snap(probe=probe)
                 sonus = self._row(snap, dp.SONUS_POOL_KEY)
                 self.assertTrue(sonus['mode_excluded'], mode)
                 self.assertFalse(sonus['participates'], mode)
                 self.assertEqual(sonus['mode_excluded_label'],
-                                 wsw.STATE_LABELS['mode_excluded'], mode)
+                                 wsw.SONUS_TEMP_DISABLED_LABEL, mode)
                 self.assertEqual(sonus['state'], 'reserved')
                 self.assertEqual(sonus['active'], 1)
                 detail = wsw.detail_text(sonus)
-                self.assertIn('本档不参与', detail)
+                self.assertIn('不接新派', detail)
                 self.assertEqual(snap['domestic_active'], 1, mode)
                 self.assertEqual(snap['domestic_total_capacity'], 16, mode)
-        # 真实终态后：strong 回到空闲 Sonus 第一；medium/weak 不再显示 Sonus 行。
+        # 真实终态后：三档都不再显示 Sonus 行，计数归零。
         with closing(self._conn()) as conn:
             conn.execute("UPDATE attempts SET state='finished', terminal='finished', "
                          "success=1, ended_at_utc=? WHERE token='s1'", (_iso(T0),))
-        with dispatch_mode('strong'):
-            snap = self._snap(probe=probe)
-            self.assertEqual(snap['rows'][0]['pool_key'], dp.SONUS_POOL_KEY)
-            self.assertEqual(snap['rows'][0]['state'], 'idle')
-        for mode in ('medium', 'weak'):
+        for mode in ('strong', 'medium', 'weak'):
             with dispatch_mode(mode):
                 snap = self._snap(probe=probe)
                 self.assertNotIn(dp.SONUS_POOL_KEY,
@@ -2426,6 +2404,15 @@ class TestClickExpandToggle(_ProductionGuiDriveMixin, _WidgetBase):
 
     def test_pin_mode_checkbox_wheel_and_detail_click_never_toggle(self):
         _idle, running = self._peak_snapshots()
+        is_mac = sys.platform == 'darwin'
+
+        def click_mode(label):
+            if is_mac:
+                mode = self._find_label(label)
+                self.assertEqual(mode.cget('fg'), wsw._TITLE)
+                mode.event_generate('<ButtonRelease-1>', when='now')
+            else:
+                self._find_button(label).invoke()
 
         def exercise(tick, frames, cards, poller, pending):
             tick(running)
@@ -2434,7 +2421,7 @@ class TestClickExpandToggle(_ProductionGuiDriveMixin, _WidgetBase):
             # 而按钮不挂任何 Button-1 实例绑定已由结构性用例证明——点击不可能进入
             # 拖动/切换路径。
             with mock.patch.object(wsw.dmode, 'save_mode') as m_save:
-                self._find_button('弱').invoke()
+                click_mode('弱')
             self.assertTrue(m_save.called)
             self.assertFalse(self._is_expanded(frames))
             # 置顶：command 生效（文字翻转）且不展开；再点复位。
@@ -2445,11 +2432,17 @@ class TestClickExpandToggle(_ProductionGuiDriveMixin, _WidgetBase):
             pin.invoke()
             self.assertEqual(pin.cget('text'), '置顶:开')
             # 空闲关机勾选：勾上/取消都不切换展开。
-            chk = self._find_checkbutton()
-            chk.invoke()
-            self.assertFalse(self._is_expanded(frames))
-            chk.invoke()
-            self.assertFalse(self._is_expanded(frames))
+            if is_mac:
+                widgets = list(self._walk(self.root))
+                self.assertFalse(any(w.winfo_class() == 'Checkbutton' for w in widgets))
+                self.assertFalse(any(w.winfo_class() == 'Button' and w.cget('text') == '×'
+                                     for w in widgets))
+            else:
+                chk = self._find_checkbutton()
+                chk.invoke()
+                self.assertFalse(self._is_expanded(frames))
+                chk.invoke()
+                self.assertFalse(self._is_expanded(frames))
             # 展开态：详情滚轮、详情单击、档位按钮、置顶、勾选都绝不折叠。
             self._click(self._find_label('牛马看板'))
             self.assertTrue(self._is_expanded(frames))
@@ -2457,9 +2450,10 @@ class TestClickExpandToggle(_ProductionGuiDriveMixin, _WidgetBase):
             detail.event_generate('<MouseWheel>', delta=-120, when='now')
             self._click(detail)
             with mock.patch.object(wsw.dmode, 'save_mode'):
-                self._find_button('中').invoke()
+                click_mode('中')
             self._find_button('置顶:开').invoke()
-            self._find_checkbutton().invoke()
+            if not is_mac:
+                self._find_checkbutton().invoke()
             self.assertTrue(self._is_expanded(frames))
 
         self._drive_gui(exercise)

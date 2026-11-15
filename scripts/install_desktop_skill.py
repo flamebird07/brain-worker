@@ -37,12 +37,13 @@ HOST_EXCLUDED = {
     # 宿主排除集恢复退役前的最小一致形态：Qoder 宿主排除自身 Max 三池与 ZCode 精确
     # 组合，ZCode 宿主递归排除自己（zcode:GLM-5.3）；G1 守卫要求排除键必须是引擎
     # 真实可派键，恢复后该键重新合法。
-    # BW-STRONG-SONUS-20261024：Qoder 桌面宿主另排除 qoder:Sonus（strong 专属独立
-    # 1 槽正常池）——宿主绝不经 Sonus 递归自派自己；ZCode 宿主不受影响。
+    # BW-STRONG-SONUS-20261024（历史）→ BW-QWEN4-SONUS-REMOVE-20261115：Qoder 桌面宿主
+    # 另排除 qoder:Sonus——宿主绝不经 Sonus 递归自派自己；ZCode 宿主不受影响。Sonus 现
+    # 已从所有档位去除新派，排除键保留以维持最小一致形态（G1 守卫仍要求其为引擎真实键）。
     "qoder": (
-        "qoder:Qwen3.8-Max",
+        "qoder:Qwen4-Max-Preview",
         "qodercn:Qwen-3.8-Max",
-        "qodercn:Qwen3.8-Max",
+        "qodercn:Qwen4-Max-Preview",
         "zcode:GLM-5.3",
         "qoder:Sonus",
     ),

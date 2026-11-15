@@ -121,7 +121,7 @@ class AuthenticationFactsTests(unittest.TestCase):
         self.assertFalse(facts['model_execution_failure'])
 
     def test_models_do_not_cross_map(self):
-        for model in ('Qwen3.8-Max', 'qodercn:Qwen-3.8-Max', 'other-custom'):
+        for model in ('Qwen4-Max-Preview', 'qodercn:Qwen-3.8-Max', 'other-custom'):
             facts = qd._qoder_failure_facts(_s3_auth_summary(model_requested=model))
             self.assertTrue(facts['authentication_failure'])
             self.assertEqual(facts['evidence']['model_requested'], model)

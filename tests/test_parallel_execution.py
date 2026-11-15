@@ -43,7 +43,7 @@ import dispatch_pool as dp  # noqa: E402  真实容量池：并发入口 Popen �
 QODER_ENTRY = SCRIPTS / 'qoder_direct.py'
 CODEBUDDY_ENTRY = SCRIPTS / 'codebuddy_direct.py'
 ZCODE_ENTRY = SCRIPTS / 'zcode_direct.py'
-# BW-MAX-WINDOW-20261010-S2：内置 Qwen3.8-Max 只在主力时段（北京 22:00含–08:00不含）放行，
+# BW-MAX-WINDOW-20261010-S2：内置 Qwen4-Max-Preview 只在主力时段（北京 22:00含–08:00不含）放行，
 # 时段外 reserve/consume 一律如实拒绝（见 dispatch_pool._domestic_policy）。并行演练要占
 # 用国际内置 Max 名额，必须让“预留（父进程）”与“消费（子进程入口）”同处时段内。真实入口
 # 在子进程读墙钟，白天会拒绝；故时钟控制只在离线夹具里做：预留传 now=WINDOW_T0，子进程用
@@ -225,7 +225,7 @@ class ParallelRehearsalTests(unittest.TestCase):
         return ws
 
     def _qoder_runner(self) -> str:
-        # BW-MAX-WINDOW-20261010-S2：并行演练占用国际内置 Qwen3.8-Max 主力名额，而入口
+        # BW-MAX-WINDOW-20261010-S2：并行演练占用国际内置 Qwen4-Max-Preview 主力名额，而入口
         # 在子进程读墙钟判时段——白天会如实拒绝。真实 fake-CLI/barrier/drift 断言不变，
         # 只把“运行原 qoder_direct 入口”换成经测试创建的离线 wrapper：先导入 dispatch_pool
         # 并把 utcnow 固定到时段内（同 WINDOW_T0/北京 23:00），再原样 sys.exit(main())。
@@ -381,9 +381,9 @@ class ParallelRehearsalTests(unittest.TestCase):
                       self._base_env('zcok', ws, report, barrier_total=4), ws,
                       'BW-PARR-ZCOK'))
         # 3 & 4) 两个 Qoder 成功完整绑定报告（独立 workspace，同名 output.py）。
-        #    BW-POOL-SPLIT-20261010-S3：国际 Qwen3.8-Max 只有 1 槽，第二个 qoder 并行任务
+        #    BW-POOL-SPLIT-20261010-S3：国际 Qwen4-Max-Preview 只有 1 槽，第二个 qoder 并行任务
         #    走同级国际 Qwen3.8-Flash 兜底（executor='qoder'，同区不跨执行器），二者共存。
-        for tag, stage, qmodel in (('qa', 'BW-PARR-QA', 'Qwen3.8-Max'),
+        for tag, stage, qmodel in (('qa', 'BW-PARR-QA', 'Qwen4-Max-Preview'),
                                     ('qb', 'BW-PARR-QB', 'Qwen3.8-Flash')):
             ws = self._mk_workspace(tag)
             prompt = self._write(f'prompt-{tag}.txt', f'Qoder {tag} 并行演练任务。\n')
@@ -532,11 +532,11 @@ class ParallelRehearsalTests(unittest.TestCase):
         self.barrier.mkdir()
 
         # 2) 起两个 Qoder 成功任务（barrier_total=3），此刻它们仍卡在 barrier 内。
-        #    BW-POOL-SPLIT-20261010-S3：国际 Qwen3.8-Max 只有 1 槽，故 ia 占主力 Max、
+        #    BW-POOL-SPLIT-20261010-S3：国际 Qwen4-Max-Preview 只有 1 槽，故 ia 占主力 Max、
         #    ib 走同级国际 Flash。各腿本就显式 claim，绝不突破任一池上限；本 cohort 不派
         #    zcode（BW-ZCODE-RESTORE-1-20261022 后其容量为 1，但不在本用例路径内）。
         inflight = {}
-        for tag, stage, qmodel in (('ia', 'BW-FB-IA', 'Qwen3.8-Max'),
+        for tag, stage, qmodel in (('ia', 'BW-FB-IA', 'Qwen4-Max-Preview'),
                                    ('ib', 'BW-FB-IB', 'Qwen3.8-Flash')):
             wsi = self._mk_workspace(tag)
             pi = self._write(f'prompt-{tag}.txt', f'Qoder {tag} 在途任务。\n')
@@ -585,7 +585,7 @@ class ParallelRehearsalTests(unittest.TestCase):
         pfb = self._write('prompt-fbtake.txt', 'Qoder 接管 fallback 任务。\n')
         plfb = self._plan('T-FB-TAKE', 'BW-FB-TAKE', 'qoder', 'Qwen3.8-Flash', wsfb,
                           pfb, ['Read'])
-        # 主力 Qwen3.8-Max 已被 ia/ib 占满，接管任务显式预留溢出 Qwen3.8-Flash 名额。
+        # 主力 Qwen4-Max-Preview 已被 ia/ib 占满，接管任务显式预留溢出 Qwen3.8-Flash 名额。
         fb_claim = self._reserve('T-FB-TAKE', 'qoder', 'Qwen3.8-Flash', wsfb, pfb,
                                  'BW-FB-TAKE')
         fb_report = self._write('report-fbtake.txt',
@@ -742,14 +742,14 @@ class ParallelRehearsalTests(unittest.TestCase):
         ws = self._mk_workspace('chatdrift')
         prompt = self._write('prompt-chatdrift.txt', 'Qoder chat 漂移演练任务。\n')
         stage = 'BW-FB-CHATDRIFT'
-        plan = self._plan('T-CHAT', stage, 'qoder', 'Qwen3.8-Max', ws, prompt, ['Read'])
+        plan = self._plan('T-CHAT', stage, 'qoder', 'Qwen4-Max-Preview', ws, prompt, ['Read'])
         res = dp.reserve(self.dispatch_store, task_id='T-CHAT', runtime='qoder',
-                         model='Qwen3.8-Max', workspace=str(ws),
+                         model='Qwen4-Max-Preview', workspace=str(ws),
                          prompt_sha256=hashlib.sha256(prompt.read_bytes()).hexdigest(),
                          stage=stage, chat_id='C-ORIG', executor='qoder', now=WINDOW_T0)
         self.assertTrue(res['allowed'], res)
         out = ws / 'out'
-        cmd = self._qoder_cmd(ws, prompt, out, stage, plan, 'Qwen3.8-Max', res['token'])
+        cmd = self._qoder_cmd(ws, prompt, out, stage, plan, 'Qwen4-Max-Preview', res['token'])
         cmd += ['--chat-id', 'C-WRONG']
         proc = subprocess.run(cmd, env=self._base_env('chatdrift', ws), cwd=str(ws),
                               capture_output=True, timeout=120)
@@ -764,7 +764,7 @@ class ParallelRehearsalTests(unittest.TestCase):
                                (res['token'],)).fetchone()
         self.assertEqual(row['state'], 'reserved')
         self.assertEqual(
-            dp.status(self.dispatch_store)['pools']['qoder:Qwen3.8-Max']['active'], 1)
+            dp.status(self.dispatch_store)['pools']['qoder:Qwen4-Max-Preview']['active'], 1)
 
 
 if __name__ == '__main__':

@@ -1,8 +1,16 @@
 # 桌面状态浮窗（只读牛马看板）
 
+macOS 版沿用同一共享派发数据库。标题栏省去右上角关闭叉，可用 ⌘Q 退出。
+不显示空闲自动关机及计时。强、中、弱按钮使用浅色文字和深色背景，
+当前档位以蓝色底标记。Windows 版保留右上角关闭和空闲自动关机。
+正式派工和浮窗使用同一个共享调度库。可以把代码放到隔离副本中执行，
+正式派工仍沿用主机共享库，临时调度库用于离线测试。
+
+**2026-11-15 当前权威：BW-QWEN4-SONUS-REMOVE-20261115**。`qoder:Sonus` 从 strong/medium/weak **所有档位**去除新派（`SONUS_TEMP_DISABLED = True` 持久事实；AUTO/显式 reserve/select/consume/claim-due/正式入口一律 `mode_excluded`；遗留 reserved 不再放行 consume，安全释放 start_failed；running/unknown 在途不追杀、不假释放，继续安全计数与结算；浮窗三档空闲整行隐藏）。两个 Qoder 内置 Max 官方显示名改为 **Qwen4-Max-Preview**（`qoder:Qwen4-Max-Preview` / `qodercn:Qwen4-Max-Preview`，SDK argv 与池键同字面串）；旧池键 `qoder:Qwen3.8-Max` / `qodercn:Qwen3.8-Max` 以 0 容量降为 legacy-retired（不接新派、绝不映射到新池，在途照常计数与自然终态结算）。带短横线的 `qodercn:Qwen-3.8-Max` 仍为独立已禁用自定义池，历史身份与禁用语义不变。本段覆盖本文及更早各段中一切 Sonus 新派资格与「Qwen3.8-Max（经 2026-11-15 批量改名同步显示为 Qwen4-Max-Preview）」的现行表述；历史段落仅作存档。
+
 **2026-10-29 当前覆盖（BW-SONUS-REENABLE-20261029-R3，另见 BW-QODERCN-TOKEN-MAX-DISABLE-20261028）**：用户要求**恢复使用** `qoder:Sonus`（Qoder 国际／Sonus）的常态新派，唯一权威开关 `scripts/dispatch_mode.py` 的 `SONUS_TEMP_DISABLED = False`，覆盖 BW-SONUS-TEMP-DISABLE-20261028-R2 的全档临时禁用（R2 及更早的恢复/禁用均保留为历史）。strong 空闲显示 Sonus 且排第一（可见 5 池、可新派 6 槽）；medium/weak 空闲隐藏 Sonus（4/10 池、5/13 槽）；切档前遗留的真实 reserved/running/unknown Sonus 在 medium/weak 整行保留，按真实状态和占用显示并标“本档不参与”，直到真实终态后隐藏，不是假释放、不改派、不追杀。静态登记行与容量 1、物理总容量 16 保留。“暂时禁用（用户指令）”展示只在开关再次为 True 时生效。汇总占用、PID 待核、在途判定、精简/展开规则不变。
 
-**2026-10-28 当前覆盖（BW-QODERCN-TOKEN-MAX-DISABLE-20261028）**：用户要求从所有档位禁用 `qodercn:Qwen-3.8-Max`（Qoder CN／token plan／Qwen-3.8-Max）新派，不影响无连字符的 `qodercn:Qwen3.8-Max`。三档空闲时目标整行隐藏；存在真实 reserved/running/unknown 时整行保留，按真实状态和占用显示并标“已禁用（用户指令）”，直到真实终态后隐藏，不是假释放、不改派、不追杀。静态登记行与容量 2 保留，物理总容量 16 不变（Sonus 恢复使用后 strong 空闲可见 5 池/6 槽）。汇总占用、PID 待核、在途判定、精简/展开规则不变。下文旧 6/5/11 池与“CN 自定义 Max 恢复/三路 Max”描述已被本次禁用覆盖，仅作历史。
+**2026-10-28 当前覆盖（BW-QODERCN-TOKEN-MAX-DISABLE-20261028）**：用户要求从所有档位禁用 `qodercn:Qwen-3.8-Max`（Qoder CN／token plan／Qwen-3.8-Max）新派，不影响无连字符的 `qodercn:Qwen4-Max-Preview`。三档空闲时目标整行隐藏；存在真实 reserved/running/unknown 时整行保留，按真实状态和占用显示并标“已禁用（用户指令）”，直到真实终态后隐藏，不是假释放、不改派、不追杀。静态登记行与容量 2 保留，物理总容量 16 不变（Sonus 恢复使用后 strong 空闲可见 5 池/6 槽）。汇总占用、PID 待核、在途判定、精简/展开规则不变。下文旧 6/5/11 池与“CN 自定义 Max 恢复/三路 Max”描述已被本次禁用覆盖，仅作历史。
 
 > 2026-10-19：Luna 已从 brain-worker 删除并强制禁用。浮窗生产 ROW_DEFS 为 12 个可派
 > 牛马组合行（11 个 weak 池 + strong 专属 `qoder:Sonus`，BW-STRONG-SONUS-20261024），
@@ -118,8 +126,8 @@ sidecar、绝不 migrate、绝不回落成空表冒充空闲。
   两个 OpenCode 免费模型行（`opencode:deepseek-v4.1-flash-free`、
   `opencode:glm-5.3-flash-free`）亦各独立 1 槽、无时段门，行注记「主力 · 独立 1 槽 ·
   无时段门」；Luna 外援行无上限、**不计入 16**。
-- 行名完整显示用户给定的 CN 名称：`Qoder CN／Qwen3.8-Max`（pool_key
-  `qodercn:Qwen3.8-Max`）与 `Qoder CN／token plan／Qwen-3.8-Max`（pool_key
+- 行名完整显示用户给定的 CN 名称：`Qoder CN／Qwen4-Max-Preview`（pool_key
+  `qodercn:Qwen4-Max-Preview`）与 `Qoder CN／token plan／Qwen-3.8-Max`（pool_key
   `qodercn:Qwen-3.8-Max`），**不再写「CN 内置/CN 自定义」**；精确 runtime/model
   pool_key 不变。主界面（精简/展开同宽）480（BW-WIDGET-CLICK-COMPACT-20261029 由 560
   收窄），关键名称、组合状态徽标与占用数绝不截断。
@@ -152,7 +160,7 @@ sidecar、绝不 migrate、绝不回落成空表冒充空闲。
   底部详情仅对精确 `codebuddy:deepseek-v4.1-flash`
   池说明其为**近 30 分钟内的真实限额/429 错误记录**；其它池详情保留原有“标记仍绑定该池最新 attempt 的历史
   限额记录、非实时额度”说明，**绝不冒称 30 分钟窗口**。二者均仅代表历史期限、不代表实时余额、不猜恢复时间、
-  BW-QWEN-MAX-LIMIT15-20261028：两个 Qoder 内置 Max（`qoder:Qwen3.8-Max`、`qodercn:Qwen3.8-Max`）加入同一权威按池窗口映射并改走 **900 秒（15 分钟）历史限额短窗**——从绑定 attempt 的 `ended_at_utc`（回退 `recorded_at_utc`）起 0<=age<900 秒显示“上轮限额”并阻断新派发（与 dispatch_pool 同口径），恰满 900 秒及更久只撤下提示、不删证据、不宣称恢复；详情文案明确写“15 分钟历史限额短窗”。原三池（CodeBuddy deepseek/ZCode/Claude）仍为 30 分钟。
+  BW-QWEN-MAX-LIMIT15-20261028：两个 Qoder 内置 Max（`qoder:Qwen4-Max-Preview`、`qodercn:Qwen4-Max-Preview`）加入同一权威按池窗口映射并改走 **900 秒（15 分钟）历史限额短窗**——从绑定 attempt 的 `ended_at_utc`（回退 `recorded_at_utc`）起 0<=age<900 秒显示“上轮限额”并阻断新派发（与 dispatch_pool 同口径），恰满 900 秒及更久只撤下提示、不删证据、不宣称恢复；详情文案明确写“15 分钟历史限额短窗”。原三池（CodeBuddy deepseek/ZCode/Claude）仍为 30 分钟。
   不新增冷却、不阻止下一轮最高优先重试；不因新
   调用成功而假造或删除原限额原件（仅展示期限）。该显示**不改** `state`/占用计数/空闲关机判定原语义，也不将
   历史限额算作活任务。

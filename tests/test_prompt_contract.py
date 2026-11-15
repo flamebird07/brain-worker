@@ -137,8 +137,8 @@ class PromptContractPureTests(unittest.TestCase):
 
     def test_build_contract_identity_uses_supplied_runtime_and_request_model(self):
         stage, ws = 'BW-PC-IDENTITY', 'C:\\work\\proj'
-        intl = pc.build_contract(stage, ws, runtime='qoder', model='Qwen3.8-Max')
-        self.assertIn('runtime=qoder；请求模型=Qwen3.8-Max', intl)
+        intl = pc.build_contract(stage, ws, runtime='qoder', model='Qwen4-Max-Preview')
+        self.assertIn('runtime=qoder；请求模型=Qwen4-Max-Preview', intl)
         self.assertIn('不覆盖本轮身份', intl)
         cn = pc.build_contract(stage, ws, runtime='qodercn', model='Qwen-3.8-Max')
         self.assertIn('runtime=qodercn；请求模型=Qwen-3.8-Max', cn)
@@ -149,16 +149,16 @@ class PromptContractPureTests(unittest.TestCase):
         with self.assertRaises(ValueError):
             pc.build_contract(stage, ws, runtime='qoder')  # 缺 model 不静默补
         with self.assertRaises(ValueError):
-            pc.build_contract(stage, ws, model='Qwen3.8-Max')  # 缺 runtime 不静默补
+            pc.build_contract(stage, ws, model='Qwen4-Max-Preview')  # 缺 runtime 不静默补
 
     def test_old_prompt_identity_cannot_override_current_identity(self):
         # 旧交接文本里的 ZCode/GLM 身份只作为任务原文出现在契约之后，契约中的本轮身份
         # 保持不变；不得由旧文本反推或覆盖本轮执行者。
         contract = pc.build_contract('BW-PC-OLD-ID', '/isolated/ww', runtime='qoder',
-                                     model='Qwen3.8-Max')
+                                     model='Qwen4-Max-Preview')
         payload = pc.compose_task_payload(contract, '旧交接：执行者 ZCode；模型 GLM-5.3')
         body = payload.split('\n\n', 1)[0]
-        self.assertIn('runtime=qoder；请求模型=Qwen3.8-Max', body)
+        self.assertIn('runtime=qoder；请求模型=Qwen4-Max-Preview', body)
         self.assertNotIn('runtime=zcode', body)
         self.assertTrue(payload.endswith('旧交接：执行者 ZCode；模型 GLM-5.3'))
 
@@ -192,7 +192,7 @@ class _SubprocessBase(unittest.TestCase):
         self.ws = self.base / 'ws'
         self.ws.mkdir()
         self.stage = 'BW-PC-DISPATCH-01'
-        self.model_qoder = 'Qwen3.8-Max'
+        self.model_qoder = 'Qwen4-Max-Preview'
         self.model_cb = 'PC-CB-1'
         self.report_file = self.base / 'report.txt'
         self.report_file.write_text(bound_report(self.stage, str(self.ws)),
@@ -204,7 +204,7 @@ class _SubprocessBase(unittest.TestCase):
         # harness 回放前校验固定合成 CB stub 的内容哈希：声明值取自磁盘真实字节。
         self.cb_stub_sha = hashlib.sha256(
             (self.stub_dir / 'cb_stub.py').read_bytes()).hexdigest()
-        # BW-MAX-WINDOW-20261010-S2：qoder 载荷默认内置 Qwen3.8-Max，受主力时段门约束；真实
+        # BW-MAX-WINDOW-20261010-S2：qoder 载荷默认内置 Qwen4-Max-Preview，受主力时段门约束；真实
         # 入口在子进程用墙钟判定 → 白天会如实拒绝、不建目录。本组只验 prompt 原字节/两通道
         # 证据链路，故用测试创建的临时 wrapper 把 dispatch_pool.utcnow 固定到主力时段内
         # （北京 23:00）再原样运行 qoder_direct 入口。时钟控制仅在此离线夹具，生产入口不加

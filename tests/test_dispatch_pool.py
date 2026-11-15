@@ -156,7 +156,7 @@ class _PoolBase(unittest.TestCase):
         使全局物理在途达到 16（BW-STRONG-SONUS-20261024）：主力 zcode:GLM-5.3=1（BW-ZCODE-RESTORE-1-20261022 恢复可派、
         容量 1，经显式 executor='zcode' 真实 claim 填入）、
         codebuddy:glm-5.3-flash=1（BW-WORKER-WIDGET-20261018-S3 起独立 1 槽，经真实
-        reserve 填入）、qoder:Qwen3.8-Max=1、qodercn:Qwen3.8-Max=1、
+        reserve 填入）、qoder:Qwen4-Max-Preview=1、qodercn:Qwen4-Max-Preview=1、
         qodercn:Qwen-3.8-Max=2、claude:deepseek-flash=2、两 OpenCode 免费模型各 1
         （BW-OPENCODE-20261019：opencode:deepseek-v4.1-flash-free 与
         opencode:glm-5.3-flash-free 各独立 1 槽、无时段门/无额度前提，经显式
@@ -177,8 +177,8 @@ class _PoolBase(unittest.TestCase):
         self.assertClaimed(glm, 'codebuddy:glm-5.3-flash')
         toks = [glm['token']]
         plan = [('fz', 'zcode', 'GLM-5.3', 'zcode'),
-                ('f2', 'qoder', 'Qwen3.8-Max', 'qoder'),
-                ('f3', 'qodercn', 'Qwen3.8-Max', 'qodercn'),
+                ('f2', 'qoder', 'Qwen4-Max-Preview', 'qoder'),
+                ('f3', 'qodercn', 'Qwen4-Max-Preview', 'qodercn'),
                 ('f4', 'qodercn', 'Qwen-3.8-Max', 'qodercn'),
                 ('f5', 'qodercn', 'Qwen-3.8-Max', 'qodercn'),
                 ('f6', 'claude', 'deepseek-flash', 'claude'),
@@ -198,8 +198,8 @@ class _PoolBase(unittest.TestCase):
         self.assertTrue(st['domestic']['full'])
         self.assertEqual(st['pools'][dp.SONUS_POOL_KEY]['active'], 1)
         self.assertEqual(st['pools']['codebuddy:glm-5.3-flash']['active'], 1)
-        self.assertEqual(st['pools']['qoder:Qwen3.8-Max']['active'], 1)
-        self.assertEqual(st['pools']['qodercn:Qwen3.8-Max']['active'], 1)
+        self.assertEqual(st['pools']['qoder:Qwen4-Max-Preview']['active'], 1)
+        self.assertEqual(st['pools']['qodercn:Qwen4-Max-Preview']['active'], 1)
         self.assertEqual(st['pools']['qodercn:Qwen-3.8-Max']['active'], 2)
         self.assertEqual(st['pools']['claude:deepseek-flash']['active'], 2)
         self.assertEqual(st['pools']['opencode:deepseek-v4.1-flash-free']['active'], 1)
@@ -222,8 +222,8 @@ class CapacityAndKnownPoolTests(_PoolBase):
         # 两地区 Flash 各 2；weak 可新派仍为 15（Sonus 弱档不可新派）。
         # CN DeepSeek-Flash 退出正常池，保留池名但 capacity=0（在途排干用）。
         self.assertEqual(dp.capacity_for('zcode:GLM-5.3'), 1)
-        self.assertEqual(dp.capacity_for('qoder:Qwen3.8-Max'), 1)
-        self.assertEqual(dp.capacity_for('qodercn:Qwen3.8-Max'), 1)
+        self.assertEqual(dp.capacity_for('qoder:Qwen4-Max-Preview'), 1)
+        self.assertEqual(dp.capacity_for('qodercn:Qwen4-Max-Preview'), 1)
         self.assertEqual(dp.capacity_for('qodercn:Qwen-3.8-Max'), 2)
         self.assertEqual(dp.capacity_for('claude:deepseek-flash'), 2)
         self.assertEqual(dp.capacity_for('qoder:Qwen3.8-Flash'), 2)
@@ -240,11 +240,11 @@ class CapacityAndKnownPoolTests(_PoolBase):
         self.assertEqual(weak_new_dispatch_capacity(), 15)
 
     def test_is_known_pool(self):
-        for pk in ('zcode:GLM-5.3', 'qoder:Qwen3.8-Max',
+        for pk in ('zcode:GLM-5.3', 'qoder:Qwen4-Max-Preview',
                    'qoder:Qwen3.8-Flash', 'qodercn:DeepSeek-Flash', 'luna:native'):
             self.assertTrue(dp.is_known_pool(pk), pk)
         self.assertFalse(dp.is_known_pool('qoder:GLM-5.3'))
-        self.assertFalse(dp.is_known_pool('zcode:Qwen3.8-Max'))
+        self.assertFalse(dp.is_known_pool('zcode:Qwen4-Max-Preview'))
 
     def test_unknown_pool_refused_on_reserve_and_select(self):
         r = dp.reserve(self.store, task_id='u1', runtime='qoder', model='Bogus',
@@ -279,12 +279,12 @@ class CapacityAndKnownPoolTests(_PoolBase):
 
     def test_duplicate_task_in_flight_refused(self):
         self.reserve('dup', 'qodercn', 'Qwen-3.8-Max')
-        r = dp.reserve(self.store, task_id='dup', runtime='qoder', model='Qwen3.8-Max',
+        r = dp.reserve(self.store, task_id='dup', runtime='qoder', model='Qwen4-Max-Preview',
                        workspace=str(self._ws_for('dup')), prompt_sha256='p',
                        now=T0, _preclaim=False)
         self.assertRejected(r, 'duplicate_task_in_flight')
         r2 = dp.select_and_claim(self.store, task_id='dup', runtime='qoder',
-                                 model='Qwen3.8-Max', workspace=str(self._ws_for('dup')),
+                                 model='Qwen4-Max-Preview', workspace=str(self._ws_for('dup')),
                                  prompt_sha256='p', now=T0, _preclaim=False)
         self.assertRejected(r2, 'duplicate_task_in_flight')
 
@@ -297,28 +297,28 @@ class MainForceRotationTests(_PoolBase):
         # qodercn:Qwen-3.8-Max 先于两内置。空池请求国际内置 Max → AUTO 改派到最高层且有位的
         # 自定义 Max（历史 committed 计数仍照旧记账，但绝不再参与跨层排序，低层不能抢高层
         # 名额）。
-        r1 = self.select('t1', 'qoder', 'Qwen3.8-Max')
+        r1 = self.select('t1', 'qoder', 'Qwen4-Max-Preview')
         self.assertRouting(r1, dp.CN_MAX_POOL_KEY)
         self.assertFalse(r1.get('sent', True))
         # 占满三 Qoder Max 层（4 槽）后，请求内置 Max → 落到下一层 zcode:GLM-5.3（层=2，
-        # 紧跟三路 Qwen3.8-Max 之后）。
-        self.reserve_exec('m0', 'qoder', 'Qwen3.8-Max', 'qoder')
-        self.reserve_exec('m1', 'qodercn', 'Qwen3.8-Max', 'qodercn')
+        # 紧跟三路 Qwen4-Max-Preview 之后）。
+        self.reserve_exec('m0', 'qoder', 'Qwen4-Max-Preview', 'qoder')
+        self.reserve_exec('m1', 'qodercn', 'Qwen4-Max-Preview', 'qodercn')
         self.reserve_exec('m2', 'qodercn', 'Qwen-3.8-Max', 'qodercn')
         self.reserve_exec('m3', 'qodercn', 'Qwen-3.8-Max', 'qodercn')
-        r2 = self.select('t2', 'qoder', 'Qwen3.8-Max')
+        r2 = self.select('t2', 'qoder', 'Qwen4-Max-Preview')
         self.assertRouting(r2, 'zcode:GLM-5.3')
         self.assertFalse(r2.get('sent', True))
         # ZCode 层也满（容量 1）后，请求内置 Max → 落到 claude:deepseek-flash。
         self.reserve_exec('z0', 'zcode', 'GLM-5.3', 'zcode')
-        r2b = self.select('t2b', 'qoder', 'Qwen3.8-Max')
+        r2b = self.select('t2b', 'qoder', 'Qwen4-Max-Preview')
         self.assertRouting(r2b, 'claude:deepseek-flash')
         self.assertFalse(r2b.get('sent', True))
         # claude 层也满（容量 2）后，请求内置 Max → 落到 tier5 的 OpenCode 免费模型
         # （同层 stable tie 选 deepseek 免费组合）。
         self.reserve_exec('c0', 'claude', 'deepseek-flash', 'claude')
         self.reserve_exec('c1', 'claude', 'deepseek-flash', 'claude')
-        r3 = self.select('t3', 'qoder', 'Qwen3.8-Max')
+        r3 = self.select('t3', 'qoder', 'Qwen4-Max-Preview')
         self.assertRouting(r3, dp.OPENCODE_DEEPSEEK_POOL_KEY)
 
     def test_select_prefers_requested_combo_on_tie(self):
@@ -326,10 +326,10 @@ class MainForceRotationTests(_PoolBase):
         # 各自分层（1）而国际 Max 独立为层=4，故同层平票改用唯一同层的一组——两 OpenCode
         # 免费模型（层=6，各独立 1 槽）。先占满其上方所有层，使两者 0 在途平票。
         self.reserve_exec('t0', 'zcode', 'GLM-5.3', 'zcode')
-        self.reserve_exec('t1', 'qodercn', 'Qwen3.8-Max', 'qodercn')
+        self.reserve_exec('t1', 'qodercn', 'Qwen4-Max-Preview', 'qodercn')
         self.reserve_exec('t2', 'qodercn', 'Qwen-3.8-Max', 'qodercn')
         self.reserve_exec('t3', 'qodercn', 'Qwen-3.8-Max', 'qodercn')
-        self.reserve_exec('t4', 'qoder', 'Qwen3.8-Max', 'qoder')
+        self.reserve_exec('t4', 'qoder', 'Qwen4-Max-Preview', 'qoder')
         self.reserve_exec('t5', 'claude', 'deepseek-flash', 'claude')
         self.reserve_exec('t6', 'claude', 'deepseek-flash', 'claude')
         self.reserve_exec('t7', 'codebuddy', dp.CODEBUDDY_GLM_MODEL, 'codebuddy')
@@ -344,8 +344,8 @@ class MainForceRotationTests(_PoolBase):
         # 经显式 executor 确定性占位，AUTO select 主力全满
         # → 同级 Flash 兜底，两区平票按 pool_key stable tie 选国际 Flash。
         self.reserve_exec('z0', 'zcode', 'GLM-5.3', 'zcode')
-        self.reserve_exec('m2', 'qoder', 'Qwen3.8-Max', 'qoder')
-        self.reserve_exec('m3', 'qodercn', 'Qwen3.8-Max', 'qodercn')
+        self.reserve_exec('m2', 'qoder', 'Qwen4-Max-Preview', 'qoder')
+        self.reserve_exec('m3', 'qodercn', 'Qwen4-Max-Preview', 'qodercn')
         self.reserve_exec('m4', 'qodercn', 'Qwen-3.8-Max', 'qodercn')
         self.reserve_exec('m5', 'qodercn', 'Qwen-3.8-Max', 'qodercn')
         self.reserve_exec('m6', 'claude', 'deepseek-flash', 'claude')
@@ -353,12 +353,12 @@ class MainForceRotationTests(_PoolBase):
         self.reserve_exec('m8', 'opencode', dp.OPENCODE_DEEPSEEK_MODEL, 'opencode')
         self.reserve_exec('m9', 'opencode', dp.OPENCODE_GLM_MODEL, 'opencode')
         self.reserve_exec('m10', 'codebuddy', dp.CODEBUDDY_GLM_MODEL, 'codebuddy')
-        r = self.select('of', 'qoder', 'Qwen3.8-Max')
+        r = self.select('of', 'qoder', 'Qwen4-Max-Preview')
         self.assertRouting(r, 'qoder:Qwen3.8-Flash')
 
     def test_select_capacity_full_when_all_main_occupied(self):
         self.fill_domestic()
-        r = self.select('full', 'qoder', 'Qwen3.8-Max')
+        r = self.select('full', 'qoder', 'Qwen4-Max-Preview')
         self.assertRejected(r, 'capacity_full')
         self.assertTrue(r.get('domestic_full'))
         self.assertFalse(r.get('sent', True))
@@ -377,8 +377,8 @@ class OverflowRoutingTests(_PoolBase):
         # 独立始终参与候选）填满后，AUTO 直接请求 Flash → 主力满不再拦，同级 Flash 有空位
         # 即 claim。
         self.reserve_exec('z0', 'zcode', 'GLM-5.3', 'zcode')
-        self.reserve_exec('m2', 'qoder', 'Qwen3.8-Max', 'qoder')
-        self.reserve_exec('m3', 'qodercn', 'Qwen3.8-Max', 'qodercn')
+        self.reserve_exec('m2', 'qoder', 'Qwen4-Max-Preview', 'qoder')
+        self.reserve_exec('m3', 'qodercn', 'Qwen4-Max-Preview', 'qodercn')
         self.reserve_exec('m4', 'qodercn', 'Qwen-3.8-Max', 'qodercn')
         self.reserve_exec('m5', 'qodercn', 'Qwen-3.8-Max', 'qodercn')
         self.reserve_exec('m6', 'claude', 'deepseek-flash', 'claude')
@@ -392,8 +392,8 @@ class OverflowRoutingTests(_PoolBase):
     def test_flash_capacity_full_after_two(self):
         # BW-ZCODE-RESTORE-1-20261022：ZCode 恢复占 1 主力槽，一并填满全部主力。
         self.reserve_exec('z0', 'zcode', 'GLM-5.3', 'zcode')
-        self.reserve_exec('m2', 'qoder', 'Qwen3.8-Max', 'qoder')
-        self.reserve_exec('m3', 'qodercn', 'Qwen3.8-Max', 'qodercn')
+        self.reserve_exec('m2', 'qoder', 'Qwen4-Max-Preview', 'qoder')
+        self.reserve_exec('m3', 'qodercn', 'Qwen4-Max-Preview', 'qodercn')
         self.reserve_exec('m4', 'qodercn', 'Qwen-3.8-Max', 'qodercn')
         self.reserve_exec('m5', 'qodercn', 'Qwen-3.8-Max', 'qodercn')
         self.reserve_exec('m6', 'claude', 'deepseek-flash', 'claude')
@@ -431,14 +431,14 @@ class SameWorkspaceGuardTests(_PoolBase):
                         workspace=str(shared), prompt_sha256='p', executor='opencode',
                         now=T0, _preclaim=False)
         self.assertClaimed(r1, dp.OPENCODE_DEEPSEEK_POOL_KEY)
-        r2 = dp.reserve(self.store, task_id='w2', runtime='qoder', model='Qwen3.8-Max',
+        r2 = dp.reserve(self.store, task_id='w2', runtime='qoder', model='Qwen4-Max-Preview',
                         workspace=str(shared), prompt_sha256='p', executor='qoder',
                         now=T0, _preclaim=False)
         self.assertFalse(r2.get('allowed'), r2)
         self.assertEqual(r2.get('reason'), 'workspace_in_flight')
         # 释放 w1 后，同一真实目录恢复可写。
         dp.finish(self.store, r1['token'], terminal='cancelled', now=T0)
-        r3 = dp.reserve(self.store, task_id='w2', runtime='qoder', model='Qwen3.8-Max',
+        r3 = dp.reserve(self.store, task_id='w2', runtime='qoder', model='Qwen4-Max-Preview',
                         workspace=str(shared), prompt_sha256='p', executor='qoder',
                         now=T0, _preclaim=False)
         self.assertTrue(r3.get('allowed'), r3)
@@ -447,15 +447,15 @@ class SameWorkspaceGuardTests(_PoolBase):
 class ValidateClaimTests(_PoolBase):
     def test_validate_ok_when_exact(self):
         # BW-ZCODE-RETIRE-20261020：原 zcode 夹具组合已退役，改用现役 qoder Max。
-        tok = self.reserve('v', 'qoder', 'Qwen3.8-Max', prompt='abc123')
+        tok = self.reserve('v', 'qoder', 'Qwen4-Max-Preview', prompt='abc123')
         chk = dp.validate_claim(self.store, tok, task_id='v', runtime='qoder',
-                                model='Qwen3.8-Max', workspace=str(self._ws_for('v')),
+                                model='Qwen4-Max-Preview', workspace=str(self._ws_for('v')),
                                 prompt_sha256='abc123')
         self.assertTrue(chk['ok'], chk['reasons'])
         self.assertFalse(chk['drift'])
 
     def test_validate_detects_each_drift(self):
-        tok = self.reserve('v', 'qoder', 'Qwen3.8-Max', prompt='abc123')
+        tok = self.reserve('v', 'qoder', 'Qwen4-Max-Preview', prompt='abc123')
         ws = str(self._ws_for('v'))
         self.assertTrue(dp.validate_claim(self.store, tok, model='Qwen3.8-Flash')['drift'])
         self.assertTrue(dp.validate_claim(self.store, tok, runtime='codebuddy')['drift'])
@@ -470,7 +470,7 @@ class ValidateClaimTests(_PoolBase):
         self.assertTrue(chk['drift'])
 
     def test_validate_terminal_claim_cannot_consume(self):
-        tok = self.reserve('v', 'qoder', 'Qwen3.8-Max')
+        tok = self.reserve('v', 'qoder', 'Qwen4-Max-Preview')
         # reserved 无 child：只有 cancelled/start_failed 合法释放（finished 需 child 证据）。
         dp.finish(self.store, tok, terminal='cancelled', now=T0)
         chk = dp.validate_claim(self.store, tok, task_id='v')
@@ -480,20 +480,20 @@ class ValidateClaimTests(_PoolBase):
 
 class ConsumeForEntryTests(_PoolBase):
     def test_consume_with_valid_claim_token_marks_running(self):
-        tok = self.reserve('e', 'qoder', 'Qwen3.8-Max', prompt='pp')
+        tok = self.reserve('e', 'qoder', 'Qwen4-Max-Preview', prompt='pp')
         r = dp.consume_for_entry(self.store, task_id='e', runtime='qoder',
-                                 model='Qwen3.8-Max', workspace=str(self._ws_for('e')),
+                                 model='Qwen4-Max-Preview', workspace=str(self._ws_for('e')),
                                  prompt_sha256='pp', claim_token=tok,
                                  wrapper_pid=4321, wrapper_created='w1', now=T0)
         self.assertTrue(r['allowed'], r)
         self.assertTrue(r['claimed'])
         self.assertEqual(r['token'], tok)
         self.assertEqual(self._state(tok), 'running')
-        st = dp.status(self.store, now=T0)['pools']['qoder:Qwen3.8-Max']
+        st = dp.status(self.store, now=T0)['pools']['qoder:Qwen4-Max-Preview']
         self.assertEqual(st['active'], 1)
 
     def test_consume_with_drifted_claim_refused(self):
-        tok = self.reserve('e', 'qoder', 'Qwen3.8-Max', prompt='pp')
+        tok = self.reserve('e', 'qoder', 'Qwen4-Max-Preview', prompt='pp')
         r = dp.consume_for_entry(self.store, task_id='e', runtime='qoder',
                                  model='Qwen3.8-Flash', workspace=str(self._ws_for('e')),
                                  prompt_sha256='pp', claim_token=tok,
@@ -510,7 +510,7 @@ class ConsumeForEntryTests(_PoolBase):
         # CN 自定义 qodercn:Qwen-3.8-Max 先于两内置，空池请求该组合即被 AUTO 选中并直接
         # claim（无需改派）。
         r = dp.consume_for_entry(self.store, task_id='n', runtime='qodercn',
-                                 model='Qwen3.8-Max', workspace=str(self._ws_for('n')),
+                                 model='Qwen4-Max-Preview', workspace=str(self._ws_for('n')),
                                  prompt_sha256='p', wrapper_pid=4321, wrapper_created='w1',
                                  now=T0)
         self.assertTrue(r['allowed'], r)
@@ -520,9 +520,9 @@ class ConsumeForEntryTests(_PoolBase):
     def test_consume_without_token_can_route_wrong_combo(self):
         # BW-ZCODE-RETIRE-20261020：原 zcode 请求组合已退役（会先撞 unknown_pool），
         # 改用现役 qoder Max：占满其唯一槽后，无 token 的同组合消费必须 routing 改道。
-        self.reserve('q0', 'qoder', 'Qwen3.8-Max')
+        self.reserve('q0', 'qoder', 'Qwen4-Max-Preview')
         r = dp.consume_for_entry(self.store, task_id='n2', runtime='qoder',
-                                 model='Qwen3.8-Max', workspace=str(self._ws_for('n2')),
+                                 model='Qwen4-Max-Preview', workspace=str(self._ws_for('n2')),
                                  prompt_sha256='p', wrapper_pid=4321, wrapper_created='w1',
                                  now=T0)
         self.assertFalse(r['allowed'], r)
@@ -541,7 +541,7 @@ class ConsumeForEntryTests(_PoolBase):
         # BW-ZCODE-RETIRE-20261020：fill_domestic 已无 zcode 占位（f0/f1 退出），
         # 防重断言改用在途的 f2（qoder Max）。
         dup = dp.consume_for_entry(self.store, task_id='f2', runtime='qoder',
-                                   model='Qwen3.8-Max', workspace=str(self._ws_for('f2')),
+                                   model='Qwen4-Max-Preview', workspace=str(self._ws_for('f2')),
                                    prompt_sha256='p', wrapper_pid=4321,
                                    wrapper_created='w1', now=T0)
         self.assertRejected(dup, 'duplicate_task_in_flight')
@@ -550,72 +550,72 @@ class ConsumeForEntryTests(_PoolBase):
 class ReleaseAndUnknownTests(_PoolBase):
     def test_cancel_releases_reserved_capacity_immediately(self):
         # BW-ZCODE-RETIRE-20261020：原 zcode 夹具已退役，生命周期断言改用现役 qoder Max。
-        tok = self.reserve('r', 'qoder', 'Qwen3.8-Max')
-        self.assertEqual(dp.status(self.store, now=T0)['pools']['qoder:Qwen3.8-Max']['active'], 1)
+        tok = self.reserve('r', 'qoder', 'Qwen4-Max-Preview')
+        self.assertEqual(dp.status(self.store, now=T0)['pools']['qoder:Qwen4-Max-Preview']['active'], 1)
         res = dp.finish(self.store, tok, terminal='cancelled', now=T0)
         self.assertTrue(res['released'])
-        self.assertEqual(dp.status(self.store, now=T0)['pools']['qoder:Qwen3.8-Max']['active'], 0)
+        self.assertEqual(dp.status(self.store, now=T0)['pools']['qoder:Qwen4-Max-Preview']['active'], 0)
 
     def test_finished_on_reserved_no_child_refused(self):
         # finished 需要 child 真实退出证据；reserved 无 child 用 finished → 拒绝，不释放。
-        tok = self.reserve('r', 'qoder', 'Qwen3.8-Max')
+        tok = self.reserve('r', 'qoder', 'Qwen4-Max-Preview')
         res = dp.finish(self.store, tok, terminal='finished', now=T0)
         self.assertFalse(res['released'], res)
         self.assertEqual(res.get('reason'), 'no_child_terminal_unverified')
-        self.assertEqual(dp.status(self.store, now=T0)['pools']['qoder:Qwen3.8-Max']['active'], 1)
+        self.assertEqual(dp.status(self.store, now=T0)['pools']['qoder:Qwen4-Max-Preview']['active'], 1)
 
     def test_start_failed_and_cancelled_release(self):
         t1 = self.reserve('a', 'qodercn', 'Qwen-3.8-Max')
-        t2 = self.reserve('b', 'qoder', 'Qwen3.8-Max')
+        t2 = self.reserve('b', 'qoder', 'Qwen4-Max-Preview')
         dp.finish(self.store, t1, terminal='start_failed', now=T0)
         dp.finish(self.store, t2, terminal='cancelled', now=T0)
         st = dp.status(self.store, now=T0)['pools']
         self.assertEqual(st['qodercn:Qwen-3.8-Max']['active'], 0)
-        self.assertEqual(st['qoder:Qwen3.8-Max']['active'], 0)
+        self.assertEqual(st['qoder:Qwen4-Max-Preview']['active'], 0)
 
     def test_finish_rejects_non_release_terminal(self):
-        tok = self.reserve('r', 'qoder', 'Qwen3.8-Max')
+        tok = self.reserve('r', 'qoder', 'Qwen4-Max-Preview')
         with self.assertRaises(ValueError):
             dp.finish(self.store, tok, terminal='unknown')
 
     def test_double_finish_second_is_noop(self):
-        tok = self.reserve('r', 'qoder', 'Qwen3.8-Max')
+        tok = self.reserve('r', 'qoder', 'Qwen4-Max-Preview')
         self.assertTrue(dp.finish(self.store, tok, terminal='cancelled', now=T0)['released'])
         self.assertFalse(dp.finish(self.store, tok, terminal='cancelled', now=T0)['released'])
 
     def test_mark_unknown_holds_capacity(self):
-        tok = self.reserve('u', 'qoder', 'Qwen3.8-Max')
+        tok = self.reserve('u', 'qoder', 'Qwen4-Max-Preview')
         res = dp.mark_unknown(self.store, tok, now=T0)
         self.assertTrue(res['capacity_held'])
         self.assertFalse(res['released'])
-        self.assertEqual(dp.status(self.store, now=T0)['pools']['qoder:Qwen3.8-Max']['active'], 1)
+        self.assertEqual(dp.status(self.store, now=T0)['pools']['qoder:Qwen4-Max-Preview']['active'], 1)
 
     def test_finish_unknown_no_child_requires_owner(self):
         # 进入 Popen-bind 窗口（有 wrapper）后 mark_unknown：无 owner 身份绝不释放；
         # 记录的真实 owner 亲证取消才释放（绝不凭一个终态参数假定未启动）。
-        tok = self.reserve('u', 'qoder', 'Qwen3.8-Max')
+        tok = self.reserve('u', 'qoder', 'Qwen4-Max-Preview')
         dp.mark_running(self.store, tok, wrapper_pid=7000, wrapper_created='c7000', now=T0)
         dp.mark_unknown(self.store, tok, now=T0)
         refused = dp.finish(self.store, tok, terminal='cancelled', now=T0)
         self.assertFalse(refused['released'], refused)
         self.assertEqual(refused.get('reason'), 'owner_unverified')
-        self.assertEqual(dp.status(self.store, now=T0)['pools']['qoder:Qwen3.8-Max']['active'], 1)
+        self.assertEqual(dp.status(self.store, now=T0)['pools']['qoder:Qwen4-Max-Preview']['active'], 1)
         released = dp.finish(self.store, tok, terminal='cancelled', now=T0,
                              wrapper_pid=7000, wrapper_created='c7000')
         self.assertTrue(released['released'], released)
-        self.assertEqual(dp.status(self.store, now=T0)['pools']['qoder:Qwen3.8-Max']['active'], 0)
+        self.assertEqual(dp.status(self.store, now=T0)['pools']['qoder:Qwen4-Max-Preview']['active'], 0)
 
     def test_real_child_death_releases_before_report(self):
         # 绑定真实 child 后其死亡（真实 Windows 死 PID created=None）→ finish 释放容量。
         # BW-ZCODE-RETIRE-20261020：原 zcode 夹具已退役，改用现役 qoder Max。
-        tok = self.reserve('d', 'qoder', 'Qwen3.8-Max')
+        tok = self.reserve('d', 'qoder', 'Qwen4-Max-Preview')
         dp.mark_running(self.store, tok, wrapper_pid=8000, wrapper_created='c8000', now=T0)
         dp.bind_child(self.store, tok, 8001, child_created='c8001',
                       wrapper_pid=8000, wrapper_created='c8000', now=T0)
         res = dp.finish(self.store, tok, terminal='finished', now=T0,
                         prober=_fake_prober({8001: ('dead', None)}))
         self.assertTrue(res['released'], res)
-        self.assertEqual(dp.status(self.store, now=T0)['pools']['qoder:Qwen3.8-Max']['active'], 0)
+        self.assertEqual(dp.status(self.store, now=T0)['pools']['qoder:Qwen4-Max-Preview']['active'], 0)
 
 
 def _fake_prober(live_map):
@@ -637,7 +637,7 @@ class ReconcileTests(_PoolBase):
 
     def test_wrapper_alive_promotes_reserved_to_running(self):
         # BW-ZCODE-RETIRE-20261020：原 zcode 夹具已退役，reconcile 断言改用现役 qoder Max。
-        tok = self.reserve('p', 'qoder', 'Qwen3.8-Max')
+        tok = self.reserve('p', 'qoder', 'Qwen4-Max-Preview')
         dp.mark_running(self.store, tok, wrapper_pid=1000, wrapper_created='c1000', now=T0)
         # 手动退回 reserved 以验证 promote 分支（closing 确保 Windows 下句柄释放）。
         with closing(dp.connect(self.store)) as conn:
@@ -648,7 +648,7 @@ class ReconcileTests(_PoolBase):
         self.assertEqual(self._state(tok), 'running')
 
     def test_wrapper_dead_child_alive_match_kept(self):
-        tok = self.reserve('q', 'qoder', 'Qwen3.8-Max')
+        tok = self.reserve('q', 'qoder', 'Qwen4-Max-Preview')
         self._bind(tok, wrapper_pid=2000, child_pid=2001,
                    wrapper_created='c2000', child_created='c2001')
         res = dp.reconcile(self.store, prober=_fake_prober(
@@ -657,20 +657,20 @@ class ReconcileTests(_PoolBase):
         self.assertNotIn(tok, res['released'])
         self.assertFalse(any(h['token'] == tok for h in res['held']), res)
         self.assertEqual(self._state(tok), 'running')
-        self.assertEqual(dp.status(self.store, now=T0)['pools']['qoder:Qwen3.8-Max']['active'], 1)
+        self.assertEqual(dp.status(self.store, now=T0)['pools']['qoder:Qwen4-Max-Preview']['active'], 1)
 
     def test_wrapper_dead_child_dead_created_match_released(self):
-        tok = self.reserve('r', 'qoder', 'Qwen3.8-Max')
+        tok = self.reserve('r', 'qoder', 'Qwen4-Max-Preview')
         self._bind(tok, wrapper_pid=3000, child_pid=3001,
                    wrapper_created='c3000', child_created='c3001')
         res = dp.reconcile(self.store, prober=_fake_prober(
             {3000: ('dead', 'c3000'), 3001: ('dead', 'c3001')}), now=T0)
         self.assertIn(tok, res['released'])
-        self.assertEqual(dp.status(self.store, now=T0)['pools']['qoder:Qwen3.8-Max']['active'], 0)
+        self.assertEqual(dp.status(self.store, now=T0)['pools']['qoder:Qwen4-Max-Preview']['active'], 0)
 
     def test_real_dead_pid_created_none_released(self):
         # 真实 Windows 死 PID 的 created=None 属正常，不额外要求创建时刻。
-        tok = self.reserve('rd', 'qoder', 'Qwen3.8-Max')
+        tok = self.reserve('rd', 'qoder', 'Qwen4-Max-Preview')
         self._bind(tok, wrapper_pid=3100, child_pid=3101,
                    wrapper_created='c3100', child_created='c3101')
         res = dp.reconcile(self.store, prober=_fake_prober(
@@ -678,7 +678,7 @@ class ReconcileTests(_PoolBase):
         self.assertIn(tok, res['released'])
 
     def test_child_alive_pid_reuse_held(self):
-        tok = self.reserve('s', 'qoder', 'Qwen3.8-Max')
+        tok = self.reserve('s', 'qoder', 'Qwen4-Max-Preview')
         self._bind(tok, wrapper_pid=4000, child_pid=4001,
                    wrapper_created='c4000', child_created='c4001')
         # child 现在活着但出生时刻与记录不同（PID 复用嫌疑）→ unknown 不抢占。
@@ -689,7 +689,7 @@ class ReconcileTests(_PoolBase):
         self.assertEqual(self._state(tok), 'unknown')
 
     def test_child_alive_created_unknown_held(self):
-        tok = self.reserve('t', 'qoder', 'Qwen3.8-Max')
+        tok = self.reserve('t', 'qoder', 'Qwen4-Max-Preview')
         self._bind(tok, wrapper_pid=5000, child_pid=5001,
                    wrapper_created='c5000', child_created='c5001')
         res = dp.reconcile(self.store, prober=_fake_prober(
@@ -698,7 +698,7 @@ class ReconcileTests(_PoolBase):
         self.assertEqual(self._state(tok), 'unknown')
 
     def test_wrapper_dead_child_never_bound_held(self):
-        tok = self.reserve('u', 'qoder', 'Qwen3.8-Max')
+        tok = self.reserve('u', 'qoder', 'Qwen4-Max-Preview')
         dp.mark_running(self.store, tok, wrapper_pid=6000, wrapper_created='c6000', now=T0)
         res = dp.reconcile(self.store, prober=_fake_prober({6000: ('dead', 'c6000')}), now=T0)
         self.assertTrue(any(h['token'] == tok for h in res['held']), res)
@@ -707,12 +707,12 @@ class ReconcileTests(_PoolBase):
     def test_never_consumed_reserved_left_reserved(self):
         # 从未消费的合法预留（reserved、无 wrapper、无 child）：reconcile 保持 reserved，
         # 绝不翻 unknown（否则会破坏 consume 的同事务 CAS 竞争并令合法 cancel 误报）。
-        tok = self.reserve('v', 'qoder', 'Qwen3.8-Max')
+        tok = self.reserve('v', 'qoder', 'Qwen4-Max-Preview')
         res = dp.reconcile(self.store, prober=_fake_prober({}), now=T0)
         self.assertNotIn(tok, res['released'])
         self.assertFalse(any(h['token'] == tok for h in res['held']), res)
         self.assertEqual(self._state(tok), 'reserved')
-        self.assertEqual(dp.status(self.store, now=T0)['pools']['qoder:Qwen3.8-Max']['active'], 1)
+        self.assertEqual(dp.status(self.store, now=T0)['pools']['qoder:Qwen4-Max-Preview']['active'], 1)
 
 
 class NeverConsumedReservationTests(_PoolBase):
@@ -720,24 +720,24 @@ class NeverConsumedReservationTests(_PoolBase):
 
     def test_reserve_reconcile_cancel_releases(self):
         # BW-ZCODE-RETIRE-20261020：原 zcode 夹具已退役，改用现役 qoder Max。
-        tok = self.reserve('nc', 'qoder', 'Qwen3.8-Max')
+        tok = self.reserve('nc', 'qoder', 'Qwen4-Max-Preview')
         # reconcile 绝不把从未消费的 reserved 翻成 unknown。
         res = dp.reconcile(self.store, prober=_fake_prober({}), now=T0)
         self.assertNotIn(tok, res['released'])
         self.assertFalse(any(h['token'] == tok for h in res['held']), res)
         self.assertEqual(self._state(tok), 'reserved')
-        self.assertEqual(dp.status(self.store, now=T0)['pools']['qoder:Qwen3.8-Max']['active'], 1)
+        self.assertEqual(dp.status(self.store, now=T0)['pools']['qoder:Qwen4-Max-Preview']['active'], 1)
         # 合法取消释放这个干净名额（不再误报 owner_unverified）。
         out = dp.finish(self.store, tok, terminal='cancelled', now=T0)
         self.assertTrue(out['released'], out)
         self.assertEqual(self._state(tok), 'cancelled')
-        self.assertEqual(dp.status(self.store, now=T0)['pools']['qoder:Qwen3.8-Max']['active'], 0)
+        self.assertEqual(dp.status(self.store, now=T0)['pools']['qoder:Qwen4-Max-Preview']['active'], 0)
 
     def test_consume_wins_then_non_owner_cancel_refused(self):
-        tok = self.reserve('sw', 'qoder', 'Qwen3.8-Max', stage='s1', chat_id='c1')
+        tok = self.reserve('sw', 'qoder', 'Qwen4-Max-Preview', stage='s1', chat_id='c1')
         ws = str(self._ws_for('sw'))
         c = dp.consume_for_entry(self.store, task_id='sw', runtime='qoder',
-                                 model='Qwen3.8-Max',
+                                 model='Qwen4-Max-Preview',
                                  workspace=ws, prompt_sha256='p', stage='s1', chat_id='c1',
                                  claim_token=tok, wrapper_pid=4321, wrapper_created='w1',
                                  now=T0)
@@ -750,13 +750,13 @@ class NeverConsumedReservationTests(_PoolBase):
         self.assertEqual(self._state(tok), 'running')
 
     def test_cancel_wins_then_consume_refused(self):
-        tok = self.reserve('cf', 'qoder', 'Qwen3.8-Max', stage='s1', chat_id='c1')
+        tok = self.reserve('cf', 'qoder', 'Qwen4-Max-Preview', stage='s1', chat_id='c1')
         ws = str(self._ws_for('cf'))
         out = dp.finish(self.store, tok, terminal='cancelled', now=T0)
         self.assertTrue(out['released'], out)
         # cancel 已赢：终态 claim 不能再被消费。
         c = dp.consume_for_entry(self.store, task_id='cf', runtime='qoder',
-                                 model='Qwen3.8-Max',
+                                 model='Qwen4-Max-Preview',
                                  workspace=ws, prompt_sha256='p', stage='s1', chat_id='c1',
                                  claim_token=tok, wrapper_pid=4321, wrapper_created='w1',
                                  now=T0)
@@ -929,7 +929,7 @@ class StatusTests(_PoolBase):
     def test_status_shape_and_domestic_total(self):
         # BW-STRONG-SONUS-20261024：物理总量 16（ZCode 1 槽 + strong 专属 Sonus 1 槽）。
         self.reserve('z', 'qodercn', 'Qwen-3.8-Max')
-        self.reserve('q', 'qoder', 'Qwen3.8-Max')
+        self.reserve('q', 'qoder', 'Qwen4-Max-Preview')
         st = dp.status(self.store, now=T0)
         self.assertEqual(set(st['pools']), set(dp.CAPACITY))
         self.assertEqual(st['domestic']['capacity'], 16)
@@ -980,8 +980,8 @@ class MainForceLimitTests(_PoolBase):
     drift（task/pool 漂移、证据 sha 不一致、attempt 缺失、非限额池）一律拒；
     consume_for_entry 消费预留票据前先查限额并把本 reserved 释放为 start_failed。"""
 
-    QMAX = 'qoder:Qwen3.8-Max'
-    CNMAX = 'qodercn:Qwen3.8-Max'
+    QMAX = 'qoder:Qwen4-Max-Preview'
+    CNMAX = 'qodercn:Qwen4-Max-Preview'
     CUSTOMMAX = 'qodercn:Qwen-3.8-Max'  # 自定义 CN 主力：可限额、与内置同套时段门（用例经 T0 夜间 claim）、复用同一标记机制
 
     def _evidence(self, name='stdout.json', payload='{"result_errors":["You\'ve reached '
@@ -994,7 +994,7 @@ class MainForceLimitTests(_PoolBase):
 
     def test_record_read_release_read_roundtrip(self):
         """temp 库完整往返：record → main_force_limited/Limits → release → 再读恒 False。"""
-        tok = self.reserve_exec('rt', 'qoder', 'Qwen3.8-Max', 'qoder', pk=self.QMAX)
+        tok = self.reserve_exec('rt', 'qoder', 'Qwen4-Max-Preview', 'qoder', pk=self.QMAX)
         ev_path, ev_sha = self._evidence()
         rec = dp.record_main_force_limit(self.store, self.QMAX, task_id='rt',
                                          attempt_token=tok, evidence_path=ev_path,
@@ -1073,7 +1073,7 @@ class MainForceLimitTests(_PoolBase):
 
     def test_record_rejects_task_and_pool_drift(self):
         """attempt 已存在但 pool_key 或 task_id 与 marker 参数不一致 → drift 拒。"""
-        tok = self.reserve_exec('real', 'qoder', 'Qwen3.8-Max', 'qoder', pk=self.QMAX)
+        tok = self.reserve_exec('real', 'qoder', 'Qwen4-Max-Preview', 'qoder', pk=self.QMAX)
         ev_path, ev_sha = self._evidence('ev1.json')
         # task_id 漂移
         r1 = dp.record_main_force_limit(self.store, self.QMAX, task_id='someone-else',
@@ -1094,7 +1094,7 @@ class MainForceLimitTests(_PoolBase):
 
     def test_record_rejects_evidence_sha_mismatch(self):
         """证据文件存在但 sha256 与声明值不一致 → drift 拒。"""
-        tok = self.reserve_exec('es', 'qoder', 'Qwen3.8-Max', 'qoder', pk=self.QMAX)
+        tok = self.reserve_exec('es', 'qoder', 'Qwen4-Max-Preview', 'qoder', pk=self.QMAX)
         ev_path, _ = self._evidence('ev2.json', payload='real bytes\n')
         r = dp.record_main_force_limit(self.store, self.QMAX, task_id='es',
                                        attempt_token=tok, evidence_path=ev_path,
@@ -1105,7 +1105,7 @@ class MainForceLimitTests(_PoolBase):
         self.assertFalse(dp.main_force_limited(self.store, self.QMAX, now=T0))
 
     def test_record_rejects_missing_evidence_file(self):
-        tok = self.reserve_exec('ef', 'qoder', 'Qwen3.8-Max', 'qoder', pk=self.QMAX)
+        tok = self.reserve_exec('ef', 'qoder', 'Qwen4-Max-Preview', 'qoder', pk=self.QMAX)
         missing = str(self.base / 'no-such-file.json')
         r = dp.record_main_force_limit(self.store, self.QMAX, task_id='ef',
                                        attempt_token=tok, evidence_path=missing,
@@ -1116,7 +1116,7 @@ class MainForceLimitTests(_PoolBase):
 
     def test_record_requires_binding_fields(self):
         """缺 attempt_token/task_id 或 evidence_path/evidence_sha256 → drift 拒。"""
-        tok = self.reserve_exec('bf', 'qoder', 'Qwen3.8-Max', 'qoder', pk=self.QMAX)
+        tok = self.reserve_exec('bf', 'qoder', 'Qwen4-Max-Preview', 'qoder', pk=self.QMAX)
         ev_path, ev_sha = self._evidence('ev3.json')
         for kwargs in (
             dict(task_id='bf', attempt_token=tok),  # 缺 evidence 字段
@@ -1130,7 +1130,7 @@ class MainForceLimitTests(_PoolBase):
 
     def test_record_is_idempotent_and_clears_release_traces(self):
         """同一 pool 重复 record 只刷新证据/时间戳，仍 limited=1，清空旧的 released_at/note。"""
-        tok = self.reserve_exec('idp', 'qoder', 'Qwen3.8-Max', 'qoder', pk=self.QMAX)
+        tok = self.reserve_exec('idp', 'qoder', 'Qwen4-Max-Preview', 'qoder', pk=self.QMAX)
         ev1, s1 = self._evidence('a.json', payload='first\n')
         r1 = dp.record_main_force_limit(self.store, self.QMAX, task_id='idp',
                                         attempt_token=tok, evidence_path=ev1,
@@ -1159,8 +1159,8 @@ class MainForceLimitTests(_PoolBase):
         仅作诊断（main_force_limits 表/limited 状态/limits API 均原样保留）。同 workspace 单
         写、时段门、unknown 在途、审批拒绝等守卫照常，本用例只验证 consume 真跑通到 running、
         不越权释放别人的占位。"""
-        tok = self.reserve_exec('c1', 'qoder', 'Qwen3.8-Max', 'qoder', pk=self.QMAX)
-        tok_cn = self.reserve_exec('c2', 'qodercn', 'Qwen3.8-Max', 'qodercn',
+        tok = self.reserve_exec('c1', 'qoder', 'Qwen4-Max-Preview', 'qoder', pk=self.QMAX)
+        tok_cn = self.reserve_exec('c2', 'qodercn', 'Qwen4-Max-Preview', 'qodercn',
                                    pk=self.CNMAX)
         ev, sha = self._evidence('c1.json', payload='limited evidence\n')
         # BW-QWEN-MAX-LIMIT15-20261028：QMAX 限额标记已入 900 秒短窗——本用例验证窗口
@@ -1174,7 +1174,7 @@ class MainForceLimitTests(_PoolBase):
         self.assertTrue(dp.main_force_limited(self.store, self.QMAX, now=T0))
         # 但入口 consume 不再据此前置挡：reserved→running 正常放行、capacity 由本 attempt 持有。
         out = dp.consume_for_entry(self.store, task_id='c1', runtime='qoder',
-                                   model='Qwen3.8-Max',
+                                   model='Qwen4-Max-Preview',
                                    workspace=str(self._ws_for('c1')),
                                    prompt_sha256='p', claim_token=tok,
                                    now=T0 + timedelta(seconds=2))
@@ -1190,10 +1190,10 @@ class MainForceLimitTests(_PoolBase):
         """BW-SIMPLE-PRIORITY-RETRY-S4：consume 不再据 main_force_limit 前置挡；running
         旧 token 重放仍走 CAS reserved→running 单赢家路径，UPDATE WHERE state=reserved 命中
         0 行 → 拒重复启动、绝不谎称 capacity_released，保留原 running 状态与在途占位。"""
-        tok = self.reserve_exec('rn', 'qoder', 'Qwen3.8-Max', 'qoder', pk=self.QMAX)
+        tok = self.reserve_exec('rn', 'qoder', 'Qwen4-Max-Preview', 'qoder', pk=self.QMAX)
         ws = str(self._ws_for('rn'))
         first = dp.consume_for_entry(self.store, task_id='rn', runtime='qoder',
-                                     model='Qwen3.8-Max', workspace=ws,
+                                     model='Qwen4-Max-Preview', workspace=ws,
                                      prompt_sha256='p', claim_token=tok,
                                      wrapper_pid=4321, wrapper_created='w1', now=T0)
         self.assertTrue(first['allowed'], first)
@@ -1205,7 +1205,7 @@ class MainForceLimitTests(_PoolBase):
             evidence_path=ev, evidence_sha256=sha,
             now=T0 - timedelta(seconds=2000))['recorded'])
         out = dp.consume_for_entry(self.store, task_id='rn', runtime='qoder',
-                                   model='Qwen3.8-Max', workspace=ws,
+                                   model='Qwen4-Max-Preview', workspace=ws,
                                    prompt_sha256='p', claim_token=tok,
                                    wrapper_pid=4321, wrapper_created='w1',
                                    now=T0 + timedelta(seconds=2))
@@ -1223,7 +1223,7 @@ class MainForceLimitTests(_PoolBase):
         旧 token 重放走 CAS reserved→running 单赢家路径，UPDATE WHERE state=reserved 命中 0
         行 → 拒重复启动，绝不假释放，保留原 unknown 状态与在途占位。"""
         self.assertIn('unknown', dp.ACTIVE_STATES)
-        tok = self.reserve_exec('uk', 'qoder', 'Qwen3.8-Max', 'qoder', pk=self.QMAX)
+        tok = self.reserve_exec('uk', 'qoder', 'Qwen4-Max-Preview', 'qoder', pk=self.QMAX)
         ws = str(self._ws_for('uk'))
         dp.mark_running(self.store, tok, wrapper_pid=5000, wrapper_created='c5000', now=T0)
         dp.mark_unknown(self.store, tok, now=T0)
@@ -1234,7 +1234,7 @@ class MainForceLimitTests(_PoolBase):
             evidence_path=ev, evidence_sha256=sha,
             now=T0 + timedelta(seconds=1))['recorded'])
         out = dp.consume_for_entry(self.store, task_id='uk', runtime='qoder',
-                                   model='Qwen3.8-Max', workspace=ws,
+                                   model='Qwen4-Max-Preview', workspace=ws,
                                    prompt_sha256='p', claim_token=tok,
                                    wrapper_pid=5000, wrapper_created='c5000',
                                    now=T0 + timedelta(seconds=2))
@@ -1250,7 +1250,7 @@ class MainForceLimitTests(_PoolBase):
 
     def test_consume_for_entry_allows_when_pool_released(self):
         """release_main_force_limit 后同一 reserved 可正常 consume 到 running。"""
-        tok = self.reserve_exec('rl', 'qoder', 'Qwen3.8-Max', 'qoder', pk=self.QMAX)
+        tok = self.reserve_exec('rl', 'qoder', 'Qwen4-Max-Preview', 'qoder', pk=self.QMAX)
         ev, sha = self._evidence('rl.json', payload='limited once\n')
         self.assertTrue(dp.record_main_force_limit(
             self.store, self.QMAX, task_id='rl', attempt_token=tok,
@@ -1259,7 +1259,7 @@ class MainForceLimitTests(_PoolBase):
             self.store, self.QMAX, note='user refill',
             now=T0 + timedelta(seconds=5))['released'])
         out = dp.consume_for_entry(self.store, task_id='rl', runtime='qoder',
-                                   model='Qwen3.8-Max',
+                                   model='Qwen4-Max-Preview',
                                    workspace=str(self._ws_for('rl')),
                                    prompt_sha256='p', claim_token=tok,
                                    now=T0 + timedelta(seconds=6))
@@ -1296,7 +1296,7 @@ class MainForceLimitTests(_PoolBase):
         reserved 完全不受影响。"""
         tok_cx = self.reserve_exec('cxl', 'qodercn', 'Qwen-3.8-Max', 'qodercn',
                                    pk=self.CUSTOMMAX)
-        tok_cn = self.reserve_exec('cnkeep', 'qodercn', 'Qwen3.8-Max', 'qodercn',
+        tok_cn = self.reserve_exec('cnkeep', 'qodercn', 'Qwen4-Max-Preview', 'qodercn',
                                    pk=self.CNMAX)
         ev, sha = self._evidence('cxl.json', payload='custom limit hit\n')
         self.assertTrue(dp.record_main_force_limit(
@@ -1415,7 +1415,7 @@ class QuotaLimitWindowTests(_PoolBase):
         self.assertTrue(out.get('capacity_released'), out)
         self.assertEqual(self._state(tok), 'start_failed')
         # 记录/拒绝/释放全程不遗留写锁：后续普通预留仍可立即成功。
-        nxt = self._claim('zc-next', 'qoder', 'Qwen3.8-Max', T0 + timedelta(seconds=2))
+        nxt = self._claim('zc-next', 'qoder', 'Qwen4-Max-Preview', T0 + timedelta(seconds=2))
         self.assertTrue(nxt.get('allowed'), nxt)
 
     def test_auto_zcode_combo_restored_selectable(self):
@@ -1424,7 +1424,7 @@ class QuotaLimitWindowTests(_PoolBase):
         # 已占；BW-QODER-INTL-MAX-ALLDAY-20261023 起国际 Max 白天也可派，故先占满其唯一
         # 名额，AUTO 请求 zcode 组合才会落到层=2 的 ZCode 并直接 claim。
         WEEKDAY_PEAK = datetime(2026, 10, 12, 2, 0, 0, tzinfo=timezone.utc)
-        self.reserve_exec('intlmax', 'qoder', 'Qwen3.8-Max', 'qoder')
+        self.reserve_exec('intlmax', 'qoder', 'Qwen4-Max-Preview', 'qoder')
         r = dp.select_and_claim(
             self.store, task_id='aauto', runtime='zcode', model='GLM-5.3',
             workspace=str(self._ws_for('aauto')), prompt_sha256='p',
@@ -1455,14 +1455,14 @@ class QuotaLimitWindowTests(_PoolBase):
 class BeijingMainForceWindowTests(_PoolBase):
     """BW-MAX-WINDOW-20261010-S1 + BW-CUSTOM-MAX-NIGHT-20261010-S1 + BW-QODER-INTL-MAX-
     ALLDAY-20261023（当前权威）：夜间时段门只约束**两个 CN Max**（CN 内置
-    qodercn:Qwen3.8-Max、CN 自定义 qodercn:Qwen-3.8-Max），它们只在北京时间 22:00（含）
-    至次日 08:00（不含）作为主力；**国际内置 qoder:Qwen3.8-Max 全天可派**，任何注入时间
+    qodercn:Qwen4-Max-Preview、CN 自定义 qodercn:Qwen-3.8-Max），它们只在北京时间 22:00（含）
+    至次日 08:00（不含）作为主力；**国际内置 qoder:Qwen4-Max-Preview 全天可派**，任何注入时间
     （北京 08:00 / 10:00 / 21:59 等）都不得被挡。全部使用确定性时间夹具，绝不依赖宿主
     墙钟；跨午夜/08:00 边界、AUTO 白天口径、显式 Max 白天如实拒绝、reserved 跨 08 点真实
     释放、running/unknown 不假释放、降级 claim_due 使用同一时段候选过滤都覆盖。"""
 
-    QMAX = 'qoder:Qwen3.8-Max'
-    CNMAX = 'qodercn:Qwen3.8-Max'
+    QMAX = 'qoder:Qwen4-Max-Preview'
+    CNMAX = 'qodercn:Qwen4-Max-Preview'
     CXMAX = 'qodercn:Qwen-3.8-Max'
     CN_GATED = (CNMAX, CXMAX)
     ALL_QMAX = (QMAX, CNMAX, CXMAX)
@@ -1495,7 +1495,7 @@ class BeijingMainForceWindowTests(_PoolBase):
         self.assertEqual(dp._beijing_hour(datetime(2026, 10, 8, 14, 0, 0)), 22)
 
     def test_three_max_are_window_gated_in_weak_mode(self):
-        # BW-MANUAL-THREE-MODE-20261023（当前权威）：**默认 weak 档**恢复三个 Qwen3.8-Max
+        # BW-MANUAL-THREE-MODE-20261023（当前权威）：**默认 weak 档**恢复三个 Qwen4-Max-Preview
         # 的北京 22:00–08:00 夜间门（含自定义/内置/国际），边界左闭右开。
         for pk in self.ALL_QMAX:
             self.assertTrue(dp._max_window_blocks(pk, self.NOON), pk)
@@ -1533,23 +1533,23 @@ class BeijingMainForceWindowTests(_PoolBase):
     def test_auto_daytime_claims_intl_max_in_strong_mode(self):
         # BW-MANUAL-THREE-MODE-20261023：**strong 档**六个可派池全部无时段门——白天（北京
         # 12:00）AUTO 请求国际内置 Max 直接 claim 该池，绝不因时段门改派到别池。
-        # strong 层序 Sonus(1) > ZCode(2) > claude(3) > 三个 Max(4)，故先占满上方
-        # Sonus、ZCode、claude 各槽。BW-SONUS-REENABLE-20261029-R3：Sonus 恢复常态
-        # 新派，显式 reserve 如实占用其独立 1 槽。
+        # strong 层序 ZCode(2) > claude(3) > 三个 Max(4)，故先占满上方 ZCode、claude
+        # 各槽。BW-QWEN4-SONUS-REMOVE-20261115：Sonus 从所有档位去除——显式 reserve
+        # 一律 mode_excluded，绝不占用其槽。
         with dispatch_mode('strong'):
-            occupied = dp.reserve(self.store, task_id='s0x', runtime='qoder',
-                                  model='Sonus', workspace=str(self._ws_for('s0x')),
-                                  prompt_sha256='p', executor='qoder', now=self.NOON,
-                                  _preclaim=False)
-            self.assertTrue(occupied['allowed'], occupied)
-            self.assertEqual(occupied['pool_key'], dp.SONUS_POOL_KEY, occupied)
+            sonus_refused = dp.reserve(self.store, task_id='s0x', runtime='qoder',
+                                       model='Sonus', workspace=str(self._ws_for('s0x')),
+                                       prompt_sha256='p', executor='qoder', now=self.NOON,
+                                       _preclaim=False)
+            self.assertFalse(sonus_refused['allowed'], sonus_refused)
+            self.assertEqual(sonus_refused['reason'], 'mode_excluded', sonus_refused)
             self.reserve_exec('z0', 'zcode', 'GLM-5.3', 'zcode', pk='zcode:GLM-5.3')
             self.reserve_exec('c1', 'claude', 'deepseek-flash', 'claude',
                               pk=dp.CLAUDE_POOL_KEY)
             self.reserve_exec('c2', 'claude', 'deepseek-flash', 'claude',
                               pk=dp.CLAUDE_POOL_KEY)
             r = dp.select_and_claim(self.store, task_id='a1', runtime='qoder',
-                                    model='Qwen3.8-Max', workspace=str(self._ws_for('a1')),
+                                    model='Qwen4-Max-Preview', workspace=str(self._ws_for('a1')),
                                     prompt_sha256='p', now=self.NOON, _preclaim=False)
             self.assertTrue(r.get('allowed'), r)
             self.assertFalse(r.get('routing_required'), r)
@@ -1557,7 +1557,7 @@ class BeijingMainForceWindowTests(_PoolBase):
         # weak（默认）同一白天时刻：三个 Max 全部被夜间门挡下，AUTO 绝不落到国际 Max
         # （改道到未被时段门挡下的池，绝不落任何 Max）。
         r2 = dp.select_and_claim(self.store, task_id='a1w', runtime='qoder',
-                                 model='Qwen3.8-Max', workspace=str(self._ws_for('a1w')),
+                                 model='Qwen4-Max-Preview', workspace=str(self._ws_for('a1w')),
                                  prompt_sha256='p', now=self.NOON, _preclaim=False)
         self.assertTrue(r2.get('routing_required'), r2)
         self.assertNotIn(r2['selected']['pool_key'], self.ALL_QMAX, r2)
@@ -1572,7 +1572,7 @@ class BeijingMainForceWindowTests(_PoolBase):
         WEEKDAY_OFFPEAK = datetime(2026, 10, 12, 5, 0, 0, tzinfo=timezone.utc)  # 北京 13:00 周一
         self.reserve_exec('z0', 'zcode', 'GLM-5.3', 'zcode',
                           pk='zcode:GLM-5.3')
-        self.reserve_exec('im1', 'qoder', 'Qwen3.8-Max', 'qoder', pk=self.QMAX)
+        self.reserve_exec('im1', 'qoder', 'Qwen4-Max-Preview', 'qoder', pk=self.QMAX)
         self.reserve_exec('cu1', 'qodercn', 'Qwen-3.8-Max', 'qodercn',
                           pk='qodercn:Qwen-3.8-Max')
         self.reserve_exec('cu2', 'qodercn', 'Qwen-3.8-Max', 'qodercn',
@@ -1584,7 +1584,7 @@ class BeijingMainForceWindowTests(_PoolBase):
         self.reserve_exec('cbg', 'codebuddy', dp.CODEBUDDY_GLM_MODEL, 'codebuddy',
                           pk=dp.CODEBUDDY_GLM_POOL_KEY)
         r = dp.select_and_claim(self.store, task_id='a2', runtime='qodercn',
-                                model='Qwen3.8-Max', workspace=str(self._ws_for('a2')),
+                                model='Qwen4-Max-Preview', workspace=str(self._ws_for('a2')),
                                 prompt_sha256='p', now=WEEKDAY_OFFPEAK, _preclaim=False)
         self.assertTrue(r['routing_required'], r)
         self.assertEqual(r['selected']['pool_key'], dp.CLAUDE_POOL_KEY, r)
@@ -1594,7 +1594,7 @@ class BeijingMainForceWindowTests(_PoolBase):
         self.reserve_exec('c2', 'claude', 'deepseek-flash', 'claude',
                           pk=dp.CLAUDE_POOL_KEY)
         r2 = dp.select_and_claim(self.store, task_id='a3', runtime='qodercn',
-                                 model='Qwen3.8-Max', workspace=str(self._ws_for('a3')),
+                                 model='Qwen4-Max-Preview', workspace=str(self._ws_for('a3')),
                                  prompt_sha256='p', now=WEEKDAY_OFFPEAK, _preclaim=False)
         self.assertTrue(r2['routing_required'], r2)
         self.assertIn(r2['selected']['pool_key'],
@@ -1603,22 +1603,22 @@ class BeijingMainForceWindowTests(_PoolBase):
     def test_auto_daytime_never_falls_to_cn_max_in_strong_mode(self):
         # strong 档三个 Max 同层且无门；占满上方 ZCode 与 claude 后，AUTO 请求
         # 国际 Max 时由「请求组合优先」命中国际 Max，绝不落到 CN 自定义或 CN 内置 Max。
-        # BW-SONUS-REENABLE-20261029-R3：Sonus 恢复常态新派——显式 reserve 如实占用
-        # 其独立 1 槽，保持「占满上方层后由请求组合命中」的断言强度。
+        # BW-QWEN4-SONUS-REMOVE-20261115：Sonus 从所有档位去除——显式 reserve 被拒
+        # （mode_excluded、零占位），「占满上方层后由请求组合命中」断言强度不变。
         with dispatch_mode('strong'):
             r0 = dp.reserve(self.store, task_id='s0', runtime='qoder',
                             model='Sonus', workspace=str(self._ws_for('s0')),
                             prompt_sha256='p', executor='qoder', now=self.NOON,
                             _preclaim=False)
-            self.assertTrue(r0['allowed'], r0)
-            self.assertEqual(r0['pool_key'], dp.SONUS_POOL_KEY, r0)
+            self.assertFalse(r0['allowed'], r0)
+            self.assertEqual(r0['reason'], 'mode_excluded', r0)
             self.reserve_exec('z0', 'zcode', 'GLM-5.3', 'zcode', pk='zcode:GLM-5.3')
             self.reserve_exec('c1', 'claude', 'deepseek-flash', 'claude',
                               pk=dp.CLAUDE_POOL_KEY)
             self.reserve_exec('c2', 'claude', 'deepseek-flash', 'claude',
                               pk=dp.CLAUDE_POOL_KEY)
             r = dp.select_and_claim(self.store, task_id='cu', runtime='qoder',
-                                    model='Qwen3.8-Max', workspace=str(self._ws_for('cu')),
+                                    model='Qwen4-Max-Preview', workspace=str(self._ws_for('cu')),
                                     prompt_sha256='p', now=self.NOON, _preclaim=False)
             self.assertTrue(r.get('allowed'), r)
             self.assertEqual(r['pool_key'], self.QMAX, r)
@@ -1653,7 +1653,7 @@ class BeijingMainForceWindowTests(_PoolBase):
     def test_explicit_reserve_cn_builtin_max_daytime_honestly_refused(self):
         # 主脑显式 reserve 新任务到 CN 内置 Max、白天 → 如实拒绝，绝不静默换成 Flash。
         r = dp.reserve(self.store, task_id='r-cn', runtime='qodercn',
-                       model='Qwen3.8-Max', workspace=str(self._ws_for('r-cn')),
+                       model='Qwen4-Max-Preview', workspace=str(self._ws_for('r-cn')),
                        prompt_sha256='p', now=self.NOON, executor='qodercn',
                        _preclaim=False)
         self.assertFalse(r['allowed'], r)
@@ -1668,7 +1668,7 @@ class BeijingMainForceWindowTests(_PoolBase):
         for now in (self.NOON, self.OUT_0800, self.OUT_2159, self.LATE):
             with dispatch_mode('strong'):
                 r = dp.reserve(self.store, task_id=f'ri-{now.hour}', runtime='qoder',
-                               model='Qwen3.8-Max',
+                               model='Qwen4-Max-Preview',
                                workspace=str(self._ws_for(f'ri-{now.hour}')),
                                prompt_sha256='p', now=now, executor='qoder',
                                _preclaim=False)
@@ -1677,7 +1677,7 @@ class BeijingMainForceWindowTests(_PoolBase):
                 self.assertEqual(r['pool_key'], self.QMAX, r)
                 dp.finish(self.store, r['token'], terminal='cancelled', now=now)
             rw = dp.reserve(self.store, task_id=f'rw-{now.hour}', runtime='qoder',
-                            model='Qwen3.8-Max',
+                            model='Qwen4-Max-Preview',
                             workspace=str(self._ws_for(f'rw-{now.hour}')),
                             prompt_sha256='p', now=now, executor='qoder',
                             _preclaim=False)
@@ -1693,7 +1693,7 @@ class BeijingMainForceWindowTests(_PoolBase):
         self.assertEqual(r['pool_key'], 'qoder:Qwen3.8-Flash', r)
 
     def test_reserve_in_window_builtin_max_allowed(self):
-        r = dp.reserve(self.store, task_id='ok', runtime='qoder', model='Qwen3.8-Max',
+        r = dp.reserve(self.store, task_id='ok', runtime='qoder', model='Qwen4-Max-Preview',
                        workspace=str(self._ws_for('ok')), prompt_sha256='p',
                        now=self.IN_2200, executor='qoder', _preclaim=False)
         self.assertTrue(r['allowed'], r)
@@ -1702,13 +1702,13 @@ class BeijingMainForceWindowTests(_PoolBase):
     def test_reserved_cn_builtin_max_crossing_08_is_really_released(self):
         # 22:00 时段内预留 CN 内置 Max，跨过 08:00 后才启动 → 真实释放本 reserved 占位为
         # start_failed（国际 Max 已全天，本门只对两个 CN Max 生效）。
-        r = dp.reserve(self.store, task_id='x08', runtime='qodercn', model='Qwen3.8-Max',
+        r = dp.reserve(self.store, task_id='x08', runtime='qodercn', model='Qwen4-Max-Preview',
                        workspace=str(self._ws_for('x08')), prompt_sha256='p',
                        now=self.IN_2200, executor='qodercn', _preclaim=False)
         tok = self.assertClaimed(r, self.CNMAX)
         self.assertEqual(dp.status(self.store, now=self.IN_2200)['pools'][self.CNMAX]['active'], 1)
         out = dp.consume_for_entry(self.store, task_id='x08', runtime='qodercn',
-                                   model='Qwen3.8-Max', workspace=str(self._ws_for('x08')),
+                                   model='Qwen4-Max-Preview', workspace=str(self._ws_for('x08')),
                                    prompt_sha256='p', claim_token=tok,
                                    wrapper_pid=4321, wrapper_created='w1', now=self.LATE)
         self.assertFalse(out['allowed'], out)
@@ -1723,12 +1723,12 @@ class BeijingMainForceWindowTests(_PoolBase):
         # 绝不释放占位、绝不误判 main_force_window_closed。
         with dispatch_mode('strong'):
             r = dp.reserve(self.store, task_id='xi08', runtime='qoder',
-                           model='Qwen3.8-Max',
+                           model='Qwen4-Max-Preview',
                            workspace=str(self._ws_for('xi08')), prompt_sha256='p',
                            now=self.IN_2200, executor='qoder', _preclaim=False)
             tok = self.assertClaimed(r, self.QMAX)
             out = dp.consume_for_entry(
-                self.store, task_id='xi08', runtime='qoder', model='Qwen3.8-Max',
+                self.store, task_id='xi08', runtime='qoder', model='Qwen4-Max-Preview',
                 workspace=str(self._ws_for('xi08')), prompt_sha256='p',
                 claim_token=tok, wrapper_pid=4321, wrapper_created='w1', now=self.LATE)
             self.assertTrue(out['allowed'], out)
@@ -1739,12 +1739,12 @@ class BeijingMainForceWindowTests(_PoolBase):
     def test_reserved_intl_max_crossing_08_is_really_released_in_weak_mode(self):
         # weak（默认）档：三个 Max 全部恢复夜间门——22:00 预留、08:30 启动必须真实释放本
         # reserved 占位为 start_failed（绝不泄漏、绝不抢占别人），且不冒充时段外改派。
-        r = dp.reserve(self.store, task_id='wi08', runtime='qoder', model='Qwen3.8-Max',
+        r = dp.reserve(self.store, task_id='wi08', runtime='qoder', model='Qwen4-Max-Preview',
                        workspace=str(self._ws_for('wi08')), prompt_sha256='p',
                        now=self.IN_2200, executor='qoder', _preclaim=False)
         tok = self.assertClaimed(r, self.QMAX)
         out = dp.consume_for_entry(self.store, task_id='wi08', runtime='qoder',
-                                   model='Qwen3.8-Max', workspace=str(self._ws_for('wi08')),
+                                   model='Qwen4-Max-Preview', workspace=str(self._ws_for('wi08')),
                                    prompt_sha256='p', claim_token=tok,
                                    wrapper_pid=4321, wrapper_created='w1', now=self.LATE)
         self.assertFalse(out['allowed'], out)
@@ -1754,19 +1754,19 @@ class BeijingMainForceWindowTests(_PoolBase):
 
     def test_running_cn_builtin_max_crossing_08_not_falsely_released(self):
         # 时段内已 consume 到 running，跨 08 点后重复启动 → 拒绝但不假释放，保留 running。
-        r = dp.reserve(self.store, task_id='rn', runtime='qodercn', model='Qwen3.8-Max',
+        r = dp.reserve(self.store, task_id='rn', runtime='qodercn', model='Qwen4-Max-Preview',
                        workspace=str(self._ws_for('rn')), prompt_sha256='p',
                        now=self.IN_2200, executor='qodercn', _preclaim=False)
         tok = self.assertClaimed(r, self.CNMAX)
         c1 = dp.consume_for_entry(self.store, task_id='rn', runtime='qodercn',
-                                  model='Qwen3.8-Max', workspace=str(self._ws_for('rn')),
+                                  model='Qwen4-Max-Preview', workspace=str(self._ws_for('rn')),
                                   prompt_sha256='p', claim_token=tok,
                                   wrapper_pid=7000, wrapper_created='c7000',
                                   now=self.IN_2200 + timedelta(seconds=1))
         self.assertTrue(c1['allowed'], c1)
         self.assertEqual(self._state(tok), 'running')
         c2 = dp.consume_for_entry(self.store, task_id='rn', runtime='qodercn',
-                                  model='Qwen3.8-Max', workspace=str(self._ws_for('rn')),
+                                  model='Qwen4-Max-Preview', workspace=str(self._ws_for('rn')),
                                   prompt_sha256='p', claim_token=tok,
                                   wrapper_pid=7000, wrapper_created='c7000', now=self.LATE)
         self.assertFalse(c2['allowed'], c2)
@@ -1837,7 +1837,7 @@ class BeijingMainForceWindowTests(_PoolBase):
         ws = str(self._ws_for('cd'))
         scope = {'task_id': 'cd', 'stage': 's1', 'chat_id': 'c1', 'workspace': ws,
                  'prompt_sha256': 'p' * 64, 'executor': 'qodercn',
-                 'model': 'Qwen3.8-Max'}
+                 'model': 'Qwen4-Max-Preview'}
         rec = dp.ask_record(self.store, task_id='cd', scope=scope, ask_message_id='m1',
                             now=self.IN_2200)
         self.assertTrue(rec['recorded'], rec)

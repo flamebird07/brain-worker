@@ -1,0 +1,18 @@
+{
+  "command": [
+    "/Users/<you>/Applications/ZCode.app/Contents/MacOS/ZCode",
+    "/Users/<you>/.local/share/zcode-cli/zcode.cjs",
+    "app-server"
+  ],
+  "environment": {
+    "ELECTRON_RUN_AS_NODE": "1"
+  },
+  "_notes": [
+    "复制为 scripts/zcode-appserver-entry.json 后填入本机真实路径；该文件已被 .gitignore 忽略，只存路径引用，不存任何 token/账号/凭据。",
+    "command 是逐元素 argv（不经 shell）：第 0 元素为启动器可执行文件（桌面端 Electron 二进制或官方 CLI 启动脚本，如 ~/.local/bin/zcode）；后续元素为官方 CLI bundle 路径与 'app-server' 子命令。",
+    "用桌面端 Electron 二进制作第 0 元素时必须注入 ELECTRON_RUN_AS_NODE=1；用官方 CLI 启动脚本（~/.local/bin/zcode）时不要重复设置该变量。",
+    "environment 是可选的字符串到字符串映射，只放明确需要透传给官方 CLI 的变量；不要写凭据值。",
+    "模型与推理级别由命令行 --provider/--model/--reasoning 显式绑定（经 session/setModel，官方拒绝即不提交），本配置不承载模型选择。",
+    "先用 --preflight-only 验证 runtime/capabilities 往返，再用最小 plan 会话做一次真实预检；真实派工语义见 references/zcode-appserver-direct.md。"
+  ]
+}

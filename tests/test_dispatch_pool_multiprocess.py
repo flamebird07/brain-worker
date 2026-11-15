@@ -204,8 +204,8 @@ class _SpawnMixin(unittest.TestCase):
         plan = [('codebuddy', 'deepseek-v4.1-flash', 'codebuddy'),
                 ('codebuddy', 'glm-5.3-flash', 'codebuddy'),
                 ('zcode', 'GLM-5.3', 'zcode'),
-                ('qoder', 'Qwen3.8-Max', 'qoder'),
-                ('qodercn', 'Qwen3.8-Max', 'qodercn'),
+                ('qoder', 'Qwen4-Max-Preview', 'qoder'),
+                ('qodercn', 'Qwen4-Max-Preview', 'qodercn'),
                 ('qodercn', 'Qwen-3.8-Max', 'qodercn'),
                 ('qodercn', 'Qwen-3.8-Max', 'qodercn'),
                 ('qoder', 'Qwen3.8-Flash', 'qoder'),
@@ -245,7 +245,7 @@ class TestConcurrentClaims(_SpawnMixin, unittest.TestCase):
         n = 12
         barrier = _CTX.Barrier(n)
         q = _CTX.Queue()
-        combos = [('zcode', 'GLM-5.3'), ('qoder', 'Qwen3.8-Max'),
+        combos = [('zcode', 'GLM-5.3'), ('qoder', 'Qwen4-Max-Preview'),
                   ('qoder', 'Qwen3.8-Flash')]
         for i in range(n):
             rt, md = combos[i % 3]
@@ -268,8 +268,8 @@ class TestConcurrentClaims(_SpawnMixin, unittest.TestCase):
         for r in allowed:
             self.assertEqual(len(by_task[f"mpc-{r['worker']}"]), 1)
         # 各池 ≤2；pool_key 恒等于 runtime+':'+model（无偷换落库）。
-        for pk in ('zcode:GLM-5.3', 'qoder:Qwen3.8-Max', 'qoder:Qwen3.8-Flash',
-                   'qodercn:Qwen3.8-Max', 'qodercn:Qwen-3.8-Max', 'qodercn:Qwen3.8-Flash'):
+        for pk in ('zcode:GLM-5.3', 'qoder:Qwen4-Max-Preview', 'qoder:Qwen3.8-Flash',
+                   'qodercn:Qwen4-Max-Preview', 'qodercn:Qwen-3.8-Max', 'qodercn:Qwen3.8-Flash'):
             act = dp.status(self.store, now=T0)['pools'][pk]['active']
             self.assertLessEqual(act, 2, f'{pk} over capacity: {act}')
         for row in rows:
@@ -277,7 +277,7 @@ class TestConcurrentClaims(_SpawnMixin, unittest.TestCase):
         # 持久 1:1：committed_zcode 等于 Z 真实 claim 数；committed_qoder 等于 Qoder 主力组
         # （两内置 Max + 自定义 Max）真实 claim 总数（_bump_rotation 三池同记入 committed_qoder）。
         z = sum(1 for r in rows if r['pool_key'] == 'zcode:GLM-5.3')
-        qgroup = ('qoder:Qwen3.8-Max', 'qodercn:Qwen3.8-Max', 'qodercn:Qwen-3.8-Max')
+        qgroup = ('qoder:Qwen4-Max-Preview', 'qodercn:Qwen4-Max-Preview', 'qodercn:Qwen-3.8-Max')
         qq = sum(1 for r in rows if r['pool_key'] in qgroup)
         st = dp.status(self.store, now=T0)['rotation']
         self.assertEqual(st['committed_zcode'], z)
@@ -417,7 +417,7 @@ class TestPidReuseAndLateFinish(_SpawnMixin, unittest.TestCase):
         # 同 task 新 attempt（显式 executor='qoder' 固定 Qoder Max 组合），旧 token 晚到的
         # 重复 finish 只能幂等，绝不影响/释放新在途行。
         new = dp.select_and_claim(self.store, task_id='lat', runtime='qoder',
-                                  model='Qwen3.8-Max', workspace='C:/mp',
+                                  model='Qwen4-Max-Preview', workspace='C:/mp',
                                   prompt_sha256='n' * 64, stage='ls', chat_id='lc',
                                   executor='qoder', now=T0, _preclaim=False)
         self.assertTrue(new['allowed'], new)
@@ -551,7 +551,7 @@ class TestAdoptLegacyOffline(_SpawnMixin, unittest.TestCase):
         self.assertEqual(dp.status(self.store, now=T0)['pools']['zcode:GLM-5.3']
                          ['active'], 3)
         nxt = dp.select_and_claim(self.store, task_id='after', runtime='qoder',
-                                  model='Qwen3.8-Max', workspace='C:/mp',
+                                  model='Qwen4-Max-Preview', workspace='C:/mp',
                                   prompt_sha256='z' * 64, stage='as', chat_id='ac',
                                   executor='qoder', now=T0, _preclaim=False)
         # Max 池不受影响可 claim（显式 executor='qoder' 固定该组合：CodeBuddy 空位存在时
@@ -662,7 +662,7 @@ class TestAdoptLegacyRealSchemaZ4(_SpawnMixin, unittest.TestCase):
         # 真实旧 Qoder 原件：runtime 是 {node, qodercli} 对象（不是字符串），模型在
         # model_requested；task 来自 dispatch_plan.task_id。process.json 只有 pid/state。
         rp.write_text(json.dumps({
-            'model_requested': 'Qwen3.8-Max',
+            'model_requested': 'Qwen4-Max-Preview',
             'runtime': {'node': 'SYNTHETIC_NODE', 'qodercli': 'SYNTHETIC_QODER_CLI'},
             'workspace': 'C:/legacy-q', 'prompt_sha256': 'f' * 64,
             'stage': 'qs', 'chat_id': 'qc',
@@ -692,11 +692,11 @@ class TestAdoptLegacyRealSchemaZ4(_SpawnMixin, unittest.TestCase):
         rp, pp = self._qoder_receipts(self._tmp.name)
         prober = lambda pid: {'pid': pid, 'state': 'alive', 'created': 'vb-1'}
         out = dp.adopt_legacy(self.store, task_id='dq1', runtime='qoder',
-                              model='Qwen3.8-Max', request_path=str(rp),
+                              model='Qwen4-Max-Preview', request_path=str(rp),
                               process_path=str(pp), prober=prober, now=T0,
                               child_created='vb-1')
         self.assertTrue(out['adopted'], out)
-        self.assertEqual(out['pool_key'], 'qoder:Qwen3.8-Max')
+        self.assertEqual(out['pool_key'], 'qoder:Qwen4-Max-Preview')
         row = self._rows("SELECT * FROM attempts WHERE token=?", (out['token'],))[0]
         self.assertEqual(row['child_pid'], 5555)
         self.assertEqual(row['child_created'], 'vb-1')
@@ -724,7 +724,7 @@ class TestAdoptLegacyRealSchemaZ4(_SpawnMixin, unittest.TestCase):
     def test_legacy_drift_and_missing_identity_refused(self):
         rp, pp = self._qoder_receipts(self._tmp.name)
         prober = lambda pid: {'pid': pid, 'state': 'alive', 'created': 'vb-1'}
-        # 调用组合漂移：原 request 是 Qwen3.8-Max，不能按 GLM-5.3 计入。
+        # 调用组合漂移：原 request 是 Qwen4-Max-Preview，不能按 GLM-5.3 计入。
         bad = dp.adopt_legacy(self.store, task_id='dq1', runtime='zcode',
                               model='GLM-5.3', request_path=str(rp),
                               process_path=str(pp), prober=prober, now=T0,
@@ -733,20 +733,20 @@ class TestAdoptLegacyRealSchemaZ4(_SpawnMixin, unittest.TestCase):
         self.assertEqual(bad['reason'], 'request_combo_mismatch')
         # task 与 dispatch_plan.task_id 不一致。
         badtask = dp.adopt_legacy(self.store, task_id='OTHER', runtime='qoder',
-                                  model='Qwen3.8-Max', request_path=str(rp),
+                                  model='Qwen4-Max-Preview', request_path=str(rp),
                                   process_path=str(pp), prober=prober, now=T0,
                                   child_created='vb-1')
         self.assertFalse(badtask['adopted'])
         self.assertEqual(badtask['reason'], 'request_task_mismatch')
         # 缺 child_created 又缺 receipt created：待核验拒绝，不凭裸 PID 接纳。
         noid = dp.adopt_legacy(self.store, task_id='dq1', runtime='qoder',
-                               model='Qwen3.8-Max', request_path=str(rp),
+                               model='Qwen4-Max-Preview', request_path=str(rp),
                                process_path=str(pp), prober=prober, now=T0)
         self.assertFalse(noid['adopted'])
         self.assertEqual(noid['reason'], 'process_identity_missing')
         # 宿主留证身份与真实探针观测不一致（birth 漂移）→ 拒绝。
         drift = dp.adopt_legacy(self.store, task_id='dq1', runtime='qoder',
-                                model='Qwen3.8-Max', request_path=str(rp),
+                                model='Qwen4-Max-Preview', request_path=str(rp),
                                 process_path=str(pp),
                                 prober=lambda pid: {'pid': pid, 'state': 'alive',
                                                     'created': 'REUSED'},
@@ -759,7 +759,7 @@ class TestAdoptLegacyRealSchemaZ4(_SpawnMixin, unittest.TestCase):
         pp2 = Path(self._tmp.name) / 'unk-process.json'
         pp2.write_text(json.dumps({'pid': 5557}), encoding='utf-8')
         unk = dp.adopt_legacy(self.store, task_id='dq1', runtime='qoder',
-                              model='Qwen3.8-Max', request_path=str(rp2),
+                              model='Qwen4-Max-Preview', request_path=str(rp2),
                               process_path=str(pp2), prober=prober, now=T0,
                               child_created='vb-1')
         self.assertFalse(unk['adopted'])
@@ -770,7 +770,7 @@ class TestAdoptLegacyRealSchemaZ4(_SpawnMixin, unittest.TestCase):
         rp, pp = self._qoder_receipts(self._tmp.name)
         prober = lambda pid: {'pid': pid, 'state': 'alive', 'created': 'vb-1'}
         first = dp.adopt_legacy(self.store, task_id='dq1', runtime='qoder',
-                                model='Qwen3.8-Max', request_path=str(rp),
+                                model='Qwen4-Max-Preview', request_path=str(rp),
                                 process_path=str(pp), prober=prober, now=T0,
                                 child_created='vb-1')
         self.assertTrue(first['adopted'], first)

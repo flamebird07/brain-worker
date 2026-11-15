@@ -1,12 +1,26 @@
 """dispatch_pool — brain-worker 跨会话并发容量池与路由（标准库 sqlite3）。
 
+2026-11-15（BW-QWEN4-SONUS-REMOVE-20261115，用户明确指令，**当前权威**）：
+- Sonus（qoder:Sonus）从所有档位去除新派资格（dispatch_mode.SONUS_TEMP_DISABLED=True
+  为持久事实）；遗留 reserved 的 Sonus 精确 claim 不再放行 consume（sonus_legacy_reserved
+  例外已删除，reserved 安全释放为 start_failed）；running/unknown 在途不追杀、不假释放，
+  继续安全计数与结算。物理登记与容量 1 保留（legacy 计数语义不变）。
+- 两个 Qoder 内置 Max 改名 **Qwen4-Max-Preview**（qoder:Qwen4-Max-Preview /
+  qodercn:Qwen4-Max-Preview，SDK argv 与池键同一字面串）；旧池键 qoder:Qwen3.8-Max /
+  qodercn:Qwen3.8-Max 以 0 容量进 QWEN_MAX_LEGACY_POOL_KEYS/LEGACY_RETIRED_POOL_KEYS
+  ——旧池在途 attempt 继续安全计数（_domestic_active/物理总 16）与自然终态结算，绝不
+  丢失；任何新派（AUTO/executor/显式 combo）一律拒绝，绝不把旧键映射到新池。
+- 带短横线的 qodercn:Qwen-3.8-Max 是独立已禁用自定义池（2026-10-28 用户指令），历史身份
+  与禁用语义原样保留，与 CN 内置新名 qodercn:Qwen4-Max-Preview 互不冲突、互不映射。
+- 本文下方历史段落中的 Qwen3.8-Max / Sonus 相关描述按上文新口径理解，不再逐一改写历史。
+
 2026-10-28：qodercn:Qwen-3.8-Max 按用户指令禁用新派；物理登记和遗留生命周期保留。
 以下涉及 CN 自定义 Max 恢复/三路 Max 新派资格的历史描述由 dispatch_mode 当前策略覆盖。
 
 用户 2026-10-08 最终分配决策的可执行落地：所有会话共享同一持久池，绝不各自为政。
 2026-10-10 用户最新分配（BW-POOL-SPLIT-20261010-S2）在 BW-QODER-CN-20261010-A 系列之上
 再次刷新：总数仍 8，五池布局（容量口径见 references/global-dispatch.md）：
-- 主力（3 池共 4 槽）：`zcode:GLM-5.3`=2、`qoder:Qwen3.8-Max`=1、`qodercn:Qwen3.8-Max`=1；
+- 主力（3 池共 4 槽）：`zcode:GLM-5.3`=2、`qoder:Qwen4-Max-Preview`=1、`qodercn:Qwen4-Max-Preview`=1；
   Z2 与两地区 Qwen Max（合计 2 槽）之间 best-effort 1:1（沿用 rotation 两列
   committed_zcode / committed_qoder，两地区 Max 共享 committed_qoder 一列），两地区 Max
   之间用当前真实在途数平衡；仅对合格可用候选平衡，绝不因历史计数拦有空位的候选；
@@ -45,10 +59,11 @@
   （task_already_on_luna 理由准确，语义不变仍拒绝）；reconcile 对无 wrapper 无 child 的
   在途行（含 running）一律明确 held_unknown。
 - process_identity：Linux 在 /proc 可读时返回稳定创建身份（boot_id + /proc/PID/stat
-  starttime），Windows 沿用 GetProcessTimes；失败一律 unknown/无身份。
+  starttime），Windows 沿用 GetProcessTimes，macOS 沿用 libproc pbi_start_tvsec/usec
+  （BW-MAC-COMPAT-20261114-S1）；失败一律 unknown/无身份。
 - adopt-legacy（CLI 同名）：受信任宿主专用的最小上线交接——只接纳宿主提供的既有原
   request.json 与邻近 process.json，核验真实活 PID 与创建身份后把老 worker 如实计入；
-  仅 GLM-5.3 / Qwen3.8-Max / Flash，超上限如实计入并阻止新派；无 fake-alive 开关。
+  仅 GLM-5.3 / Qwen4-Max-Preview / Flash，超上限如实计入并阻止新派；无 fake-alive 开关。
 
 2026-10-08 修订四（BW-GLOBAL-POOL-20261008-Z4）实质修正：
 - _local_pid_state Windows fallback：OpenProcess 句柄成功不等于存活（父进程仍持
@@ -171,7 +186,7 @@ import dispatch_mode as dm  # noqa: E402
 #   精确模型 1 槽；BW-WORKER-WIDGET-20261018-S3 起 CodeBuddy GLM 独立 1 槽；
 #   BW-OPENCODE-20261019 再加两个 OpenCode 免费模型各 1 槽）、当前调度总数 16：
 #   主力（四池共 6 槽，同属 best-effort 1:1 的两个组）：
-#     zcode:GLM-5.3=2（Z 组）、qoder:Qwen3.8-Max=1、qodercn:Qwen3.8-Max=1（国际/CN 内置
+#     zcode:GLM-5.3=2（Z 组）、qoder:Qwen4-Max-Preview=1、qodercn:Qwen4-Max-Preview=1（国际/CN 内置
 #     Max，属 Qoder 组；BW-QODER-INTL-MAX-ALLDAY-20261023 起**国际内置全天可派**，仅 CN
 #     内置受北京时间 22:00 含至次日 08:00 不含的夜间门）、
 #     qodercn:Qwen-3.8-Max=2（CN 自定义友好名 Qwen-3.8-Max（有短横线），属 Qoder 组主力，
@@ -192,7 +207,7 @@ import dispatch_mode as dm  # noqa: E402
 # 独立 CodeBuddy CLI 的精确模型 **codebuddy:deepseek-v4.1-flash**（界面名
 # Deepseek-V4.1-Flash）为独立主力名额 1、**优先级层=5**——排在 claude:deepseek-flash 与
 # 国际 Qoder Max 之后、紧挨 opencode:deepseek-v4.1-flash-free 之前；旧「最高优先/层=0、
-# 高于所有 Qwen3.8-Max」口径作废、仅属历史。该模型仍**不受任何时段门约束**（不套 Max
+# 高于所有 Qwen4-Max-Preview」口径作废、仅属历史。该模型仍**不受任何时段门约束**（不套 Max
 # 北京夜间窗）。
 # BW-WORKER-WIDGET-20261018-S3（用户 2026-10-18 最新明确）：codebuddy:deepseek-v4.1-flash
 # 与 codebuddy:glm-5.3-flash **不共享名额，各自独立 1 槽**（旧「同一物理 1 槽」口径作废）。
@@ -216,8 +231,8 @@ import dispatch_mode as dm  # noqa: E402
 # 真实在途时才被占到第 16 个（已有在途切档不追杀、不假释放）。
 # WorkBuddy 仍 human-relay、CodeBuddy 其它旧模型（新旧 GLM 之外的组合）仍不恢复。
 MAIN_FORCE_POOLS = (('zcode', 'GLM-5.3'),
-                    ('qoder', 'Qwen3.8-Max'),
-                    ('qodercn', 'Qwen3.8-Max'),
+                    ('qoder', 'Qwen4-Max-Preview'),
+                    ('qodercn', 'Qwen4-Max-Preview'),
                     ('qodercn', 'Qwen-3.8-Max'),
                     ('claude', 'deepseek-flash'),
                     ('codebuddy', 'deepseek-v4.1-flash'),
@@ -228,8 +243,8 @@ MAIN_FORCE_POOLS = (('zcode', 'GLM-5.3'),
 MAIN_FORCE_CAPACITY = {'zcode:GLM-5.3': 1,
                        'codebuddy:deepseek-v4.1-flash': 1,
                        'codebuddy:glm-5.3-flash': 1,
-                       'qoder:Qwen3.8-Max': 1,
-                       'qodercn:Qwen3.8-Max': 1,
+                       'qoder:Qwen4-Max-Preview': 1,
+                       'qodercn:Qwen4-Max-Preview': 1,
                        'qodercn:Qwen-3.8-Max': 2,
                        'claude:deepseek-flash': 2,
                        'opencode:deepseek-v4.1-flash-free': 1,
@@ -256,6 +271,14 @@ MODE_EXCLUDED = 'mode_excluded'
 # BW-ZCODE-RETIRE-20261020 → BW-ZCODE-RESTORE-1-20261022：zcode:GLM-5.3 曾同机制全局
 # 退役，现按用户明确指令恢复为正常可派池（容量 1、层=2），不再列入退役清单。
 LEGACY_RETIRED_POOL_KEYS = ('qodercn:DeepSeek-Flash',)
+# BW-QWEN4-SONUS-REMOVE-20261115：两个 Qoder 内置 Max 改名 Qwen4-Max-Preview 后，旧池键
+# （qoder:Qwen3.8-Max / qodercn:Qwen3.8-Max）同样以 0 容量 legacy-retired 登记——旧池在途
+# attempt 继续安全计数（计入 _domestic_active/物理总 16 守卫）与结算（finish/reconcile 到
+# 自然终态），但不再接任何新派（AUTO/executor/显式 combo 一律拒绝，绝不把旧键映射到新池）。
+# 带短横线的 qodercn:Qwen-3.8-Max 不在此列：它是独立的已禁用自定义池（dm.USER_DISABLED_
+# POOL_KEYS），历史身份与禁用语义原样保留，与内置新名互不冲突。
+QWEN_MAX_LEGACY_POOL_KEYS = ('qoder:Qwen3.8-Max', 'qodercn:Qwen3.8-Max')
+LEGACY_RETIRED_POOL_KEYS = LEGACY_RETIRED_POOL_KEYS + QWEN_MAX_LEGACY_POOL_KEYS
 LUNA_RUNTIME = 'luna'
 LUNA_MODEL = 'native'
 LUNA_ASK_TIMEOUT_SECONDS = 300
@@ -288,7 +311,7 @@ MODE_POOLS_UNKNOWN = tuple(k for k in (dm.ALL_POOL_KEYS + dm.STRONG_ONLY_POOL_KE
 #    claude 与它们在途都计入国内总在途（_domestic_active 只排除 Luna）；
 #  - _select_main_force 按主力优先级层排序（BW-CLAUDE-ALLDAY-QMAX-AFTER-20261023）：
 #    两个 CN Max > zcode:GLM-5.3（层=2，容量 1）> claude:deepseek-flash（层=3，全天）>
-#    qoder:Qwen3.8-Max（层=4，全天）> codebuddy:deepseek-v4.1-flash（层=5）> 两 OpenCode
+#    qoder:Qwen4-Max-Preview（层=4，全天）> codebuddy:deepseek-v4.1-flash（层=5）> 两 OpenCode
 #    同级（层=6）> codebuddy:glm-5.3-flash（层=7，低层补位，额度独立，BW-LIMIT30-20261019-S3）；
 #    committed 仍只作历史记账、不参与跨层排序，低层绝不凭历史计数抢高层名额；
 #  - claude:deepseek-flash **已解除全部派发时段限制、全天可派**（BW-CLAUDE-ALLDAY-QMAX-
@@ -342,9 +365,9 @@ OVERFLOW_KEYS = tuple(f'{r}:{m}' for r, m in OVERFLOW_POOLS)
 # 保留符号避免下游 import 报错，任何候选枚举只走 MAIN_FORCE_KEYS/OVERFLOW_KEYS。
 CN_KEYS: tuple = ()
 CN_RUNTIME = 'qodercn'
-CN_MODEL = 'Qwen3.8-Max'
-CN_POOL_KEY = f'{CN_RUNTIME}:{CN_MODEL}'  # 现指向 CN 主力 Qwen3.8-Max（正常池新组合）
-CN_MAX_POOL_KEY = f'{CN_RUNTIME}:Qwen3.8-Max'
+CN_MODEL = 'Qwen4-Max-Preview'
+CN_POOL_KEY = f'{CN_RUNTIME}:{CN_MODEL}'  # 现指向 CN 主力 Qwen4-Max-Preview（正常池新组合）
+CN_MAX_POOL_KEY = f'{CN_RUNTIME}:Qwen4-Max-Preview'
 # BW-MAX-WINDOW-20261010-S2：CN 自定义 Qoder 主力友好名（短横线 Qwen-3.8-Max），真实 --model
 # 经既有私有 model_ids 映射下发，池名以友好名为准，属 Qoder 主力组；BW-CUSTOM-MAX-NIGHT-
 # 20261010-S1 起与 CN 内置 Max 同受北京时间夜间时段门（仅 22:00 含至 08:00 不含新派工）。
@@ -352,7 +375,7 @@ CN_MAX_POOL_KEY = f'{CN_RUNTIME}:Qwen3.8-Max'
 CN_CUSTOM_MAX_POOL_KEY = f'{CN_RUNTIME}:Qwen-3.8-Max'
 CN_CUSTOM_MAX_MODEL = 'Qwen-3.8-Max'
 CN_FLASH_POOL_KEY = f'{CN_RUNTIME}:Qwen3.8-Flash'
-QMAX_POOL_KEY = 'qoder:Qwen3.8-Max'
+QMAX_POOL_KEY = 'qoder:Qwen4-Max-Preview'
 # BW-STRONG-SONUS-20261024：国际 Qoder / Sonus 精确池（CLI --list-models 核验字面名）。
 # strong 专属独立 1 槽正常池：strong 优先级层=1（全档最前）、无时段门；medium/weak 由
 # 档位硬策略统一拒为 mode_excluded；绝不列入 QUOTA_LIMITABLE/QUOTA_LIMIT_WINDOW 池
@@ -364,7 +387,7 @@ DEEPSEEK_RETIRED_KEY = 'qodercn:DeepSeek-Flash'
 LUNA_KEY = f'{LUNA_RUNTIME}:{LUNA_MODEL}'
 LUNA_DISABLED = True
 # BW-POOL-SPLIT-20261010-S3 + BW-MAX-WINDOW-20261010-S2：可承载“明确限额”最小标记的主力池——
-# 两个 Qoder 内置 Max（qoder:Qwen3.8-Max / qodercn:Qwen3.8-Max）与 CN 自定义 Qoder Max
+# 两个 Qoder 内置 Max（qoder:Qwen4-Max-Preview / qodercn:Qwen4-Max-Preview）与 CN 自定义 Qoder Max
 # （qodercn:Qwen-3.8-Max）。ZCode 走既有 quota_control availability/hard_hold（本轮不改），
 # 两地区 Flash 兜底永不被限额标记误挡；自定义 Max 与内置 Max 各自独立落标、互不连坐。标记只是
 # 布尔不可用 + pool_key + 真实 attempt + 错误证据路径/哈希，绝不查余额、不带定时器/期限/
@@ -375,7 +398,7 @@ LUNA_DISABLED = True
 # 恢复、不需要手动重置。Qoder Max 的既有标记语义不变。CodeBuddy DeepSeek 的真实
 # 限额也使用同一 1800 秒新派发窗口；CodeBuddy GLM 额度独立、不被连带。
 QUOTA_LIMIT_WINDOW_SECONDS = 1800
-# BW-QWEN-MAX-LIMIT15-20261028：两个 Qoder 内置 Max（qoder:Qwen3.8-Max / qodercn:Qwen3.8-Max）
+# BW-QWEN-MAX-LIMIT15-20261028：两个 Qoder 内置 Max（qoder:Qwen4-Max-Preview / qodercn:Qwen4-Max-Preview）
 # 的真实限额标记改走 **900 秒（15 分钟）只读短窗**；原三池（zcode:GLM-5.3、Claude、
 # CodeBuddy deepseek）维持 1800 秒不变。短窗只影响新派发/浮窗展示，原 main_force_limits
 # 证据不清除、不宣称额度恢复；带短横线的 CN 自定义 Max（qodercn:Qwen-3.8-Max）不进本表。
@@ -482,7 +505,7 @@ def _parse(ts):
 # 20261023 / BW-CLAUDE-ALLDAY-QMAX-AFTER-20261023 的「无门」口径）：时段门改为**按档位**：
 # - strong：六个可派池**全部无时段门**（Sonus 无任何门，Claude 不套高峰门，三个 Max 不套
 #   夜间门）；
-# - medium / weak：三个 Qwen3.8-Max（CN 自定义 + CN 内置 + 国际内置）恢复北京 22:00（含）至
+# - medium / weak：三个 Qwen4-Max-Preview（CN 自定义 + CN 内置 + 国际内置）恢复北京 22:00（含）至
 #   次日 08:00（不含）夜间门；claude:deepseek-flash 恢复既有工作日高峰门（09:00–12:00、
 #   14:00–18:00，周末/法定假日/离峰放行）；ZCode 与其它原本无门的池保持无门。
 # 北京时间固定按 UTC+8 计算，绝不依赖宿主系统时区：把注入的 now（缺省 utcnow）折算到
@@ -699,6 +722,66 @@ def _linux_process_created(pid):
         return None
 
 
+def _macos_process_created(pid):
+    """macOS 只读创建身份（BW-MAC-COMPAT-20261114-S1）：经 libproc `proc_pidinfo`
+    的 PROC_PIDTBSDINFO 读 proc_bsdinfo 的 pbi_start_tvsec/tvusec（进程创建时刻），
+    组成 'mac:{sec}:{usec}' 稳定区分 PID 复用——与 Linux boot_id:starttime 同契约。
+    结构布局按本机 SDK sys/proc_info.h 权威字段（uint64 start，含自然对齐填充）；
+    只读、绝不 os.kill、绝不终止任何进程：ret<=0（进程已死/不可访问/沙箱拒绝）或
+    libproc 不可用或字段异常一律返回 None（调用方按 unknown 保守处理，绝不臆造身份）。
+    非 macOS 宿主调用同样返回 None，绝不猜测。"""
+    if not sys.platform.startswith('darwin'):
+        return None
+    try:
+        import ctypes
+        import ctypes.util
+
+        class _ProcBsdInfo(ctypes.Structure):
+            _fields_ = [
+                ('pbi_flags', ctypes.c_uint32),
+                ('pbi_status', ctypes.c_uint32),
+                ('pbi_xstatus', ctypes.c_uint32),
+                ('pbi_pid', ctypes.c_uint32),
+                ('pbi_ppid', ctypes.c_uint32),
+                ('pbi_uid', ctypes.c_uint32),
+                ('pbi_gid', ctypes.c_uint32),
+                ('pbi_ruid', ctypes.c_uint32),
+                ('pbi_rgid', ctypes.c_uint32),
+                ('pbi_svuid', ctypes.c_uint32),
+                ('pbi_svgid', ctypes.c_uint32),
+                ('rfu_1', ctypes.c_uint32),
+                ('pbi_comm', ctypes.c_char * 16),
+                ('pbi_name', ctypes.c_char * 32),
+                ('pbi_nfiles', ctypes.c_uint32),
+                ('pbi_pgid', ctypes.c_uint32),
+                ('pbi_pjobc', ctypes.c_uint32),
+                ('e_tdev', ctypes.c_uint32),
+                ('e_tpgid', ctypes.c_uint32),
+                ('pbi_nice', ctypes.c_int32),
+                ('pbi_start_tvsec', ctypes.c_uint64),
+                ('pbi_start_tvusec', ctypes.c_uint64),
+            ]
+
+        libproc = ctypes.CDLL(ctypes.util.find_library('proc') or 'libproc.dylib')
+        proc_pidinfo = libproc.proc_pidinfo
+        proc_pidinfo.restype = ctypes.c_int
+        proc_pidinfo.argtypes = [ctypes.c_int, ctypes.c_int, ctypes.c_uint64,
+                                 ctypes.c_void_p, ctypes.c_int]
+        PROC_PIDTBSDINFO = 3
+        info = _ProcBsdInfo()
+        ret = proc_pidinfo(int(pid), PROC_PIDTBSDINFO, 0, ctypes.byref(info),
+                           ctypes.sizeof(info))
+        if ret <= 0:
+            return None
+        sec = int(info.pbi_start_tvsec)
+        usec = int(info.pbi_start_tvusec)
+        if sec <= 0:
+            return None
+        return f'mac:{sec}:{usec}'
+    except (OSError, AttributeError, ImportError, ValueError):
+        return None
+
+
 def _local_pid_state(pid, platform=None):
     """quota_control 缺席时的本地只读存活探测（Windows GetExitCodeProcess / POSIX 信号 0）。
     Z4：Windows 上父进程仍持 process 句柄时，OpenProcess 对已退出的子进程同样能成功，
@@ -749,7 +832,8 @@ def _local_pid_state(pid, platform=None):
 
 def process_identity(pid, platform=None):
     """只读进程身份：{pid, state: alive/dead/unknown, created}. Z3：created 在 Windows
-    为 GetProcessTimes 的 FILETIME；在 /proc 可读的 Linux 为 boot_id+starttime。死进程或
+    为 GetProcessTimes 的 FILETIME；在 /proc 可读的 Linux 为 boot_id+starttime；在 macOS
+    为 libproc pbi_start_tvsec/usec（BW-MAC-COMPAT-20261114-S1）。死进程或
     读取失败一律 None（没有身份，绝不臆造）。绝不带副作用（不终止、不信号投递，除 POSIX
     信号 0）。生命周期对账据此区分明确 dead 与 PID 复用（同 PID 活但 birth 不符 ≠ 原
     child 已死）。"""
@@ -764,6 +848,8 @@ def process_identity(pid, platform=None):
         state = _local_pid_state(pid, platform)
     if plat.startswith('win') or plat == 'nt':
         created = _windows_process_created(pid)
+    elif plat.startswith('darwin'):
+        created = _macos_process_created(pid)
     else:
         created = _linux_process_created(pid)
     return {'pid': pid, 'state': state, 'created': created}
@@ -985,7 +1071,7 @@ def _rotation_row(conn):
 def _bump_rotation(conn, pk, now):
     """committed 计数语义（BW-POOL-SPLIT-20261010-S2 + BW-MAX-WINDOW-20261010-S2）：
     - `zcode:GLM-5.3` → committed_zcode +1（Z2 组）；
-    - `qoder:Qwen3.8-Max`、`qodercn:Qwen3.8-Max`（两内置 Max）与 `qodercn:Qwen-3.8-Max`
+    - `qoder:Qwen4-Max-Preview`、`qodercn:Qwen4-Max-Preview`（两内置 Max）与 `qodercn:Qwen-3.8-Max`
       （CN 自定义 Qoder Max）**合起来**记入 committed_qoder（Qoder 主力组，共享一列历史计数，
       代表 1:1 对侧 Z2），组内以真实在途数平衡；不新造轮换算法，自定义 Max 只是 Qoder 组新成员；
     - Flash/兜底、Luna、已退出正常池的 DeepSeek 均不再新增 rotation 记录。"""
@@ -993,7 +1079,7 @@ def _bump_rotation(conn, pk, now):
     if pk == 'zcode:GLM-5.3':
         conn.execute('UPDATE rotation SET committed_zcode=committed_zcode+1, '
                      'updated_at_utc=? WHERE pool_group=?', (_iso(now), 'main'))
-    elif pk in ('qoder:Qwen3.8-Max', 'qodercn:Qwen3.8-Max', CN_CUSTOM_MAX_POOL_KEY):
+    elif pk in ('qoder:Qwen4-Max-Preview', 'qodercn:Qwen4-Max-Preview', CN_CUSTOM_MAX_POOL_KEY):
         conn.execute('UPDATE rotation SET committed_qoder=committed_qoder+1, '
                      'updated_at_utc=? WHERE pool_group=?', (_iso(now), 'main'))
 
@@ -1463,14 +1549,14 @@ def _domestic_policy(conn, requested_pk, now, executor='auto', eligible=None,
     - 已 retired 的 CN DeepSeek-Flash 一律 `unknown_pool`：不新派、绝不作为 AUTO/executor
       任何分支的候选；已存在的真实在途 attempt 由 finish/reconcile 独立释放，与本策略无关；
     - executor='qoder'（可信主脑显式指定 Qoder 入口）：有空位且**未被明确限额**的
-      qoder:Qwen3.8-Max 一律直接 claim，绝不因历史 committed 计数被改派到 ZCode 或 CN；
+      qoder:Qwen4-Max-Preview 一律直接 claim，绝不因历史 committed 计数被改派到 ZCode 或 CN；
       strong 档无夜间门；medium/weak 档恢复夜间门（时段外 `main_force_window_closed`）；
       Max 满**或 Max 被明确限额标记命中** → routing 到自身 qoder:Qwen3.8-Flash（同级
       Max→Flash 兜底，sent=false 明示改道、绝不偷偷提交限额 Max；strong/medium 档 Flash
       被排除 → `mode_excluded`，绝不跨档兜底）；Flash 也满 → full；
       绝不跨执行器；提交非 qoder 组合 → executor_conflict；
     - executor='qodercn'（受信任主脑显式指定 CN 原生入口）：有空位且未被明确限额的
-      qodercn:Qwen3.8-Max 直接 claim，strong 档无门、medium/weak 档仅主力时段（时段外
+      qodercn:Qwen4-Max-Preview 直接 claim，strong 档无门、medium/weak 档仅主力时段（时段外
       `main_force_window_closed` 拒绝）；自定义 qodercn:Qwen-3.8-Max 同套门；Max 满或被
       明确限额 → routing 到 qodercn:Qwen3.8-Flash（strong/medium 档 → `mode_excluded`）；
       Flash 也满 → full；绝不跨执行器；提交非 CN 组合 → executor_conflict；
@@ -1632,7 +1718,7 @@ def _domestic_policy(conn, requested_pk, now, executor='auto', eligible=None,
             # 同区 CN Flash。
             if _max_window_blocks(CN_MAX_POOL_KEY, now, mode):
                 return 'main_force_window_closed', None
-            # BW-QWEN-MAX-LIMIT15-20261028：与 qoder:Qwen3.8-Max 同口径的 900 秒只读短窗；
+            # BW-QWEN-MAX-LIMIT15-20261028：与 qoder:Qwen4-Max-Preview 同口径的 900 秒只读短窗；
             # 带短横线的 CN 自定义 Max（qodercn:Qwen-3.8-Max）不在窗口表、维持原语义。
             if _quota_limit_window_active(conn, CN_MAX_POOL_KEY, now):
                 return 'main_force_limited', None
@@ -1880,7 +1966,7 @@ def select_and_claim(store_path=None, *, task_id, runtime, model, workspace,
                 return _reject('unknown_pool', task_id, pk,
                                [f'runtime/model {runtime!r}/{model!r} is not part of the '
                                 f'sanctioned allocation (main force zcode:GLM-5.3 / '
-                                f'qoder:Qwen3.8-Max / qodercn:Qwen3.8-Max, same-tier '
+                                f'qoder:Qwen4-Max-Preview / qodercn:Qwen4-Max-Preview, same-tier '
                                 f'overflow qoder:Qwen3.8-Flash + qodercn:Qwen3.8-Flash, '
                                 f'rescue luna:native; the retired '
                                 f'qodercn:DeepSeek-Flash pool is no longer dispatched); '
@@ -2274,21 +2360,18 @@ def consume_for_entry(store_path=None, *, task_id, runtime, model, workspace,
                 # 本 token 的 reserved 安全释放为 start_failed（真实释放自己那份占位、绝不
                 # 抢占别人），running/unknown 旧在途绝不假释放，只拒绝重复启动。
                 consume_mode = dm.current_mode()
-                # BW-SONUS-TEMP-DISABLE-20261026：Sonus 专项最小例外——禁用只针对**新派发**。
-                # 禁用期间（dm.SONUS_TEMP_DISABLED=True）Sonus 在所有档位都被排除、不可能
-                # 产生新的 reserved，因此一个已通过精确 claim 校验、仍为 reserved 的 Sonus
-                # token 只能是禁用前合法遗留：放行其 consume/mark running（不追杀、不假
-                # 释放）。绝不放开新 reserve/select/claim-due，不泛化到其它 mode_excluded
-                # 池，工作区/容量/PID/限额等其余门全部照旧。
-                sonus_legacy_reserved = (row['pool_key'] == SONUS_POOL_KEY
-                                         and bool(getattr(dm, 'SONUS_TEMP_DISABLED',
-                                                          False)))
+                # BW-QWEN4-SONUS-REMOVE-20261115：Sonus 已从所有档位去除新派，遗留 reserved
+                # 的 Sonus 精确 claim 也不再放行 consume——删除原 BW-SONUS-TEMP-DISABLE-
+                # 20261026 的 sonus_legacy_reserved 例外，reserved token 落入下方通用
+                # mode_excluded 分支被安全释放为 start_failed（真实释放、不泄漏容量）；
+                # running/unknown 旧在途绝不假释放，只拒绝重复启动，继续按既有安全语义
+                # 计数与自然终态结算。
                 # 新派硬门关闭后，精确校验通过的本池 reserved 只能来自禁用前遗留。
                 custom_max_legacy_reserved = (row['pool_key'] == CN_CUSTOM_MAX_POOL_KEY
                                               and row['pool_key'] in dm.USER_DISABLED_POOL_KEYS
                                               and row['state'] == 'reserved')
                 if row['pool_key'] not in dm.allowed_pools_for_mode(consume_mode) \
-                        and not sonus_legacy_reserved and not custom_max_legacy_reserved:
+                        and not custom_max_legacy_reserved:
                     cur = conn.execute(
                         "UPDATE attempts SET state='start_failed', "
                         "terminal='start_failed', ended_at_utc=? WHERE token=? "
@@ -4036,8 +4119,8 @@ def cancel_pending(store_path=None, *, task_id, now=None, reason='domestic_slot_
 # Z3：新旧版本上线交接。只接纳“受信任宿主”提供的既有 Qoder/Zcode 原请求与邻近
 # process.json，绝不自动扫描用户目录；宿主负责确认该 PID 与该 receipt 的真实命令/
 # 工作区对应（可信操作前提，见 handoff/revision3-report.md）。仅允许 GLM-5.3 与
-# Qwen3.8-Max/Flash；CB/WB 等其它组合一律拒绝且不触摸其 quota/并发锁。
-ADOPTABLE_POOL_KEYS = ('zcode:GLM-5.3', 'qoder:Qwen3.8-Max', 'qoder:Qwen3.8-Flash')
+# Qwen4-Max-Preview/Flash；CB/WB 等其它组合一律拒绝且不触摸其 quota/并发锁。
+ADOPTABLE_POOL_KEYS = ('zcode:GLM-5.3', 'qoder:Qwen4-Max-Preview', 'qoder:Qwen3.8-Flash')
 
 
 def _normalize_legacy_request(request):
@@ -4125,7 +4208,7 @@ def adopt_legacy(store_path=None, *, task_id, runtime, model, request_path,
       核验真实 argv/工作区与该 PID 对应）。生产仍用真实只读探针验证：PID 现在
       必须 alive 且观测创建身份与留证身份完全一致；已退出/unknown/漂移一律拒绝；
       无任何 fake-alive 开关（prober 仅供离线测试注入，CLI 不暴露）；
-    - 仅 ADOPTABLE_POOL_KEYS（GLM-5.3 / Qwen3.8-Max / Flash）；其它组合（CB/WB 等）
+    - 仅 ADOPTABLE_POOL_KEYS（GLM-5.3 / Qwen4-Max-Preview / Flash）；其它组合（CB/WB 等）
       拒绝且不触摸其 quota/并发锁；
     - Z4-D：确认的实际 worker PID+birth 绑定到 child_pid/child_created（绝不冒充
       未启动 wrapper），旧 worker 真实退出后 reconcile 即 reconciled_exit 释放容量
@@ -4436,7 +4519,7 @@ def _add_claim_args(p):
     p.add_argument('--executor', default='auto',
                    choices=['auto', 'qoder', 'zcode', CN_RUNTIME, CODEBUDDY_RUNTIME],
                    help='Explicit executor constraint from a trusted brain caller: '
-                        'qoder honors a free Qwen3.8-Max slot without 1:1 rerouting to '
+                        'qoder honors a free Qwen4-Max-Preview slot without 1:1 rerouting to '
                         'ZCode; zcode is the authoritative last gate (unavailable → '
                         'refused); auto keeps historical committed-count fairness')
     p.add_argument('--quota-store', dest='quota_store', default=None,

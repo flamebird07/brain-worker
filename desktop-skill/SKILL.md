@@ -34,7 +34,7 @@ ZCode 桌面端与 Qoder 桌面端共用的**同一份**入口，安装到两个
 
 | 宿主 | 识别信号（环境变量存在即命中） | 本宿主不可派发的精确组合 |
 |---|---|---|
-| Qoder 桌面 | `QODER_CONFIG_DIR` 或 `QODERCN_CONFIG_DIR` 或 `QODER_PRODUCT_ID` | `qoder:Qwen3.8-Max`、`qodercn:Qwen-3.8-Max`、`qodercn:Qwen3.8-Max`、`zcode:GLM-5.3`、`qoder:Sonus` |
+| Qoder 桌面 | `QODER_CONFIG_DIR` 或 `QODERCN_CONFIG_DIR` 或 `QODER_PRODUCT_ID` | `qoder:Qwen4-Max-Preview`、`qodercn:Qwen-3.8-Max`、`qodercn:Qwen4-Max-Preview`、`zcode:GLM-5.3`、`qoder:Sonus` |
 | ZCode 桌面 | `ZCODE_SKILL_DIR` 或 `ZCODE_DESKTOP_CONTEXT_PROMPT_ENABLED` 或 `ZCODE_APP_VERSION` | `zcode:GLM-5.3`（宿主不递归自派自己；BW-ZCODE-RESTORE-1-20261022 起该组合恢复为引擎正常可派主力，故须显式排除） |
 
 **无法确定宿主时必须 fail-closed：排除上表全部组合的并集**，并在回执中说明宿主未识别。绝不默认放行、绝不猜测宿主、绝不因为识别失败而放宽候选。

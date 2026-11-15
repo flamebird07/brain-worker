@@ -37,8 +37,8 @@ import dispatch_pool as dp  # noqa: E402
 import stage_selection as ss  # noqa: E402
 from dispatch_mode_support import dispatch_mode, user_disabled_pools  # noqa: E402
 
-QMAX = 'qoder:Qwen3.8-Max'
-CN_MAX = 'qodercn:Qwen3.8-Max'
+QMAX = 'qoder:Qwen4-Max-Preview'
+CN_MAX = 'qodercn:Qwen4-Max-Preview'
 CN_CUSTOM_MAX = 'qodercn:Qwen-3.8-Max'
 CLAUDE = 'claude:deepseek-flash'
 ZCODE = 'zcode:GLM-5.3'  # BW-ZCODE-RESTORE-1-20261022：恢复可派主力（容量 1、层=2）
@@ -143,7 +143,7 @@ class _Base(unittest.TestCase):
                           workspace=ws or self.ws(tid), prompt_sha256=SHA, stage='s',
                           now=now, executor=executor, _preclaim=False)
 
-    def claim_auto(self, tid, runtime='qoder', model='Qwen3.8-Max', now=NIGHT,
+    def claim_auto(self, tid, runtime='qoder', model='Qwen4-Max-Preview', now=NIGHT,
                    executor='auto'):
         return dp.select_and_claim(self.store, task_id=tid, runtime=runtime, model=model,
                                    workspace=self.ws(tid), prompt_sha256=SHA, stage='s',
@@ -311,8 +311,8 @@ class HighLevelDispatchTests(_Base):
         # BW-ZCODE-RESTORE-1-20261022：zcode 恢复为正常可派主力（容量 1），满主力夹具
         # 一并占住其唯一槽，其余层占满方式不变。
         self.assertTrue(self.reserve('z0', 'zcode', 'GLM-5.3', 'zcode').get('allowed'))
-        self.assertTrue(self.reserve('qm', 'qoder', 'Qwen3.8-Max', 'qoder').get('allowed'))
-        self.assertTrue(self.reserve('cm', 'qodercn', 'Qwen3.8-Max', 'qodercn').get('allowed'))
+        self.assertTrue(self.reserve('qm', 'qoder', 'Qwen4-Max-Preview', 'qoder').get('allowed'))
+        self.assertTrue(self.reserve('cm', 'qodercn', 'Qwen4-Max-Preview', 'qodercn').get('allowed'))
         # BW-QODERCN-TOKEN-MAX-DISABLE-20261028：目标池两槽按禁用前 legacy 占位构造
         # 「全部主力占满」物理场景（临时空禁用集，仅限这两次 reserve）。
         with user_disabled_pools(frozenset()):

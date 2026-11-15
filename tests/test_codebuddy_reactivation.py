@@ -4,7 +4,7 @@
 子进程、零真实池。覆盖任务政策：
 - 独立池 codebuddy:deepseek-v4.1-flash=1（BW-WORKER-WIDGET-20261018-S3 起与 GLM 各自
   独立 1 槽），AUTO 层=3（BW-CB-REORDER-20261020 用户明确指令：由旧层=0 下调，排三
-  Qwen3.8-Max（1）与 claude（2）之后、紧挨 opencode:deepseek-v4.1-flash-free（4）之前）；
+  Qwen4-Max-Preview（1）与 claude（2）之后、紧挨 opencode:deepseek-v4.1-flash-free（4）之前）；
   本轮真实失败（round 候选剔除）后落其余合格层；显式 executor/qodercn 不越权跨执行器改派；
 - 仅 1 个 CodeBuddy deepseek，第二个拒绝，终态释放后可复用；总 16（BW-OPENCODE-20261019
   起含两 OpenCode 免费模型各 1 槽）与迁移债务守卫、同 workspace/unknown 不绕过；
@@ -46,8 +46,8 @@ import stub_codebuddy_live as stub  # noqa: E402
 
 CB = 'codebuddy:deepseek-v4.1-flash'
 CB_MODEL = 'deepseek-v4.1-flash'
-QMAX = 'qoder:Qwen3.8-Max'
-CN_MAX = 'qodercn:Qwen3.8-Max'
+QMAX = 'qoder:Qwen4-Max-Preview'
+CN_MAX = 'qodercn:Qwen4-Max-Preview'
 CN_CUSTOM_MAX = 'qodercn:Qwen-3.8-Max'
 CLAUDE = 'claude:deepseek-flash'
 ZCODE = 'zcode:GLM-5.3'
@@ -197,7 +197,7 @@ class TestCodebuddyPoolPriority(_PoolBase):
     def test_auto_prefers_max_over_codebuddy_when_all_free(self):
         # BW-CB-REORDER-20261020：空库 AUTO 不再落 CodeBuddy——三 Qoder Max（层=1）在先，
         # CodeBuddy（层=3）绝不在 Max/claude 有空位时被选中。
-        out = self.reserve('t1', 'qoder', 'Qwen3.8-Max', 'auto')
+        out = self.reserve('t1', 'qoder', 'Qwen4-Max-Preview', 'auto')
         self.assertTrue(out.get('routing_required'), out)
         self.assertIn(out['selected']['pool_key'], MAXES, out)
         self.assertNotEqual(out['selected']['pool_key'], CB, out)
@@ -206,8 +206,8 @@ class TestCodebuddyPoolPriority(_PoolBase):
         # 新 AUTO 选择顺序的完整走位：三 Max（4 槽）、ZCode（1 槽）与 claude（2 槽）全满
         # → 下一层正是 CodeBuddy deepseek（4）；CodeBuddy 也满 → 才轮到两 OpenCode 免费
         # 模型（5）。
-        self.reserve('qm', 'qoder', 'Qwen3.8-Max', 'qoder')
-        self.reserve('cm', 'qodercn', 'Qwen3.8-Max', 'qodercn')
+        self.reserve('qm', 'qoder', 'Qwen4-Max-Preview', 'qoder')
+        self.reserve('cm', 'qodercn', 'Qwen4-Max-Preview', 'qodercn')
         self.reserve('cx1', 'qodercn', 'Qwen-3.8-Max', 'qodercn')
         self.reserve('cx2', 'qodercn', 'Qwen-3.8-Max', 'qodercn')
         self.reserve('z1', 'zcode', 'GLM-5.3', 'zcode')
@@ -249,7 +249,7 @@ class TestCodebuddyPoolPriority(_PoolBase):
         self.assertTrue(any('capacity of 1' in r for r in second['reasons']), second)
 
     def test_explicit_qoder_never_crosses_to_codebuddy(self):
-        out = self.reserve('q', 'qoder', 'Qwen3.8-Max', 'qoder')
+        out = self.reserve('q', 'qoder', 'Qwen4-Max-Preview', 'qoder')
         self.assertEqual(out['pool_key'], QMAX)
         self.assertFalse(out.get('routing_required'))
 
@@ -726,7 +726,7 @@ class TestLiveTransport(unittest.TestCase):
 
     def test_does_not_mis_clear_other_placeholder(self):
         # 预置另一 task 的在途占位；本次 codebuddy 传输的成功释放绝不触碰别人的锁。
-        self.seed_foreign('qoder', 'Qwen3.8-Max', QMAX, 'foreign-task')
+        self.seed_foreign('qoder', 'Qwen4-Max-Preview', QMAX, 'foreign-task')
         stream = _success_stream(self.report)
         out = self._run(stdout=stream, returncode=0, task='iso', outname='iso')
         self.assertTrue(out['passed'], out)

@@ -27,7 +27,7 @@ import deepseek_offpeak as off  # noqa: E402
 from dispatch_mode_support import dispatch_mode, insert_sonus_leftover  # noqa: E402
 
 CLAUDE = 'claude:deepseek-flash'
-MAINS = ('zcode:GLM-5.3', 'qoder:Qwen3.8-Max', 'qodercn:Qwen3.8-Max', 'qodercn:Qwen-3.8-Max')
+MAINS = ('zcode:GLM-5.3', 'qoder:Qwen4-Max-Preview', 'qodercn:Qwen4-Max-Preview', 'qodercn:Qwen-3.8-Max')
 OFFPEAK_NIGHT = datetime(2026, 10, 8, 15, 0, 0, tzinfo=timezone.utc)   # 北京 23:00 周四 offhours
 PEAK_WEEKDAY = datetime(2026, 10, 12, 1, 0, 0, tzinfo=timezone.utc)    # 北京 09:00 周一 高峰
 PEAK_WEEKDAY_1500 = datetime(2026, 10, 12, 7, 0, 0, tzinfo=timezone.utc)  # 北京 15:00 周一 高峰
@@ -75,8 +75,8 @@ class _ClaudeBase(unittest.TestCase):
         self.assertTrue(self._reserve('cb', 'codebuddy', 'deepseek-v4.1-flash',
                                       'codebuddy', now).get('allowed'))
         self.assertTrue(self._reserve('z0', 'zcode', 'GLM-5.3', 'zcode', now).get('allowed'))
-        self.assertTrue(self._reserve('qm', 'qoder', 'Qwen3.8-Max', 'qoder', now).get('allowed'))
-        self.assertTrue(self._reserve('cnm', 'qodercn', 'Qwen3.8-Max', 'qodercn', now).get('allowed'))
+        self.assertTrue(self._reserve('qm', 'qoder', 'Qwen4-Max-Preview', 'qoder', now).get('allowed'))
+        self.assertTrue(self._reserve('cnm', 'qodercn', 'Qwen4-Max-Preview', 'qodercn', now).get('allowed'))
         with mock.patch.object(dp.dm, 'USER_DISABLED_POOL_KEYS', frozenset()):
             for i in range(2):
                 self.assertTrue(self._reserve(f'cnx{i}', 'qodercn', 'Qwen-3.8-Max', 'qodercn',
@@ -175,7 +175,7 @@ class CapacityAndRouting(_ClaudeBase):
         # claude 空闲 → 选中 claude
         self.occupy_non_claude_mains()
         r = dp.select_and_claim(self.store, task_id='auto', runtime='qoder',
-                                model='Qwen3.8-Max', workspace=self.ws('auto'),
+                                model='Qwen4-Max-Preview', workspace=self.ws('auto'),
                                 prompt_sha256='p', stage='s', now=OFFPEAK_NIGHT,
                                 executor='auto', _preclaim=False)
         self.assertTrue(r.get('routing_required'), r)
@@ -210,15 +210,15 @@ class CapacityAndRouting(_ClaudeBase):
 
     def test_auto_claude_entry_peak_now_claims_in_strong_mode(self):
         # BW-MANUAL-THREE-MODE-20261023：**strong 档**解除 claude 工作日高峰门——AUTO 的
-        # claude 入口在高峰绝不返回 `main_force_window_closed`。strong 常态层序 Sonus(1) >
-        # ZCode(2) > claude(3) > 三个 Max(4)，占满 ZCode 后 claude 即最优先可用候选。
-        # BW-SONUS-REENABLE-20261029-R3：Sonus 恢复常态新派——显式 reserve 如实占用
-        # 其独立 1 槽；占满 Sonus 与 ZCode 后 claude 即第一候选，断言强度不变。
+        # claude 入口在高峰绝不返回 `main_force_window_closed`。strong 常态层序 ZCode(2) >
+        # claude(3) > 三个 Max(4)，占满 ZCode 后 claude 即最优先可用候选。
+        # BW-QWEN4-SONUS-REMOVE-20261115：Sonus 从所有档位去除——显式 reserve 一律
+        # mode_excluded（零占位）；占满 ZCode 后 claude 即第一候选，断言强度不变。
         with dispatch_mode('strong'):
             sonus = self._reserve('hi0', 'qoder', 'Sonus', 'qoder',
                                   PEAK_WEEKDAY)
-            self.assertTrue(sonus.get('allowed'), sonus)
-            self.assertEqual(sonus.get('pool_key'), dp.SONUS_POOL_KEY, sonus)
+            self.assertFalse(sonus.get('allowed'), sonus)
+            self.assertEqual(sonus.get('reason'), 'mode_excluded', sonus)
             self.assertTrue(self._reserve('hi1', 'zcode', 'GLM-5.3', 'zcode',
                                           PEAK_WEEKDAY).get('allowed'))
             r = self.claim_claude('apc', now=PEAK_WEEKDAY, executor='auto')

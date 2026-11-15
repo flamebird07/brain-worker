@@ -35,7 +35,7 @@ def _plan(**over):
     g = _grants()
     plan = {
         'task_id': 'T01', 'stage': 'S-1', 'runtime': 'qoder',
-        'model': 'Qwen3.8-Max', 'workspace': 'C:\\ws\\T01',
+        'model': 'Qwen4-Max-Preview', 'workspace': 'C:\\ws\\T01',
         'cwd': 'C:\\ws\\T01', 'prompt_sha256': 'a' * 64,
         'grants': {'edits': g['edits'], 'bash': g['bash'], 'read_dirs': g['read_dirs']},
         'tool_visibility': g['tool_visibility'], 'visible_tools': g['visible_tools'],
@@ -50,7 +50,7 @@ def _plan(**over):
 def _actual(**over):
     actual = {
         'task_id': 'T01', 'stage': 'S-1', 'runtime': 'qoder',
-        'model': 'Qwen3.8-Max', 'workspace': 'C:\\ws\\T01',
+        'model': 'Qwen4-Max-Preview', 'workspace': 'C:\\ws\\T01',
         'cwd': 'C:\\ws\\T01', 'prompt_sha256': 'a' * 64,
         'argv': ['node', 'cli', '-p'], 'shell': False,
         'grants': _grants(),
@@ -749,7 +749,7 @@ class AdapterDispatchPlanTests(unittest.TestCase):
         self.entry.write_text(json.dumps(
             {'node': sys.executable, 'qodercli': str(STUB_QODER)}), encoding='utf-8')
         self.stage = 'BW-PLAN-TEST-01'
-        # BW-MAX-WINDOW-20261010-S2：计划默认用内置 Qwen3.8-Max（主力时段门约束），真实入口
+        # BW-MAX-WINDOW-20261010-S2：计划默认用内置 Qwen4-Max-Preview（主力时段门约束），真实入口
         # 在子进程用墙钟判定 → 白天会如实拒绝。本组只验 dispatch plan 预检/Popen 链路，故用
         # 测试创建的临时 wrapper 把 dispatch_pool.utcnow 固定到主力时段内（北京 23:00）再原样
         # 运行 qoder_direct 入口；时钟控制仅在此离线夹具，生产入口不加 --now/环境开关。
@@ -781,7 +781,7 @@ class AdapterDispatchPlanTests(unittest.TestCase):
         g = _grants(rules=allowed, tools=('Read',))
         plan = {
             'task_id': 'TP', 'stage': self.stage, 'runtime': 'qoder',
-            'model': 'Qwen3.8-Max', 'workspace': str(self.ws), 'cwd': str(self.ws),
+            'model': 'Qwen4-Max-Preview', 'workspace': str(self.ws), 'cwd': str(self.ws),
             'prompt_sha256': _sha(prompt.read_bytes()),
             'grants': {'edits': g['edits'], 'bash': g['bash'],
                        'read_dirs': g['read_dirs']},

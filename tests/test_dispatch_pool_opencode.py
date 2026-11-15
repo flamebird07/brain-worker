@@ -77,8 +77,8 @@ class _PoolBase(unittest.TestCase):
         toks = [self.reserve('cb1', 'codebuddy', dp.CODEBUDDY_MODEL,
                              executor='codebuddy')]
         toks.append(self.reserve('zc1', 'zcode', 'GLM-5.3', executor='zcode'))
-        toks.append(self.reserve('qm', 'qoder', 'Qwen3.8-Max', executor='qoder'))
-        toks.append(self.reserve('cm', 'qodercn', 'Qwen3.8-Max', executor='qodercn'))
+        toks.append(self.reserve('qm', 'qoder', 'Qwen4-Max-Preview', executor='qoder'))
+        toks.append(self.reserve('cm', 'qodercn', 'Qwen4-Max-Preview', executor='qodercn'))
         # BW-QODERCN-TOKEN-MAX-DISABLE-20261028：目标池两槽按禁用前 legacy 占位构造
         # 「上层全满」历史层序场景（临时空禁用集，仅限这两次 reserve）。
         with user_disabled_pools(frozenset()):
@@ -176,9 +176,9 @@ class ExactDesignationTests(_PoolBase):
 
     def test_other_executors_never_route_to_opencode(self):
         # 夜间显式 qoder Max 请求：直接 claim 自身池，绝不改派更低价 OpenCode。
-        r = self.select('q1', 'qoder', 'Qwen3.8-Max', executor='qoder')
+        r = self.select('q1', 'qoder', 'Qwen4-Max-Preview', executor='qoder')
         self.assertTrue(r.get('allowed'), r)
-        self.assertEqual(r['pool_key'], 'qoder:Qwen3.8-Max')
+        self.assertEqual(r['pool_key'], 'qoder:Qwen4-Max-Preview')
 
     def test_consume_claim_exact_combo_allowed(self):
         tok = self.reserve('d1', 'opencode', DEEPSEEK, prompt='p')
@@ -198,7 +198,7 @@ class NoWindowNoQuotaGateTests(_PoolBase):
                        workspace=str(self._ws_for('day1')), prompt_sha256='p',
                        executor='opencode', now=DAY, _preclaim=False)
         self.assertTrue(r.get('allowed'), r)
-        # 同一时刻三个 Qwen3.8-Max 都时段外拒派（BW-MANUAL-THREE-MODE-20261023：weak 档
+        # 同一时刻三个 Qwen4-Max-Preview 都时段外拒派（BW-MANUAL-THREE-MODE-20261023：weak 档
         # 恢复三个 Max 的夜间门）——对照证明 OpenCode 自身无时段门。
         # BW-QODERCN-TOKEN-MAX-DISABLE-20261028：目标池现行被用户禁用——禁用拒绝
         # （mode_excluded，「用户要求禁用」）优先于时段门，先单独断言它；两个仍可派的
@@ -209,8 +209,8 @@ class NoWindowNoQuotaGateTests(_PoolBase):
                          _preclaim=False)
         self.assertEqual(r2d.get('reason'), 'mode_excluded', r2d)
         for task, runtime, model, executor in (
-                ('m1', 'qodercn', 'Qwen3.8-Max', 'qodercn'),
-                ('m3', 'qoder', 'Qwen3.8-Max', 'qoder')):
+                ('m1', 'qodercn', 'Qwen4-Max-Preview', 'qodercn'),
+                ('m3', 'qoder', 'Qwen4-Max-Preview', 'qoder')):
             r2 = dp.reserve(self.store, task_id=task, runtime=runtime, model=model,
                             workspace=str(self._ws_for(task)), prompt_sha256='p',
                             executor=executor, now=DAY, _preclaim=False)
@@ -218,11 +218,11 @@ class NoWindowNoQuotaGateTests(_PoolBase):
         # strong 档：三个 Max 无夜间门，同一白天时刻照常可派；OpenCode 则被档位排除。
         with dispatch_mode('strong'):
             r3 = dp.reserve(self.store, task_id='s3', runtime='qoder',
-                            model='Qwen3.8-Max', workspace=str(self._ws_for('s3')),
+                            model='Qwen4-Max-Preview', workspace=str(self._ws_for('s3')),
                             prompt_sha256='p', executor='qoder', now=DAY,
                             _preclaim=False)
             self.assertTrue(r3.get('allowed'), r3)
-            self.assertEqual(r3['pool_key'], 'qoder:Qwen3.8-Max', r3)
+            self.assertEqual(r3['pool_key'], 'qoder:Qwen4-Max-Preview', r3)
             dp.finish(self.store, r3['token'], terminal='cancelled', now=DAY)
             r4 = dp.reserve(self.store, task_id='s4', runtime='opencode', model=DEEPSEEK,
                             workspace=str(self._ws_for('s4')), prompt_sha256='p',
@@ -253,8 +253,8 @@ class AutoTierOrderTests(_PoolBase):
         # BW-CB-REORDER-20261020 + BW-ZCODE-RESTORE-1-20261022：三 Max(1)+ZCode(2)+
         # claude(3) 全满后，AUTO 下一层是 CodeBuddy deepseek(4)，仍先于两 OpenCode
         # 免费模型(5)。
-        self.reserve('qm', 'qoder', 'Qwen3.8-Max', executor='qoder')
-        self.reserve('cm', 'qodercn', 'Qwen3.8-Max', executor='qodercn')
+        self.reserve('qm', 'qoder', 'Qwen4-Max-Preview', executor='qoder')
+        self.reserve('cm', 'qodercn', 'Qwen4-Max-Preview', executor='qodercn')
         # 同上：目标池两槽 legacy 占位（临时空禁用集）。
         with user_disabled_pools(frozenset()):
             self.reserve('cx1', 'qodercn', 'Qwen-3.8-Max', executor='qodercn')

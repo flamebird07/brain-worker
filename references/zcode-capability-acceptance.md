@@ -202,7 +202,7 @@ def init_plan_deny(plan: dict, tools: list) -> dict:
 
 ## 七、当前默认路由（与 SKILL/zcode-direct/README 对齐）
 
-- 直连候选 **ZCode / GLM-5.3** 与 **Qoder / Qwen3.8-Max** 在**合格可用**候选间尽力 **1:1**；用户明确
+- 直连候选 **ZCode / GLM-5.3** 与 **Qoder / Qwen4-Max-Preview** 在**合格可用**候选间尽力 **1:1**；用户明确
   给出的已授权 **executor+model 组合是硬约束、优先于历史比例**，有空位的指定 Qoder 绝不因 committed
   比例被改道 ZCode。默认 AUTO 主力优先，两主力均无合格可用槽时可走溢出 Qwen3.8-Flash，用户明确指定
   已授权 Flash 时按其真实容量独立受控派发（主力各 2、Flash 2、国内合计 6 属 Skill 策略，非官方 Qoder
