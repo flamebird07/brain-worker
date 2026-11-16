@@ -36,11 +36,30 @@ ACTIVE_STATES attempt 的遗留池整行保留并标「本档不参与」。BW-O
 
 ## 最简单启动
 
+**Windows**：
+
 ```text
 pythonw scripts/worker_status_widget.py
 ```
 
-`pythonw` 无控制台窗口；用 `python` 也可以。可选参数：
+`pythonw` 无控制台窗口；用 `python` 也可以。
+
+**macOS（BW-MAC-COMPAT-20261114-S1 起）**：
+
+```bash
+python3 scripts/worker_status_widget.py &
+```
+
+- **依赖**：homebrew Python 默认不含 tkinter，GUI 启动前需 `brew install python-tk@3.15`
+  （与已装 python@3.15 小版本一致；缺失时浮窗窗口起不来，`--once` 命令行快照不受影响）。
+- **窗口形态**：无边框小型状态条窗口（可拖动、可置顶、单击展开），**不是菜单栏图标，
+  也没有 Dock 应用图标**；`⌘Q` 退出。找不到窗口时先查屏幕边缘遮挡，或 `pkill -f
+  worker_status_widget.py` 后重启回到默认位置。
+- **单实例**：POSIX flock 闸（锁文件 `~/.brain-worker/widget-instance.lock`，对等
+  Windows 命名 mutex）；重复启动如实提示「浮窗已在运行（单实例）」并退出，锁目录
+  不可写时诚实降级放行（不加第二道闸）。
+
+可选参数（两平台同）：
 
 - `--store <路径>`：显式指定调度池 SQLite。缺省沿用 `dispatch_pool` 的权威默认
   （`~/.brain-worker/dispatch-pool.sqlite3`，`BRAIN_WORKER_DISPATCH_STORE` 环境覆盖）。
@@ -49,8 +68,39 @@ pythonw scripts/worker_status_widget.py
 - `--once`：不启动 GUI，只读取一次并输出安全 JSON（不含 token/prompt/argv/秘密），
   供主脑/脚本做真实只读验证；快照不可用时退出码 2。
 
-桌面双击入口（`.bat`/快捷方式指向上述 `pythonw` 命令）、真实本机启动与截图验收由
-root 阶段完成；本文件只登记启动方式。
+桌面双击入口（Windows `.bat`/快捷方式指向 `pythonw` 命令、macOS 可做成 `.command`
+或登录项）由 root 阶段完成；本文件只登记启动方式。
+
+## 跨平台优先级一致性与同步（Mac/Windows，2026-11-16）
+
+浮窗行序在两台机器上**必须一致**，机制是单一来源、无平台分叉：
+
+- 优先级唯一数字来源是 `scripts/dispatch_mode.py`（`PRIORITY_BY_MODE`）；
+  `dispatch_pool`/`stage_selection`/浮窗**每次裁决现读**，任何机器上都不缓存、
+  不抄写、不按平台分叉。行序守卫由离线回归固化
+  （`tests/test_worker_status_widget.py` 行序用例）。
+- 因此「更新 Windows 的优先级」= **让 Windows 跑同一份引擎代码**，不存在在
+  Windows 单独改数字的步骤。Mac/Windows 共用同一 GitHub 仓库
+  （flamebird07/brain-worker），改一处提交推送后，另一台拉取即同步。
+
+**Windows 侧同步步骤**（在 Windows 机器上执行；对应 2026-11-15 的 Qwen4 层序
+更新，`origin/main` 已含）：
+
+```text
+cd <Windows 上的 brain-worker 仓库副本>
+git pull origin main
+python scripts/install_desktop_skill.py install   # 重装桌面技能，两宿主字节一致
+python scripts/install_desktop_skill.py check     # 校验 ready
+```
+
+随后重启浮窗（旧窗口关闭后重新启动），行序即与新优先级一致。验证方式（任一平台）：
+
+```text
+python3 scripts/worker_status_widget.py --once
+```
+
+对比输出 `rows` 的顺序与 `scripts/dispatch_mode.py` 中当前档位的优先级表一致即可；
+不需要也不应该在两台机器上分别维护优先级数字。
 
 ## 数据从哪来
 
