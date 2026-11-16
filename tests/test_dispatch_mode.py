@@ -204,7 +204,7 @@ class ModePolicyTests(unittest.TestCase):
         self.assertEqual(dm.priority_map_for_mode('weak'), {
             'qodercn:Qwen-3.8-Max': 1,
             'qodercn:Qwen4-Max-Preview': 1,
-            'zcode:GLM-5.3': 2,
+            'zcode:GLM-5.3': 9,
             'claude:deepseek-flash': 3,
             'qoder:Qwen4-Max-Preview': 4,
             'codebuddy:deepseek-v4.1-flash': 5,
@@ -218,7 +218,7 @@ class ModePolicyTests(unittest.TestCase):
     def test_priority_maps_are_copies(self):
         first = dm.priority_map_for_mode('weak')
         first['zcode:GLM-5.3'] = 99
-        self.assertEqual(dm.priority_map_for_mode('weak')['zcode:GLM-5.3'], 2)
+        self.assertEqual(dm.priority_map_for_mode('weak')['zcode:GLM-5.3'], 9)
 
     def test_pool_key_literals_match_dispatch_pool(self):
         # 键名漂移守卫：dispatch_mode 的独立字面量必须与 dispatch_pool 真实池表一致。

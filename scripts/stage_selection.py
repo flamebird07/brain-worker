@@ -404,7 +404,7 @@ def _per_candidate_view(allowed, filters, mode=None):
 
 
 def _relational_select(conn, mode, auth, allowed, passed, now, dispatch_mode=None):
-    """auto/executor 的关系选择：先主力（复用 `_select_main_force` 公平轮换）再 Flash；
+    """auto/executor 的关系选择：按当前档排序，弱档两路 Flash 优先于 ZCode；
     executor 只在本 runtime 内、绝不跨区；候选只在**当前档可派集合**内。
     返回 (pk_or_None, reason)。"""
     dispatch_mode = (dmode.normalize_mode(dispatch_mode) if dispatch_mode is not None
@@ -424,7 +424,9 @@ def _relational_select(conn, mode, auth, allowed, passed, now, dispatch_mode=Non
             return None, 'rotation_state_unavailable'
         target, _why = dp._select_main_force(conn, elig[0], now, eligible=set(elig),
                                             mode=dispatch_mode)
-        if target is not None:
+        if target is not None and not (
+                dispatch_mode == 'weak' and target == dp.ZCODE_POOL_KEY
+                and pset.intersection(flashes)):
             if ex:
                 return target, 'executor_region_main'
             return target, 'main_force_selected'

@@ -159,17 +159,14 @@ class AuthorizationTests(_Base):
                 'INSERT INTO main_force_limits(pool_key, limited, recorded_at_utc) '
                 'VALUES(?,1,?)', (dp.CODEBUDDY_POOL_KEY, dp._iso(T_DAY)))
             conn.execute('PRAGMA journal_mode=DELETE')
-        # BW-MANUAL-THREE-MODE-20261023：回执的 selected_priority / eligible / 排除原因
-        # 必须跟随**当前档**。弱档白天：三个 Max 夜间窗与 claude 工作日高峰门都关，
-        # ZCode（层=2）是最高可用层；CodeBuddy 因真实限额排除，下一候选是层=6 的 OpenCode。
         with dispatch_mode('weak'):
             r = self.plan(self.auth('auto', 'T', 's2', allowed), now=T_DAY)
             self.assertIsNone(r['refused'], r)
             self.assertEqual(r['dispatch_mode'], 'weak', r)
-            self.assertEqual(r['selected_priority'], 2, r)
-            self.assertEqual(r['selected']['pool_key'], dp.ZCODE_POOL_KEY, r)
+            self.assertEqual(r['selected_priority'], 6, r)
+            self.assertIn(r['selected']['pool_key'], dp.OPENCODE_POOL_KEYS, r)
             eligible = {x['pool_key']: x for x in r['eligible_candidates']}
-            self.assertEqual(eligible[dp.ZCODE_POOL_KEY]['priority'], 2)
+            self.assertEqual(eligible[dp.ZCODE_POOL_KEY]['priority'], 9)
             self.assertEqual(eligible[dp.ZCODE_POOL_KEY]['capacity'], 1)
             self.assertEqual(eligible[dp.OPENCODE_DEEPSEEK_POOL_KEY]['priority'], 6)
             for pk in (dp.CLAUDE_POOL_KEY, dp.QMAX_POOL_KEY, dp.CN_MAX_POOL_KEY,
@@ -186,10 +183,10 @@ class AuthorizationTests(_Base):
             # 选中层=2 之上只剩两个层=1 的 CN Max；claude(3)/国际 Max(4) 更低层不算
             # higher_priority。
             self.assertEqual([x['pool_key'] for x in r['higher_priority_exclusions']],
-                             [dp.CN_CUSTOM_MAX_POOL_KEY, dp.CN_MAX_POOL_KEY])
+                             [dp.CN_CUSTOM_MAX_POOL_KEY, dp.CN_MAX_POOL_KEY, dp.CLAUDE_POOL_KEY,
+                              dp.QMAX_POOL_KEY, dp.CODEBUDDY_POOL_KEY])
             self.assertEqual(r['next_candidate']['priority'], 6)
             self.assertIn(r['next_candidate']['pool_key'], dp.OPENCODE_POOL_KEYS)
-        # 强档两路内置 Max 同层，回执的下一候选是另一条 Max 路线。
         with dispatch_mode('strong'):
             r = self.plan(self.auth('auto', 'T', 's2', allowed), now=T_DAY)
             self.assertEqual(r['dispatch_mode'], 'strong', r)
@@ -273,15 +270,13 @@ class AuthorizationTests(_Base):
                     'INSERT INTO main_force_limits(pool_key, limited, recorded_at_utc) '
                     'VALUES(?,1,?)', (pk, dp._iso(T_DAY)))
             conn.execute('PRAGMA journal_mode=DELETE')
-        # BW-QODER-INTL-MAX-ALLDAY-20261023：国际 Max 白天可派，先占满其唯一名额，
-        # 层=2 的 ZCode 才是最高可用层（两个 CN Max 仍被夜间门挡下）。
         self.reserve('im', 'qoder', 'Qwen4-Max-Preview', executor='qoder')
         r = self.plan(self.auth('auto', 'T', 's2', ALL_MAINS + ALL_FLASH), now=T_DAY)
         self.assertIsNone(r['refused'], r)
         self.assertEqual(r['candidate_filters'][dp.CODEBUDDY_POOL_KEY],
                          'main_force_limited')
         self.assertEqual(r['candidate_filters'][dp.ZCODE_POOL_KEY], 'eligible', r)
-        self.assertEqual(r['selected']['pool_key'], dp.ZCODE_POOL_KEY, r)
+        self.assertIn(r['selected']['pool_key'], dp.OPENCODE_POOL_KEYS, r)
         self.assertNotIn(r['selected']['pool_key'], dp.OVERFLOW_KEYS)
 
     def test_fixed_cn_flash_kept_even_with_free_main(self):
@@ -575,7 +570,7 @@ class ReorderTierTests(_Base):
         self.assertEqual(dp.POOL_PRIORITY[dp.CODEBUDDY_POOL_KEY], 5)
         self.assertEqual(dp.POOL_PRIORITY, {
             dp.CN_CUSTOM_MAX_POOL_KEY: 1, dp.CN_MAX_POOL_KEY: 1,
-            dp.ZCODE_POOL_KEY: 2,
+            dp.ZCODE_POOL_KEY: 9,
             dp.CLAUDE_POOL_KEY: 3,
             dp.QMAX_POOL_KEY: 4,
             dp.CODEBUDDY_POOL_KEY: 5,
@@ -619,27 +614,29 @@ class ReorderTierTests(_Base):
 
 
 class WindowAndLimitTests(_Base):
-    def test_day_peak_gates_close_max_and_claude_select_zcode_then_opencode(self):
-        # BW-MANUAL-THREE-MODE-CLOSEOUT-20261023：weak 档白天（工作日高峰）三个 Max 的
-        # 北京 22:00–08:00 夜间门与 claude 的工作日高峰门都关；ZCode（层=2）无门，是白天
-        # 最高可用层。旧「国际 Max/claude 白天可派」断言属 BW-QODER-INTL-MAX-ALLDAY /
-        # BW-CLAUDE-ALLDAY 旧口径，已按三档最终口径废止。
+    def test_day_peak_gates_close_max_and_claude_select_opencode(self):
         self.build_store()
         r = self.plan(self.auth('auto', 'T', 's2', LEGACY_MAINS + ALL_FLASH), now=T_DAY)
-        self.assertEqual(r['selected']['pool_key'], dp.ZCODE_POOL_KEY, r)
+        self.assertIn(r['selected']['pool_key'], dp.OPENCODE_POOL_KEYS, r)
         self.assertEqual(r['candidate_filters']['qoder:Qwen4-Max-Preview'], 'window_closed')
         self.assertEqual(r['candidate_filters'][dp.CN_MAX_POOL_KEY], 'window_closed')
         self.assertEqual(r['candidate_filters'][dp.CN_CUSTOM_MAX_POOL_KEY],
                          'mode_excluded')
         self.assertEqual(r['candidate_filters'][dp.CLAUDE_POOL_KEY], 'window_closed')
         self.assertEqual(r['candidate_filters'][dp.ZCODE_POOL_KEY], 'eligible')
-        # ZCode 占满后（层=2 无空位）白天按层序落到无门的 OpenCode（层=6）；被门关住的
-        # claude（层=3）与国际 Max（层=4）绝不因层序更高被放进白天。
         self.reserve('z0', 'zcode', 'GLM-5.3', executor='zcode')
         r2 = self.plan(self.auth('auto', 'T2', 's2', LEGACY_MAINS + ALL_FLASH),
                        task='T2', now=T_DAY)
         self.assertEqual(r2['selected']['pool_key'], dp.OPENCODE_DEEPSEEK_POOL_KEY, r2)
         self.assertEqual(r2['candidate_filters'][dp.CLAUDE_POOL_KEY], 'window_closed', r2)
+
+    def test_weak_auto_prefers_flash_to_zcode(self):
+        self.build_store()
+        for flash in dp.OVERFLOW_KEYS:
+            r = self.plan(self.auth('auto', 'T', 's2', [dp.ZCODE_POOL_KEY, flash]),
+                          now=T_DAY)
+            self.assertEqual(r['selected']['pool_key'], flash, r)
+            self.assertEqual(r['next_candidate']['pool_key'], dp.ZCODE_POOL_KEY, r)
 
     def test_night_admits_gated_max_and_keeps_fairness(self):
         self.build_store()
@@ -1067,14 +1064,11 @@ class PermissionGrantsTests(_Base):
         self._assert_capability_table_untouched()
 
     def test_day_same_window_without_exact_rules_z_still_eligible(self):
-        """同一白天窗口、不要求精确规则（未传 grants）：BW-ZCODE-RESTORE-1-20261022
-        后 ZCode 恢复为层=2 现役候选并被直接选中（无需求时不做能力过滤）。
-        BW-QODER-INTL-MAX-ALLDAY-20261023：国际 Max 白天也可派且层=1，故先占满其唯一
-        名额后 ZCode 才是最高可用层。"""
+        """弱档按时段和权限筛选，在 ZCode 前选用可用的 OpenCode。"""
         self.build_store()
         self.reserve('im', 'qoder', 'Qwen4-Max-Preview', executor='qoder')
         r = self.plan(self.auth('auto', 'T', 's2', LEGACY_MAINS + ALL_FLASH), now=T_DAY)
-        self.assertEqual(r['selected']['pool_key'], dp.ZCODE_POOL_KEY, r)
+        self.assertIn(r['selected']['pool_key'], dp.OPENCODE_POOL_KEYS, r)
         self.assertEqual(r['candidate_filters'][dp.ZCODE_POOL_KEY], 'eligible')
         self.assertEqual(r['permission_requirements'],
                          {'fine_grained': False, 'read_dirs': False})
@@ -1275,14 +1269,10 @@ class PermissionGrantsTests(_Base):
         self.assertEqual(r['selected_reason'], 'flash_fallback_selected', r)
 
     def test_edits_only_grants_select_zcode_with_controlled_profile(self):
-        """仅需精确文件 Edit（无 Bash、无 read_dirs）：BW-ZCODE-RESTORE-1-20261022 起
-        ZCode 恢复现役候选，纯精确 Edit 受控文件 profile 使其重新可选（层=2 直接选中）；
-        回执按 grants 结构标 controlled_file_profile_required=True，且绝不修改 CAPABILITY
-        的能力表。BW-QODER-INTL-MAX-ALLDAY-20261023：国际 Max 白天可派且能力兼容，故先
-        占满其唯一名额，层=2 的 ZCode 才是最高可用层。"""
+        """在 ZCode 授权范围内，纯精确 Edit 可选受控文件配置。"""
         self.build_store()
         self.reserve('im', 'qoder', 'Qwen4-Max-Preview', executor='qoder')
-        r = self.plan(self.auth('auto', 'T', 's2', ALL_MAINS + ALL_FLASH), now=T_DAY,
+        r = self.plan(self.auth('auto', 'T', 's2', [dp.ZCODE_POOL_KEY, *dp.OPENCODE_POOL_KEYS]), now=T_DAY,
                       permission_grants={'edits': ['Edit(C:/a.py)'], 'bash': [],
                                          'read_dirs': []})
         self.assertEqual(r['refused'], None, r)
@@ -1337,17 +1327,14 @@ class TaskScopeTests(_Base):
     FINE = PermissionGrantsTests.FINE
 
     def test_ordinary_scope_selects_opencode_when_only_route_open(self):
-        """白天三 Max 窗关、Claude 明确 limited，同 5 文件/1 测试只是 task_scope
-        （无硬 grants）：requirements 全 false、不做能力过滤。BW-ZCODE-RESTORE-1-20261022：
-        ZCode 恢复为层=2 现役候选并被直接选中。BW-QODER-INTL-MAX-ALLDAY-20261023：白天
-        只有两个 CN Max 窗关，国际 Max 可派且层=1，故先占满其唯一名额。"""
+        """弱档按时段和权限筛选，在 ZCode 前选用可用的 OpenCode。"""
         self.build_store()
         self.set_limit(dp.CLAUDE_POOL_KEY)
         self.reserve('im', 'qoder', 'Qwen4-Max-Preview', executor='qoder')
         r = self.plan(self.auth('auto', 'T', 's2', LEGACY_MAINS + ALL_FLASH), now=T_DAY,
                       task_scope=self.SCOPE)
         self.assertEqual(r['refused'], None, r)
-        self.assertEqual(r['selected']['pool_key'], dp.ZCODE_POOL_KEY, r)
+        self.assertIn(r['selected']['pool_key'], dp.OPENCODE_POOL_KEYS, r)
         self.assertEqual(r['candidate_filters'][dp.ZCODE_POOL_KEY], 'eligible')
         self.assertEqual(r['permission_requirements'],
                          {'fine_grained': False, 'read_dirs': False})
@@ -1403,14 +1390,10 @@ class TaskScopeTests(_Base):
                       r['permission_incompatibility_details'])
 
     def test_pure_hard_edits_keep_controlled_profile_consistency(self):
-        """纯 hard Edit：仍 required controlled profile 与正式 preflight 同口径；
-        两个 OpenCode 免费模型不支持逐文件硬授权，如实出现在明细里（绝不因"整池空诊断"
-        而放过）。BW-ZCODE-RESTORE-1-20261022：ZCode 恢复后纯精确 Edit 受控 profile 重新
-        可选（层=2 直接选中）。BW-QODER-INTL-MAX-ALLDAY-20261023：国际 Max 白天可派且
-        能力兼容，故先占满其唯一名额。"""
+        """在 ZCode 授权范围内，纯精确 Edit 可选受控文件配置。"""
         self.build_store()
         self.reserve('im', 'qoder', 'Qwen4-Max-Preview', executor='qoder')
-        r = self.plan(self.auth('auto', 'T', 's2', ALL_MAINS + ALL_FLASH), now=T_DAY,
+        r = self.plan(self.auth('auto', 'T', 's2', [dp.ZCODE_POOL_KEY, *dp.OPENCODE_POOL_KEYS]), now=T_DAY,
                       permission_grants={'edits': ['Edit(source/f1.cjs)'], 'bash': [],
                                          'read_dirs': []},
                       task_scope={'edits': ['source/f1.cjs'], 'bash': [], 'read_dirs': []})

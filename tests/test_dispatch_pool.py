@@ -290,32 +290,21 @@ class CapacityAndKnownPoolTests(_PoolBase):
 
 
 class MainForceRotationTests(_PoolBase):
-    def test_select_prefers_max_tier_then_zcode_then_claude_then_opencode(self):
-        # BW-MAIN-PRIORITY-S1 主力优先级（BW-ZCODE-RESTORE-1-20261022 恢复 ZCode 层=2）：
-        # 三 Qoder Max > zcode:GLM-5.3（容量 1）> claude:deepseek-flash > 两 OpenCode
-        # 免费模型；BW-CUSTOM-MAX-RESUME-20261018-S1 起 Max 层内 CN 自定义
-        # qodercn:Qwen-3.8-Max 先于两内置。空池请求国际内置 Max → AUTO 改派到最高层且有位的
-        # 自定义 Max（历史 committed 计数仍照旧记账，但绝不再参与跨层排序，低层不能抢高层
-        # 名额）。
+    def test_select_prefers_max_then_claude_then_opencode(self):
         r1 = self.select('t1', 'qoder', 'Qwen4-Max-Preview')
         self.assertRouting(r1, dp.CN_MAX_POOL_KEY)
         self.assertFalse(r1.get('sent', True))
-        # 占满三 Qoder Max 层（4 槽）后，请求内置 Max → 落到下一层 zcode:GLM-5.3（层=2，
-        # 紧跟三路 Qwen4-Max-Preview 之后）。
         self.reserve_exec('m0', 'qoder', 'Qwen4-Max-Preview', 'qoder')
         self.reserve_exec('m1', 'qodercn', 'Qwen4-Max-Preview', 'qodercn')
         self.reserve_exec('m2', 'qodercn', 'Qwen-3.8-Max', 'qodercn')
         self.reserve_exec('m3', 'qodercn', 'Qwen-3.8-Max', 'qodercn')
         r2 = self.select('t2', 'qoder', 'Qwen4-Max-Preview')
-        self.assertRouting(r2, 'zcode:GLM-5.3')
+        self.assertRouting(r2, 'claude:deepseek-flash')
         self.assertFalse(r2.get('sent', True))
-        # ZCode 层也满（容量 1）后，请求内置 Max → 落到 claude:deepseek-flash。
         self.reserve_exec('z0', 'zcode', 'GLM-5.3', 'zcode')
         r2b = self.select('t2b', 'qoder', 'Qwen4-Max-Preview')
         self.assertRouting(r2b, 'claude:deepseek-flash')
         self.assertFalse(r2b.get('sent', True))
-        # claude 层也满（容量 2）后，请求内置 Max → 落到 tier5 的 OpenCode 免费模型
-        # （同层 stable tie 选 deepseek 免费组合）。
         self.reserve_exec('c0', 'claude', 'deepseek-flash', 'claude')
         self.reserve_exec('c1', 'claude', 'deepseek-flash', 'claude')
         r3 = self.select('t3', 'qoder', 'Qwen4-Max-Preview')
@@ -1419,12 +1408,22 @@ class QuotaLimitWindowTests(_PoolBase):
         self.assertTrue(nxt.get('allowed'), nxt)
 
     def test_auto_zcode_combo_restored_selectable(self):
-        # BW-ZCODE-RESTORE-1-20261022：zcode:GLM-5.3 恢复为 AUTO 可选候选（层=2）。北京
-        # 周一 10:00 高峰：两个 CN Max 时段窗外、claude 高峰门关、CodeBuddy deepseek 夹具
-        # 已占；BW-QODER-INTL-MAX-ALLDAY-20261023 起国际 Max 白天也可派，故先占满其唯一
-        # 名额，AUTO 请求 zcode 组合才会落到层=2 的 ZCode 并直接 claim。
         WEEKDAY_PEAK = datetime(2026, 10, 12, 2, 0, 0, tzinfo=timezone.utc)
         self.reserve_exec('intlmax', 'qoder', 'Qwen4-Max-Preview', 'qoder')
+        for pool in (*dp.OPENCODE_POOL_KEYS, dp.CODEBUDDY_GLM_POOL_KEY):
+            runtime, model = pool.split(':', 1)
+            for slot in range(dp.capacity_for(pool)):
+                self.reserve_exec(f'fill-{pool}-{slot}', runtime, model, runtime)
+        flash = dp.reserve(
+            self.store, task_id='try-flash', runtime='zcode', model='GLM-5.3',
+            workspace=str(self._ws_for('try-flash')), prompt_sha256='p',
+            now=WEEKDAY_PEAK, executor='auto', _preclaim=False)
+        self.assertTrue(flash['routing_required'], flash)
+        self.assertIn(flash['selected']['pool_key'], dp.OVERFLOW_KEYS, flash)
+        for pool in dp.OVERFLOW_KEYS:
+            runtime, model = pool.split(':', 1)
+            for slot in range(dp.capacity_for(pool)):
+                self.reserve_exec(f'fill-{pool}-{slot}', runtime, model, runtime)
         r = dp.select_and_claim(
             self.store, task_id='aauto', runtime='zcode', model='GLM-5.3',
             workspace=str(self._ws_for('aauto')), prompt_sha256='p',

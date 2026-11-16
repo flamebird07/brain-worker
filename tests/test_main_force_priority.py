@@ -184,17 +184,13 @@ class NightMaxPriorityTests(_Base):
             target, _ = self.select(ZCODE, NIGHT)
             self.assertEqual(target, CN_CUSTOM_MAX)
 
-    def test_zcode_restored_preferred_over_claude_when_both_free(self):
-        # BW-ZCODE-RESTORE-1-20261022：GAP（两个 CN Max 窗外）下 ZCode（层=2）与 claude
-        # （层=3）都有空位 → 按新层序 ZCode 优先于 Claude，即使 claude 有更高的历史提交
-        # （child_pid 真实启动行）且请求点名 zcode。BW-QODER-INTL-MAX-ALLDAY-20261023 起
-        # 国际 Max 白天也可派，故先占满其唯一名额，层=2 才是最高可用层。
+    def test_claude_precedes_zcode_when_both_free(self):
         self.seed(QMAX, 1)
         self.seed(CLAUDE, 3, state='finished', child_pid=4321)
         self.bump(ZCODE, 0)
         target, reason = self.select(ZCODE, GAP)
         self.assertEqual(reason, 'main_force_selected')
-        self.assertEqual(target, ZCODE)
+        self.assertEqual(target, CLAUDE)
 
     def test_claude_when_zcode_full(self):
         # ZCode 容量严格 1：占满后（GAP，两个 CN Max 窗外、国际 Max 已占满）按层序落到
@@ -212,18 +208,15 @@ class NightMaxPriorityTests(_Base):
         self.seed(ZCODE, 1)
         self.assertEqual(self.select(ZCODE, GAP)[0], CLAUDE)
 
-    def test_zcode_before_claude_when_both_free(self):
-        # PEAK：两个 CN Max 窗外 + 国际 Max 已占满 → ZCode（层=2）直接选中，先于 claude（3）；
-        # CodeBuddy deepseek 夹具已占、GLM tier 7 更低。
+    def test_weak_peak_opencode_precedes_zcode(self):
         self.seed(QMAX, 1)
-        self.assertEqual(self.select(ZCODE, PEAK)[0], ZCODE)
+        self.assertIn(self.select(ZCODE, PEAK)[0], dp.OPENCODE_POOL_KEYS)
 
     def test_history_zcode_hold_no_longer_makes_auto_full(self):
-        # BW-SIMPLE-PRIORITY-RETRY-S3：旧 availability 阻断不再改变候选集合；PEAK 下
-        # 两个 CN Max 窗外、国际 Max 已占满，ZCode 恢复可派（BW-ZCODE-RESTORE-1-20261022）
-        # → AUTO 新轮按层序直接落 ZCode，绝不再 main_force_full。
         self.seed(QMAX, 1)
-        target, reason = self.select(QMAX, PEAK, zcode_blocked=True)
+        for key in (*dp.OPENCODE_POOL_KEYS, dp.CODEBUDDY_GLM_POOL_KEY):
+            self.seed(key, 1)
+        target, reason = self.select(ZCODE, PEAK, zcode_blocked=True)
         self.assertEqual(target, ZCODE)
         self.assertEqual(reason, 'main_force_selected')
 
@@ -393,22 +386,20 @@ class HighLevelDispatchTests(_Base):
         self.assertEqual(dp.capacity_for(ZCODE), 1)
         self.assertIn(ZCODE, dp.MAIN_FORCE_KEYS)
         self.assertIn(ZCODE, dp.POOL_PRIORITY)
-        # BW-CLAUDE-ALLDAY-QMAX-AFTER-20261023（用户明确指令，当前权威）：ZCode 层=2 紧跟
-        # 两个 CN Max 之后、claude 之前；国际 Qoder Max 层=4 紧邻 claude 之后；CodeBuddy
-        # deepseek 层=5；整表即唯一权威层序，任何漂移都直接失败。
         self.assertEqual(dp.POOL_PRIORITY[CODEBUDDY], 5)
         self.assertEqual(dp.POOL_PRIORITY, {
             CN_CUSTOM_MAX: 1, CN_MAX: 1,
-            ZCODE: 2,
+            ZCODE: 9,
             CLAUDE: 3,
             QMAX: 4,
             CODEBUDDY: 5,
             dp.OPENCODE_DEEPSEEK_POOL_KEY: 6, dp.OPENCODE_GLM_POOL_KEY: 6,
             'codebuddy:glm-5.3-flash': 7,
             QFLASH: 8, CN_FLASH: 8})
-        # 用户要求的三条相邻关系：CN Max < ZCode < Claude < 国际 Qoder < CodeBuddy。
+        # 弱档 ZCode 排在两个 Flash 之后。
         self.assertLess(dp.POOL_PRIORITY[CN_MAX], dp.POOL_PRIORITY[ZCODE])
-        self.assertLess(dp.POOL_PRIORITY[ZCODE], dp.POOL_PRIORITY[CLAUDE])
+        self.assertLess(dp.POOL_PRIORITY[QFLASH], dp.POOL_PRIORITY[ZCODE])
+        self.assertLess(dp.POOL_PRIORITY[CN_FLASH], dp.POOL_PRIORITY[ZCODE])
         self.assertLess(dp.POOL_PRIORITY[CLAUDE], dp.POOL_PRIORITY[QMAX])
         self.assertLess(dp.POOL_PRIORITY[QMAX], dp.POOL_PRIORITY[CODEBUDDY])
         self.assertEqual(dp.POOL_PRIORITY[QMAX], dp.POOL_PRIORITY[CLAUDE] + 1)
@@ -438,15 +429,12 @@ class StageSelectionPriorityTests(_Base):
         self.assertEqual(r['selected_reason'], 'main_force_selected')
         self.assertIn(r['selected']['pool_key'], MAXES)
 
-    def test_stage_selection_zcode_when_max_window_closed(self):
-        # BW-ZCODE-RESTORE-1-20261022：GAP（两个 CN Max 窗外）且 ZCode 有空位 → 层=2 的
-        # ZCode 先于 claude 被选中。BW-QODER-INTL-MAX-ALLDAY-20261023 起国际 Max 白天也
-        # 可派，故先占满其唯一名额。
+    def test_stage_selection_claude_when_max_window_closed(self):
         self.seed(QMAX, 1)
         auth = self.auth('auto', 'T', 's2', ALL_MAINS + ALL_FLASH)
         r = self.plan(auth, now=GAP)
         self.assertEqual(r['refused'], None, r)
-        self.assertEqual(r['selected']['pool_key'], ZCODE)
+        self.assertEqual(r['selected']['pool_key'], CLAUDE)
 
     def test_stage_selection_claude_when_zcode_full(self):
         # ZCode 唯一槽占满后（GAP，国际 Max 也已占满），按层序落到 claude:deepseek-flash。
@@ -457,15 +445,12 @@ class StageSelectionPriorityTests(_Base):
         self.assertEqual(r['refused'], None, r)
         self.assertEqual(r['selected']['pool_key'], CLAUDE)
 
-    def test_stage_selection_zcode_before_claude(self):
-        # PEAK 下两个 CN Max 窗外、CB deepseek 夹具已占、国际 Max 已占满 → 按层序选中恢复
-        # 可派的 ZCode（层=2，BW-ZCODE-RESTORE-1-20261022），先于 claude（层=3）。
+    def test_stage_selection_keeps_zcode_eligible_at_lowest_priority(self):
         self.seed(QMAX, 1)
         auth = self.auth('auto', 'T', 's2', ALL_MAINS + ALL_FLASH)
         r = self.plan(auth, now=PEAK)
         self.assertEqual(r['refused'], None, r)
-        self.assertEqual(r['selected']['pool_key'], ZCODE)
-        # ZCode 出现在逐候选回执中且为 eligible（未被任何资格门过滤）。
+        self.assertIn(r['selected']['pool_key'], dp.OPENCODE_POOL_KEYS)
         self.assertEqual(r['candidate_filters'].get(ZCODE), 'eligible', r)
 
     def test_stage_selection_fixed_flash_not_forced_to_max(self):

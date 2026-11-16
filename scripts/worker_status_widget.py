@@ -70,8 +70,8 @@ import dispatch_mode as dmode  # noqa: E402  手动三档（strong/medium/weak�
 # ------------------------------------------------------------------ 展示常量
 # 12 个已知池行：weak/medium/strong 各按**当前档**动态排序（read_snapshot 末尾按
 # dispatch_mode.priority_map_for_mode 重排），本表只定名称/注释与 stable-tie 基准序
-# （weak 档层序：两个 CN Max(1) > ZCode(2) > Claude(3) > 国际 Qoder Max(4) > CodeBuddy
-# DeepSeek(5) > 两 OpenCode(6) > CodeBuddy GLM(7) > 两区 Flash(8)；Sonus 不参与 weak）。
+# （weak 档层序：CN Max(1) > Claude(3) > 国际 Qoder Max(4) > CodeBuddy
+# DeepSeek(5) > 两 OpenCode(6) > CodeBuddy GLM(7) > 两区 Flash(8) > ZCode(9)；Sonus 不参与 weak）。
 # BW-QWEN4-SONUS-REMOVE-20261115（当前权威）：Sonus 从所有档位去除新派——三档空闲一律
 # 整行隐藏（绝不显示可派行）；真实在途（reserved/running/unknown 遗留）整行保留并标
 # 「不接新派（用户指令）」直到真实终态；遗留 reserved 不放行启动（安全释放 start_failed）。
@@ -84,7 +84,6 @@ ROW_DEFS = (
     (dp.SONUS_POOL_KEY, 'Qoder 国际／Sonus', '强档独占 · 独立 1 槽 · 无时段门'),
     (dp.CN_CUSTOM_MAX_POOL_KEY, 'Qoder CN／token plan／Qwen-3.8-Max', '主力 Max · 夜间窗'),
     (dp.CN_MAX_POOL_KEY, 'Qoder CN／Qwen4-Max-Preview', '主力 Max · 夜间窗'),
-    (dp.ZCODE_POOL_KEY, 'ZCode／GLM-5.3', '主力 · 全天'),
     (dp.CLAUDE_POOL_KEY, 'Claude Code／deepseek-flash', '主力 · 全天 · 无时段门'),
     (dp.QMAX_POOL_KEY, 'Qoder 国际／Qwen4-Max-Preview', '主力 Max · 国际内置 · 全天'),
     (dp.CODEBUDDY_POOL_KEY, 'CodeBuddy 国际／Deepseek-V4.1-Flash', '主力 · 无时段门'),
@@ -96,6 +95,7 @@ ROW_DEFS = (
      '独立 1 槽 · 与 DeepSeek 额度独立 · 无证据前置门'),
     (dp.QFLASH_POOL_KEY, 'Qoder 国际／Qwen3.8-Flash', '兜底'),
     (dp.CN_FLASH_POOL_KEY, 'Qoder CN／Qwen3.8-Flash', '兜底'),
+    (dp.ZCODE_POOL_KEY, 'ZCode／GLM-5.3', '主力 · 全天'),
 )
 
 STATE_LABELS = {'running': '运行中', 'unknown': '待核实', 'reserved': '已预留',

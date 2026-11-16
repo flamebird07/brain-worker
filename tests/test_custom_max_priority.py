@@ -132,22 +132,18 @@ class CustomMaxPriorityTests(_Base):
         target, _ = self.select(ZCODE, NIGHT)
         self.assertIn(target, (QMAX, CN_MAX))
 
-    def test_all_max_full_falls_to_zcode_then_claude(self):
-        # 全部 Max 满后先落恢复可派的 ZCode（层=2）；ZCode 唯一槽占满才轮到 claude。
+    def test_all_max_full_falls_to_claude_then_opencode(self):
         self.fill_codebuddy()
         self.seed(CN_CUSTOM_MAX, 2)
         self.seed(QMAX, 1)
         self.seed(CN_MAX, 1)
         target, _ = self.select(ZCODE, NIGHT)
-        self.assertEqual(target, ZCODE)
-        self.seed(ZCODE, 1)
-        target, _ = self.select(ZCODE, NIGHT)
         self.assertEqual(target, CLAUDE)
+        self.seed(CLAUDE, 2)
+        target, _ = self.select(ZCODE, NIGHT)
+        self.assertIn(target, dp.OPENCODE_POOL_KEYS)
 
     def test_day_all_max_excluded_in_weak_mode(self):
-        # BW-MANUAL-THREE-MODE-20261023：weak（默认）档白天三个 Max **全部**被恢复后的夜间门
-        # 剔除（DAY = 北京 10:00 工作日，claude 高峰门关闭）。层序 ZCode(2) > claude(3) >
-        # 两 OpenCode(6)，绝不改派任何 Max。
         self.fill_codebuddy()
         with closing(dp.connect(self.store)) as conn:
             elig = dp._eligible_main_forces(conn, False, DAY)
@@ -155,8 +151,6 @@ class CustomMaxPriorityTests(_Base):
             self.assertNotIn(pk, elig)
         self.assertIn(ZCODE, elig)
         self.assertNotIn(CLAUDE, elig)  # 工作日 10:00 属高峰 → claude 恢复高峰门
-        self.assertEqual(self.select(ZCODE, DAY)[0], ZCODE)
-        self.seed(ZCODE, 1)
         self.assertIn(self.select(ZCODE, DAY)[0], dp.OPENCODE_POOL_KEYS)
 
     def test_day_max_all_day_in_strong_mode(self):

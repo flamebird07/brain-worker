@@ -142,10 +142,11 @@ class TestModuleDiscipline(_WidgetBase):
         # 且排第一；medium/weak 空闲隐藏（Sonus 仍为 strong 专属）。
         self.assertEqual(order[:12], [
             dp.SONUS_POOL_KEY,
-            dp.CN_CUSTOM_MAX_POOL_KEY, dp.CN_MAX_POOL_KEY, dp.ZCODE_POOL_KEY,
+            dp.CN_CUSTOM_MAX_POOL_KEY, dp.CN_MAX_POOL_KEY,
             dp.CLAUDE_POOL_KEY, dp.QMAX_POOL_KEY, dp.CODEBUDDY_POOL_KEY,
             dp.OPENCODE_DEEPSEEK_POOL_KEY, dp.OPENCODE_GLM_POOL_KEY,
-            dp.CODEBUDDY_GLM_POOL_KEY, dp.QFLASH_POOL_KEY, dp.CN_FLASH_POOL_KEY])
+            dp.CODEBUDDY_GLM_POOL_KEY, dp.QFLASH_POOL_KEY, dp.CN_FLASH_POOL_KEY,
+            dp.ZCODE_POOL_KEY])
         self.assertEqual(order[12:], [dp.LUNA_KEY])  # 本测试模块为历史用例追加的 Luna 行
         self.assertNotIn(dp.LUNA_KEY, order[:12])
         # 生产 ROW_DEFS 原件：恰好 12 行、含且只含一个 Sonus 与一个 ZCode 行、无 Luna。
@@ -180,7 +181,7 @@ class TestModuleDiscipline(_WidgetBase):
         # 其余 11 行与 weak 权威整表逐行一致。
         weak_prios = [dp.POOL_PRIORITY[pk] for pk in prod_order[1:]]
         self.assertEqual(weak_prios, sorted(weak_prios), weak_prios)
-        self.assertEqual(weak_prios, [1, 1, 2, 3, 4, 5, 6, 6, 7, 8, 8])
+        self.assertEqual(weak_prios, [1, 1, 3, 4, 5, 6, 6, 7, 8, 8, 9])
         # 国际 Qoder Max 行紧邻 Claude 之后（用户明确要求"排到 Claude 后面"）。
         self.assertEqual(prod_order.index(dp.QMAX_POOL_KEY),
                          prod_order.index(dp.CLAUDE_POOL_KEY) + 1)

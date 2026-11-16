@@ -1,5 +1,7 @@
 # brain-worker
 
+**弱档顺序**：ZCode 排在两路 Qoder Flash 之后，是弱档最后一个自动派发候选。浮窗使用同一优先级。
+
 **2026-11-14 当前权威：BW-MAC-COMPAT-20261114（macOS 兼容性，S1/S2）**。本仓库在 macOS（darwin/arm64，实测 ZCode 桌面 3.18.2 + ChatGPT 桌面端）上完成兼容性开发：
 
 - **S1 引擎修复**：`dispatch_pool.process_identity` 新增 macOS 创建身份探针（libproc `pbi_start_tvsec/usec`，身份串 `mac:{sec}:{usec}`）——此前 darwin 落 /proc 分支恒 None，PID 复用绑定失效；浮窗单实例补 POSIX flock 闸（`~/.brain-worker/widget-instance.lock`，目录不可写诚实降级放行）；CI 矩阵加 `macos-latest`。另修复主仓回归：`qoder_direct.py` 对 `consume_for_entry` 的失效 `priority_enforced` 参数调用（48ae2a2 遗留，全平台崩溃）。
@@ -12,7 +14,7 @@
 1. **Sonus 从所有档位去除新派**——唯一权威开关 `scripts/dispatch_mode.py` 的 `SONUS_TEMP_DISABLED = True`（持久事实）。三档（含 strong）可新派集合全部剔除 `qoder:Sonus`：AUTO 不选；显式 reserve/select-and-claim、consume、claim-due 与正式 Qoder `--model Sonus` 一律 `mode_excluded`（sent=false、零新占位、绝不静默换模型）。**遗留 reserved 的 Sonus claim 不再放行 consume**（sonus_legacy_reserved 例外已删除，reserved 安全释放为 start_failed）；已在途 running/unknown 不追杀、不假释放，继续安全计数与自然终态结算。浮窗三档空闲一律整行隐藏；真实在途遗留整行保留并标「不接新派（用户指令）」。容量登记 1、模型字面量、优先级历史层号、宿主递归排除、物理总容量 16 与历史 attempt 全部保留。strong 常态降为 **4 池/5 槽**（两内置 Qwen4-Max-Preview > Claude > ZCode）。
 2. **两个 Qoder 内置 Max 官方显示名改为 Qwen4-Max-Preview**——`qoder:Qwen4-Max-Preview` / `qodercn:Qwen4-Max-Preview`（SDK argv `--model` 与池键同一字面串）；旧池键 `qoder:Qwen3.8-Max` / `qodercn:Qwen3.8-Max` 以 0 容量降为 legacy-retired：不再接任何新派、绝不映射到新池，旧池在途 attempt 继续安全计数（计入物理总 16 守卫）与自然终态结算，绝不丢失。带短横线的 `qodercn:Qwen-3.8-Max` 仍是独立**已禁用**自定义池（BW-QODERCN-TOKEN-MAX-DISABLE-20261028），历史身份与禁用语义原样保留，与 CN 内置新名互不冲突。
 
-当前新派范围：strong 常态 4 池/5 槽（两内置 Qwen4-Max-Preview > Claude > ZCode，全部无时段门）；medium **4 池/5 槽**（两内置 Qwen4-Max-Preview > Claude > ZCode）；weak **10 池/13 槽**（CN 内置 Max > ZCode > Claude > 国际 Max > CodeBuddy DeepSeek > 两 OpenCode > CodeBuddy GLM > 两 Flash）。物理总容量仍 **16**。
+当前新派范围：strong 常态 4 池/5 槽（两内置 Qwen4-Max-Preview > Claude > ZCode，全部无时段门）；medium **4 池/5 槽**（两内置 Qwen4-Max-Preview > Claude > ZCode）；weak **10 池/13 槽**（CN 内置 Max > Claude > 国际 Max > CodeBuddy DeepSeek > 两 OpenCode > CodeBuddy GLM > 两 Flash > ZCode）。物理总容量仍 **16**。
 
 （历史命名说明：下文 R3/R2/20261028/20261026/20261024 等历史段落中经 2026-11-15 批量改名同步出现的 `Qwen4-Max-Preview` 字样，在各自历史时点实际为 `Qwen3.8-Max`；Sonus 相关历史描述均按当时口径存档。）
 

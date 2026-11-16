@@ -1451,8 +1451,8 @@ def _select_main_force(conn, requested_pk, now, eligible=None, mode=None):
        - strong：Sonus=1 > zcode=2 > claude=3 > 三个 Max=4（Max 组内保留既有 CN 自定义
          子优先与稳定公平规则；Sonus 独立 1 槽、层内无子优先）；
        - medium：三个 Max=1 > claude=2 > zcode=3；
-       - weak：两个 CN Max=1 > zcode=2 > claude=3 > 国际 Max=4 > CodeBuddy deepseek=5 >
-         两 OpenCode=6 > CodeBuddy GLM=7（两 Flash 属兜底层，不在本函数）。
+       - weak：CN Max=1 > claude=3 > 国际 Max=4 > CodeBuddy deepseek=5 >
+         两 OpenCode=6 > CodeBuddy GLM=7 > zcode=9（调用方在 ZCode 前检查两路 Flash）。
        历史 committed、请求池偏好与在途数**绝不能**让低层抢高层名额；
     3b. Max 层内保留自定义子优先键——CN 自定义 qodercn:Qwen-3.8-Max（0）先于 CN 内置
        Max（1）；该子键位于真实在途数之前，故自定义即使已有 1 在途、内置 0 在途，仍先选
@@ -1497,7 +1497,7 @@ def _select_main_force(conn, requested_pk, now, eligible=None, mode=None):
     return avail[0][0], 'main_force_selected'
 
 
-def _flash_fallback_or_full(conn, requested_pk, mode=None):
+def _flash_fallback_or_full(conn, requested_pk, mode=None, candidates=None):
     """主力均不可用或已满 → 两地区 Flash **同级**兜底（BW-POOL-SPLIT-20261010-S2）：
     先按真实在途数少者优先，平票才按同区偏好（requested 若属 qodercn 则优先 CN Flash，
     属 qoder 则优先国际 Flash；ZCode 入口两区平权），再按 pool_key stable tie；命中
@@ -1511,7 +1511,9 @@ def _flash_fallback_or_full(conn, requested_pk, mode=None):
         if requested_pk.startswith('qoder:') and not requested_pk.startswith('qodercn:'):
             return 0 if pk.startswith('qoder:') and not pk.startswith('qodercn:') else 1
         return 0
-    flash = [pk for pk in OVERFLOW_KEYS if pk in set(dm.allowed_pools_for_mode(mode))]
+    allowed = set(dm.allowed_pools_for_mode(mode))
+    flash = [pk for pk in OVERFLOW_KEYS if pk in allowed
+             and (candidates is None or pk in candidates)]
     if not flash:
         # BW-MANUAL-THREE-MODE-20261023：strong/medium 档两个 Flash 均不在可派集合——
         # 绝不把被排除池当兜底，统一回 mode_excluded（sent=false、零新占位）。
@@ -1779,33 +1781,36 @@ def _domestic_policy(conn, requested_pk, now, executor='auto', eligible=None,
         return 'executor_conflict', None
 
     # executor == 'auto'
+    if requested_pk not in MAIN_FORCE_KEYS and requested_pk not in OVERFLOW_KEYS:
+        return 'unknown_pool', None
+    target, _ = _select_main_force(conn, requested_pk, now, eligible=elig, mode=mode)
+    if mode == 'weak' and target == ZCODE_POOL_KEY:
+        flash_verdict, flash_target = _flash_fallback_or_full(conn, requested_pk, mode=mode)
+        if flash_target is not None:
+            return flash_verdict, flash_target
     if requested_pk in MAIN_FORCE_KEYS:
         # BW-SIMPLE-PRIORITY-RETRY-S3：普通 AUTO 不再因历史 availability 把 ZCode 改派走；
         # ZCode 与其它主力一样进 elig（已不含 availability/限额剔除），按**当前档**优先级层
         # 选择：有空位且为最高优先层的候选直接 claim（真实尝试），选中≠请求才 routing，
         # 绝不因旧 hard_hold/backoff 标记永久挡新轮。时段/容量/总守卫/unknown/工作区仍照常。
-        target, _ = _select_main_force(conn, requested_pk, now, eligible=elig, mode=mode)
         if target is not None:
             if target == requested_pk:
                 return 'claim', requested_pk
             return 'routing', target
         # 主力都不可用/已满：当前档允许才走两地区 Flash 兜底，否则 mode_excluded。
         return _flash_fallback_or_full(conn, requested_pk, mode=mode)
-    if requested_pk in OVERFLOW_KEYS:
-        target, _ = _select_main_force(conn, requested_pk, now, eligible=elig, mode=mode)
-        if target is not None:
-            return 'routing', target
-        cap = capacity_for(requested_pk)
-        if cap is not None and _count_active(conn, requested_pk) < cap:
-            return 'claim', requested_pk
-        # 本 Flash 已满：另一地区 Flash 是同级兜底候选，有空位则 routing 过去。
-        for k in OVERFLOW_KEYS:
-            if k == requested_pk:
-                continue
-            if capacity_for(k) is not None and _count_active(conn, k) < capacity_for(k):
-                return 'routing', k
-        return 'full', None
-    return 'unknown_pool', None
+    if target is not None:
+        return 'routing', target
+    cap = capacity_for(requested_pk)
+    if cap is not None and _count_active(conn, requested_pk) < cap:
+        return 'claim', requested_pk
+    # 本 Flash 已满：另一地区 Flash 是同级兜底候选，有空位则 routing 过去。
+    for k in OVERFLOW_KEYS:
+        if k == requested_pk:
+            continue
+        if capacity_for(k) is not None and _count_active(conn, k) < capacity_for(k):
+            return 'routing', k
+    return 'full', None
 
 
 def _preclaim_reconcile(conn, now):
@@ -3480,6 +3485,13 @@ def claim_due(store_path=None, *, task_id, now=None, scope=None,
                     eligible2 = eligible2 - ticket_round_failed
                 target, _ = _select_main_force(conn, scope_combo, now, eligible=eligible2,
                                                mode=mode)
+                if mode == 'weak' and target == ZCODE_POOL_KEY:
+                    flash_candidates = set(OVERFLOW_KEYS) if allowed is None else set(allowed)
+                    flash_candidates -= ticket_round_failed
+                    _, flash_target = _flash_fallback_or_full(
+                        conn, scope_combo or ZCODE_POOL_KEY, mode=mode, candidates=flash_candidates)
+                    if flash_target is not None:
+                        target = flash_target
                 if target is None and allowed is not None:
                     for k in allowed:
                         if k not in MAIN_FORCE_KEYS and capacity_for(k) is not None \

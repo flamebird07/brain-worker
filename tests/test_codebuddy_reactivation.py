@@ -181,9 +181,9 @@ class TestCodebuddyPoolPriority(_PoolBase):
     def test_pool_priority_codebuddy_is_five(self):
         # BW-CLAUDE-ALLDAY-QMAX-AFTER-20261023：codebuddy:deepseek-v4.1-flash priority=5，
         # 紧挨 opencode:deepseek-v4.1-flash-free（6）之前；其上为 claude（3）与国际
-        # Qoder Max（4）；ZCode 为层=2。
+        # Qoder Max（4）；ZCode 为层=9。
         self.assertEqual(dp.POOL_PRIORITY[CB], 5)
-        self.assertEqual(dp.POOL_PRIORITY[dp.ZCODE_POOL_KEY], 2)
+        self.assertEqual(dp.POOL_PRIORITY[dp.ZCODE_POOL_KEY], 9)
         self.assertEqual(dp.POOL_PRIORITY[CLAUDE], 3)
         self.assertEqual(dp.POOL_PRIORITY[QMAX], 4)
         self.assertEqual(dp.POOL_PRIORITY[dp.OPENCODE_DEEPSEEK_POOL_KEY], 6)
