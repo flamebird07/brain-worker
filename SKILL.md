@@ -3,6 +3,10 @@ name: brain-worker
 description: 主脑负责规划与独立验收，工程执行交已授权外部 Agent。支持 CodeBuddy 两模型、Qoder 国际（Qwen4-Max-Preview/Flash；Sonus 已于 2026-11-15 从所有档位去除新派）与 CN、Claude/deepseek-flash、OpenCode 两个指定 free 模型、ZCode/GLM-5.3（恢复可派、容量 1）；Luna 已删除并强制禁用。手动三档 strong/medium/weak 共享派发策略（默认 weak，仅影响新派发）；strong/medium/weak 常态可新派分别为 4/4/10 池、5/5/13 槽（BW-QWEN4-SONUS-REMOVE-20261115 起 Sonus 从所有档位去除、两内置 Max 改名 Qwen4-Max-Preview）；2026-10-28 用户要求从所有档位禁用 `qodercn:Qwen-3.8-Max`（Qoder CN／token plan／Qwen-3.8-Max），不影响 CN 内置 `qodercn:Qwen4-Max-Preview`；旧池键 `qoder:Qwen3.8-Max`/`qodercn:Qwen3.8-Max` 降为 legacy-retired（0 容量、在途照常安全计数与结算、绝不新派）；精确模型、优先级、时段、30分钟限额展示/重派规则、权限边界与收尾要求以正文和 references 为准。
 ---
 
+## 当前派工方式（2026-11-18）
+
+用户暂时只启用本机已配置的专用 CLI 派工入口；旧文中的默认人工转发与通用 API 派工暂停。先查已配置的正式 CLI 并预检。CLI 不可用或正式调用被拦截时，报告具体阻碍，不自动切换方式。CLI 可能连接模型服务，仍须核对实际接收方、数据范围和授权。恢复其他方式须按用户后续指示。
+
 ## 激活、预检与正式派工
 
 显式调用 `$brain-worker` 后，分别记录以下状态：
