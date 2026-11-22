@@ -8,8 +8,9 @@ BW-MANUAL-THREE-MODE-20261023（用户明确指令，当前权威）：
 - 缺文件 / 畸形 / 读失败一律**安全回落 weak**，并把真实来源与读取错误如实回报（
   `source` / `error`），绝不把错误冒充成用户选过的 strong/medium。
 
-三档常态新派池数 strong/medium/weak=4/4/10，槽数=5/5/13；物理登记仍为 16。
-strong 常态：两内置 Qwen4-Max-Preview(1) > Claude(2) > ZCode(3)，全部无时段门。
+三档常态新派池数 strong/medium/weak=4/4/5，槽数=5/5/6；物理登记为 17
+（BW-WEAK-RESTRUCTURE-20261116 起：弱档收窄为 5 池并新增 zcode:GLM-5.3-Flash 独立
+1 槽，16→17）。strong 常态：两内置 Qwen4-Max-Preview(1) > Claude(2) > ZCode(3)，全部无时段门。
 
 BW-QWEN4-SONUS-REMOVE-20261115（用户明确指令，**当前权威**）：
 - Sonus（qoder:Sonus）从**所有档位**（含 strong）去除新派资格——`SONUS_TEMP_DISABLED
@@ -23,9 +24,10 @@ BW-QWEN4-SONUS-REMOVE-20261115（用户明确指令，**当前权威**）：
   attempt 继续安全计数与结算，绝不丢失。
 - 带短横线的 qodercn:Qwen-3.8-Max 仍为独立**已禁用**自定义池：历史身份与禁用语义原样
   保留，与 CN 内置新名 qodercn:Qwen4-Max-Preview 互不冲突、互不映射。
-medium：两内置 Max(1) > Claude(2) > ZCode(3)；weak：CN 内置 Max(1) > ZCode(2) >
-Claude(3) > 国际 Max(4) > CodeBuddy DeepSeek(5) > 两 OpenCode(6) > CodeBuddy GLM(7) >
-两 Flash(8)。medium/weak 保留 Max 夜间门与 Claude 高峰门。
+medium：两内置 Max(1) > Claude(2) > ZCode(3)；weak（BW-WEAK-RESTRUCTURE-20261116）：
+两 OpenCode(1) > CodeBuddy GLM(2) > Claude(3，倒数第二) > ZCode GLM-5.3-Flash(4，最后)。
+全部 Qoder 池与 codebuddy:deepseek-v4.1-flash 自弱档移除（weak 一律 mode_excluded）。
+medium 保留 Max 夜间门与 Claude 高峰门；weak 只保留 Claude 高峰门。
 2026-10-28 用户要求禁用 qodercn:Qwen-3.8-Max 新派；登记、历史和精确遗留 claim 保留。
 历史「CN 自定义 Max 恢复/三路 Max」的新派口径已被该禁用覆盖。
 
@@ -93,14 +95,16 @@ MODE_LABELS = {'strong': '强', 'medium': '中', 'weak': '弱'}
 MODE_NOTES = {
     'strong': '强档 · 两内置 Qwen4-Max-Preview／Claude／ZCode · 全部无时段门',
     'medium': '中档 · 仅 ZCode／Claude／两内置 Qwen4-Max-Preview · Max 夜间门 + Claude 高峰门',
-    'weak': '弱档 · 10 个可新派池 · Max 夜间门 + Claude 高峰门',
+    'weak': '弱档 · 5 个可新派池 · Claude 高峰门',
 }
 # 每档可新派范围的纯文字描述（回执/浮窗文案用，绝不承载数字层号/容量，防漂移）。
 # BW-QWEN4-SONUS-REMOVE-20261115：Sonus 已从所有档位去除；两内置 Max 改为 Qwen4-Max-Preview。
+# BW-WEAK-RESTRUCTURE-20261116：弱档去掉全部 Qoder 与 codebuddy deepseek；ZCode 只用
+# GLM-5.3-Flash；Claude 倒数第二。
 MODE_SCOPE_TEXT = {
     'strong': '两内置 Qwen4-Max-Preview／Claude／ZCode（4 池）',
     'medium': 'ZCode／Claude／两内置 Qwen4-Max-Preview（4 池）',
-    'weak': '10 个可新派池（不含 Sonus 与 CN token plan Max）',
+    'weak': '两 OpenCode 免费模型／CodeBuddy GLM／Claude／ZCode GLM-5.3-Flash（5 池）',
 }
 
 # ------------------------------------------------------------------ 池名（权威字面量）
@@ -108,6 +112,9 @@ MODE_SCOPE_TEXT = {
 # 依赖（dispatch_pool 反过来 import 本模块）。键名漂移由 dispatch_pool 的启动自检与测试
 # `test_dispatch_mode.py` 共同兜住。
 ZCODE_POOL_KEY = 'zcode:GLM-5.3'
+# BW-WEAK-RESTRUCTURE-20261116：weak 档的 ZCode 只用 GLM-5.3-Flash（独立池键，与
+# strong/medium 的 zcode:GLM-5.3 各自独立 1 槽、互不占位）。
+ZCODE_FLASH_POOL_KEY = 'zcode:GLM-5.3-Flash'
 CLAUDE_POOL_KEY = 'claude:deepseek-flash'
 # BW-QWEN4-SONUS-REMOVE-20261115：两个 Qoder 内置 Max 官方显示名 Qwen4-Max-Preview。
 # 旧池键（qoder:Qwen3.8-Max / qodercn:Qwen3.8-Max）在 dispatch_pool 以 0 容量
@@ -152,11 +159,18 @@ STRONG_POOL_KEYS = (SONUS_POOL_KEY,) + NARROW_POOL_KEYS
 # 判定使用；这些池必须在 dispatch_pool.CAPACITY 里真实登记（tests/test_dispatch_mode.py
 # 断言），否则就是键名漂移。
 STRONG_ONLY_POOL_KEYS = (SONUS_POOL_KEY,)
-# weak 的完整可派集合（与浮窗 11 行一致；Sonus 不属于 weak 全候选）。
-ALL_POOL_KEYS = (QMAX_CN_CUSTOM_POOL_KEY, QMAX_CN_POOL_KEY, ZCODE_POOL_KEY,
-                 CLAUDE_POOL_KEY, QMAX_INTL_POOL_KEY, CODEBUDDY_DEEPSEEK_POOL_KEY,
-                 OPENCODE_DEEPSEEK_POOL_KEY, OPENCODE_GLM_POOL_KEY,
-                 CODEBUDDY_GLM_POOL_KEY, QFLASH_INTL_POOL_KEY, QFLASH_CN_POOL_KEY)
+# weak 的完整可派集合（BW-WEAK-RESTRUCTURE-20261116：用户指令——全部 Qoder 池与
+# codebuddy:deepseek-v4.1-flash 从弱档去除，弱档 ZCode 只用 GLM-5.3-Flash，Claude 调到
+# 倒数第二；Sonus 本就不属于 weak 全候选）。5 池：
+WEAK_POOL_KEYS = (OPENCODE_DEEPSEEK_POOL_KEY, OPENCODE_GLM_POOL_KEY,
+                  CODEBUDDY_GLM_POOL_KEY, CLAUDE_POOL_KEY, ZCODE_FLASH_POOL_KEY)
+# 全部档位策略池的并集（浮窗行登记与「本档不参与」遗留显示的判定来源）：weak 新集 +
+# 曾属弱档、现被移出但仍在 strong/medium 或留有历史在途的池。集合成员必须都在
+# dispatch_pool.CAPACITY 真实登记（tests/test_dispatch_mode.py 断言），否则就是键名漂移。
+ALL_POOL_KEYS = (WEAK_POOL_KEYS
+                 + (QMAX_CN_CUSTOM_POOL_KEY, QMAX_CN_POOL_KEY, QMAX_INTL_POOL_KEY,
+                    CODEBUDDY_DEEPSEEK_POOL_KEY, QFLASH_INTL_POOL_KEY,
+                    QFLASH_CN_POOL_KEY, ZCODE_POOL_KEY))
 # 档位策略管辖的全部已知池（weak 全表 + strong 专属池）：浮窗据此判断一行是否属于
 # 「本档不参与」语义；集合外的行（如已禁用的 Luna）不属于任何档位，绝不冒充排除标记。
 KNOWN_POLICY_POOL_KEYS = ALL_POOL_KEYS + STRONG_ONLY_POOL_KEYS
@@ -179,20 +193,16 @@ MEDIUM_PRIORITY = {
     CLAUDE_POOL_KEY: 2,
     ZCODE_POOL_KEY: 3,
 }
-# weak = 上一阶段已验收的当前整表（BW-CLAUDE-ALLDAY-QMAX-AFTER-20261023 层序）。
+# weak = BW-WEAK-RESTRUCTURE-20261116（用户明确指令）：全部 Qoder 池与
+# codebuddy:deepseek-v4.1-flash 从弱档去除；弱档 ZCode 只用 GLM-5.3-Flash（新独立池键）；
+# Claude Code 调到倒数第二；ZCode GLM-5.3-Flash 保持最后。层号重新连续编号。
 # dispatch_pool.POOL_PRIORITY 仍是本表的兼容别名（同一份数值），不另存一份漂移副本。
 WEAK_PRIORITY = {
-    QMAX_CN_CUSTOM_POOL_KEY: 1,
-    QMAX_CN_POOL_KEY: 1,
+    OPENCODE_DEEPSEEK_POOL_KEY: 1,
+    OPENCODE_GLM_POOL_KEY: 1,
+    CODEBUDDY_GLM_POOL_KEY: 2,
     CLAUDE_POOL_KEY: 3,
-    QMAX_INTL_POOL_KEY: 4,
-    CODEBUDDY_DEEPSEEK_POOL_KEY: 5,
-    OPENCODE_DEEPSEEK_POOL_KEY: 6,
-    OPENCODE_GLM_POOL_KEY: 6,
-    CODEBUDDY_GLM_POOL_KEY: 7,
-    QFLASH_INTL_POOL_KEY: 8,
-    QFLASH_CN_POOL_KEY: 8,
-    ZCODE_POOL_KEY: 9,
+    ZCODE_FLASH_POOL_KEY: 4,
 }
 PRIORITY_BY_MODE = {'strong': STRONG_PRIORITY, 'medium': MEDIUM_PRIORITY,
                     'weak': WEAK_PRIORITY}
@@ -341,7 +351,7 @@ def allowed_pools_for_mode(mode=None) -> tuple:
     elif m == 'medium':
         pools = NARROW_POOL_KEYS
     else:
-        pools = ALL_POOL_KEYS
+        pools = WEAK_POOL_KEYS
     if SONUS_TEMP_DISABLED:
         pools = tuple(pk for pk in pools if pk != SONUS_POOL_KEY)
     return tuple(pk for pk in pools if pk not in USER_DISABLED_POOL_KEYS)
@@ -362,21 +372,26 @@ def pool_allowed(pk, mode=None) -> bool:
 
 
 def window_gated_pools_for_mode(mode=None) -> tuple:
-    """该档位受时段门约束的池（strong 为空；medium/weak 为三个 Max + Claude）。"""
+    """该档位受时段门约束的池（strong 为空；medium 为三个 Max + Claude；
+    BW-WEAK-RESTRUCTURE-20261116 起 weak 只剩 Claude 高峰门——全部 Qoder 池已移出弱档）。"""
     m = normalize_mode(mode) if mode is not None else current_mode()
     if m == 'strong':
         return ()
-    return tuple(MAX_POOL_KEYS) + (CLAUDE_POOL_KEY,)
+    if m == 'medium':
+        return tuple(MAX_POOL_KEYS) + (CLAUDE_POOL_KEY,)
+    return (CLAUDE_POOL_KEY,)
 
 
 def window_blocks_for_mode(pk, now, mode=None) -> bool:
     """该池在该档位、该时刻是否被时段门挡下（只影响**新派发**）。
 
-    - strong：六个可派池全部无门 → 恒 False（Sonus 无任何门，Claude 不套高峰门，
+    - strong：可派池全部无门 → 恒 False（Sonus 无任何门，Claude 不套高峰门，
       三个 Max 不套夜间门）；
-    - medium/weak：三个 Max 受北京 22:00–08:00 夜间门；Claude 受既有工作日高峰门；
-      其它池（Sonus / ZCode / CodeBuddy / OpenCode / 两 Flash）保持无时段门——Sonus 在
-      medium/weak 是 mode_excluded 排除，时段门永不先于档位硬策略生效。"""
+    - medium：三个 Max 受北京 22:00–08:00 夜间门；Claude 受既有工作日高峰门；
+    - weak（BW-WEAK-RESTRUCTURE-20261116）：全部 Qoder 池已移出弱档，只剩 Claude 既有
+      工作日高峰门；其它弱档池（ZCode GLM-5.3-Flash / CodeBuddy GLM / 两 OpenCode）
+      保持无时段门——被移出的池在 weak 是 mode_excluded 排除，时段门永不先于档位硬
+      策略生效。"""
     m = normalize_mode(mode) if mode is not None else current_mode()
     if m == 'strong':
         return False

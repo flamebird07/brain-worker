@@ -24,6 +24,10 @@ import json
 import os
 import sys
 import tempfile
+import sys as _sys
+_sys.path.insert(0, str(__import__("pathlib").Path(__file__).resolve().parent))
+from dispatch_mode_support import dispatch_mode  # noqa: E402
+
 import unittest
 from contextlib import closing, redirect_stdout
 from datetime import datetime, timezone
@@ -147,6 +151,12 @@ class ResolveModelIdTests(_NoPopen):
 
 class CnMainRefusalTests(_NoPopen):
     def _run_main(self, argv):
+        # BW-WEAK-RESTRUCTURE-20261116：CN Qwen4-Max-Preview 已移出弱档——机制测试
+        # 固定 strong 档。
+        with dispatch_mode('strong'):
+            return self._run_main_inner(argv)
+
+    def _run_main_inner(self, argv):
         old = sys.argv
         sys.argv = ['qoder_direct.py', *argv]
         try:
@@ -211,10 +221,13 @@ class CnMainRefusalTests(_NoPopen):
             cfg = self.write_cn_config({'DeepSeek-Flash': 'real-id-123'})
             ws, pf = self.make_prompt()
             out_dir = self.tmp / 'out-builtin-daytime'
-            rc = self._run_main([
-                '--runtime', 'qodercn', '--cn-config', str(cfg),
-                '--workspace', str(ws), '--prompt-file', str(pf),
-                '--output-dir', str(out_dir), '--stage', 'BW-CN-TEST'])
+            # BW-WEAK-RESTRUCTURE-20261116：白天容量门语义属 medium（Max 夜间门）——
+            # class _run_main 固定 strong 无门，此用例改走 _run_main_inner + medium。
+            with dispatch_mode('medium'):
+                rc = self._run_main_inner([
+                    '--runtime', 'qodercn', '--cn-config', str(cfg),
+                    '--workspace', str(ws), '--prompt-file', str(pf),
+                    '--output-dir', str(out_dir), '--stage', 'BW-CN-TEST'])
         finally:
             qd.dp.utcnow = real_utcnow
         self.assertEqual(rc, 2, rc)
@@ -400,7 +413,9 @@ class CnMainWriteRuleRefusalTests(_NoPopen):
         sys.argv = ['qoder_direct.py', *argv]
         printed = io.StringIO()
         try:
-            with redirect_stdout(printed):
+            # BW-WEAK-RESTRUCTURE-20261116：CN Qwen4-Max-Preview 已移出弱档——机制测试
+            # 固定 strong 档（CN 池在 strong 无门）。
+            with dispatch_mode('strong'), redirect_stdout(printed):
                 rc = qd.main()
         finally:
             sys.argv = old
@@ -460,11 +475,14 @@ class CnMainWriteRuleRefusalTests(_NoPopen):
         sys.argv = ['qoder_direct.py', '--runtime', 'qodercn', '--cn-config', str(cfg),
                     '--workspace', str(ws), '--prompt-file', str(pf),
                     '--output-dir', str(out_dir), '--stage', 'BW-CN-WRITE-RULE-OK',
-                    '--model', 'Qwen3.8-Flash', '--tools', 'Read,Write',
+                    # BW-WEAK-RESTRUCTURE-20261116：CN Qwen3.8-Flash 已 legacy-retired——
+                # 机制测试改用可派的 CN 内置 Qwen4-Max-Preview。
+                '--model', 'Qwen4-Max-Preview', '--tools', 'Read,Write',
                     '--allowed-tools', 'Edit(/scripts/qoder_direct.py)',
                     '--dispatch-store', str(self.tmp / 'pool.sqlite3')]
         try:
-            with redirect_stdout(io.StringIO()):
+            # BW-WEAK-RESTRUCTURE-20261116：CN Qwen4-Max-Preview 已移出弱档——固定 strong。
+            with dispatch_mode('strong'), redirect_stdout(io.StringIO()):
                 rc = qd.main()
         finally:
             sys.argv = old
@@ -752,8 +770,10 @@ class MainForceLimitRealEntryTests(_NoPopen):
                  '--quota-store', self.quota_store]
         return argv, out
 
-    def _run_main(self, argv, envelope, exit_code):
-        """唯一入口：正式 qd.main()。测试只提供外部事实（argv + 子进程终态字节）。"""
+    def _run_main(self, argv, envelope, exit_code, require_popen=True):
+        """唯一入口：正式 qd.main()。测试只提供外部事实（argv + 子进程终态字节）。
+        BW-WEAK-RESTRUCTURE-20261116：legacy-retired 的 CN Flash 用例必然 0 Popen，
+        由调用方显式 require_popen=False 跳过该断言。"""
         self._pending = (json.dumps(envelope, ensure_ascii=False).encode('utf-8'),
                          exit_code)
         before = len(self.calls)
@@ -761,15 +781,19 @@ class MainForceLimitRealEntryTests(_NoPopen):
         sys.argv = ['qoder_direct.py', *argv]
         printed = io.StringIO()
         try:
-            with redirect_stdout(printed):
+            # BW-WEAK-RESTRUCTURE-20261116：CN Qwen4-Max-Preview 已移出弱档——机制测试
+            # 固定 strong 档（CN 池在 strong 无门）。
+            with dispatch_mode('strong'), redirect_stdout(printed):
                 rc = qd.main()
         finally:
             sys.argv = old
         # 真实到达过一次外部子进程入口——不是复刻分支，也不是 0 Popen 的早退路径。
-        self.assertEqual(len(self.calls) - before, 1,
-                         f'main must reach Popen exactly once; calls={self.calls}')
-        self.assertEqual(len(self.children), len(self.calls))
-        self.assertTrue(self.children[-1].terminated, 'synthetic child must truly exit')
+        if require_popen:
+            self.assertEqual(len(self.calls) - before, 1,
+                             f'main must reach Popen exactly once; calls={self.calls}')
+            self.assertEqual(len(self.children), len(self.calls))
+            self.assertTrue(self.children[-1].terminated,
+                            'synthetic child must truly exit')
         return rc, json.loads(printed.getvalue())
 
     @staticmethod
@@ -967,18 +991,21 @@ class MainForceLimitRealEntryTests(_NoPopen):
 
     # ---------- 6. Flash 终态即使带真实限额文本也永不落标（池 key 恒 None） ----------
     def test_main_flash_quota_text_is_never_recorded(self):
+        # BW-WEAK-RESTRUCTURE-20261116：CN Qwen3.8-Flash 已 legacy-retired（无任何档位
+        # 可派）——e2e 路径变为 unknown_pool 拒绝（rc 2、零 Popen、零落标）；「Flash
+        # 池 key 恒 None、限额文本永不落标」的机制由 _qoder_max_pool_key 直接断言保留。
         argv, out = self._cn_case('flash', 'Qwen3.8-Flash',
                                   {'DeepSeek-Flash': 'real-id-123'})
-        rc, summary = self._run_main(argv, self._failure_envelope([_CN_LIMIT_TEXT]),
-                                     exit_code=1)
-        self.assertEqual(rc, 3, rc)
-        self.assertNotIn('main_force_limit', summary)
+        rc, _printed = self._run_main(
+            argv, self._failure_envelope([_CN_LIMIT_TEXT]), exit_code=1,
+            require_popen=False)
+        self.assertEqual(rc, 2, rc)
+        self.assertIsNone(qd._qoder_max_pool_key(qd.RUNTIME_CN, 'Qwen3.8-Flash'))
         self.assertEqual(self._limited_pools(), [])
-        self.assertEqual(summary['result_errors'], [_CN_LIMIT_TEXT])
         self.assertTrue(qd.dp.main_force_limited(self.store, 'qodercn:Qwen4-Max-Preview')
                         is False)
-        self.assertEqual(self._attempt_by_task('T-flash')['pool_key'],
-                         'qodercn:Qwen3.8-Flash')
+        # legacy-retired 拒绝发生在 Popen/建目录之前 → 零 attempt 落库（诚实零占位）。
+        self.assertIsNone(self._attempt_by_task('T-flash'))
 
 
 if __name__ == '__main__':

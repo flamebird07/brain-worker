@@ -30,6 +30,12 @@ Windows 宿主明确拒绝（Windows 走既有 SDK bootstrap 传输）。
 边界（与 references/zcode-appserver-direct.md 一致）：
 - 配置缺失、命令不可执行、阶段为空、mode/reasoning 非法 → 派工前拒绝，不建证据目录；
 - setModel 被官方拒绝 → 会话已建但从未提交 → start_failed 安全结算；
+- `--preflight-only`（BW-WEAK-RESTRUCTURE-20261116-R2 收紧）：只做 `runtime/capabilities`
+  只读预检——**零共享状态写入**（不调 availability/容量/额度门，不创建/迁移/WAL 共享
+  数据库），缺库不建库；预检成功绝不代替正式派发或业务验收；
+- 共享状态数据库无法打开/写入（环境权限、路径问题）→ 结构化拒绝（sent=false、
+  shared_state_error=true、失败阶段/目标路径/原始异常），退出码 2——**绝不误分类为
+  认证、额度、时段或模型错误**，绝不输出裸 traceback；
 - 协议终态、正文绑定、业务验收三者分离：退出码只反映协议终态，绑定看
   report-state.json，`business_verified` 恒为 false，由主脑独立判定。
 """
@@ -40,6 +46,7 @@ import hashlib
 import json
 import os
 import queue
+import sqlite3
 import subprocess
 import sys
 import threading
@@ -447,68 +454,28 @@ def main(argv=None):
 
     out = Path(args.output_dir)
     quota_store = args.quota_store or str(qc.default_store_path())
-    if not args.preflight_only:
-        # ---- ZCode 持久 availability 门（权威最后原子闸；与 zcode_direct 同口径）----
-        availability_gate = qc.zcode_availability_gate(
-            quota_store, provider=args.provider, routes_path=args.quota_routes,
-            identity={'provider': args.provider}, purpose='dispatch')
-        if not availability_gate['allowed']:
-            print(json.dumps({'refused_before_dispatch': True, 'sent': False,
-                              'exit_code': 2, 'zcode_availability_rejected': True,
-                              'reasons': availability_gate['reasons'],
-                              'channel_key': availability_gate.get('channel_key')},
-                             ensure_ascii=False))
-            return 2
-    else:
-        availability_gate = None
-    availability_attempt_id = (availability_gate or {}).get('attempt_id')
-    availability_epoch = (availability_gate or {}).get('availability_epoch')
-    availability_group = (availability_gate or {}).get('quota_group')
-    availability_channel_key = (availability_gate or {}).get('granted_channel_key')
-
-    def _settle_availability(executed, success=False):
-        if availability_gate is None or availability_group is None:
-            return None
-        try:
-            return qc.settle_zcode_attempt(
-                quota_store, provider=args.provider, quota_group=availability_group,
-                attempt_id=availability_attempt_id, epoch=availability_epoch,
-                success=success, executed=executed,
-                channel_key=availability_channel_key)
-        except Exception as exc:  # noqa: BLE001
-            return {'settled': False, 'error': str(exc)}
-
-    # ---- 跨会话并发容量门（Popen 前原子消费；同一 zcode 池，绝不新增池）----
     dispatch_store = args.dispatch_store or str(dp.default_store_path())
     task_id = args.task_id or args.stage
     wrapper_pid = os.getpid()
     wrapper_created = dp.process_identity(wrapper_pid).get('created')
+    availability_gate = None
     claim_token = None
     pool_gate = None
     quota_verified_claim = None
-    if not args.preflight_only:
-        pool_gate = dp.consume_for_entry(
-            dispatch_store, task_id=task_id, runtime='zcode', model=args.model,
-            workspace=work_real, prompt_sha256=prompt_sha256, stage=args.stage,
-            chat_id=args.chat_id, claim_token=args.dispatch_claim,
-            wrapper_pid=wrapper_pid, wrapper_created=wrapper_created,
-            executor='zcode', quota_store=quota_store, quota_routes=args.quota_routes)
-        if not pool_gate['allowed']:
-            _settle_availability(executed=False)
-            print(json.dumps({'refused_before_dispatch': True,
-                              'capacity_gate_rejected': True,
-                              'sent': False, 'exit_code': 2,
-                              'routing_required': bool(pool_gate.get('routing_required')),
-                              'reason': pool_gate.get('reason'),
-                              'selected': pool_gate.get('selected'),
-                              'pool_key': pool_gate.get('pool_key'),
-                              'domestic_full': pool_gate.get('domestic_full'),
-                              'reasons': pool_gate['reasons']}, ensure_ascii=False))
-            return 2
-        claim_token = pool_gate['token']
-        quota_verified_claim = {'token': claim_token, 'store': dispatch_store,
-                                'pool_key': pool_gate.get('pool_key'),
-                                'capacity': dp.capacity_for(pool_gate.get('pool_key'))}
+
+    def _settle_availability(executed, success=False):
+        if availability_gate is None or availability_gate.get('quota_group') is None:
+            return None
+        try:
+            return qc.settle_zcode_attempt(
+                quota_store, provider=args.provider,
+                quota_group=availability_gate.get('quota_group'),
+                attempt_id=availability_gate.get('attempt_id'),
+                epoch=availability_gate.get('availability_epoch'),
+                success=success, executed=executed,
+                channel_key=availability_gate.get('granted_channel_key'))
+        except Exception as exc:  # noqa: BLE001
+            return {'settled': False, 'error': str(exc)}
 
     def _release_capacity(terminal, success=None):
         if claim_token is None:
@@ -520,27 +487,102 @@ def main(argv=None):
         except Exception as exc:  # noqa: BLE001
             return {'released': False, 'terminal': terminal, 'error': str(exc)}
 
-    quota_gate = qc.gate_dispatch(
-        quota_store, runtime='zcode',
-        identity={'provider': args.provider},
-        workspace=work_real,
-        purpose='dispatch',
-        routes_path=args.quota_routes,
-        verified_pool_claim=quota_verified_claim)
-    if not quota_gate['allowed']:
-        _settle_availability(executed=False)
-        _release_capacity('start_failed')
-        print(json.dumps({'refused_before_dispatch': True, 'sent': False,
-                          'quota_gate_rejected': True, 'exit_code': 2,
-                          'reasons': quota_gate['reasons'],
-                          'quota_group': quota_gate.get('quota_group')},
-                         ensure_ascii=False))
-        return 2
+    def _shared_state_refusal(exc, phase):
+        """共享状态数据库无法打开/写入的结构化拒绝（BW-WEAK-RESTRUCTURE-20261116-R2）：
+        环境权限/路径问题，**不是**认证、额度、时段或模型错误——如实分类、给出目标
+        路径与原始异常，零提交、零占位、绝不输出裸 traceback。"""
+        target = (quota_store if phase != 'capacity_claim' else dispatch_store)
+        return _print_json({
+            'refused_before_dispatch': True, 'sent': False, 'exit_code': 2,
+            'shared_state_error': True,
+            'error_class': 'shared_state_unwritable',
+            'phase': phase,
+            'store_path': target,
+            'reasons': [f'{type(exc).__name__}: {exc}',
+                        'the shared state database cannot be opened/written in this '
+                        'session (environment permission or path problem) — this is '
+                        'NOT an auth/quota/time-window/model error; nothing was '
+                        'submitted and no placeholder was taken'],
+            }, 2)
+
+    def _print_json(payload, code):
+        print(json.dumps(payload, ensure_ascii=False))
+        return code
+
+    quota_gate = {'allowed': True, 'purpose': 'registry_preflight'}
+    if not args.preflight_only:
+        # ---- ZCode 持久 availability 门（权威最后原子闸；与 zcode_direct 同口径）----
+        try:
+            availability_gate = qc.zcode_availability_gate(
+                quota_store, provider=args.provider, routes_path=args.quota_routes,
+                identity={'provider': args.provider}, purpose='dispatch')
+        except (sqlite3.OperationalError, OSError) as exc:
+            return _shared_state_refusal(exc, 'availability_gate')
+        if not availability_gate['allowed']:
+            return _print_json({'refused_before_dispatch': True, 'sent': False,
+                                'exit_code': 2, 'zcode_availability_rejected': True,
+                                'reasons': availability_gate['reasons'],
+                                'channel_key': availability_gate.get('channel_key')}, 2)
+
+        # ---- 跨会话并发容量门（Popen 前原子消费；同一 zcode 池，绝不新增池）----
+        try:
+            pool_gate = dp.consume_for_entry(
+                dispatch_store, task_id=task_id, runtime='zcode', model=args.model,
+                workspace=work_real, prompt_sha256=prompt_sha256, stage=args.stage,
+                chat_id=args.chat_id, claim_token=args.dispatch_claim,
+                wrapper_pid=wrapper_pid, wrapper_created=wrapper_created,
+                executor='zcode', quota_store=quota_store,
+                quota_routes=args.quota_routes)
+        except (sqlite3.OperationalError, OSError) as exc:
+            return _shared_state_refusal(exc, 'capacity_claim')
+        if not pool_gate['allowed']:
+            _settle_availability(executed=False)
+            return _print_json({'refused_before_dispatch': True,
+                                'capacity_gate_rejected': True,
+                                'sent': False, 'exit_code': 2,
+                                'routing_required': bool(pool_gate.get('routing_required')),
+                                'reason': pool_gate.get('reason'),
+                                'selected': pool_gate.get('selected'),
+                                'pool_key': pool_gate.get('pool_key'),
+                                'domestic_full': pool_gate.get('domestic_full'),
+                                'reasons': pool_gate['reasons']}, 2)
+        claim_token = pool_gate['token']
+        quota_verified_claim = {'token': claim_token, 'store': dispatch_store,
+                                'pool_key': pool_gate.get('pool_key'),
+                                'capacity': dp.capacity_for(pool_gate.get('pool_key'))}
+
+        # ---- 额度门（ZCode 手动额度政策照旧：无自动冷却，并发占位保留）----
+        try:
+            quota_gate = qc.gate_dispatch(
+                quota_store, runtime='zcode',
+                identity={'provider': args.provider},
+                workspace=work_real,
+                purpose='dispatch',
+                routes_path=args.quota_routes,
+                verified_pool_claim=quota_verified_claim)
+        except (sqlite3.OperationalError, OSError) as exc:
+            _settle_availability(executed=False)
+            _release_capacity('start_failed')
+            return _shared_state_refusal(exc, 'quota_gate')
+        if not quota_gate['allowed']:
+            _settle_availability(executed=False)
+            _release_capacity('start_failed')
+            return _print_json({'refused_before_dispatch': True, 'sent': False,
+                                'quota_gate_rejected': True, 'exit_code': 2,
+                                'reasons': quota_gate['reasons'],
+                                'quota_group': quota_gate.get('quota_group')}, 2)
+
+    def _settle_quota(terminal):
+        # BW-WEAK-RESTRUCTURE-20261116-R2：preflight 无真实额度门（占位）→ 不结算、
+        # 零共享状态写入。
+        if args.preflight_only:
+            return {'settled': False, 'released': False,
+                    'terminal_state': 'no_attempt'}
+        return qc.settle_attempt(quota_store, quota_gate, terminal=terminal)
 
     def _abort_before_start(payload, code):
         payload = dict(payload)
-        payload['quota_settlement'] = qc.settle_attempt(
-            quota_store, quota_gate, terminal='start_failed')
+        payload['quota_settlement'] = _settle_quota('start_failed')
         payload['zcode_availability_settled'] = _settle_availability(executed=False)
         if claim_token is not None:
             rel = _release_capacity('start_failed')
@@ -695,12 +737,8 @@ def main(argv=None):
                                    client=None, preflight_only=True,
                                    protocol_success=True)
                 _write_summary(out, summary)
-                # 预检同样拿过额度门的 workspace/channel 占位：同进程内必须结算释放，
-                # 绝不带锁退出（否则死进程锁会保守阻断后续派工——真实事故已复现）。
-                qc.settle_attempt(quota_store, quota_gate, terminal='confirmed_exit',
-                                  success=False,
-                                  source='zcode_appserver_direct preflight-only '
-                                         '(capabilities verified, nothing submitted)')
+                # BW-WEAK-RESTRUCTURE-20261116-R2：preflight 不再过额度门/拿占位——
+                # 本分支零共享状态写入（无门、无结算、无锁），缺库也绝不建库。
                 return 0
 
             # 2) session/create（服务器异步启动：结果可能滞后，窗口放宽）。
@@ -958,7 +996,12 @@ def _abort_after_start(out, child, dispatch_store, claim_token, quota_store,
         except Exception:  # noqa: BLE001
             pass
     _write_process_exit(out, child)
-    settlement = qc.settle_attempt(quota_store, quota_gate, terminal=terminal)
+    # BW-WEAK-RESTRUCTURE-20261116-R2：preflight 占位额度门 → 不结算（零共享状态写入）。
+    if quota_gate.get('purpose') == 'registry_preflight':
+        settlement = {'settled': False, 'released': False,
+                      'terminal_state': 'no_attempt'}
+    else:
+        settlement = qc.settle_attempt(quota_store, quota_gate, terminal=terminal)
     availability_settled = _settle_availability(executed=False)
     rel = _release_capacity(terminal)
     payload = dict(payload)

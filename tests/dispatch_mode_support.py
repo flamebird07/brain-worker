@@ -42,10 +42,11 @@ def insert_sonus_leftover(store, *, token='sonus-leftover', task_id='sonus-lefto
 
 
 def weak_new_dispatch_capacity():
-    """weak 档可新派容量（原 15）：Sonus 不在 weak 候选，永不贡献弱档新派名额。"""
+    """weak 档可新派容量（BW-WEAK-RESTRUCTURE-20261116 起 6）：只累计当前 weak
+    可新派集合（allowed_pools_for_mode('weak')），被移出弱档的池不计入。"""
     import dispatch_mode as dm
     import dispatch_pool as dp
-    return sum(dp.capacity_for(k) for k in dm.ALL_POOL_KEYS)
+    return sum(dp.capacity_for(k) for k in dm.allowed_pools_for_mode('weak'))
 
 
 @contextlib.contextmanager

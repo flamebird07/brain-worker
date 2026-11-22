@@ -17,6 +17,13 @@
 - 超时口径：缺省不加墙钟限制、显式正数才生效、<=0 零副作用拒绝；起止时间真实采集，
   注入时钟保持离线确定性；
 - 正式 main 只为该精确 model 开放，其它 model 派发前零副作用 manual_relay_only 拒绝。
+- BW-WEAK-RESTRUCTURE-20261116（用户明确指令，本文件按其同步期望）：弱档收窄为 5 池
+  （两 OpenCode／CodeBuddy GLM／Claude／ZCode GLM-5.3-Flash、合计 6 槽），
+  codebuddy:deepseek-v4.1-flash 从弱档移除且本就不在 strong/medium——现在**没有任何档位**
+  能新派它（weak 一律 mode_excluded、sent=false）；物理总容量 16→17（新增
+  zcode:GLM-5.3-Flash 独立 1 槽）。原「weak 下派 deepseek 成功」类用例改写为负例；
+  不依赖档位可派性的纯机制用例（回执解析/限额标记/超时/起止时间等）换到仍处弱档层2的
+  codebuddy:glm-5.3-flash 等价复现，绝不删除测试、绝不弱化断言。
 """
 import io
 import json
@@ -46,6 +53,10 @@ import stub_codebuddy_live as stub  # noqa: E402
 
 CB = 'codebuddy:deepseek-v4.1-flash'
 CB_MODEL = 'deepseek-v4.1-flash'
+# BW-WEAK-RESTRUCTURE-20261116: 弱档层2的 CodeBuddy GLM（weak 仍可真实 claim）——
+# 纯机制用例的换池载体；deepseek 池键 CB 保留给负例断言。
+CB_GLM = 'codebuddy:glm-5.3-flash'
+CB_GLM_MODEL = 'glm-5.3-flash'
 QMAX = 'qoder:Qwen4-Max-Preview'
 CN_MAX = 'qodercn:Qwen4-Max-Preview'
 CN_CUSTOM_MAX = 'qodercn:Qwen-3.8-Max'
@@ -81,12 +92,14 @@ def _valid_report(stage, workspace) -> str:
     return '\n'.join(body)
 
 
-def _success_stream(report_text, *, model=CB_MODEL, session='S1', errors=None,
+def _success_stream(report_text, *, model=CB_GLM_MODEL, session='S1', errors=None,
                     tools=('Read', 'Write')):
     """构造合法成功 stream-json。tools 非空时附带**真实形状**的 tool_use 与同 ID 成功
     tool_result（Read + Write），供适配器统计工具证据；tools=() 时为零工具纯文本流。
     这是**合成协议**，不执行真实文件 IO，也不证明任何业务结果。errors 非空会破坏成功
-    信封（用于 exit0 但不伪成功）。"""
+    信封（用于 exit0 但不伪成功）。
+    BW-WEAK-RESTRUCTURE-20261116: 缺省 model 同步换到弱档层2载体 glm-5.3-flash，与
+    TestLiveTransport._run 的缺省请求模型一致（否则 init.model 相对请求模型即漂移）。"""
     err = [] if errors is None else errors
     init = {'type': 'system', 'subtype': 'init', 'session_id': session,
             'model': model, 'tools': list(tools), 'mcp_servers': [],
@@ -173,99 +186,171 @@ class TestCodebuddyPoolPriority(_PoolBase):
     def test_codebuddy_has_one_independent_slot(self):
         self.assertEqual(dp.capacity_for(CB), 1)
         self.assertIn(CB, dp.MAIN_FORCE_KEYS)
-        # BW-STRONG-SONUS-20261024：物理总 16（原 15 + strong 专属 Sonus 1 槽）；
-        # weak 可新派仍为 15。
-        self.assertEqual(dp.DOMESTIC_TOTAL_CAPACITY, 16)
-        self.assertEqual(sum(dp.capacity_for(k) for k in dm.ALL_POOL_KEYS), 15)
+        # BW-WEAK-RESTRUCTURE-20261116: 物理总 17（16 + 弱档专用 zcode:GLM-5.3-Flash
+        # 独立 1 槽）；ALL_POOL_KEYS 为全档位策略池并集（12 池、不含 strong 专属 Sonus）
+        # 合计 16；weak 可新派集合 5 池 6 槽（deepseek 已移出弱档）。
+        self.assertEqual(dp.DOMESTIC_TOTAL_CAPACITY, 17)
+        self.assertEqual(sum(dp.capacity_for(k) for k in dm.ALL_POOL_KEYS), 16)
+        self.assertEqual(sum(dp.capacity_for(k)
+                             for k in dm.allowed_pools_for_mode('weak')), 6)
 
     def test_pool_priority_codebuddy_is_five(self):
-        # BW-CLAUDE-ALLDAY-QMAX-AFTER-20261023：codebuddy:deepseek-v4.1-flash priority=5，
-        # 紧挨 opencode:deepseek-v4.1-flash-free（6）之前；其上为 claude（3）与国际
-        # Qoder Max（4）；ZCode 为层=9。
-        self.assertEqual(dp.POOL_PRIORITY[CB], 5)
-        self.assertEqual(dp.POOL_PRIORITY[dp.ZCODE_POOL_KEY], 9)
+        # BW-WEAK-RESTRUCTURE-20261116: 弱档层表重排（层号重新连续编号）——两 OpenCode=1 >
+        # CodeBuddy GLM=2 > Claude=3（倒数第二）> ZCode GLM-5.3-Flash=4（最后）；
+        # codebuddy:deepseek-v4.1-flash 与 zcode:GLM-5.3 已不在弱档层表（前者任何档位
+        # 都不可新派，后者仅 strong/medium）。
+        self.assertEqual(dp.POOL_PRIORITY, dict(dm.WEAK_PRIORITY))
+        self.assertEqual(dp.POOL_PRIORITY[dp.OPENCODE_DEEPSEEK_POOL_KEY], 1)
+        self.assertEqual(dp.POOL_PRIORITY[dp.OPENCODE_GLM_POOL_KEY], 1)
+        self.assertEqual(dp.POOL_PRIORITY[CB_GLM], 2)
         self.assertEqual(dp.POOL_PRIORITY[CLAUDE], 3)
-        self.assertEqual(dp.POOL_PRIORITY[QMAX], 4)
-        self.assertEqual(dp.POOL_PRIORITY[dp.OPENCODE_DEEPSEEK_POOL_KEY], 6)
-        self.assertLess(dp.POOL_PRIORITY[CLAUDE], dp.POOL_PRIORITY[QMAX])
-        self.assertLess(dp.POOL_PRIORITY[QMAX], dp.POOL_PRIORITY[CB])
-        self.assertLess(dp.POOL_PRIORITY[CB],
-                        dp.POOL_PRIORITY[dp.OPENCODE_DEEPSEEK_POOL_KEY])
-        for pk in (CN_MAX, CN_CUSTOM_MAX):
-            self.assertEqual(dp.POOL_PRIORITY[pk], 1)
+        self.assertEqual(dp.POOL_PRIORITY[dp.ZCODE_FLASH_POOL_KEY], 4)
+        self.assertLess(dp.POOL_PRIORITY[dp.OPENCODE_DEEPSEEK_POOL_KEY],
+                        dp.POOL_PRIORITY[CB_GLM])
+        self.assertLess(dp.POOL_PRIORITY[CB_GLM], dp.POOL_PRIORITY[CLAUDE])
+        self.assertLess(dp.POOL_PRIORITY[CLAUDE],
+                        dp.POOL_PRIORITY[dp.ZCODE_FLASH_POOL_KEY])
+        self.assertNotIn(CB, dp.POOL_PRIORITY)
+        self.assertNotIn(dp.ZCODE_POOL_KEY, dp.POOL_PRIORITY)
+        self.assertNotIn(dp.SONUS_POOL_KEY, dp.POOL_PRIORITY)
 
     def test_auto_prefers_max_over_codebuddy_when_all_free(self):
-        # BW-CB-REORDER-20261020：空库 AUTO 不再落 CodeBuddy——三 Qoder Max（层=1）在先，
-        # CodeBuddy（层=3）绝不在 Max/claude 有空位时被选中。
-        out = self.reserve('t1', 'qoder', 'Qwen4-Max-Preview', 'auto')
-        self.assertTrue(out.get('routing_required'), out)
-        self.assertIn(out['selected']['pool_key'], MAXES, out)
-        self.assertNotEqual(out['selected']['pool_key'], CB, out)
+        # BW-CB-REORDER-20261020：AUTO 绝不在 Max/claude 有空位时落 CodeBuddy。
+        # BW-WEAK-RESTRUCTURE-20261116: 三个 Qoder Max 已全部移出弱档（weak 显式请求即
+        # mode_excluded）——「Max 优先于 CodeBuddy」的层序对照改在中档（北京 23:00 夜间
+        # 窗内、Max 可派）复现；CodeBuddy deepseek 在任何档位都不可新派。
+        with dispatch_mode('medium'):
+            out = self.reserve('t1', 'qoder', 'Qwen4-Max-Preview', 'auto')
+            self.assertTrue(out.get('allowed'), out)
+            chosen = ((out.get('selected') or {}).get('pool_key')
+                      or out.get('pool_key'))
+            self.assertIn(chosen, MAXES, out)
+            self.assertNotEqual(chosen, CB, out)
+        with dispatch_mode('weak'):
+            excluded = self.reserve('t1-weak', 'qoder', 'Qwen4-Max-Preview',
+                                    'qoder')
+            self.assertFalse(excluded.get('allowed'), excluded)
+            self.assertEqual(excluded['reason'], 'mode_excluded', excluded)
+            self.assertFalse(excluded.get('sent'), excluded)
+            self.assertIsNone(excluded.get('token'), excluded)
 
     def test_auto_lands_codebuddy_after_max_zcode_and_claude_full(self):
-        # 新 AUTO 选择顺序的完整走位：三 Max（4 槽）、ZCode（1 槽）与 claude（2 槽）全满
-        # → 下一层正是 CodeBuddy deepseek（4）；CodeBuddy 也满 → 才轮到两 OpenCode 免费
-        # 模型（5）。
-        self.reserve('qm', 'qoder', 'Qwen4-Max-Preview', 'qoder')
-        self.reserve('cm', 'qodercn', 'Qwen4-Max-Preview', 'qodercn')
-        self.reserve('cx1', 'qodercn', 'Qwen-3.8-Max', 'qodercn')
-        self.reserve('cx2', 'qodercn', 'Qwen-3.8-Max', 'qodercn')
-        self.reserve('z1', 'zcode', 'GLM-5.3', 'zcode')
+        # BW-WEAK-RESTRUCTURE-20261116: 弱档收窄为 5 池——「更高层满后 AUTO 走位」在弱档
+        # 新层序下完整复现：两 OpenCode（层1）满 → CodeBuddy GLM（层2）→ claude（层3，
+        # 2 槽）满 → ZCode GLM-5.3-Flash（层4）满 → 无候选即 mode_excluded（两地区 Flash
+        # 与 codebuddy:deepseek 都不在弱档可派集合，绝不借道改派）。
+        self.reserve('o1', 'opencode', 'deepseek-v4.1-flash-free', 'opencode')
+        self.reserve('o2', 'opencode', 'glm-5.3-flash-free', 'opencode')
+        out = self.reserve('t3', 'opencode', 'deepseek-v4.1-flash-free', 'auto')
+        self.assertTrue(out.get('routing_required'), out)
+        self.assertEqual(out['selected']['pool_key'], CB_GLM, out)
+        self.reserve('cb1', 'codebuddy', CB_GLM_MODEL, 'codebuddy')
+        out2 = self.reserve('t4', 'opencode', 'deepseek-v4.1-flash-free', 'auto')
+        self.assertTrue(out2.get('routing_required'), out2)
+        self.assertEqual(out2['selected']['pool_key'], CLAUDE, out2)
         self.reserve('cl1', 'claude', 'deepseek-flash', 'claude')
         self.reserve('cl2', 'claude', 'deepseek-flash', 'claude')
-        out = self.reserve('t3', 'qoder', 'Qwen3.8-Flash', 'auto')
-        self.assertTrue(out.get('routing_required'), out)
-        self.assertEqual(out['selected']['pool_key'], CB, out)
-        self.reserve('cb1', 'codebuddy', CB_MODEL, 'codebuddy')
-        out2 = self.reserve('t4', 'qoder', 'Qwen3.8-Flash', 'auto')
-        self.assertTrue(out2.get('routing_required'), out2)
-        self.assertIn(out2['selected']['pool_key'],
-                      (dp.OPENCODE_DEEPSEEK_POOL_KEY, dp.OPENCODE_GLM_POOL_KEY), out2)
+        out3 = self.reserve('t5', 'opencode', 'deepseek-v4.1-flash-free', 'auto')
+        self.assertTrue(out3.get('routing_required'), out3)
+        self.assertEqual(out3['selected']['pool_key'], dp.ZCODE_FLASH_POOL_KEY,
+                         out3)
+        self.reserve('zf1', 'zcode', 'GLM-5.3-Flash', 'zcode')
+        out4 = self.reserve('t6', 'opencode', 'deepseek-v4.1-flash-free', 'auto')
+        self.assertFalse(out4.get('allowed'), out4)
+        self.assertEqual(out4['reason'], 'mode_excluded', out4)
+        self.assertFalse(out4.get('sent'), out4)
+        self.assertIsNone(out4.get('token'), out4)
+        # BW-WEAK-RESTRUCTURE-20261116 负例：弱档显式 CodeBuddy deepseek 请求一律
+        # mode_excluded（sent=false、零新占位、绝不静默换模型）。
+        out5 = self.reserve('t7', 'codebuddy', CB_MODEL, 'codebuddy')
+        self.assertFalse(out5.get('allowed'), out5)
+        self.assertEqual(out5['reason'], 'mode_excluded', out5)
+        self.assertFalse(out5.get('sent'), out5)
+        self.assertIsNone(out5.get('token'), out5)
 
     def test_after_codebuddy_occupied_auto_lands_max(self):
-        # CodeBuddy 唯一名额被占（本轮真实失败/在用）→ AUTO 仍按新层序从三 Qoder Max
-        # （层=1，本就先于 CodeBuddy 层=4）中选择；ZCode（层=2）也在其前。
-        self.reserve('occ', 'codebuddy', CB_MODEL, 'codebuddy')
-        out = self.reserve('t2', 'qoder', 'Qwen3.8-Flash', 'auto')
-        self.assertIn(out['selected']['pool_key'], MAXES)
+        # CodeBuddy 名额被占 → AUTO 仍按层序选择，绝不落 CodeBuddy deepseek。
+        # BW-WEAK-RESTRUCTURE-20261116: codebuddy:deepseek-v4.1-flash 已从弱档移除且本就
+        # 不在 strong/medium——「CodeBuddy 在途」按真实形态 seed 为遗留占用（不追杀、
+        # 不假释放）；「AUTO 落 Max」的层序对照在中档（北京 23:00 Max 夜间窗内）复现；
+        # 弱档显式 deepseek 请求如实 mode_excluded（sent=false）。
+        self.seed(CB, 1, task_prefix='occ')
+        with dispatch_mode('medium'):
+            # BW-WEAK-RESTRUCTURE-20261116: 中档请求组合改用可派的 Qwen4-Max-Preview
+            # （两地区 Flash 已不在中档可派集合，请求 Flash 组合会在档位硬门即被拒）。
+            out = self.reserve('t2', 'qoder', 'Qwen4-Max-Preview', 'auto')
+            self.assertTrue(out.get('allowed'), out)
+            chosen = ((out.get('selected') or {}).get('pool_key')
+                      or out.get('pool_key'))
+            self.assertIn(chosen, MAXES, out)
+            self.assertNotEqual(chosen, CB, out)
+        with dispatch_mode('weak'):
+            excluded = self.reserve('t2b', 'codebuddy', CB_MODEL, 'codebuddy')
+            self.assertFalse(excluded.get('allowed'), excluded)
+            self.assertEqual(excluded['reason'], 'mode_excluded', excluded)
+            self.assertFalse(excluded.get('sent'), excluded)
+            self.assertIsNone(excluded.get('token'), excluded)
 
     def test_round_failed_codebuddy_falls_to_next_qualified(self):
-        # 本轮 codebuddy 真实失败 → 候选剔除后，_select_main_force 在剩余合格候选里仍按
-        # 层序选择（三 Max 层=1 高于 CodeBuddy 层=3，落于 Max）。
+        # 本轮 CodeBuddy 真实失败 → 候选剔除后，_select_main_force 在剩余合格候选里仍按
+        # 层序选择。BW-WEAK-RESTRUCTURE-20261116: codebuddy:deepseek-v4.1-flash 已不在
+        # 任何档位可派集合（弱档候选也不含它），轮内剔除机制用仍处弱档层2的
+        # codebuddy:glm-5.3-flash 等价复现：GLM 剔除后落到更高合格层（两 OpenCode），
+        # 绝不落到已被移出的池。
         with closing(dp.connect(self.store)) as conn:
             elig = set(dp._eligible_main_forces(conn, False, NIGHT))
-            self.assertIn(CB, elig)  # codebuddy 无时段门，默认可选
-            elig.discard(CB)
-            target, reason = dp._select_main_force(conn, CB, NIGHT, eligible=elig)
+            self.assertNotIn(CB, elig)  # deepseek 已移出弱档，绝不在候选
+            self.assertIn(CB_GLM, elig)  # CodeBuddy GLM 无时段门，默认可选
+            elig.discard(CB_GLM)
+            target, reason = dp._select_main_force(conn, CB_GLM, NIGHT,
+                                                   eligible=elig)
         self.assertEqual(reason, 'main_force_selected')
-        self.assertIn(target, MAXES)
+        self.assertIn(target, (dp.OPENCODE_DEEPSEEK_POOL_KEY,
+                               dp.OPENCODE_GLM_POOL_KEY))
 
     def test_only_one_codebuddy_second_rejected(self):
-        first = self.reserve('a', 'codebuddy', CB_MODEL, 'codebuddy')
+        # BW-WEAK-RESTRUCTURE-20261116: 换到弱档层2的 codebuddy:glm-5.3-flash（独立 1 槽）
+        # 等价复现「唯一名额、第二个拒绝、文案含 capacity of 1」；deepseek 池已无任何
+        # 档位可新派，不能再作此机制的载体。
+        first = self.reserve('a', 'codebuddy', CB_GLM_MODEL, 'codebuddy')
         self.assertTrue(first.get('allowed'), first)
-        second = self.reserve('b', 'codebuddy', CB_MODEL, 'codebuddy')
+        second = self.reserve('b', 'codebuddy', CB_GLM_MODEL, 'codebuddy')
         self.assertFalse(second.get('allowed'), second)
         self.assertEqual(second['reason'], 'capacity_full')
         self.assertTrue(any('capacity of 1' in r for r in second['reasons']), second)
 
     def test_explicit_qoder_never_crosses_to_codebuddy(self):
-        out = self.reserve('q', 'qoder', 'Qwen4-Max-Preview', 'qoder')
-        self.assertEqual(out['pool_key'], QMAX)
-        self.assertFalse(out.get('routing_required'))
+        # BW-WEAK-RESTRUCTURE-20261116: 弱档已移出全部 Qoder 池——「显式 Qoder 不跨
+        # 执行器」的既有语义在中档（北京 23:00 Max 夜间窗内可派）复现；弱档显式 Qoder
+        # 请求一律 mode_excluded（sent=false、零占位）。
+        with dispatch_mode('medium'):
+            out = self.reserve('q', 'qoder', 'Qwen4-Max-Preview', 'qoder')
+            self.assertEqual(out['pool_key'], QMAX)
+            self.assertFalse(out.get('routing_required'))
+        with dispatch_mode('weak'):
+            excluded = self.reserve('q-weak', 'qoder', 'Qwen4-Max-Preview',
+                                    'qoder')
+            self.assertFalse(excluded.get('allowed'), excluded)
+            self.assertEqual(excluded['reason'], 'mode_excluded', excluded)
+            self.assertFalse(excluded.get('sent'), excluded)
+            self.assertIsNone(excluded.get('token'), excluded)
 
     def test_codebuddy_no_time_window_gate_across_dayparts(self):
-        # CodeBuddy deepseek 自身无任何时段门（weak 档下各时刻都在候选里）。
+        # CodeBuddy GLM 自身无任何时段门（BW-WEAK-RESTRUCTURE-20261116: 换到弱档层2的
+        # codebuddy:glm-5.3-flash 复现——deepseek 池已移出弱档，weak 各时刻都不在候选）。
         for now in (PEAK, GAP, DAY, NIGHT):
             with closing(dp.connect(self.store)) as conn:
                 elig = dp._eligible_main_forces(conn, False, now)
-            self.assertIn(CB, elig, f'codebuddy must be eligible at {now}')
-            self.assertFalse(dp._max_window_blocks(CB, now))
-        # 对照（BW-MANUAL-THREE-MODE-20261023）：weak 档恢复 claude 工作日高峰门与三个 Max
-        # 夜间门——PEAK 的 claude、DAY 的三个 Max 都不在候选；strong 档则 CodeBuddy 被档位
-        # 排除（mode_excluded），claude 与三个 Max 全天在候选。
+            self.assertIn(CB_GLM, elig, f'codebuddy glm must be eligible at {now}')
+            self.assertNotIn(CB, elig,
+                             'deepseek must stay mode-excluded from weak candidates')
+            self.assertFalse(dp._max_window_blocks(CB_GLM, now))
+        # 对照（BW-MANUAL-THREE-MODE-20261023 + BW-WEAK-RESTRUCTURE-20261116）：weak 档
+        # 只剩 claude 工作日高峰门——PEAK 的 claude 不在候选；三个 Max 与 zcode:GLM-5.3
+        # 已整档移出弱档，任何时刻都不在 weak 候选（时段门永不先于档位硬策略生效）。
         with closing(dp.connect(self.store)) as conn:
             self.assertNotIn(CLAUDE, dp._eligible_main_forces(conn, False, PEAK))
-            for pk in (CN_MAX, QMAX, CN_CUSTOM_MAX):
+            for pk in (CN_MAX, QMAX, CN_CUSTOM_MAX, dp.ZCODE_POOL_KEY):
                 self.assertNotIn(pk, dp._eligible_main_forces(conn, False, DAY))
         # BW-QODERCN-TOKEN-MAX-DISABLE-20261028：「strong 档三个 Max 全天无门」对照属
         # 禁用前三 Max 历史口径——目标池现行被用户禁用，临时空禁用集复现历史语义。
@@ -276,9 +361,11 @@ class TestCodebuddyPoolPriority(_PoolBase):
                 self.assertIn(pk, elig_s)
 
     def test_total_guard_blocks_sixteenth(self):
-        # 真实填 15：zcode1 + codebuddy1 + glm1 + qmax1 + cnmax1 + cnx2 + claude2
-        # + opencode-deepseek1 + opencode-glm1 + qflash2 + cnflash2 = 15
+        # BW-WEAK-RESTRUCTURE-20261116: 物理总 17——真实填满全部 17 槽：
+        # zcode1 + zcode-flash1 + codebuddy1 + glm1 + qmax1 + cnmax1 + cnx2 + claude2
+        # + opencode-deepseek1 + opencode-glm1 + qflash2 + cnflash2 = 16
         self.seed(ZCODE, 1, task_prefix='full')
+        self.seed(dp.ZCODE_FLASH_POOL_KEY, 1, task_prefix='full')
         self.seed(CB, 1, task_prefix='full')
         self.seed('codebuddy:glm-5.3-flash', 1, task_prefix='full')
         self.seed(QMAX, 1, task_prefix='full')
@@ -290,34 +377,43 @@ class TestCodebuddyPoolPriority(_PoolBase):
         self.seed(QFLASH, 2, task_prefix='full')
         self.seed(CN_FLASH, 2, task_prefix='full')
         # BW-STRONG-SONUS-20261024：weak 不能新派 Sonus；按真实形态 seed 一条 strong
-        # 遗留在途，使全局在途达到物理总 16。
+        # 遗留在途，使全局在途达到物理总 17。
         self.seed(dp.SONUS_POOL_KEY, 1, task_prefix='full')
         with closing(dp.connect(self.store)) as conn:
-            self.assertEqual(dp._domestic_active(conn), 16)
-        out = self.reserve('over', 'codebuddy', CB_MODEL, 'codebuddy')
+            self.assertEqual(dp._domestic_active(conn), 17)
+        # 满载后再派弱档可派池（CodeBuddy GLM）：总守卫如实 capacity_full +
+        # domestic_full=true，绝不派第 18 个（deepseek 池已无任何档位可新派，
+        # 不再作本机制的载体）。
+        out = self.reserve('over', 'codebuddy', CB_GLM_MODEL, 'codebuddy')
         self.assertFalse(out.get('allowed'), out)
         self.assertTrue(out.get('domestic_full') or out['reason'] == 'capacity_full', out)
 
     def test_workspace_conflict_and_unknown_not_bypassed_for_codebuddy(self):
+        # BW-WEAK-RESTRUCTURE-20261116: 换到弱档层2的 codebuddy:glm-5.3-flash 复现
+        # 同 workspace 单写守卫（deepseek 池已无任何档位可新派）。
         shared = self.ws('shared')
-        r1 = dp.reserve(self.store, task_id='w1', runtime='codebuddy', model=CB_MODEL,
+        r1 = dp.reserve(self.store, task_id='w1', runtime='codebuddy',
+                        model=CB_GLM_MODEL,
                         workspace=shared, prompt_sha256=SHA, stage='s', now=NIGHT,
                         executor='codebuddy', _preclaim=False)
         self.assertTrue(r1.get('allowed'), r1)
-        r2 = dp.reserve(self.store, task_id='w2', runtime='codebuddy', model=CB_MODEL,
+        r2 = dp.reserve(self.store, task_id='w2', runtime='codebuddy',
+                        model=CB_GLM_MODEL,
                         workspace=shared, prompt_sha256=SHA, stage='s', now=NIGHT,
                         executor='codebuddy', _preclaim=False)
         self.assertFalse(r2.get('allowed'), r2)
         self.assertEqual(r2['reason'], 'workspace_in_flight')
 
     def test_release_allows_reuse_of_codebuddy_slot(self):
-        first = self.reserve('r1', 'codebuddy', CB_MODEL, 'codebuddy')
+        # BW-WEAK-RESTRUCTURE-20261116: 换到弱档层2的 codebuddy:glm-5.3-flash 复现
+        # 「终态释放后同槽可复用」。
+        first = self.reserve('r1', 'codebuddy', CB_GLM_MODEL, 'codebuddy')
         self.assertTrue(first.get('allowed'), first)
         # 终态释放本次 reserved 占位（无 child 的合法取消路径）。
         rel = dp.finish(self.store, first['token'], terminal='cancelled', now=NIGHT,
                         wrapper_pid=None)
         self.assertTrue(rel.get('released') or rel.get('settled'), rel)
-        again = self.reserve('r2', 'codebuddy', CB_MODEL, 'codebuddy')
+        again = self.reserve('r2', 'codebuddy', CB_GLM_MODEL, 'codebuddy')
         self.assertTrue(again.get('allowed'), again)
 
 
@@ -387,8 +483,12 @@ class TestLiveTransport(unittest.TestCase):
 
     def _run(self, *, stdout=b'', returncode=0, task='t', outname='out',
              raise_on_launch=False, raise_after_start=False, timeout=False,
-             record=None, child_prober=None, tools_items=None, model=CB_MODEL,
+             record=None, child_prober=None, tools_items=None,
+             model=CB_GLM_MODEL,
              timeout_seconds=60, now=None):
+        # BW-WEAK-RESTRUCTURE-20261116: 缺省模型换到 codebuddy:glm-5.3-flash（弱档层2、
+        # 仍可真实 claim）——deepseek 已无任何档位可新派，weak 下正式传输的纯机制用例
+        # （回执/证据/超时/起止时间/释放语义）统一用 GLM 载体，本意不变。
         pf = self._prompt_file()
         out = self.base / outname
         factory = stub.make_popen_factory(stdout=stdout, returncode=returncode,
@@ -468,11 +568,11 @@ class TestLiveTransport(unittest.TestCase):
         payload = (outdir / 'sent-payload-stdin.bin').read_bytes()
         self.assertTrue(payload)
         text = payload.decode('utf-8')
-        self.assertIn(f'runtime=codebuddy；请求模型={CB_MODEL}', text)
+        self.assertIn(f'runtime=codebuddy；请求模型={CB_GLM_MODEL}', text)
         self.assertIn('不覆盖本轮身份', text)
         req = json.loads((outdir / 'request.json').read_text(encoding='utf-8'))
         self.assertEqual(req['executor_identity']['runtime'], 'codebuddy')
-        self.assertEqual(req['executor_identity']['request_model'], CB_MODEL)
+        self.assertEqual(req['executor_identity']['request_model'], CB_GLM_MODEL)
         task_text = self._prompt_file().read_text(encoding='utf-8')
         self.assertTrue(text.endswith('\n\n' + task_text), text)
         sent_contract = text[:-len('\n\n' + task_text)]
@@ -482,8 +582,9 @@ class TestLiveTransport(unittest.TestCase):
                          self.report)
         self._assert_final_summary(out, 'out')
         # codebuddy slot released after confirmed exit.
+        # BW-WEAK-RESTRUCTURE-20261116: 载体为弱档层2的 CodeBuddy GLM 独立 1 槽。
         with closing(dp.connect(self.store)) as conn:
-            self.assertEqual(dp._count_active(conn, CB), 0)
+            self.assertEqual(dp._count_active(conn, CB_GLM), 0)
 
     def _assert_final_summary(self, out, outname):
         summary = json.loads((self.base / outname / 'summary.json').read_text(
@@ -575,6 +676,18 @@ class TestLiveTransport(unittest.TestCase):
                             redirect_stdout(buf):
                         code = cl.main(argv)
                     out = json.loads(buf.getvalue())
+                    if model == CB_MODEL:
+                        # BW-WEAK-RESTRUCTURE-20261116 负例：codebuddy:deepseek-v4.1-flash
+                        # 已从弱档移除且本就不在 strong/medium——正式 CLI 入口对它的每个
+                        # 用例都在任何副作用之前如实 mode_excluded 拒绝（sent=false、
+                        # 不派发、不产出证据文件）；证据门机制由 GLM 分支完整覆盖。
+                        self.assertEqual(code, 2, out)
+                        self.assertFalse(out['dispatched'], out)
+                        self.assertFalse(out.get('sent'), out)
+                        self.assertEqual(out['gate']['reason'], 'mode_excluded', out)
+                        self.assertFalse(
+                            (self.base / outname / 'request.json').exists(), out)
+                        continue
                     self.assertEqual(code, 0 if case == 'success' else 3, out)
                     self.assertTrue(out['protocol_success'], out)
                     self.assertTrue(out['report_bound'], out)
@@ -644,18 +757,19 @@ class TestLiveTransport(unittest.TestCase):
         self.assertEqual(rec['communicate_timeout'], 60, rec)
 
     def test_nonpositive_timeout_refused_before_any_side_effect(self):
+        # BW-WEAK-RESTRUCTURE-20261116: 载体换到弱档层2的 CodeBuddy GLM（机制不变）。
         for bad in (0, -5):
             outname = f'tobad-{bad}'
             out = cl.run(self.cfg, workspace=str(self.work), prompt_file=self._prompt_file(),
                          out_dir=self.base / outname, stage=self.stage, task_id='to-bad',
-                         model=CB_MODEL, tools_items=[], prompt_sha256=SHA,
+                         model=CB_GLM_MODEL, tools_items=[], prompt_sha256=SHA,
                          dispatch_store=self.store, timeout_seconds=bad)
             self.assertTrue(out['dispatch_failed'], out)
             self.assertFalse(out['dispatched'], out)
             self.assertEqual(out['reason'], 'timeout_out_of_bounds', out)
             self.assertFalse((self.base / outname).exists())
         with closing(dp.connect(self.store)) as conn:
-            self.assertEqual(dp._count_active(conn, CB), 0)
+            self.assertEqual(dp._count_active(conn, CB_GLM), 0)
 
     def test_request_records_real_start_and_finish(self):
         stream = _success_stream(self.report)
@@ -682,13 +796,15 @@ class TestLiveTransport(unittest.TestCase):
 
     def test_model_drift_rejected(self):
         # init.model 漂移到旧 GLM：协议失败，不伪成功、不绑定。
+        # BW-WEAK-RESTRUCTURE-20261116: 载体换到弱档层2的 CodeBuddy GLM（'glm-4' 相对
+        # 'glm-5.3-flash' 仍是模型漂移）。
         stream = _success_stream(self.report, model='glm-4')
         out = self._run(stdout=stream, returncode=0, task='drift', outname='drift')
         self.assertTrue(out['dispatched'])
         self.assertFalse(out['protocol_success'], out)
         self.assertFalse(out['passed'], out)
         with closing(dp.connect(self.store)) as conn:
-            self.assertEqual(dp._count_active(conn, CB), 0)  # 仍真实释放
+            self.assertEqual(dp._count_active(conn, CB_GLM), 0)  # 仍真实释放
 
     def test_exit0_with_errors_not_falsely_success(self):
         # CLI exit 0 但成功信封带非空 errors：不得绿灯。
@@ -699,19 +815,21 @@ class TestLiveTransport(unittest.TestCase):
         self.assertFalse(out['passed'], out)
 
     def test_start_failure_releases_own_slot(self):
+        # BW-WEAK-RESTRUCTURE-20261116: 载体为弱档层2的 CodeBuddy GLM 独立 1 槽。
         out = self._run(raise_on_launch=True, task='sf', outname='sf')
         self.assertFalse(out.get('started'), out)
         self.assertTrue(out['capacity_release'].get('released'), out)
         with closing(dp.connect(self.store)) as conn:
-            self.assertEqual(dp._count_active(conn, CB), 0)
+            self.assertEqual(dp._count_active(conn, CB_GLM), 0)
 
     def test_exception_after_start_keeps_unknown(self):
         # 绑定成功后 communicate 异常、终态无法确认 → mark_unknown 保留占位，绝不假释放。
+        # BW-WEAK-RESTRUCTURE-20261116: 载体为弱档层2的 CodeBuddy GLM 独立 1 槽。
         out = self._run(raise_after_start=True, task='unk', outname='unk')
         self.assertTrue(out.get('launch_unknown'), out)
         self.assertTrue(out['started'])
         with closing(dp.connect(self.store)) as conn:
-            self.assertEqual(dp._count_active(conn, CB), 1)
+            self.assertEqual(dp._count_active(conn, CB_GLM), 1)
             row = conn.execute("SELECT state FROM attempts WHERE token=?",
                                (out['token'],)).fetchone()
             self.assertEqual(row['state'], 'unknown')  # 仅占位，未释放
@@ -739,40 +857,44 @@ class TestLiveTransport(unittest.TestCase):
     def test_real_structured_429_records_codebuddy_limit_and_isolates_glm(self):
         """BW-WIDGET-QUOTA-20261019-S5：正式 CodeBuddy 入口真实结构化 429（result.errors 里
         独立 status=429）在终态原始字节落盘后、finish 释放前按精确 pool_key 落 main_force_limits；
-        绑定真实 attempt/证据 sha256；DeepSeek 限额不污染 GLM（独立池）；落标不影响本任务释放。
+        绑定真实 attempt/证据 sha256；两 CodeBuddy 池额度独立、互不连带；落标不影响本任务释放。
         BW-WIDGET-QUOTA-20261019-S6：CodeBuddy 展示池不影响路由——_main_force_limit_active
-        对 CodeBuddy 恒 False，不阻止下一轮真实尝试。"""
+        对 CodeBuddy 恒 False，不阻止下一轮真实尝试。
+        BW-WEAK-RESTRUCTURE-20261116: deepseek 池已无任何档位可新派——限额落标/隔离机制
+        换到弱档层2的 codebuddy:glm-5.3-flash 载体（GLM 限额不连带 deepseek，隔离方向
+        对称等价）。"""
         stream = _success_stream(self.report, errors=[{'status': 429,
                                                        'message': 'rate limited'}])
         out = self._run(stdout=stream, returncode=1, task='q429', outname='q429')
         self.assertFalse(out['protocol_success'], out)
         self.assertTrue(out['main_force_limit']['recorded'], out['main_force_limit'])
-        self.assertEqual(out['main_force_limit']['pool_key'], CB)
+        self.assertEqual(out['main_force_limit']['pool_key'], CB_GLM)
         # 表行确实写入（widget 能读出）。
         with closing(dp.connect(self.store)) as conn:
             row = conn.execute('SELECT limited FROM main_force_limits WHERE pool_key=?',
-                               (CB,)).fetchone()
+                               (CB_GLM,)).fetchone()
             self.assertIsNotNone(row)
             self.assertEqual(int(row['limited']), 1)
         # 路由不受影响：_main_force_limit_active 对 CodeBuddy 恒 False。
+        self.assertFalse(dp.main_force_limited(self.store, CB_GLM, now=NIGHT))
+        # 额度独立：GLM 限额绝不连带 deepseek（对称于原「DeepSeek 不连带 GLM」）。
         self.assertFalse(dp.main_force_limited(self.store, CB, now=NIGHT))
-        # GLM 独立，绝不被 DeepSeek 限额连带。
-        self.assertFalse(dp.main_force_limited(self.store, dp.CODEBUDDY_GLM_POOL_KEY,
-                                               now=NIGHT))
         # 记录不阻塞释放：本任务 codebuddy 占位已真实释放。
         with closing(dp.connect(self.store)) as conn:
-            self.assertEqual(dp._count_active(conn, CB), 0)
+            self.assertEqual(dp._count_active(conn, CB_GLM), 0)
 
     def test_body_429_string_not_marked(self):
-        """正文/错误串中间出现 '429' 字样（非开头独立码、非结构化 status/code）不误标。"""
+        """正文/错误串中间出现 '429' 字样（非开头独立码、非结构化 status/code）不误标。
+        BW-WEAK-RESTRUCTURE-20261116: 载体换到弱档层2的 CodeBuddy GLM（机制不变）。"""
         stream = _success_stream(self.report, errors=['upstream hiccup 429 retry later'])
         out = self._run(stdout=stream, returncode=1, task='body', outname='body')
         self.assertFalse(out['protocol_success'], out)
         self.assertIsNone(out['main_force_limit'], out)
-        self.assertFalse(dp.main_force_limited(self.store, CB, now=NIGHT))
+        self.assertFalse(dp.main_force_limited(self.store, CB_GLM, now=NIGHT))
 
     def test_auth_error_not_marked_as_quota(self):
-        """认证失败错误载体不串型为限额：结构化 auth 文案不触发 429 落标。"""
+        """认证失败错误载体不串型为限额：结构化 auth 文案不触发 429 落标。
+        BW-WEAK-RESTRUCTURE-20261116: 载体换到弱档层2的 CodeBuddy GLM（机制不变）。"""
         stream = _success_stream(
             self.report,
             errors=[{'message': 'Custom model authentication failed. Please check '
@@ -780,15 +902,16 @@ class TestLiveTransport(unittest.TestCase):
         out = self._run(stdout=stream, returncode=1, task='auth', outname='auth')
         self.assertFalse(out['protocol_success'], out)
         self.assertIsNone(out['main_force_limit'], out)
-        self.assertFalse(dp.main_force_limited(self.store, CB, now=NIGHT))
+        self.assertFalse(dp.main_force_limited(self.store, CB_GLM, now=NIGHT))
 
     def test_success_does_not_mark_limit(self):
-        """成功终态绝不落限额标记（不假成功、不误标）。"""
+        """成功终态绝不落限额标记（不假成功、不误标）。
+        BW-WEAK-RESTRUCTURE-20261116: 载体换到弱档层2的 CodeBuddy GLM（机制不变）。"""
         stream = _success_stream(self.report)
         out = self._run(stdout=stream, returncode=0, task='ok2', outname='ok2')
         self.assertTrue(out['passed'], out)
         self.assertIsNone(out['main_force_limit'], out)
-        self.assertFalse(dp.main_force_limited(self.store, CB, now=NIGHT))
+        self.assertFalse(dp.main_force_limited(self.store, CB_GLM, now=NIGHT))
 
     def test_dispatch_store_none_with_env_var_still_records(self):
         """BW-WIDGET-QUOTA-20261019-S6：dispatch_store=None + BRAIN_WORKER_DISPATCH_STORE 环境变量
@@ -807,7 +930,7 @@ class TestLiveTransport(unittest.TestCase):
         with mock.patch.dict(os.environ, {'BRAIN_WORKER_DISPATCH_STORE': env_store}):
             result = cl.run(self.cfg, workspace=str(self.work), prompt_file=pf,
                             out_dir=out_dir, stage=self.stage, task_id='envq',
-                            model=CB_MODEL, tools_items=['Read', 'Write'],
+                            model=CB_GLM_MODEL, tools_items=['Read', 'Write'],
                             prompt_sha256=cl._sha(pf.read_bytes()),
                             dispatch_store=None, popen_factory=factory,
                             child_prober=lambda pid: {'state': 'dead', 'created': None},
@@ -817,7 +940,7 @@ class TestLiveTransport(unittest.TestCase):
         self.assertTrue(result['main_force_limit']['recorded'], result['main_force_limit'])
         with closing(dp.connect(env_store)) as conn:
             row = conn.execute('SELECT limited FROM main_force_limits WHERE pool_key=?',
-                               (CB,)).fetchone()
+                               (CB_GLM,)).fetchone()
             self.assertIsNotNone(row)
             self.assertEqual(int(row['limited']), 1)
 

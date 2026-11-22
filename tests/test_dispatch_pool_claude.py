@@ -1,8 +1,8 @@
 """BW-CLAUDE-DEEPSEEK-S3 / BW-CLAUDE-CAPACITY2 离线回归：claude:deepseek-flash AUTO 可选主力槽。
 
-覆盖：物理 DOMESTIC_TOTAL_CAPACITY=15（BW-ZCODE-RESTORE-1-20261022：含 ZCode 恢复的
-严格 1 槽、CodeBuddy 1 槽、GLM 独立 1 槽与两
-OpenCode 免费槽各 1，BW-OPENCODE-20261019 现行口径）；claude 在 MAIN_FORCE_KEYS 且容量 2（第 2 个请求可认领、
+覆盖：物理 DOMESTIC_TOTAL_CAPACITY=17（BW-WEAK-RESTRUCTURE-20261116：含 ZCode GLM-5.3
+与弱档专用 GLM-5.3-Flash 各严格 1 槽、CodeBuddy 两模型各 1 槽、两 OpenCode 免费槽各 1、
+strong 专属 Sonus 1 槽；现行权威口径）；claude 在 MAIN_FORCE_KEYS 且容量 2（第 2 个请求可认领、
 第 3 个满且绝不回退别模型；完成释放后可再用；同 workspace 仍拒绝；reserved/running/unknown 均
 正确占位）；AUTO 在其它主力占满时可选中 claude（无需用户显式点名）；claude 在途计入国内总在途
 聚合、但绝不污染 committed_qoder；显式 executor='claude' 点名；**时段门已整体解除
@@ -67,23 +67,33 @@ class _ClaudeBase(unittest.TestCase):
                           now=now, executor=executor, _preclaim=False)
 
     def occupy_non_claude_mains(self, now=OFFPEAK_NIGHT):
-        """占满 8 个非 claude 主力槽（codebuddy deepseek 1 + zcode 1（BW-ZCODE-RESTORE-
-        1-20261022 恢复、容量严格 1）+ qoder Max 1 + cn Max 1 + cn 自定义 Max 2 +
-        两 OpenCode 免费槽各 1，BW-OPENCODE-20261019），使 AUTO 在 claude 仍空闲时按
-        现行层序（三 Max(1) > zcode(2) > claude(3) > CB deepseek(4) > 两 OpenCode(5)）
-        落到 claude。"""
-        self.assertTrue(self._reserve('cb', 'codebuddy', 'deepseek-v4.1-flash',
+        """BW-WEAK-RESTRUCTURE-20261116: 占满全部**非 claude 可真实新派**的主力槽——
+        weak 档 4 槽（两 OpenCode 各 1 + CBGLM 1 + ZCode GLM-5.3-Flash 1，claude 层3 之上
+        是 OpenCode(1)/CBGLM(2)）+ strong 档 5 槽（两内置 Max 各 1 + zcode:GLM-5.3 1 +
+        CN 自定义 Max 2 按禁用前 legacy 占位构造，临时空禁用集）。已移出所有档位的
+        codebuddy:deepseek-v4.1-flash 不在此列（由需要它的用例按遗留形态直插），
+        使 AUTO 在 claude 仍空闲时按现行弱档层序（两 OpenCode(1) > CBGLM(2) > claude(3)
+        > ZCode GLM-5.3-Flash(4)）落到 claude。"""
+        self.assertTrue(self._reserve('oc0', 'opencode', dp.OPENCODE_DEEPSEEK_MODEL,
+                                      'opencode', now).get('allowed'))
+        self.assertTrue(self._reserve('oc1', 'opencode', dp.OPENCODE_GLM_MODEL,
+                                      'opencode', now).get('allowed'))
+        self.assertTrue(self._reserve('cbg', 'codebuddy', dp.CODEBUDDY_GLM_MODEL,
                                       'codebuddy', now).get('allowed'))
-        self.assertTrue(self._reserve('z0', 'zcode', 'GLM-5.3', 'zcode', now).get('allowed'))
-        self.assertTrue(self._reserve('qm', 'qoder', 'Qwen4-Max-Preview', 'qoder', now).get('allowed'))
-        self.assertTrue(self._reserve('cnm', 'qodercn', 'Qwen4-Max-Preview', 'qodercn', now).get('allowed'))
-        with mock.patch.object(dp.dm, 'USER_DISABLED_POOL_KEYS', frozenset()):
-            for i in range(2):
-                self.assertTrue(self._reserve(f'cnx{i}', 'qodercn', 'Qwen-3.8-Max', 'qodercn',
-                                              now).get('allowed'))
-        for i, model in enumerate((dp.OPENCODE_DEEPSEEK_MODEL, dp.OPENCODE_GLM_MODEL)):
-            self.assertTrue(self._reserve(f'oc{i}', 'opencode', model, 'opencode',
+        self.assertTrue(self._reserve('zcf', 'zcode', 'GLM-5.3-Flash', 'zcode',
+                                      now).get('allowed'))
+        with dispatch_mode('strong'):
+            self.assertTrue(self._reserve('qm', 'qoder', 'Qwen4-Max-Preview', 'qoder',
                                           now).get('allowed'))
+            self.assertTrue(self._reserve('cnm', 'qodercn', 'Qwen4-Max-Preview', 'qodercn',
+                                          now).get('allowed'))
+            self.assertTrue(self._reserve('z0', 'zcode', 'GLM-5.3', 'zcode', now).get('allowed'))
+            # BW-QODERCN-TOKEN-MAX-DISABLE-20261028：目标池两槽按禁用前 legacy 占位构造
+            # 「非 claude 全满」场景（临时空禁用集，仅限这两次 reserve）。
+            with mock.patch.object(dp.dm, 'USER_DISABLED_POOL_KEYS', frozenset()):
+                for i in range(2):
+                    self.assertTrue(self._reserve(f'cnx{i}', 'qodercn', 'Qwen-3.8-Max',
+                                                  'qodercn', now).get('allowed'))
 
 
 class CapacityAndRouting(_ClaudeBase):
@@ -96,10 +106,11 @@ class CapacityAndRouting(_ClaudeBase):
         self.assertIn(CLAUDE, dp.MAIN_FORCE_KEYS)
 
     def test_physical_domestic_total_is_sixteen(self):
-        # BW-STRONG-SONUS-20261024 当前权威总数：12 主力（含两 CodeBuddy 各独立 1 槽、
-        # 两 OpenCode 免费模型各独立 1 槽、ZCode 恢复的严格 1 槽与 strong 专属 Sonus
-        # 1 槽）+ 4 Flash = 16；weak 可新派仍为 15（Sonus 弱档不可新派）。
-        self.assertEqual(dp.DOMESTIC_TOTAL_CAPACITY, 16)
+        # BW-WEAK-RESTRUCTURE-20261116 当前权威总数：13 主力（含两 CodeBuddy 各独立 1 槽、
+        # 两 OpenCode 免费模型各独立 1 槽、ZCode GLM-5.3 与弱档专用 GLM-5.3-Flash 各
+        # 严格 1 槽、strong 专属 Sonus 1 槽）+ 4 Flash = 17；weak 可新派收窄为 6
+        # （Sonus/Max/zcode:GLM-5.3/CB deepseek/Flash 弱档均不可新派）。
+        self.assertEqual(dp.DOMESTIC_TOTAL_CAPACITY, 17)
         self.assertEqual(dp.DOMESTIC_TOTAL_CAPACITY,
                          sum(dp.MAIN_FORCE_CAPACITY.values())
                          + sum(dp.OVERFLOW_CAPACITY.values()))
@@ -170,12 +181,13 @@ class CapacityAndRouting(_ClaudeBase):
         self.assertEqual(r4['reason'], 'capacity_full', r4)
 
     def test_auto_selects_claude_when_other_mains_full(self):
-        # 另一主力的 AUTO 请求（未点名 claude）：其余 9 个主力槽（含 CodeBuddy 与两
-        # OpenCode）占满、
-        # claude 空闲 → 选中 claude
+        # BW-WEAK-RESTRUCTURE-20261116: 另一主力（ZCode GLM-5.3-Flash，弱档层4）的 AUTO
+        # 请求（未点名 claude）：全部非 claude 可派主力槽（两 OpenCode + CBGLM + 该层）
+        # 占满、claude 空闲 → 选中 claude。qoder Max 组合已移出弱档，请求组合改用
+        # zcode:GLM-5.3-Flash 保持「未点名 claude 的 AUTO 请求」本意。
         self.occupy_non_claude_mains()
-        r = dp.select_and_claim(self.store, task_id='auto', runtime='qoder',
-                                model='Qwen4-Max-Preview', workspace=self.ws('auto'),
+        r = dp.select_and_claim(self.store, task_id='auto', runtime='zcode',
+                                model='GLM-5.3-Flash', workspace=self.ws('auto'),
                                 prompt_sha256='p', stage='s', now=OFFPEAK_NIGHT,
                                 executor='auto', _preclaim=False)
         self.assertTrue(r.get('routing_required'), r)
@@ -195,18 +207,18 @@ class CapacityAndRouting(_ClaudeBase):
         self.assertEqual(st['rotation']['committed_zcode'], 0)
 
     def test_auto_claude_entry_does_not_bypass_fair_selection(self):
-        # BW-CLAUDE-DEEPSEEK-S4 反例：AUTO 的 claude 入口请求绝不绕过公平选择直接认领
-        # 自己那槽——先占住最高层 CodeBuddy（新最高层由独立回归验证），claude 请求按层序
-        # routing 到 Max 层；BW-CUSTOM-MAX-RESUME-20261018-S1 起 Max 层内自定义优先。
-        self.assertTrue(self._reserve('cb', 'codebuddy', 'deepseek-v4.1-flash',
-                                      'codebuddy').get('allowed'))
+        # BW-CLAUDE-DEEPSEEK-S4 反例（BW-WEAK-RESTRUCTURE-20261116 适配）：AUTO 的 claude
+        # 入口请求绝不绕过公平选择直接认领自己那槽——claude 在现行弱档是层3，其上的
+        # OpenCode(1)/CBGLM(2) 空闲时，claude 请求按层序 routing 到层首
+        # opencode:deepseek-v4.1-flash-free（两 OpenCode 同级，stable tie 取前者），
+        # 绝不先认领 claude。旧弱档最高层 Max/CB deepseek 已移出弱档。
         r = dp.select_and_claim(self.store, task_id='afc', runtime='claude',
                                 model='deepseek-flash', workspace=self.ws('afc'),
                                 prompt_sha256='p' + '0' * 63, stage='s',
                                 now=OFFPEAK_NIGHT, executor='auto', _preclaim=False)
         self.assertFalse(r.get('allowed'), r)
         self.assertTrue(r.get('routing_required'), r)
-        self.assertEqual(r['selected']['pool_key'], dp.CN_MAX_POOL_KEY, r)
+        self.assertEqual(r['selected']['pool_key'], dp.OPENCODE_DEEPSEEK_POOL_KEY, r)
 
     def test_auto_claude_entry_peak_now_claims_in_strong_mode(self):
         # 两个 Max 槽都满后，高峰时段强档仍优先选 Claude，再考虑 ZCode。
@@ -225,8 +237,16 @@ class CapacityAndRouting(_ClaudeBase):
     def test_auto_claude_entry_peak_refused_in_weak_mode(self):
         # weak（默认）档恢复既有工作日高峰门：高峰 AUTO 的 claude 入口如实
         # `main_force_window_closed`（sent=false、零占位），离峰则正常可派。
-        self.assertTrue(self._reserve('hw1', 'zcode', 'GLM-5.3', 'zcode',
-                                      PEAK_WEEKDAY).get('allowed'))
+        # BW-WEAK-RESTRUCTURE-20261116: 现行弱档层序 OpenCode(1) > CBGLM(2) > claude(3)
+        # （旧弱档 claude 层3 之上只有 Max/ZCode，均已移出弱档）——离峰 AUTO 要真实落
+        # claude，必须先占满其上的 OpenCode 两槽与 CBGLM；这些池无时段门，可在高峰时刻
+        # 预先占位。
+        self.assertTrue(self._reserve('hw1', 'opencode', dp.OPENCODE_DEEPSEEK_MODEL,
+                                      'opencode', PEAK_WEEKDAY).get('allowed'))
+        self.assertTrue(self._reserve('hw2', 'opencode', dp.OPENCODE_GLM_MODEL,
+                                      'opencode', PEAK_WEEKDAY).get('allowed'))
+        self.assertTrue(self._reserve('hw3', 'codebuddy', dp.CODEBUDDY_GLM_MODEL,
+                                      'codebuddy', PEAK_WEEKDAY).get('allowed'))
         r = self.claim_claude('apw', now=PEAK_WEEKDAY, executor='auto')
         self.assertFalse(r.get('allowed'), r)
         self.assertEqual(r['reason'], 'main_force_window_closed', r)
@@ -236,24 +256,31 @@ class CapacityAndRouting(_ClaudeBase):
         self.assertEqual(r2['pool_key'], CLAUDE, r2)
 
     def test_total_guard_blocks_claude_with_migration_debt(self):
-        # BW-CODEBUDDY-MAIN-S3 + BW-WORKER-WIDGET-20261018-S3 + BW-OPENCODE-20261019：
-        # 真实国内在途已达物理总 16（8 个非 claude 主力含 CodeBuddy deepseek、恢复的
-        # ZCode 1 槽 + GLM 独立 1 槽在途 + 4 个 Flash + 1 个 claude 在途 + 1 条 retired
-        # 池超额迁移在途 + 1 条 strong 遗留 Sonus），claude 自身按容量看似仍空（1/2），
-        # 但总守卫对 claude 同样生效，绝不派第 17 个。显式点名也如实拒绝。
+        # BW-CODEBUDDY-MAIN-S3 + BW-WORKER-WIDGET-20261018-S3 + BW-OPENCODE-20261019
+        # （BW-WEAK-RESTRUCTURE-20261116 适配：物理总 16→17）：
+        # 真实国内在途已达物理总 17（全部非 claude 可派主力槽——weak 4 槽 + strong 5 槽，
+        # 含恢复的 ZCode 1 槽与弱档专用 GLM-5.3-Flash 1 槽——+ 4 个 Flash + 1 个 claude
+        # 在途 + 1 条 retired 池超额迁移在途 + 1 条 strong 遗留 Sonus），claude 自身按
+        # 容量看似仍空（1/2），但总守卫对 claude 同样生效，绝不派第 18 个。显式点名也
+        # 如实拒绝。两地区 Flash 与 codebuddy deepseek 已移出所有档位的新派集合，按
+        # 「重构前派出、仍在途」的真实遗留形态直插。
         self.occupy_non_claude_mains()
-        for i in range(2):
-            self.assertTrue(self._reserve(f'of{i}', 'qoder', 'Qwen3.8-Flash',
-                                          'qoder').get('allowed'))
-            self.assertTrue(self._reserve(f'cf{i}', 'qodercn', 'Qwen3.8-Flash',
-                                          'qodercn').get('allowed'))
         self.assertTrue(self.claim_claude('pre').get('allowed'))
         with closing(dp.connect(self.store)) as conn:
             conn.execute('INSERT INTO attempts(token, task_id, runtime, model, pool_key, '
                          "state, reserved_at_utc) VALUES(?,?,?,?,?,?,?)",
-                         ('glm-inflight', 'gi', 'codebuddy', 'glm-5.3-flash',
-                          'codebuddy:glm-5.3-flash', 'running',
+                         ('cbds-inflight', 'cbds', 'codebuddy', dp.CODEBUDDY_MODEL,
+                          dp.CODEBUDDY_POOL_KEY, 'running',
                           dp._iso(OFFPEAK_NIGHT)))
+            for i in range(2):
+                conn.execute('INSERT INTO attempts(token, task_id, runtime, model, '
+                             'pool_key, state, reserved_at_utc) VALUES(?,?,?,?,?,?,?)',
+                             (f'of{i}-inflight', f'of{i}', 'qoder', 'Qwen3.8-Flash',
+                              dp.QFLASH_POOL_KEY, 'running', dp._iso(OFFPEAK_NIGHT)))
+                conn.execute('INSERT INTO attempts(token, task_id, runtime, model, '
+                             'pool_key, state, reserved_at_utc) VALUES(?,?,?,?,?,?,?)',
+                             (f'cf{i}-inflight', f'cf{i}', 'qodercn', 'Qwen3.8-Flash',
+                              dp.CN_FLASH_POOL_KEY, 'running', dp._iso(OFFPEAK_NIGHT)))
             conn.execute('INSERT INTO attempts(token, task_id, runtime, model, pool_key, '
                          "state, reserved_at_utc) VALUES(?,?,?,?,?,?,?)",
                          ('legacy-mig', 'lm', 'qodercn', 'DeepSeek-Flash',
@@ -265,7 +292,7 @@ class CapacityAndRouting(_ClaudeBase):
                           dp.SONUS_POOL_KEY, 'running',
                           dp._iso(OFFPEAK_NIGHT)))
         st = dp.status(self.store, now=OFFPEAK_NIGHT)
-        self.assertEqual(st['domestic']['active'], 16, st['domestic'])
+        self.assertEqual(st['domestic']['active'], 17, st['domestic'])
         self.assertEqual(st['pools'][CLAUDE]['active'], 1, st['pools'][CLAUDE])
         r = self.claim_claude('late', executor='claude')
         self.assertFalse(r.get('allowed'), r)

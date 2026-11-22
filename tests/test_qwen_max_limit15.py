@@ -24,9 +24,14 @@ REPO = Path(__file__).resolve().parent.parent
 SCRIPTS = REPO / 'scripts'
 if str(SCRIPTS) not in sys.path:
     sys.path.insert(0, str(SCRIPTS))
+if str(REPO / 'tests') not in sys.path:
+    sys.path.insert(0, str(REPO / 'tests'))
 
 import dispatch_pool as dp  # noqa: E402
 import worker_status_widget as wsw  # noqa: E402
+# BW-WEAK-RESTRUCTURE-20261116: 两内置 Max 与 zcode:GLM-5.3 均已移出弱档，限额短窗的
+# 派发门用例改在 strong 档（两池常态、无时段门）验证。
+from dispatch_mode_support import dispatch_mode  # noqa: E402
 
 QMAX = 'qoder:Qwen4-Max-Preview'
 CNMAX = 'qodercn:Qwen4-Max-Preview'
@@ -114,39 +119,44 @@ class TestDispatchWindow(_PoolBase):
         return tok
 
     def test_899_rejects_and_exactly_900_allows(self):
-        for pk, runtime, tag in ((QMAX, 'qoder', 'qi'), (CNMAX, 'qodercn', 'qc')):
-            with self.subTest(pool=pk):
-                self._bound_and_release(pk, tag)
-                denied = self.claim(f'new-{tag}', runtime, 'Qwen4-Max-Preview', runtime,
-                                    T0 + timedelta(seconds=899))
-                self.assertFalse(denied.get('allowed'), denied)
-                self.assertEqual(denied['reason'], 'main_force_limited', denied)
-                allowed = self.claim(f'exp-{tag}', runtime, 'Qwen4-Max-Preview', runtime,
-                                     T0 + timedelta(seconds=900))
-                self.assertTrue(allowed.get('allowed'), allowed)
-                self.assertEqual(allowed['pool_key'], pk)
-                # 只读放行：原标记与证据仍在，不声称恢复。
-                with closing(dp.connect(self.store)) as conn:
-                    row = conn.execute('SELECT limited FROM main_force_limits '
-                                       'WHERE pool_key=?', (pk,)).fetchone()
-                    self.assertEqual(int(row['limited']), 1)
+        # BW-WEAK-RESTRUCTURE-20261116: 两内置 Max 已移出弱档，899/900 秒派发门改在
+        # strong 档验证（两池 strong 常态、无时段门）。
+        with dispatch_mode('strong'):
+            for pk, runtime, tag in ((QMAX, 'qoder', 'qi'), (CNMAX, 'qodercn', 'qc')):
+                with self.subTest(pool=pk):
+                    self._bound_and_release(pk, tag)
+                    denied = self.claim(f'new-{tag}', runtime, 'Qwen4-Max-Preview', runtime,
+                                        T0 + timedelta(seconds=899))
+                    self.assertFalse(denied.get('allowed'), denied)
+                    self.assertEqual(denied['reason'], 'main_force_limited', denied)
+                    allowed = self.claim(f'exp-{tag}', runtime, 'Qwen4-Max-Preview', runtime,
+                                         T0 + timedelta(seconds=900))
+                    self.assertTrue(allowed.get('allowed'), allowed)
+                    self.assertEqual(allowed['pool_key'], pk)
+                    # 只读放行：原标记与证据仍在，不声称恢复。
+                    with closing(dp.connect(self.store)) as conn:
+                        row = conn.execute('SELECT limited FROM main_force_limits '
+                                           'WHERE pool_key=?', (pk,)).fetchone()
+                        self.assertEqual(int(row['limited']), 1)
 
     def test_repeat_limit_retimes_from_newer_ended_at(self):
-        self._bound_and_release(QMAX, 'r1', ended=T0)
-        later = T0 + timedelta(seconds=600)
-        tok2 = 'bound-r2'
-        self.insert_attempt(tok2, 'b-r2', QMAX, 'running', ended=later)
-        self.mark(QMAX, 'b-r2', tok2, now=later)
-        with closing(dp.connect(self.store)) as conn:
-            conn.execute("UPDATE attempts SET state='finished', "
-                         "terminal='finished' WHERE token=?", (tok2,))
-        # 第一窗口到期（1200 秒）但新限额只过了 600 秒：仍拒绝；1500 秒后放行。
-        denied = self.claim('re1', 'qoder', 'Qwen4-Max-Preview', 'qoder',
-                            later + timedelta(seconds=899))
-        self.assertEqual(denied['reason'], 'main_force_limited', denied)
-        allowed = self.claim('re2', 'qoder', 'Qwen4-Max-Preview', 'qoder',
-                             later + timedelta(seconds=900))
-        self.assertTrue(allowed.get('allowed'), allowed)
+        # BW-WEAK-RESTRUCTURE-20261116: qoder:Qwen4-Max-Preview 已移出弱档，改在 strong 档。
+        with dispatch_mode('strong'):
+            self._bound_and_release(QMAX, 'r1', ended=T0)
+            later = T0 + timedelta(seconds=600)
+            tok2 = 'bound-r2'
+            self.insert_attempt(tok2, 'b-r2', QMAX, 'running', ended=later)
+            self.mark(QMAX, 'b-r2', tok2, now=later)
+            with closing(dp.connect(self.store)) as conn:
+                conn.execute("UPDATE attempts SET state='finished', "
+                             "terminal='finished' WHERE token=?", (tok2,))
+            # 第一窗口到期（1200 秒）但新限额只过了 600 秒：仍拒绝；1500 秒后放行。
+            denied = self.claim('re1', 'qoder', 'Qwen4-Max-Preview', 'qoder',
+                                later + timedelta(seconds=899))
+            self.assertEqual(denied['reason'], 'main_force_limited', denied)
+            allowed = self.claim('re2', 'qoder', 'Qwen4-Max-Preview', 'qoder',
+                                 later + timedelta(seconds=900))
+            self.assertTrue(allowed.get('allowed'), allowed)
 
     def test_future_or_malformed_time_fail_open_and_keep_evidence(self):
         # 沿用既有安全语义：非法/未来时间不伪造有效窗口（不阻断新派发），但证据保留。
@@ -176,46 +186,52 @@ class TestDispatchWindow(_PoolBase):
             return dp._quota_limit_window_active(conn, pk, now)
 
     def test_two_max_pools_independent_and_zcode_keeps_1800(self):
-        self._bound_and_release(QMAX, 'ind-q')
-        # 国际 Max 限额不连坐 CN 内置 Max：899 秒时 CN 正常可选。
-        ok = self.claim('ind-c', 'qodercn', 'Qwen4-Max-Preview', 'qodercn',
-                        T0 + timedelta(seconds=899))
-        self.assertTrue(ok.get('allowed'), ok)
-        # 原三池保持 1800 秒：ZCode 限额在 900 秒后仍拒绝。
-        self._bound_and_release(ZC, 'ind-z')
-        denied = self.claim('ind-z2', 'zcode', 'GLM-5.3', 'zcode',
-                            T0 + timedelta(seconds=1500))
-        self.assertEqual(denied['reason'], 'main_force_limited', denied)
+        # BW-WEAK-RESTRUCTURE-20261116: 两内置 Max 与 zcode:GLM-5.3 均已移出弱档，
+        # 独立性/1800 秒口径改在 strong 档验证。
+        with dispatch_mode('strong'):
+            self._bound_and_release(QMAX, 'ind-q')
+            # 国际 Max 限额不连坐 CN 内置 Max：899 秒时 CN 正常可选。
+            ok = self.claim('ind-c', 'qodercn', 'Qwen4-Max-Preview', 'qodercn',
+                            T0 + timedelta(seconds=899))
+            self.assertTrue(ok.get('allowed'), ok)
+            # 原三池保持 1800 秒：ZCode 限额在 900 秒后仍拒绝。
+            self._bound_and_release(ZC, 'ind-z')
+            denied = self.claim('ind-z2', 'zcode', 'GLM-5.3', 'zcode',
+                                T0 + timedelta(seconds=1500))
+            self.assertEqual(denied['reason'], 'main_force_limited', denied)
 
     def test_consume_within_window_rejected_and_releases_own_reserved(self):
         # consume 与派发门同口径：900 秒内消费已预留 token 一致拒绝，只把本 token 的
         # reserved 真实释放为 start_failed；恰满 900 秒放行。
-        mine = self.claim('cm1', 'qoder', 'Qwen4-Max-Preview', 'qoder', T0)
-        self.assertTrue(mine.get('allowed'), mine)
-        ev = self.base / 'cm1.json'
-        ev.write_text(json.dumps({'errors': [{'status': 429,
-                                              'message': 'rate limited'}]}),
-                      encoding='utf-8')
-        dp.record_main_force_limit(
-            self.store, QMAX, task_id='cm1', attempt_token=mine['token'],
-            evidence_path=str(ev),
-            evidence_sha256=hashlib.sha256(ev.read_bytes()).hexdigest(), now=T0)
-        out = dp.consume_for_entry(self.store, task_id='cm1', runtime='qoder',
-                                   model='Qwen4-Max-Preview', workspace=self.ws('cm1'),
-                                   prompt_sha256=SHA64, stage='s',
-                                   claim_token=mine['token'],
-                                   now=T0 + timedelta(seconds=899))
-        self.assertFalse(out.get('allowed'), out)
-        self.assertEqual(out['reason'], 'main_force_limited', out)
-        self.assertTrue(out.get('capacity_released'), out)
-        with closing(dp.connect(self.store)) as conn:
-            r = conn.execute('SELECT state FROM attempts WHERE token=?',
-                             (mine['token'],)).fetchone()
-            self.assertEqual(r['state'], 'start_failed')
-        later = self.claim('cm2', 'qoder', 'Qwen4-Max-Preview', 'qoder',
-                           # 参照时刻是绑定 attempt 的 ended_at（T0+899 释放时刻）。
-                           T0 + timedelta(seconds=899 + 900))
-        self.assertTrue(later.get('allowed'), later)
+        # BW-WEAK-RESTRUCTURE-20261116: qoder:Qwen4-Max-Preview 已移出弱档；consume 按
+        # 当前档重新裁决，整个用例（reserve+consume+复派）都在 strong 档内验证。
+        with dispatch_mode('strong'):
+            mine = self.claim('cm1', 'qoder', 'Qwen4-Max-Preview', 'qoder', T0)
+            self.assertTrue(mine.get('allowed'), mine)
+            ev = self.base / 'cm1.json'
+            ev.write_text(json.dumps({'errors': [{'status': 429,
+                                                  'message': 'rate limited'}]}),
+                          encoding='utf-8')
+            dp.record_main_force_limit(
+                self.store, QMAX, task_id='cm1', attempt_token=mine['token'],
+                evidence_path=str(ev),
+                evidence_sha256=hashlib.sha256(ev.read_bytes()).hexdigest(), now=T0)
+            out = dp.consume_for_entry(self.store, task_id='cm1', runtime='qoder',
+                                       model='Qwen4-Max-Preview', workspace=self.ws('cm1'),
+                                       prompt_sha256=SHA64, stage='s',
+                                       claim_token=mine['token'],
+                                       now=T0 + timedelta(seconds=899))
+            self.assertFalse(out.get('allowed'), out)
+            self.assertEqual(out['reason'], 'main_force_limited', out)
+            self.assertTrue(out.get('capacity_released'), out)
+            with closing(dp.connect(self.store)) as conn:
+                r = conn.execute('SELECT state FROM attempts WHERE token=?',
+                                 (mine['token'],)).fetchone()
+                self.assertEqual(r['state'], 'start_failed')
+            later = self.claim('cm2', 'qoder', 'Qwen4-Max-Preview', 'qoder',
+                               # 参照时刻是绑定 attempt 的 ended_at（T0+899 释放时刻）。
+                               T0 + timedelta(seconds=899 + 900))
+            self.assertTrue(later.get('allowed'), later)
 
     def test_window_status_reports_pool_specific_expiry(self):
         tok = 'st-q'

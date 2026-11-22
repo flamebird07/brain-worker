@@ -17,6 +17,12 @@
   DeepSeek 证据 GLM 仍可 reserve/consume，两槽互不占用；
 - 浮窗展示纯函数：限额窗口内空闲显示"上轮限额"、真实运行中只显示"运行中"（运行
   优先于历史限额）、到期撤下且不声称恢复；旧标记时间不借杂项 updated_at 延长。
+- BW-WEAK-RESTRUCTURE-20261116（用户明确指令，本文件按其同步期望）：弱档收窄后
+  zcode:GLM-5.3 只属 strong/medium、codebuddy:deepseek-v4.1-flash 无任何档位可新派。
+  1800 秒窗口机制与档位无关——原在缺省弱档下对这两池的新派裁决改在 strong 档复现
+  （strong 无时段门，拒绝原因如实为 main_force_limited 而非 mode_excluded）；
+  codebuddy:deepseek 的弱档显式请求改为负例（mode_excluded、sent=false）。GLM 用例
+  保持弱档不变。
 
 所有用例都用合成数据，不真实关机、不联网、不读写真实 ~/.brain-worker。
 """
@@ -39,6 +45,7 @@ if str(REPO / 'tests') not in sys.path:
 import claude_direct as cd  # noqa: E402
 import dispatch_pool as dp  # noqa: E402
 import worker_status_widget as wsw  # noqa: E402
+from dispatch_mode_support import dispatch_mode  # noqa: E402  # BW-WEAK-RESTRUCTURE-20261116
 
 ZC = 'zcode:GLM-5.3'
 CL = 'claude:deepseek-flash'
@@ -198,37 +205,41 @@ class TestQuotaLimitWindow(_PoolBase):
     """1799 拒 / 1800 放行；到期不删证据、不声称恢复、不泄漏锁、跨连接一致。"""
 
     def test_1799_rejects_and_1800_allows_per_pool(self):
-        for pk, runtime, model, tag in ((ZC, 'zcode', 'GLM-5.3', 'zc'),
-                                        (CL, 'claude', 'deepseek-flash', 'cl')):
-            with self.subTest(pool=pk):
-                # task/文件/目录名一律不带 ':'（Windows 路径安全）。
-                tok = f'bound-{tag}'
-                self.insert_attempt(tok, f'b-{tag}', pk, 'running', ended=T0)
-                self.mark(pk, f'b-{tag}', tok)
-                # BW-ZCODE-RESTORE-1-20261022：zcode 容量严格 1——先把绑定占位真实置为
-                # 终态释放（模拟该失败 attempt 自然结束），使本用例只验证 1800 秒窗口
-                # 本身，不与容量满混淆；claude（容量 2）同样处理保持两池口径一致。
-                with closing(dp.connect(self.store)) as conn:
-                    conn.execute(
-                        "UPDATE attempts SET state='finished', terminal='finished' "
-                        'WHERE token=?', (tok,))
-                denied = self.claim(f'new-{tag}', runtime, model, runtime,
-                                    T0 + timedelta(seconds=1799))
-                self.assertFalse(denied.get('allowed'), denied)
-                self.assertEqual(denied['reason'], 'main_force_limited', denied)
-                allowed = self.claim(f'exp-{tag}', runtime, model, runtime,
-                                     T0 + timedelta(seconds=1800))
-                self.assertTrue(allowed.get('allowed'), allowed)
-                self.assertEqual(allowed['pool_key'], pk)
-                # 到期只是**只读**放行：原标记 limited=1、绑定证据、错误原件都还在。
-                snaps = dp.status(self.store, now=T0 + timedelta(seconds=1801))
-                self.assertTrue(snaps['pools'][pk]['limited'], snaps['pools'][pk])
-                lim = snaps['main_force_limits'][pk]
-                self.assertEqual(int(lim['limited']), 1)
-                self.assertTrue(Path(lim['evidence_path']).is_file())
-                self.assertEqual(lim['evidence_sha256'],
-                                 hashlib.sha256(
-                                     Path(lim['evidence_path']).read_bytes()).hexdigest())
+        # BW-WEAK-RESTRUCTURE-20261116: zcode:GLM-5.3 与 claude:deepseek-flash 的弱档
+        # 新派资格被移除/调整——1800 秒窗口机制与档位无关，改在 strong 档复现（strong
+        # 无时段门，窗口拒绝如实落 main_force_limited）。
+        with dispatch_mode('strong'):
+            for pk, runtime, model, tag in ((ZC, 'zcode', 'GLM-5.3', 'zc'),
+                                            (CL, 'claude', 'deepseek-flash', 'cl')):
+                with self.subTest(pool=pk):
+                    # task/文件/目录名一律不带 ':'（Windows 路径安全）。
+                    tok = f'bound-{tag}'
+                    self.insert_attempt(tok, f'b-{tag}', pk, 'running', ended=T0)
+                    self.mark(pk, f'b-{tag}', tok)
+                    # BW-ZCODE-RESTORE-1-20261022：zcode 容量严格 1——先把绑定占位真实置为
+                    # 终态释放（模拟该失败 attempt 自然结束），使本用例只验证 1800 秒窗口
+                    # 本身，不与容量满混淆；claude（容量 2）同样处理保持两池口径一致。
+                    with closing(dp.connect(self.store)) as conn:
+                        conn.execute(
+                            "UPDATE attempts SET state='finished', terminal='finished' "
+                            'WHERE token=?', (tok,))
+                    denied = self.claim(f'new-{tag}', runtime, model, runtime,
+                                        T0 + timedelta(seconds=1799))
+                    self.assertFalse(denied.get('allowed'), denied)
+                    self.assertEqual(denied['reason'], 'main_force_limited', denied)
+                    allowed = self.claim(f'exp-{tag}', runtime, model, runtime,
+                                         T0 + timedelta(seconds=1800))
+                    self.assertTrue(allowed.get('allowed'), allowed)
+                    self.assertEqual(allowed['pool_key'], pk)
+                    # 到期只是**只读**放行：原标记 limited=1、绑定证据、错误原件都还在。
+                    snaps = dp.status(self.store, now=T0 + timedelta(seconds=1801))
+                    self.assertTrue(snaps['pools'][pk]['limited'], snaps['pools'][pk])
+                    lim = snaps['main_force_limits'][pk]
+                    self.assertEqual(int(lim['limited']), 1)
+                    self.assertTrue(Path(lim['evidence_path']).is_file())
+                    self.assertEqual(lim['evidence_sha256'],
+                                     hashlib.sha256(
+                                         Path(lim['evidence_path']).read_bytes()).hexdigest())
 
     def test_two_pools_independent(self):
         tok = 'bound-z'
@@ -241,27 +252,36 @@ class TestQuotaLimitWindow(_PoolBase):
 
     def test_other_process_other_workspace_same_store_also_refused(self):
         # 已在运行的另一进程（独立连接）绑定的真实失败，跨连接/跨 workspace 同样拒新派。
+        # BW-WEAK-RESTRUCTURE-20261116: 窗口机制改在 strong 档复现（zcode:GLM-5.3 已移出
+        # 弱档可派集合，strong 无时段门，拒绝如实落 main_force_limited）。
         tok = 'proc2-bound'
         self.insert_attempt(tok, 'proc2-task', ZC, 'running', ended=T0)
         self.mark(ZC, 'proc2-task', tok)
-        r = self.claim('proc3-task', 'zcode', 'GLM-5.3', 'zcode',
-                       T0 + timedelta(seconds=60))
+        with dispatch_mode('strong'):
+            r = self.claim('proc3-task', 'zcode', 'GLM-5.3', 'zcode',
+                           T0 + timedelta(seconds=60))
         self.assertFalse(r.get('allowed'), r)
         self.assertEqual(r['reason'], 'main_force_limited', r)
 
     def test_in_flight_placeholder_never_preempted(self):
         # 窗口拒绝只作用于**新派发**：绑定失败的原 attempt 保持 running 不动。
+        # BW-WEAK-RESTRUCTURE-20261116: 窗口机制改在 strong 档复现，并显式断言拒绝原因
+        # 是 main_force_limited（而非档位排除），机制不被 mode_excluded 掩盖。
         tok = 'busy-bound'
         self.insert_attempt(tok, 'busy-task', ZC, 'running', ended=None)
         self.mark(ZC, 'busy-task', tok, now=T0)
-        r = self.claim('later', 'zcode', 'GLM-5.3', 'zcode',
-                       T0 + timedelta(seconds=60))
+        with dispatch_mode('strong'):
+            r = self.claim('later', 'zcode', 'GLM-5.3', 'zcode',
+                           T0 + timedelta(seconds=60))
         self.assertFalse(r.get('allowed'), r)
+        self.assertEqual(r['reason'], 'main_force_limited', r)
         self.assertEqual(self.state_of(tok), 'running')
 
     def test_consume_releases_only_own_reserved_and_lock_not_leaked(self):
         # 预留 consume 在窗口内一致拒绝；本 token 的 reserved 真实释放为 start_failed
         # （终态释放不泄漏锁——后续新事务立即可成功），其它在途不受影响。
+        # BW-WEAK-RESTRUCTURE-20261116: 窗口机制改在 strong 档复现（zcode:GLM-5.3 与
+        # claude 的新派资格已不在弱档，strong 无时段门，拒绝如实落 main_force_limited）。
         bound = 'lock-bound'
         self.insert_attempt(bound, 'lock-b', ZC, 'running', ended=T0)
         self.mark(ZC, 'lock-b', bound)
@@ -274,26 +294,30 @@ class TestQuotaLimitWindow(_PoolBase):
                          'WHERE token=?', (bound,))
         other = 'lock-other'
         self.insert_attempt(other, 'lock-o', CL, 'running')
-        mine = self.claim('lock-mine', 'zcode', 'GLM-5.3', 'zcode',
-                          T0 - timedelta(seconds=3600))
-        self.assertTrue(mine.get('allowed'), mine)
-        out = dp.consume_for_entry(self.store, task_id='lock-mine', runtime='zcode',
-                                   model='GLM-5.3', workspace=self.ws('lock-mine'),
-                                   prompt_sha256=SHA64, stage='s',
-                                   claim_token=mine['token'],
-                                   now=T0 + timedelta(seconds=10))
-        self.assertFalse(out.get('allowed'), out)
-        self.assertEqual(out['reason'], 'main_force_limited', out)
-        self.assertTrue(out.get('capacity_released'), out)
+        with dispatch_mode('strong'):
+            mine = self.claim('lock-mine', 'zcode', 'GLM-5.3', 'zcode',
+                              T0 - timedelta(seconds=3600))
+            self.assertTrue(mine.get('allowed'), mine)
+            out = dp.consume_for_entry(self.store, task_id='lock-mine',
+                                       runtime='zcode',
+                                       model='GLM-5.3', workspace=self.ws('lock-mine'),
+                                       prompt_sha256=SHA64, stage='s',
+                                       claim_token=mine['token'],
+                                       now=T0 + timedelta(seconds=10))
+            self.assertFalse(out.get('allowed'), out)
+            self.assertEqual(out['reason'], 'main_force_limited', out)
+            self.assertTrue(out.get('capacity_released'), out)
+            # 不泄漏锁：紧随其后的普通预留（Claude 池）在同一库上立即成功。
+            nxt = self.claim('lock-next', 'claude', 'deepseek-flash', 'claude',
+                             T0 + timedelta(seconds=11))
         self.assertEqual(self.state_of(mine['token']), 'start_failed')
         self.assertEqual(self.state_of(other), 'running')
-        # 不泄漏锁：紧随其后的普通预留（Claude 池）在同一库上立即成功。
-        nxt = self.claim('lock-next', 'claude', 'deepseek-flash', 'claude',
-                        T0 + timedelta(seconds=11))
         self.assertTrue(nxt.get('allowed'), nxt)
 
     def test_auto_explicit_consume_consistent(self):
         # 三口径一致：窗口内 AUTO 不选中 ZCode、显式入口拒绝、预留 consume 拒绝。
+        # BW-WEAK-RESTRUCTURE-20261116: 三口径裁决改在 strong 档复现（zcode:GLM-5.3 已
+        # 移出弱档可派集合；strong 无时段门，AUTO 在 ZCode 被窗口剔除后仍按层序落更高层）。
         bound = 'tri-bound'
         self.insert_attempt(bound, 'tri-b', ZC, 'running', ended=T0)
         self.mark(ZC, 'tri-b', bound)
@@ -305,13 +329,14 @@ class TestQuotaLimitWindow(_PoolBase):
         with closing(dp.connect(self.store)) as conn:
             self.assertFalse(dp._quota_limit_window_active(conn, CL, T0 + timedelta(seconds=60)))
         now = T0 + timedelta(seconds=60)
-        r = dp.select_and_claim(self.store, task_id='tri-auto', runtime='zcode',
-                                model='GLM-5.3', workspace=self.ws('tri-auto'),
-                                prompt_sha256=SHA64, now=now, executor='auto',
-                                _preclaim=False)
-        chosen = (r.get('selected') or {}).get('pool_key') or r.get('pool_key')
-        self.assertNotEqual(chosen, ZC, r)
-        exp = self.claim('tri-exp', 'zcode', 'GLM-5.3', 'zcode', now)
+        with dispatch_mode('strong'):
+            r = dp.select_and_claim(self.store, task_id='tri-auto', runtime='zcode',
+                                    model='GLM-5.3', workspace=self.ws('tri-auto'),
+                                    prompt_sha256=SHA64, now=now, executor='auto',
+                                    _preclaim=False)
+            chosen = (r.get('selected') or {}).get('pool_key') or r.get('pool_key')
+            self.assertNotEqual(chosen, ZC, r)
+            exp = self.claim('tri-exp', 'zcode', 'GLM-5.3', 'zcode', now)
         self.assertFalse(exp.get('allowed'), exp)
         self.assertEqual(exp['reason'], 'main_force_limited', exp)
 
@@ -364,6 +389,10 @@ class TestCodeBuddyIndependentOfWindow(_PoolBase):
     两模型槽各自独立、优先级不动。"""
 
     def test_glm_reserve_and_consume_without_any_evidence(self):
+        # BW-WEAK-RESTRUCTURE-20261116: GLM 用例保持弱档不变（弱档层2、无证据仍可
+        # reserve/consume）；codebuddy:deepseek-v4.1-flash 已无任何档位可新派——弱档
+        # 显式 DeepSeek 请求如实 mode_excluded（sent=false、零占位），GLM 槽位独立性
+        # 不受影响。
         r = dp.reserve(self.store, task_id='glm1', runtime='codebuddy',
                        model='glm-5.3-flash', workspace=self.ws('glm1'),
                        prompt_sha256=SHA64, stage='s', now=T0,
@@ -376,12 +405,15 @@ class TestCodeBuddyIndependentOfWindow(_PoolBase):
                                  now=T0, executor='codebuddy',
                                  codebuddy_glm_allowed=False)
         self.assertTrue(c.get('allowed'), c)
-        # 独立槽：DeepSeek 同时在途不挡 GLM 第 2 用例的入口，反之亦然。
+        # 弱档显式 DeepSeek 请求：mode_excluded 负例（零新占位）。
         d = dp.reserve(self.store, task_id='cb1', runtime='codebuddy',
                        model='deepseek-v4.1-flash', workspace=self.ws('cb1'),
                        prompt_sha256=SHA64, stage='s', now=T0,
                        executor='codebuddy', _preclaim=False)
-        self.assertTrue(d.get('allowed'), d)
+        self.assertFalse(d.get('allowed'), d)
+        self.assertEqual(d['reason'], 'mode_excluded', d)
+        self.assertFalse(d.get('sent'), d)
+        self.assertIsNone(d.get('token'), d)
         # 同模型第 2 个仍 capacity_full（各 1 独立槽，不减容量）。
         again = dp.reserve(self.store, task_id='glm2', runtime='codebuddy',
                            model='glm-5.3-flash', workspace=self.ws('glm2'),

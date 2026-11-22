@@ -267,7 +267,13 @@ class ProbeBehaviourTests(_CfgBase):
 class StageSelectionIntegrationTests(unittest.TestCase):
     """R1G（用户 2026-10-20 授权升级）：确凿 missing 挡（entry_runtime_missing）、
     unknown 与探针崩溃绝不挡（fail-open）、fixed 点名死通道诚实拒绝、全缺如实拒绝；
-    回执可见性字段与硬门同源同一次探测。"""
+    回执可见性字段与硬门同源同一次探测。
+    BW-WEAK-RESTRUCTURE-20261116: 全部 Qoder 池已移出弱档（weak 一律 mode_excluded，
+    会在探针硬门之前过滤掉候选），本组改用弱档可真实新派的两 OpenCode 免费池承载
+    完全相同的探针硬门语义（missing 挡 / unknown 与崩溃 fail-open / fixed 诚实拒绝）。"""
+
+    OC_DS = dp.OPENCODE_DEEPSEEK_POOL_KEY
+    OC_GLM = dp.OPENCODE_GLM_POOL_KEY
 
     def setUp(self):
         self._tmp = tempfile.TemporaryDirectory(prefix='bw-erp-ss-')
@@ -284,7 +290,7 @@ class StageSelectionIntegrationTests(unittest.TestCase):
     def _plan(self, mode='auto', fixed=None):
         auth = {'selection_mode': mode, 'quote': '探针硬门回归',
                 'authorization_scope': {'task_id': 'T-ERP', 'stage': 's1'},
-                'allowed_candidates': ['qoder:Qwen3.8-Flash', 'qodercn:Qwen3.8-Flash']}
+                'allowed_candidates': [self.OC_DS, self.OC_GLM]}
         if mode == 'fixed':
             auth['user_direct_selection'] = True
             auth['runtime'], auth['model'] = fixed
@@ -297,31 +303,31 @@ class StageSelectionIntegrationTests(unittest.TestCase):
                                           return_value=(statuses, missing))
 
     def test_receipt_carries_visibility_fields(self):
-        with self._probe({'qoder:Qwen3.8-Flash': erp.PRESENT,
-                          'qodercn:Qwen3.8-Flash': erp.PRESENT}):
+        with self._probe({self.OC_DS: erp.PRESENT,
+                          self.OC_GLM: erp.PRESENT}):
             receipt = self._plan()
         self.assertIsNone(receipt.get('refused'))
         self.assertEqual(set(receipt['entry_runtime_status']),
-                         {'qoder:Qwen3.8-Flash', 'qodercn:Qwen3.8-Flash'})
+                         {self.OC_DS, self.OC_GLM})
         self.assertEqual(receipt['entry_runtime_missing'], [])
 
     def test_gate_excludes_definitive_missing(self):
-        with self._probe({'qoder:Qwen3.8-Flash': erp.MISSING,
-                          'qodercn:Qwen3.8-Flash': erp.PRESENT}):
+        with self._probe({self.OC_DS: erp.MISSING,
+                          self.OC_GLM: erp.PRESENT}):
             receipt = self._plan()
         self.assertIsNone(receipt.get('refused'))
-        self.assertEqual(receipt['selected']['pool_key'], 'qodercn:Qwen3.8-Flash')
+        self.assertEqual(receipt['selected']['pool_key'], self.OC_GLM)
         excluded = {row['pool_key']: row['reason']
                     for row in receipt['excluded_candidates_with_reason']}
-        self.assertEqual(excluded.get('qoder:Qwen3.8-Flash'), 'entry_runtime_missing')
-        self.assertEqual(receipt['entry_runtime_missing'], ['qoder:Qwen3.8-Flash'])
+        self.assertEqual(excluded.get(self.OC_DS), 'entry_runtime_missing')
+        self.assertEqual(receipt['entry_runtime_missing'], [self.OC_DS])
 
     def test_unknown_and_probe_crash_never_gate(self):
         outcomes = []
-        for stub in ({'qoder:Qwen3.8-Flash': erp.PRESENT,
-                      'qodercn:Qwen3.8-Flash': erp.PRESENT},
-                     {'qoder:Qwen3.8-Flash': erp.UNKNOWN,
-                      'qodercn:Qwen3.8-Flash': erp.UNKNOWN},
+        for stub in ({self.OC_DS: erp.PRESENT,
+                      self.OC_GLM: erp.PRESENT},
+                     {self.OC_DS: erp.UNKNOWN,
+                      self.OC_GLM: erp.UNKNOWN},
                      RuntimeError('probe crashed')):
             patcher = (unittest.mock.patch.object(erp, 'probe_entry_runtimes',
                                                   side_effect=stub)
@@ -329,28 +335,32 @@ class StageSelectionIntegrationTests(unittest.TestCase):
             with patcher:
                 receipt = self._plan()
             self.assertIsNone(receipt.get('refused'))
-            self.assertEqual(receipt['selected']['pool_key'], 'qoder:Qwen3.8-Flash')
+            self.assertEqual(receipt['selected']['pool_key'], self.OC_DS)
             outcomes.append(receipt['entry_runtime_status'])
-        self.assertEqual(outcomes[1], {'qoder:Qwen3.8-Flash': erp.UNKNOWN,
-                                       'qodercn:Qwen3.8-Flash': erp.UNKNOWN})
+        self.assertEqual(outcomes[1], {self.OC_DS: erp.UNKNOWN,
+                                       self.OC_GLM: erp.UNKNOWN})
         self.assertEqual(outcomes[2], outcomes[1])  # 崩溃降级 unknown，fail-open
 
     def test_fixed_to_dead_runtime_refuses_honestly(self):
-        with self._probe({'qoder:Qwen3.8-Flash': erp.MISSING,
-                          'qodercn:Qwen3.8-Flash': erp.PRESENT}):
-            receipt = self._plan(mode='fixed', fixed=('qoder', 'Qwen3.8-Flash'))
+        # BW-WEAK-RESTRUCTURE-20261116: fixed 点名对象从 qoder:Qwen3.8-Flash（已移出弱档，
+        # 现在会在探针之前被 mode_excluded 拒绝）改为弱档可新派的 opencode 免费池，
+        # 保持「fixed 点名死通道 → 探针 missing 诚实拒绝」本意。
+        with self._probe({self.OC_DS: erp.MISSING,
+                          self.OC_GLM: erp.PRESENT}):
+            receipt = self._plan(mode='fixed',
+                                 fixed=('opencode', dp.OPENCODE_DEEPSEEK_MODEL))
         self.assertEqual(receipt['refused'], 'fixed_candidate_unavailable')
         self.assertEqual(receipt['refused_detail'], 'entry_runtime_missing')
 
     def test_all_missing_refuses_no_eligible(self):
-        with self._probe({'qoder:Qwen3.8-Flash': erp.MISSING,
-                          'qodercn:Qwen3.8-Flash': erp.MISSING}):
+        with self._probe({self.OC_DS: erp.MISSING,
+                          self.OC_GLM: erp.MISSING}):
             receipt = self._plan()
         self.assertEqual(receipt['refused'], 'no_eligible_candidate')
         excluded = {row['pool_key']: row['reason']
                     for row in receipt['excluded_candidates_with_reason']}
-        self.assertEqual(excluded, {'qoder:Qwen3.8-Flash': 'entry_runtime_missing',
-                                    'qodercn:Qwen3.8-Flash': 'entry_runtime_missing'})
+        self.assertEqual(excluded, {self.OC_DS: 'entry_runtime_missing',
+                                    self.OC_GLM: 'entry_runtime_missing'})
 
     def test_early_refusal_receipt_lacks_visibility_fields(self):
         receipt = ss.plan_stage_selection(None, store_path=self.store, task_id='T-ERP',

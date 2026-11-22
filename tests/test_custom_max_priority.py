@@ -1,4 +1,12 @@
-"""CN token plan Max 用户禁用的离线回归；临时 SQLite、假入口、零真实模型。"""
+"""CN token plan Max 用户禁用的离线回归；临时 SQLite、假入口、零真实模型。
+
+BW-WEAK-RESTRUCTURE-20261116（用户明确指令，本文件按其同步期望）：弱档收窄为 5 池 6 槽
+（两 OpenCode／CodeBuddy GLM／Claude／ZCode GLM-5.3-Flash），全部 Qoder 池与
+codebuddy:deepseek-v4.1-flash 移出弱档；物理总容量 16→17（新增 zcode:GLM-5.3-Flash
+独立 1 槽）。Qwen Max 层序与用户禁用语义只属 strong/medium——相应对照改在对应档位复现；
+codebuddy:deepseek 相关载体换到弱档层2的 codebuddy:glm-5.3-flash；遗留 reserved 的
+精确 claim 改在池仍可派的 strong 档取得。绝不删除测试、绝不弱化断言。
+"""
 import sys
 import tempfile
 import unittest
@@ -94,9 +102,14 @@ class _Base(unittest.TestCase):
                           workspace=ws or self.ws(tid), prompt_sha256=SHA, stage='s',
                           now=now, executor=executor, _preclaim=False)
 
-    def claim_auto(self, tid, runtime='qoder', model='Qwen3.8-Flash', now=NIGHT):
+    def claim_auto(self, tid, runtime='opencode',
+                   model='deepseek-v4.1-flash-free', now=NIGHT):
         # BW-ZCODE-RETIRE-20261020：原默认请求组合 zcode:GLM-5.3 已退役（会先撞
-        # unknown_pool），改用现役国际 Flash 请求组合验证 AUTO 层序。
+        # unknown_pool），改用现役组合验证 AUTO 层序。
+        # BW-WEAK-RESTRUCTURE-20261116: 弱档层1已是两 OpenCode——缺省请求组合改用
+        # opencode:deepseek-v4.1-flash-free（弱档可派；两地区 Flash 已移出弱档，原
+        # 国际 Flash 请求组合在现行弱档会在档位硬门被拒）；其它档位对照显式传入该档
+        # 可派组合（如中档的 qoder:Qwen4-Max-Preview）。
         return dp.select_and_claim(self.store, task_id=tid, runtime=runtime, model=model,
                                    workspace=self.ws(tid), prompt_sha256=SHA, stage='s',
                                    now=now, executor='auto', _preclaim=False)
@@ -114,42 +127,63 @@ class _Base(unittest.TestCase):
 
 class CustomMaxPriorityTests(_Base):
     def test_disabled_custom_skipped_builtin_precedes_codebuddy(self):
-        target, reason = self.select(ZCODE, NIGHT)
-        self.assertEqual(reason, 'main_force_selected')
-        self.assertEqual(target, CN_MAX)
-        self.assertLess(dp.POOL_PRIORITY[CN_CUSTOM_MAX],
-                        dp.POOL_PRIORITY[CODEBUDDY])
+        # BW-WEAK-RESTRUCTURE-20261116: 全部 Qoder Max 与 codebuddy:deepseek 已移出弱档
+        # ——「被禁用自定义 Max 被跳过、选中内置 Max」的层序对照改在中档（北京 23:00
+        # Max 夜间窗内）复现；中档层1三个 Max 平层，CN 自定义被用户禁用后国际内置
+        # Qwen4-Max-Preview 为层内首选；codebuddy:deepseek 不再出现在任何档位的层表。
+        with dispatch_mode('medium'):
+            target, reason = self.select(ZCODE, NIGHT)
+            self.assertEqual(reason, 'main_force_selected')
+            self.assertEqual(target, QMAX)
+        self.assertNotIn(CODEBUDDY, dm.priority_map_for_mode('medium'))
+        self.assertFalse(dm.pool_allowed(CODEBUDDY, 'medium'))
+        self.assertNotIn(CODEBUDDY, dm.priority_map_for_mode('weak'))
+        self.assertFalse(dm.pool_allowed(CODEBUDDY, 'weak'))
 
     def test_disabled_custom_with_legacy_inflight_still_skipped(self):
+        # BW-WEAK-RESTRUCTURE-20261116: 遗留在途对照在中档复现（Max 只属 strong/medium）；
+        # 被禁用自定义 Max 的 legacy 在途照旧跳过，请求的国际内置 Max（层1平层、请求
+        # tie-break 优先）被选中，绝不落被禁用池。
         self.fill_codebuddy()
         self.seed(CN_CUSTOM_MAX, 1)
-        target, _ = self.select(QMAX, NIGHT)
-        self.assertEqual(target, CN_MAX)
+        with dispatch_mode('medium'):
+            target, _ = self.select(QMAX, NIGHT)
+        self.assertEqual(target, QMAX)
 
     def test_custom_full_falls_to_builtins(self):
+        # BW-WEAK-RESTRUCTURE-20261116: Max 满后落内置 Max 的对照在中档复现。
         self.fill_codebuddy()
         self.seed(CN_CUSTOM_MAX, 2)
-        target, _ = self.select(ZCODE, NIGHT)
+        with dispatch_mode('medium'):
+            target, _ = self.select(ZCODE, NIGHT)
         self.assertIn(target, (QMAX, CN_MAX))
 
     def test_all_max_full_falls_to_claude_then_opencode(self):
+        # BW-WEAK-RESTRUCTURE-20261116: 弱档不再含任何 Max/OpenCode 旧走位——「三 Max
+        # 全满后逐层下落」的走位在中档复现：三 Max（4 槽）满 → claude（层2）→ claude
+        # （2 槽）满 → zcode:GLM-5.3（层3，中档最后）。两 OpenCode 在现行弱档是层1，
+        # 绝不在 Max 之后；本用例不再断言旧的「Max 后落 OpenCode」弱档走位。
         self.fill_codebuddy()
         self.seed(CN_CUSTOM_MAX, 2)
         self.seed(QMAX, 1)
         self.seed(CN_MAX, 1)
-        target, _ = self.select(ZCODE, NIGHT)
-        self.assertEqual(target, CLAUDE)
-        self.seed(CLAUDE, 2)
-        target, _ = self.select(ZCODE, NIGHT)
-        self.assertIn(target, dp.OPENCODE_POOL_KEYS)
+        with dispatch_mode('medium'):
+            target, _ = self.select(ZCODE, NIGHT)
+            self.assertEqual(target, CLAUDE)
+            self.seed(CLAUDE, 2)
+            target, _ = self.select(ZCODE, NIGHT)
+        self.assertEqual(target, ZCODE)
 
     def test_day_all_max_excluded_in_weak_mode(self):
+        # BW-WEAK-RESTRUCTURE-20261116: 弱档只剩 Claude 高峰门——白天三个 Max 与
+        # zcode:GLM-5.3 都整档不在 weak 候选（档位排除先于时段门）；弱档 ZCode 用
+        # zcode:GLM-5.3-Flash；claude 工作日 10:00 属高峰 → 高峰门照旧关。
         self.fill_codebuddy()
         with closing(dp.connect(self.store)) as conn:
             elig = dp._eligible_main_forces(conn, False, DAY)
-        for pk in (CN_MAX, CN_CUSTOM_MAX, QMAX):
+        for pk in (CN_MAX, CN_CUSTOM_MAX, QMAX, ZCODE, CODEBUDDY):
             self.assertNotIn(pk, elig)
-        self.assertIn(ZCODE, elig)
+        self.assertIn(dp.ZCODE_FLASH_POOL_KEY, elig)
         self.assertNotIn(CLAUDE, elig)  # 工作日 10:00 属高峰 → claude 恢复高峰门
         self.assertIn(self.select(ZCODE, DAY)[0], dp.OPENCODE_POOL_KEYS)
 
@@ -174,60 +208,101 @@ class CustomMaxPriorityTests(_Base):
             self.assertEqual(self.select(ZCODE, DAY)[0], ZCODE)
 
     def test_explicit_builtin_selection_not_rewritten(self):
-        r = self.reserve('qm', 'qoder', 'Qwen4-Max-Preview', executor='qoder')
-        self.assertTrue(r.get('allowed'), r)
-        self.assertEqual(r['pool_key'], QMAX)
-        r = self.reserve('cm', 'qodercn', 'Qwen4-Max-Preview', executor='qodercn')
-        self.assertTrue(r.get('allowed'), r)
-        self.assertEqual(r['pool_key'], CN_MAX)
+        # BW-WEAK-RESTRUCTURE-20261116: 显式内置 Max 不被改写的对照在中档复现
+        # （北京 23:00 Max 夜间窗内可派；弱档已无任何 Qoder 池）。
+        with dispatch_mode('medium'):
+            r = self.reserve('qm', 'qoder', 'Qwen4-Max-Preview', executor='qoder')
+            self.assertTrue(r.get('allowed'), r)
+            self.assertEqual(r['pool_key'], QMAX)
+            r = self.reserve('cm', 'qodercn', 'Qwen4-Max-Preview', executor='qodercn')
+            self.assertTrue(r.get('allowed'), r)
+            self.assertEqual(r['pool_key'], CN_MAX)
 
 
 class SameOrderAndGuardsTests(_Base):
     def test_stage_preview_and_atomic_entry_same_order(self):
+        # BW-WEAK-RESTRUCTURE-20261116: 弱档层1已是两 OpenCode（全部 Qoder Max 移出弱档）
+        # ——「stage 预览与原子入口同序」在弱档新层序下断言（两者都选弱档层1的
+        # opencode:deepseek-v4.1-flash-free）；被禁用自定义 Max 的 mode_excluded 标记
+        # 不变；并补中档对照（预览与原子入口同选国际内置 Max，层序口径跨档一致）。
         self.fill_codebuddy()
         auth = self.auth(ALL_MAINS + ALL_FLASH)
         r = self.plan(auth)
         self.assertEqual(r['refused'], None, r)
-        self.assertEqual(r['selected']['pool_key'], CN_MAX, r)
+        self.assertEqual(r['selected']['pool_key'], dp.OPENCODE_DEEPSEEK_POOL_KEY, r)
         self.assertEqual(r['candidate_filters'][CN_CUSTOM_MAX], 'mode_excluded')
         out = self.claim_auto('t1')
-        self.assertEqual(out['selected']['pool_key'], CN_MAX, out)
+        # 原子入口直接认领（请求组合 == 选中组合）：pool_key 与 selected 同指弱档层1。
+        # BW-WEAK-RESTRUCTURE-20261116: 直接认领回执的 selected 只含 runtime/model
+        # （routing 回执才含 pool_key），故这里同时断言 pool_key 与 selected 内容。
+        self.assertEqual(out['pool_key'], dp.OPENCODE_DEEPSEEK_POOL_KEY, out)
+        self.assertEqual(out['selected'], {'runtime': 'opencode',
+                                           'model': 'deepseek-v4.1-flash-free'},
+                         out)
+        with dispatch_mode('medium'):
+            r_m = self.plan(self.auth(ALL_MAINS + ALL_FLASH))
+            self.assertEqual(r_m['refused'], None, r_m)
+            self.assertEqual(r_m['selected']['pool_key'], QMAX, r_m)
+            # BW-WEAK-RESTRUCTURE-20261116: 中档原子入口显式传中档可派组合
+            # （opencode 请求在中档会被档位硬门拒绝）。
+            out_m = self.claim_auto('t1-medium', 'qoder', 'Qwen4-Max-Preview')
+            self.assertEqual(out_m['pool_key'], QMAX, out_m)
+            self.assertEqual(out_m['selected'], {'runtime': 'qoder',
+                                                 'model': 'Qwen4-Max-Preview'},
+                             out_m)
 
-    def test_capacity_16_current_authority(self):
+    def test_capacity_17_current_authority(self):
         # BW-STRONG-SONUS-20261024：物理总量 16（原 15 + strong 专属 Sonus 1 槽）；
-        # weak 可新派容量仍为 15（Sonus 弱档不可新派）。
-        self.assertEqual(dp.DOMESTIC_TOTAL_CAPACITY, 16)
+        # BW-WEAK-RESTRUCTURE-20261116: 16→17（新增弱档专用 zcode:GLM-5.3-Flash 独立
+        # 1 槽）；ALL_POOL_KEYS 为全档位策略池并集（12 池、不含 Sonus）合计 16；
+        # weak 可新派 5 池 6 槽（全部 Qoder 与 codebuddy:deepseek 移出弱档）。
+        self.assertEqual(dp.DOMESTIC_TOTAL_CAPACITY, 17)
         self.assertEqual(dp.capacity_for(CN_CUSTOM_MAX), 2)
         self.assertEqual(dp.capacity_for(ZCODE), 1)
+        self.assertEqual(dp.capacity_for(dp.ZCODE_FLASH_POOL_KEY), 1)
         self.assertEqual(dp.capacity_for(dp.SONUS_POOL_KEY), 1)
         self.assertEqual(sum(dp.MAIN_FORCE_CAPACITY.values())
-                         + sum(dp.OVERFLOW_CAPACITY.values()), 16)
-        self.assertEqual(sum(dp.capacity_for(k) for k in dm.ALL_POOL_KEYS), 15)
+                         + sum(dp.OVERFLOW_CAPACITY.values()), 17)
+        self.assertEqual(sum(dp.capacity_for(k) for k in dm.ALL_POOL_KEYS), 16)
+        self.assertEqual(sum(dp.capacity_for(k)
+                             for k in dm.allowed_pools_for_mode('weak')), 6)
 
     def test_workspace_single_write_guard_unchanged(self):
         # 同 workspace 在途互斥语义不变（恢复后的 zcode executor 与 codebuddy executor
-        # 同受单写守卫约束；本例用 codebuddy 占位验证）。
+        # 同受单写守卫约束）。BW-WEAK-RESTRUCTURE-20261116: codebuddy:deepseek-v4.1-flash
+        # 已无任何档位可新派——单写守卫用仍处弱档层2的 codebuddy:glm-5.3-flash 复现
+        # （同 workspace 第二请求仍拒）。
         shared = self.ws('shared')
-        r1 = self.reserve('w1', 'codebuddy', 'deepseek-v4.1-flash',
+        r1 = self.reserve('w1', 'codebuddy', 'glm-5.3-flash',
                           executor='codebuddy', ws=shared)
         self.assertTrue(r1.get('allowed'), r1)
-        r2 = self.reserve('w2', 'codebuddy', 'deepseek-v4.1-flash',
+        r2 = self.reserve('w2', 'codebuddy', 'glm-5.3-flash',
                           executor='codebuddy', ws=shared)
         self.assertFalse(r2.get('allowed'), r2)
         self.assertEqual(r2['reason'], 'workspace_in_flight')
 
     def test_unknown_inflight_still_holds_capacity(self):
+        # BW-WEAK-RESTRUCTURE-20261116: unknown 在途占容量、被禁自定义 Max 被跳过的
+        # 对照在中档复现（Max 只属 strong/medium）。
         self.fill_codebuddy()
         self.seed(CN_CUSTOM_MAX, 2, state='unknown')
-        target, _ = self.select(ZCODE, NIGHT)
+        with dispatch_mode('medium'):
+            target, _ = self.select(ZCODE, NIGHT)
         self.assertNotEqual(target, CN_CUSTOM_MAX)
         self.assertIn(target, (QMAX, CN_MAX))
 
 
 class UserDisabledCustomMaxTests(_Base):
     def legacy_claim(self, task):
-        with mock.patch.object(dm, 'USER_DISABLED_POOL_KEYS', frozenset()):
-            claim = self.reserve(task, 'qodercn', 'Qwen-3.8-Max', executor='qodercn')
+        # BW-WEAK-RESTRUCTURE-20261116: 遗留 reserved 的「取得」必须在池仍可派的档位
+        # 完成——CN 自定义 Max 现只在 strong/medium 策略集合内，且需临时清空用户禁用集
+        # 复现禁用前历史；取得统一在 strong 档完成（无时段门、确定性最高），消费/重复
+        # 消费/终态仍跨全档验证（reserved 状态的 legacy claim 经 custom_max_legacy_
+        # reserved 例外在所有档位放行消费）。
+        with dispatch_mode('strong'):
+            with mock.patch.object(dm, 'USER_DISABLED_POOL_KEYS', frozenset()):
+                claim = self.reserve(task, 'qodercn', 'Qwen-3.8-Max',
+                                     executor='qodercn')
         self.assertTrue(claim['allowed'], claim)
         return claim['token']
 
@@ -242,17 +317,31 @@ class UserDisabledCustomMaxTests(_Base):
         self.assertEqual(dm.USER_DISABLED_POOL_KEYS, {CN_CUSTOM_MAX})
         self.assertNotIn(CN_CUSTOM_MAX, dp.LEGACY_RETIRED_POOL_KEYS)
         self.assertEqual(dp.capacity_for(CN_CUSTOM_MAX), 2)
-        self.assertEqual(dp.DOMESTIC_TOTAL_CAPACITY, 16)
+        # BW-WEAK-RESTRUCTURE-20261116: 物理总 17（16 + 弱档专用 zcode:GLM-5.3-Flash
+        # 独立 1 槽）。
+        self.assertEqual(dp.DOMESTIC_TOTAL_CAPACITY, 17)
         import install_desktop_skill as installer
         self.assertIn(CN_CUSTOM_MAX, installer.HOST_EXCLUDED['qoder'])
-        # BW-QWEN4-SONUS-REMOVE-20261115：Sonus 从所有档位去除——strong/medium 4 池/5 槽、
-        # weak 10 池/13 槽。
-        for mode, count, slots in (('strong', 4, 5), ('medium', 4, 5), ('weak', 10, 13)):
+        # BW-QWEN4-SONUS-REMOVE-20261115：Sonus 从所有档位去除——strong/medium 4 池/5 槽。
+        # BW-WEAK-RESTRUCTURE-20261116: weak 收窄为 5 池/6 槽（两 OpenCode／CodeBuddy
+        # GLM／Claude／ZCode GLM-5.3-Flash；全部 Qoder 池与 codebuddy:deepseek 移出）。
+        for mode, count, slots in (('strong', 4, 5), ('medium', 4, 5), ('weak', 5, 6)):
             pools = dm.allowed_pools_for_mode(mode)
             self.assertEqual(len(pools), count)
             self.assertEqual(sum(dp.capacity_for(pk) for pk in pools), slots)
             self.assertNotIn(CN_CUSTOM_MAX, pools)
-            self.assertIn(CN_MAX, pools)
+            # BW-WEAK-RESTRUCTURE-20261116: CN 内置 Max 在 strong/medium 仍可派；weak 已
+            # 移出全部 Qoder 池——改断言弱档新集合（两 OpenCode／CodeBuddy GLM／Claude／
+            # ZCode GLM-5.3-Flash）。
+            if mode == 'weak':
+                for pk in (dp.OPENCODE_DEEPSEEK_POOL_KEY, dp.OPENCODE_GLM_POOL_KEY,
+                           dp.CODEBUDDY_GLM_POOL_KEY, CLAUDE,
+                           dp.ZCODE_FLASH_POOL_KEY):
+                    self.assertIn(pk, pools)
+                self.assertNotIn(CN_MAX, pools)
+                self.assertNotIn(QMAX, pools)
+            else:
+                self.assertIn(CN_MAX, pools)
             self.assertIn('用户要求禁用', dm.mode_excluded_reason(CN_CUSTOM_MAX, mode))
 
     def test_new_dispatch_refused_in_all_modes_day_and_night(self):

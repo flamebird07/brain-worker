@@ -61,6 +61,9 @@ class AppServerTransportTests(unittest.TestCase):
         return self.tmp / name
 
     def _run(self, *extra, timeout=180):
+        # BW-WEAK-RESTRUCTURE-20261116：弱档 ZCode 只认 GLM-5.3-Flash（GLM-5.3 在弱档
+        # mode_excluded）——传输测试统一用弱档可派模型；默认档位文件不存在 → weak。
+        extra = ('--model', 'GLM-5.3-Flash', *extra)
         env = {**os.environ.copy(), 'PYTHONUTF8': '1'}
         cmd = [sys.executable, str(ENTRY),
                '--workspace', str(self.ws),
@@ -142,7 +145,9 @@ class AppServerTransportTests(unittest.TestCase):
         # stub 视角：模式映射、模型显式绑定、契约前置。
         saw = self._stub_saw()
         self.assertEqual(saw['setMode'], 'plan')
-        self.assertEqual(saw['setModel']['modelId'], 'GLM-5.3')
+        # BW-WEAK-RESTRUCTURE-20261116：弱档 ZCode 专用 GLM-5.3-Flash——stub 视角的
+        # 显式 setModel 绑定应为该模型。
+        self.assertEqual(saw['setModel']['modelId'], 'GLM-5.3-Flash')
         self.assertEqual(saw['setModel']['providerId'],
                          'account:bigmodel-individual-coding-plan')
         self.assertEqual(saw['setModel']['options']['reasoningLevel'], 'low')
@@ -228,11 +233,66 @@ class AppServerTransportTests(unittest.TestCase):
         self.assertEqual(proc.returncode, 2)
         self.assertFalse(self._out().exists())
 
+    def _readonly_state_dir(self):
+        """共享状态隔离目录：只读（模拟受限会话对 ~/.brain-worker 的权限形态）。"""
+        ro = self.tmp / 'ro-state'
+        ro.mkdir()
+        os.chmod(ro, 0o555)
+        if os.getuid() == 0 or os.access(ro / 'w', os.W_OK):
+            try:
+                (ro / 'w').touch()
+                os.chmod(ro, 0o755)
+                self.skipTest('宿主可写只读目录（root/ACL），无法模拟受限会话')
+            except OSError:
+                pass
+        self.addCleanup(os.chmod, ro, 0o755)
+        return ro
+
+    def test_preflight_zero_shared_state_writes_survives_unwritable_store(self):
+        # BW-WEAK-RESTRUCTURE-20261116-R2：--preflight-only 零共享状态写入——共享状态
+        # 目录只读时预检仍成功（capabilities 只读往返），绝不建库/迁移/WAL。
+        ro = self._readonly_state_dir()
+        proc = self._run('--preflight-only',
+                         '--quota-store', str(ro / 'quota-state.sqlite3'),
+                         '--dispatch-store', str(ro / 'dispatch-pool.sqlite3'))
+        self.assertEqual(proc.returncode, 0, proc.stdout.decode('utf-8', 'replace')
+                         + proc.stderr.decode('utf-8', 'replace'))
+        self.assertFalse((ro / 'quota-state.sqlite3').exists(),
+                         'preflight 绝不创建共享额度库')
+        self.assertFalse((ro / 'dispatch-pool.sqlite3').exists(),
+                         'preflight 绝不创建共享调度库')
+        summary = json.loads((self._out() / 'summary.json').read_text(encoding='utf-8'))
+        self.assertTrue(summary['protocol_success'])
+        self.assertFalse(summary['submitted'])
+        self.assertEqual(json.loads((self._out() / 'preflight.json')
+                                    .read_text(encoding='utf-8'))['ok'], True)
+
+    def test_unwritable_shared_state_structured_refusal_not_traceback(self):
+        # BW-WEAK-RESTRUCTURE-20261116-R2：真实派发遇共享状态库打不开/写不进 → 结构化
+        # 拒绝（sent=false、shared_state_error、阶段/路径/原始异常），退出码 2；
+        # 绝不输出裸 traceback，绝不误分类为认证/额度/模型错误，零证据目录。
+        ro = self._readonly_state_dir()
+        proc = self._run('--quota-store', str(ro / 'quota-state.sqlite3'),
+                         '--dispatch-store', str(ro / 'dispatch-pool.sqlite3'))
+        self.assertEqual(proc.returncode, 2)
+        payload = json.loads(proc.stdout.decode('utf-8', 'replace'))
+        self.assertTrue(payload['refused_before_dispatch'])
+        self.assertFalse(payload['sent'])
+        self.assertTrue(payload['shared_state_error'])
+        self.assertEqual(payload['error_class'], 'shared_state_unwritable')
+        self.assertIn(payload['phase'],
+                      ('availability_gate', 'capacity_claim', 'quota_gate'))
+        joined = json.dumps(payload, ensure_ascii=False)
+        self.assertIn('NOT an auth/quota/time-window/model error', joined)
+        self.assertNotIn('Traceback', proc.stderr.decode('utf-8', 'replace'))
+        self.assertFalse(self._out().exists(), '拒绝路径零证据目录')
+
     def test_capacity_full_refused_with_zero_dir_and_no_placeholder(self):
-        # 先占满 zcode:GLM-5.3（容量 1）：用另一个 task 的真实 running attempt。
+        # BW-WEAK-RESTRUCTURE-20261116：弱档 ZCode 只认 GLM-5.3-Flash——先占满
+        # zcode:GLM-5.3-Flash（容量 1）：用另一个 task 的真实 running attempt。
         blocker = dp.consume_for_entry(
             str(self.dispatch), task_id='blocker', runtime='zcode',
-            model='GLM-5.3', workspace=str(self.tmp / 'other'),
+            model='GLM-5.3-Flash', workspace=str(self.tmp / 'other'),
             prompt_sha256='0' * 64, stage='blocker', executor='zcode',
             quota_store=str(self.quota))
         self.assertTrue(blocker['allowed'], blocker)

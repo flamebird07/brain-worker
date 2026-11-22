@@ -14,6 +14,7 @@
 import argparse
 import hashlib
 import json
+import sqlite3
 import os
 import re
 import shutil
@@ -1041,10 +1042,28 @@ def main():
     availability_group = None
     availability_channel_key = None
     if not args.preflight_only:
-        availability_gate = qc.zcode_availability_gate(
-            quota_store, provider=args.provider, routes_path=args.quota_routes,
-            identity={'provider': args.provider},
-            purpose='probe' if args.quota_probe else 'dispatch')
+        # BW-WEAK-RESTRUCTURE-20261116-R2：共享状态库打不开/写不进（环境权限、路径问题）
+        # → 结构化拒绝（exit 2），绝不误分类为认证/额度/模型错误，绝不裸 traceback。
+        try:
+            availability_gate = qc.zcode_availability_gate(
+                quota_store, provider=args.provider, routes_path=args.quota_routes,
+                identity={'provider': args.provider},
+                purpose='probe' if args.quota_probe else 'dispatch')
+        except (sqlite3.OperationalError, OSError) as exc:
+            print(json.dumps({'refused_before_dispatch': True, 'sent': False,
+                              'exit_code': 2, 'shared_state_error': True,
+                              'error_class': 'shared_state_unwritable',
+                              'phase': 'availability_gate',
+                              'store_path': str(quota_store),
+                              'reasons': [f'{type(exc).__name__}: {exc}',
+                                          'the shared state database cannot be '
+                                          'opened/written in this session '
+                                          '(environment permission or path problem) — '
+                                          'NOT an auth/quota/time-window/model error; '
+                                          'nothing was submitted and no placeholder '
+                                          'was taken']},
+                             ensure_ascii=False))
+            return 2
         if not availability_gate['allowed']:
             print(json.dumps({'refused_before_dispatch': True, 'sent': False,
                               'exit_code': 2, 'zcode_availability_rejected': True,
@@ -1101,13 +1120,30 @@ def main():
                             'channel_key': availability_channel_key,
                             'attempt_id': availability_attempt_id,
                             'epoch': availability_epoch}
-        pool_gate = dp.consume_for_entry(
-            dispatch_store, task_id=task_id, runtime='zcode', model=args.model,
-            workspace=str(work), prompt_sha256=prompt_sha256, stage=args.stage,
-            chat_id=args.chat_id, claim_token=args.dispatch_claim,
-            wrapper_pid=wrapper_pid, wrapper_created=wrapper_created,
-            executor='zcode', quota_store=quota_store, quota_routes=args.quota_routes,
-            probe_ticket=probe_ticket)
+        try:
+            pool_gate = dp.consume_for_entry(
+                dispatch_store, task_id=task_id, runtime='zcode', model=args.model,
+                workspace=str(work), prompt_sha256=prompt_sha256, stage=args.stage,
+                chat_id=args.chat_id, claim_token=args.dispatch_claim,
+                wrapper_pid=wrapper_pid, wrapper_created=wrapper_created,
+                executor='zcode', quota_store=quota_store,
+                quota_routes=args.quota_routes, probe_ticket=probe_ticket)
+        except (sqlite3.OperationalError, OSError) as exc:
+            _settle_availability(executed=False)
+            print(json.dumps({'refused_before_dispatch': True, 'sent': False,
+                              'exit_code': 2, 'shared_state_error': True,
+                              'error_class': 'shared_state_unwritable',
+                              'phase': 'capacity_claim',
+                              'store_path': str(dispatch_store),
+                              'reasons': [f'{type(exc).__name__}: {exc}',
+                                          'the shared state database cannot be '
+                                          'opened/written in this session '
+                                          '(environment permission or path problem) — '
+                                          'NOT an auth/quota/time-window/model error; '
+                                          'nothing was submitted and no placeholder '
+                                          'was taken']},
+                             ensure_ascii=False))
+            return 2
         if not pool_gate['allowed']:
             _settle_availability(executed=False)
             print(json.dumps({'refused_before_dispatch': True, 'capacity_gate_rejected': True,
@@ -1142,13 +1178,31 @@ def main():
 
     quota_gate = {'allowed': True, 'purpose': 'registry_preflight'}
     if not args.preflight_only:
-        quota_gate = qc.gate_dispatch(
-            quota_store, runtime='zcode',
-            identity={'provider': args.provider},
-            workspace=str(work),
-            purpose='probe' if args.quota_probe else 'dispatch',
-            routes_path=args.quota_routes,
-            verified_pool_claim=quota_verified_claim)
+        try:
+            quota_gate = qc.gate_dispatch(
+                quota_store, runtime='zcode',
+                identity={'provider': args.provider},
+                workspace=str(work),
+                purpose='probe' if args.quota_probe else 'dispatch',
+                routes_path=args.quota_routes,
+                verified_pool_claim=quota_verified_claim)
+        except (sqlite3.OperationalError, OSError) as exc:
+            _settle_availability(executed=False)
+            _release_capacity('start_failed')
+            print(json.dumps({'refused_before_dispatch': True, 'sent': False,
+                              'exit_code': 2, 'shared_state_error': True,
+                              'error_class': 'shared_state_unwritable',
+                              'phase': 'quota_gate',
+                              'store_path': str(quota_store),
+                              'reasons': [f'{type(exc).__name__}: {exc}',
+                                          'the shared state database cannot be '
+                                          'opened/written in this session '
+                                          '(environment permission or path problem) — '
+                                          'NOT an auth/quota/time-window/model error; '
+                                          'nothing was submitted and no placeholder '
+                                          'was taken']},
+                             ensure_ascii=False))
+            return 2
 
     def _settle_quota(**kwargs):
         if args.preflight_only:

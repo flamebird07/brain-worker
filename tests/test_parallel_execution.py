@@ -35,10 +35,15 @@ from pathlib import Path
 REPO = Path(__file__).resolve().parent.parent
 SCRIPTS = REPO / 'scripts'
 sys.path.insert(0, str(SCRIPTS))
+if str(REPO / 'tests') not in sys.path:
+    sys.path.insert(0, str(REPO / 'tests'))
 import execution_control as ec  # noqa: E402
 import qoder_direct as qd  # noqa: E402  复用九节头做绑定报告，不改其文件
 import zcode_direct as zd
 import dispatch_pool as dp  # noqa: E402  真实容量池：并发入口 Popen 前必须消费 claim
+# BW-WEAK-RESTRUCTURE-20261116: qoder:Qwen3.8-Flash 与 zcode:GLM-5.3/两内置 Max 的旧弱档
+# 并行场景改在 strong 档演练；不可新派的 Flash 腿改用 CN 内置 Max / zcode 接管腿。
+from dispatch_mode_support import dispatch_mode  # noqa: E402
 
 QODER_ENTRY = SCRIPTS / 'qoder_direct.py'
 CODEBUDDY_ENTRY = SCRIPTS / 'codebuddy_direct.py'
@@ -84,6 +89,24 @@ _barrier()
 rep = Path(_os.environ['STUB_REPORT_FILE']).read_text(encoding='utf-8')
 env = {'type': 'result', 'subtype': 'success', 'is_error': False,
        'stop_reason': 'end_turn', 'session_id': 'sess-parallel-qoder',
+       'modelUsage': 'stub', 'total_credits': 0, 'result': rep}
+sys.stdout.write(json.dumps(env, ensure_ascii=False))
+sys.stdout.flush()
+'''
+
+# BW-WEAK-RESTRUCTURE-20261116: CN 原生替身（可执行文件正文）。与 QODER_STUB 唯一差别：
+# 官方 CN CLI 以 `--session-id <UUID>` 接收入口生成的会话身份并原样回填信封 session_id；
+# 入口据此做 cn_session_identity 精确比对后才绑定报告。
+CN_CLI_STUB_BODY = BARRIER_SNIPPET + '''
+import json, sys
+from pathlib import Path
+sys.stdin.read()
+_emit_output()
+_barrier()
+sid = sys.argv[sys.argv.index('--session-id') + 1]
+rep = Path(_os.environ['STUB_REPORT_FILE']).read_text(encoding='utf-8')
+env = {'type': 'result', 'subtype': 'success', 'is_error': False,
+       'stop_reason': 'end_turn', 'session_id': sid,
        'modelUsage': 'stub', 'total_credits': 0, 'result': rep}
 sys.stdout.write(json.dumps(env, ensure_ascii=False))
 sys.stdout.flush()
@@ -310,6 +333,37 @@ class ParallelRehearsalTests(unittest.TestCase):
                 '--dispatch-plan', str(plan), '--dispatch-store', str(self.dispatch_store),
                 '--dispatch-claim', claim]
 
+    def _cn_cli_stub(self, tag):
+        # BW-WEAK-RESTRUCTURE-20261116: CN 原生 `cli` 被入口直接 exec（argv[0]），离线
+        # 替身必须是带 shebang 的可执行文件；正文复用同一 Qoder stub（读 stdin、写
+        # output.py、进 barrier、回成功信封），与国际腿行为完全一致。CN 入口经官方
+        # `--session-id <UUID>` 下发本会话身份并要求信封 session_id 与之精确一致才绑定
+        # 报告——替身从 argv 回读该 UUID 原样回填信封（真实 CN CLI 的官方行为）。
+        cli = self.stub_dir / f'qodercn_cli_stub_{tag}.py'
+        cli.write_text('#!' + sys.executable + '\n' + CN_CLI_STUB_BODY, encoding='utf-8')
+        cli.chmod(0o755)
+        return cli
+
+    def _qodercn_cmd(self, ws, prompt, out, stage, plan, model, claim):
+        # BW-WEAK-RESTRUCTURE-20261116: 旧弱档国际 Qwen3.8-Flash 兜底腿已全档不可新派，
+        # 第二条 Qoder 家族并行腿改走 CN 原生运行时（qodercn:Qwen4-Max-Preview，strong
+        # 常态池、容量 1，与国际 Max 各自独立槽、互不占位）。
+        cfg_dir = self.base / f'qodercn-cfgdir-{ws.name}'
+        cfg_dir.mkdir(parents=True, exist_ok=True)
+        cfg = self.base / f'qodercn-cfg-{ws.name}.json'
+        cfg.write_text(json.dumps({'cli': str(self._cn_cli_stub(ws.name)),
+                                   'config_dir': str(cfg_dir),
+                                   'model_ids': {'Qwen4-Max-Preview':
+                                                 'qwen4-max-preview-real-id'}}),
+                       encoding='utf-8')
+        # --runtime qodercn + --cn-config：经同一离线 wrapper 运行原入口（时钟冻结照旧）。
+        return [sys.executable, self._qoder_runner(), '--workspace', str(ws),
+                '--prompt-file', str(prompt), '--output-dir', str(out), '--stage', stage,
+                '--runtime', qd.RUNTIME_CN, '--cn-config', str(cfg),
+                '--model', model, '--tools', 'Read',
+                '--dispatch-plan', str(plan), '--dispatch-store', str(self.dispatch_store),
+                '--dispatch-claim', claim]
+
     def _reserve(self, task_id, runtime, model, ws, prompt_path, stage):
         # 并发演练：为确切 (runtime, model) 预留 claim，入口再用 --dispatch-claim 精确
         # 消费。BW-POOL-SPLIT-20261010-S3 真实五池（ZCode=2、两地区 Max 各 1、两地区 Flash
@@ -357,131 +411,140 @@ class ParallelRehearsalTests(unittest.TestCase):
         return cmd
 
     def test_four_task_parallel_rehearsal(self):
-        specs = []
-        # 1) CodeBuddy 结构化 429/6004
-        ws = self._mk_workspace('cb429')
-        prompt = self._write('prompt-cb429.txt', 'CodeBuddy 并行演练任务，原样汇报。\n')
-        plan = self._plan('T-CB', 'BW-PARR-CB429', 'codebuddy', 'CB-PARR-429', ws,
-                          prompt, ['Read'])
-        specs.append(('cb429', self._codebuddy_cmd(ws, prompt, ws / 'out',
-                                                   'BW-PARR-CB429', plan),
-                      self._base_env('cb429', ws, barrier_total=4), ws, 'BW-PARR-CB429'))
-        # 2) ZCode 恢复后的合法成功腿（BW-ZCODE-RESTORE-1-20261022）：zcode:GLM-5.3 容量 1，
-        #    先按确切组合 reserve 出 claim，入口再精确消费；必须 rc=0、报告绑定、进 barrier、
-        #    终态释放容量。绝不再保留退役期“rc=2/不进 barrier”的旧断言。
-        ws = self._mk_workspace('zcok')
-        prompt = self._write('prompt-zcok.txt', 'ZCode 并行演练任务，原样汇报。\n')
-        plan = self._plan('T-ZC', 'BW-PARR-ZCOK', 'zcode', 'GLM-5.3', ws,
-                          prompt, ['Read'])
-        claim = self._reserve('T-ZC', 'zcode', 'GLM-5.3', ws, prompt, 'BW-PARR-ZCOK')
-        report = self._write('report-zcok.txt',
-                             build_bound_report('BW-PARR-ZCOK', str(ws)))
-        specs.append(('zcok', self._zcode_cmd(ws, prompt, ws / 'out',
-                                              'BW-PARR-ZCOK', plan, 'GLM-5.3', claim),
-                      self._base_env('zcok', ws, report, barrier_total=4), ws,
-                      'BW-PARR-ZCOK'))
-        # 3 & 4) 两个 Qoder 成功完整绑定报告（独立 workspace，同名 output.py）。
-        #    BW-POOL-SPLIT-20261010-S3：国际 Qwen4-Max-Preview 只有 1 槽，第二个 qoder 并行任务
-        #    走同级国际 Qwen3.8-Flash 兜底（executor='qoder'，同区不跨执行器），二者共存。
-        for tag, stage, qmodel in (('qa', 'BW-PARR-QA', 'Qwen4-Max-Preview'),
-                                    ('qb', 'BW-PARR-QB', 'Qwen3.8-Flash')):
-            ws = self._mk_workspace(tag)
-            prompt = self._write(f'prompt-{tag}.txt', f'Qoder {tag} 并行演练任务。\n')
-            plan = self._plan('T-' + tag.upper(), stage, 'qoder', qmodel, ws,
+        # BW-WEAK-RESTRUCTURE-20261116: zcode:GLM-5.3 / 两内置 Max 均已移出弱档，国际
+        # Qwen3.8-Flash 更是全档不可新派——本演练的容量预留与子进程消费整体改在 strong 档
+        # （全部腿的池在 strong 均为常态、无时段门；strong 档文件在本方法全程存活，子进程
+        # 按继承 env 现读同一档位）。第二个 Qoder 家族并行腿从国际 Flash 兜底改为 CN 原生
+        # 运行时（qodercn:Qwen4-Max-Preview，与国际 Max 各自独立 1 槽）。
+        with dispatch_mode('strong'):
+            specs = []
+            # 1) CodeBuddy 结构化 429/6004
+            ws = self._mk_workspace('cb429')
+            prompt = self._write('prompt-cb429.txt', 'CodeBuddy 并行演练任务，原样汇报。\n')
+            plan = self._plan('T-CB', 'BW-PARR-CB429', 'codebuddy', 'CB-PARR-429', ws,
                               prompt, ['Read'])
-            claim = self._reserve('T-' + tag.upper(), 'qoder', qmodel, ws,
-                                  prompt, stage)
-            report = self._write(f'report-{tag}.txt',
-                                 build_bound_report(stage, str(ws)))
-            specs.append((tag, self._qoder_cmd(ws, prompt, ws / 'out', stage, plan,
+            specs.append(('cb429', self._codebuddy_cmd(ws, prompt, ws / 'out',
+                                                       'BW-PARR-CB429', plan),
+                          self._base_env('cb429', ws, barrier_total=4), ws, 'BW-PARR-CB429'))
+            # 2) ZCode 恢复后的合法成功腿（BW-ZCODE-RESTORE-1-20261022）：zcode:GLM-5.3 容量 1，
+            #    先按确切组合 reserve 出 claim，入口再精确消费；必须 rc=0、报告绑定、进 barrier、
+            #    终态释放容量。绝不再保留退役期“rc=2/不进 barrier”的旧断言。
+            ws = self._mk_workspace('zcok')
+            prompt = self._write('prompt-zcok.txt', 'ZCode 并行演练任务，原样汇报。\n')
+            plan = self._plan('T-ZC', 'BW-PARR-ZCOK', 'zcode', 'GLM-5.3', ws,
+                              prompt, ['Read'])
+            claim = self._reserve('T-ZC', 'zcode', 'GLM-5.3', ws, prompt, 'BW-PARR-ZCOK')
+            report = self._write('report-zcok.txt',
+                                 build_bound_report('BW-PARR-ZCOK', str(ws)))
+            specs.append(('zcok', self._zcode_cmd(ws, prompt, ws / 'out',
+                                                  'BW-PARR-ZCOK', plan, 'GLM-5.3', claim),
+                          self._base_env('zcok', ws, report, barrier_total=4), ws,
+                          'BW-PARR-ZCOK'))
+            # 3 & 4) 两个 Qoder 家族成功完整绑定报告（独立 workspace，同名 output.py）。
+            #    BW-WEAK-RESTRUCTURE-20261116：国际 Qwen4-Max-Preview 只有 1 槽且两地区
+            #    Flash 已移出所有档位的新派集合，第二个 qoder 家族并行任务改走 CN 内置
+            #    Max（qodercn:Qwen4-Max-Preview，独立 1 槽，同区不跨执行器），二者共存。
+            for tag, stage, runtime, qmodel, cmd_builder in (
+                    ('qa', 'BW-PARR-QA', 'qoder', 'Qwen4-Max-Preview', self._qoder_cmd),
+                    ('qb', 'BW-PARR-QB', 'qodercn', 'Qwen4-Max-Preview',
+                     self._qodercn_cmd)):
+                ws = self._mk_workspace(tag)
+                prompt = self._write(f'prompt-{tag}.txt', f'Qoder {tag} 并行演练任务。\n')
+                plan = self._plan('T-' + tag.upper(), stage, runtime, qmodel, ws,
+                                  prompt, ['Read'])
+                claim = self._reserve('T-' + tag.upper(), runtime, qmodel, ws,
+                                      prompt, stage)
+                report = self._write(f'report-{tag}.txt',
+                                     build_bound_report(stage, str(ws)))
+                specs.append((tag, cmd_builder(ws, prompt, ws / 'out', stage, plan,
                                                qmodel, claim),
-                          self._base_env(tag, ws, report, barrier_total=4), ws, stage))
+                              self._base_env(tag, ws, report, barrier_total=4), ws, stage))
 
-        # 并发启动四适配器子进程（真实重叠由 barrier 门控完成证明）。
-        procs = {tag: subprocess.Popen(cmd, env=env, cwd=str(ws),
-                                       stdout=subprocess.PIPE, stderr=subprocess.PIPE)
-                 for tag, cmd, env, ws, stage in specs}
-        results = {}
-        deadline = 180
-        for tag, cmd, env, ws, stage in specs:
-            proc = procs[tag]
-            try:
-                out, err = proc.communicate(timeout=deadline)
-            except subprocess.TimeoutExpired:
-                proc.kill()
-                out, err = proc.communicate()
-                self.fail(f'timeout for task {tag} (stage {stage}) at {ws / "out"}; '
-                          f'its stdout={out.decode("utf-8", "replace")[:400]!r} '
-                          f'stderr={err.decode("utf-8", "replace")[:400]!r} '
-                          f'summary_present={(ws / "out" / "summary.json").is_file()} '
-                          f'barrier_started={len(list(self.barrier.glob("started-*")))} '
-                          f'barrier_finished={len(list(self.barrier.glob("finished-*")))}')
-            results[tag] = {'rc': proc.returncode, 'ws': ws, 'stage': stage,
-                            'out': ws / 'out',
-                            'stdout': out.decode('utf-8', 'replace'),
-                            'stderr': err.decode('utf-8', 'replace')}
+            # 并发启动四适配器子进程（真实重叠由 barrier 门控完成证明）。
+            procs = {tag: subprocess.Popen(cmd, env=env, cwd=str(ws),
+                                           stdout=subprocess.PIPE, stderr=subprocess.PIPE)
+                     for tag, cmd, env, ws, stage in specs}
+            results = {}
+            deadline = 180
+            for tag, cmd, env, ws, stage in specs:
+                proc = procs[tag]
+                try:
+                    out, err = proc.communicate(timeout=deadline)
+                except subprocess.TimeoutExpired:
+                    proc.kill()
+                    out, err = proc.communicate()
+                    self.fail(f'timeout for task {tag} (stage {stage}) at {ws / "out"}; '
+                              f'its stdout={out.decode("utf-8", "replace")[:400]!r} '
+                              f'stderr={err.decode("utf-8", "replace")[:400]!r} '
+                              f'summary_present={(ws / "out" / "summary.json").is_file()} '
+                              f'barrier_started={len(list(self.barrier.glob("started-*")))} '
+                              f'barrier_finished={len(list(self.barrier.glob("finished-*")))}')
+                results[tag] = {'rc': proc.returncode, 'ws': ws, 'stage': stage,
+                                'out': ws / 'out',
+                                'stdout': out.decode('utf-8', 'replace'),
+                                'stderr': err.decode('utf-8', 'replace')}
 
-        # ---- barrier 证明重叠而非串行（四腿并发；ZCode 恢复后为合法腿，必须同样进 barrier） ----
-        started = sorted(float(p.read_text()) for p in self.barrier.glob('started-*'))
-        finished = sorted(float(p.read_text()) for p in self.barrier.glob('finished-*'))
-        self.assertEqual(len(started), 4, f'started={started}')
-        self.assertEqual(len(finished), 4, f'finished={finished}')
-        self.assertLessEqual(max(started), min(finished),
-                             'tasks did not truly overlap (serial execution detected)')
+            # ---- barrier 证明重叠而非串行（四腿并发；ZCode 恢复后为合法腿，必须同样进 barrier） ----
+            started = sorted(float(p.read_text()) for p in self.barrier.glob('started-*'))
+            finished = sorted(float(p.read_text()) for p in self.barrier.glob('finished-*'))
+            self.assertEqual(len(started), 4, f'started={started}')
+            self.assertEqual(len(finished), 4, f'finished={finished}')
+            self.assertLessEqual(max(started), min(finished),
+                                 'tasks did not truly overlap (serial execution detected)')
 
-        # ---- 路径隔离：三个成功任务各自独立 workspace；CodeBuddy 429 失败腿零代码产出 ----
-        qoder_outputs = set()
-        for tag in ('qa', 'qb'):
-            f = results[tag]['ws'] / 'output.py'
-            self.assertTrue(f.is_file(), f'missing isolated output for {tag}')
-            qoder_outputs.add(f.read_text(encoding='utf-8'))
-        self.assertEqual(len(qoder_outputs), 2,
-                         f'two Qoder outputs must stay isolated: {qoder_outputs}')
-        self.assertFalse((results['cb429']['ws'] / 'output.py').exists(),
-                         'failed task cb429 must produce zero code output')
+            # ---- 路径隔离：三个成功任务各自独立 workspace；CodeBuddy 429 失败腿零代码产出 ----
+            qoder_outputs = set()
+            for tag in ('qa', 'qb'):
+                f = results[tag]['ws'] / 'output.py'
+                self.assertTrue(f.is_file(), f'missing isolated output for {tag}')
+                qoder_outputs.add(f.read_text(encoding='utf-8'))
+            self.assertEqual(len(qoder_outputs), 2,
+                             f'two Qoder outputs must stay isolated: {qoder_outputs}')
+            self.assertFalse((results['cb429']['ws'] / 'output.py').exists(),
+                             'failed task cb429 must produce zero code output')
 
-        # ---- 失败任务不阻塞其余：两 Qoder 成功完成并绑定 ----
-        for tag in ('qa', 'qb'):
-            r = results[tag]
-            self.assertEqual(r['rc'], 0, r['stderr'])
-            summary = json.loads((r['out'] / 'summary.json').read_text(encoding='utf-8'))
-            self.assertTrue(summary['protocol_success'], summary)
-            self.assertTrue(summary['report_bound'], summary)
-            self.assertEqual(summary['diagnostics']['failure_types'], [],
-                             'a clean success must not be misreported as failure')
+            # ---- 失败任务不阻塞其余：两 Qoder 成功完成并绑定 ----
+            for tag in ('qa', 'qb'):
+                r = results[tag]
+                self.assertEqual(r['rc'], 0, r['stderr'])
+                summary = json.loads((r['out'] / 'summary.json').read_text(encoding='utf-8'))
+                self.assertTrue(summary['protocol_success'], summary)
+                self.assertTrue(summary['report_bound'], summary)
+                self.assertEqual(summary['diagnostics']['failure_types'], [],
+                                 'a clean success must not be misreported as failure')
 
-        # ---- CodeBuddy 结构化 429/6004（含 reset 提示，零产出、不绑定） ----
-        rcb = results['cb429']
-        self.assertEqual(rcb['rc'], 3, rcb['stderr'])
-        sb = json.loads((rcb['out'] / 'summary.json').read_text(encoding='utf-8'))
-        self.assertFalse(sb['protocol_success'])
-        self.assertIn('quota_429', sb['diagnostics']['failure_types'])
-        self.assertEqual(sb['errors_info'][0]['status'], 429)
-        self.assertEqual(sb['errors_info'][0]['code'], 6004)
-        self.assertIn('重置', sb['diagnostics']['reset_hint'] or '')
-        self.assertFalse(sb['report_bound'])
+            # ---- CodeBuddy 结构化 429/6004（含 reset 提示，零产出、不绑定） ----
+            rcb = results['cb429']
+            self.assertEqual(rcb['rc'], 3, rcb['stderr'])
+            sb = json.loads((rcb['out'] / 'summary.json').read_text(encoding='utf-8'))
+            self.assertFalse(sb['protocol_success'])
+            self.assertIn('quota_429', sb['diagnostics']['failure_types'])
+            self.assertEqual(sb['errors_info'][0]['status'], 429)
+            self.assertEqual(sb['errors_info'][0]['code'], 6004)
+            self.assertIn('重置', sb['diagnostics']['reset_hint'] or '')
+            self.assertFalse(sb['report_bound'])
 
-        # ---- ZCode 恢复后的合法成功腿（BW-ZCODE-RESTORE-1-20261022）：入口 rc=0、
-        #      九节报告完整绑定、无失败分类、真实进入 barrier，终态释放唯一容量槽 ----
-        rzc = results['zcok']
-        self.assertEqual(rzc['rc'], 0, rzc['stdout'] + rzc['stderr'])
-        szc = json.loads((rzc['out'] / 'summary.json').read_text(encoding='utf-8'))
-        self.assertTrue(szc['protocol_success'], szc)
-        self.assertTrue(szc['report_bound'], szc)
-        self.assertEqual(szc['diagnostics']['failure_types'], [],
-                         'a clean ZCode success must not be misreported as failure')
-        self.assertEqual(szc['model_requested'], 'GLM-5.3')
-        self.assertTrue((self.barrier / 'started-zcok').exists(),
-                        'restored zcode leg must reach the barrier')
-        self.assertTrue((self.barrier / 'finished-zcok').exists(),
-                        'restored zcode leg must finish the barrier')
-        st = dp.status(self.dispatch_store, now=WINDOW_T0)
-        self.assertEqual(st['pools']['zcode:GLM-5.3']['active'], 0, st)
-        self.assertEqual(st['pools']['zcode:GLM-5.3']['free'], 1, st)
+            # ---- ZCode 恢复后的合法成功腿（BW-ZCODE-RESTORE-1-20261022）：入口 rc=0、
+            #      九节报告完整绑定、无失败分类、真实进入 barrier，终态释放唯一容量槽 ----
+            rzc = results['zcok']
+            self.assertEqual(rzc['rc'], 0, rzc['stdout'] + rzc['stderr'])
+            szc = json.loads((rzc['out'] / 'summary.json').read_text(encoding='utf-8'))
+            self.assertTrue(szc['protocol_success'], szc)
+            self.assertTrue(szc['report_bound'], szc)
+            self.assertEqual(szc['diagnostics']['failure_types'], [],
+                             'a clean ZCode success must not be misreported as failure')
+            self.assertEqual(szc['model_requested'], 'GLM-5.3')
+            self.assertTrue((self.barrier / 'started-zcok').exists(),
+                            'restored zcode leg must reach the barrier')
+            self.assertTrue((self.barrier / 'finished-zcok').exists(),
+                            'restored zcode leg must finish the barrier')
+            st = dp.status(self.dispatch_store, now=WINDOW_T0)
+            self.assertEqual(st['pools']['zcode:GLM-5.3']['active'], 0, st)
+            self.assertEqual(st['pools']['zcode:GLM-5.3']['free'], 1, st)
 
-        # 若主脑给出 BRAIN_WORKER_EXERCISE_EVIDENCE_DIR，把全部 request/summary/process/
-        # stdout/stderr/失败证据复制过去，便于真实回读；默认 temp 即可，不提交进业务仓。
-        self._persist_evidence(results, rcb)
+            # 若主脑给出 BRAIN_WORKER_EXERCISE_EVIDENCE_DIR，把全部 request/summary/process/
+            # stdout/stderr/失败证据复制过去，便于真实回读；默认 temp 即可，不提交进业务仓。
+            self._persist_evidence(results, rcb)
 
     def _persist_evidence(self, results, rcb):
         dest = os.environ.get('BRAIN_WORKER_EXERCISE_EVIDENCE_DIR')
@@ -513,109 +576,118 @@ class ParallelRehearsalTests(unittest.TestCase):
         return sha
 
     def test_fallback_after_429_keeps_other_tasks_unchanged(self):
-        # 1) 先跑一个 CodeBuddy 429 任务并保存失败 summary + hash（fallback 前留证）。
-        ws = self._mk_workspace('fb429')
-        prompt = self._write('prompt-fb429.txt', 'CodeBuddy 失败演练任务。\n')
-        plan = self._plan('T-FB429', 'BW-FB-CB429', 'codebuddy', 'CB-PARR-429', ws,
-                          prompt, ['Read'])
-        proc = subprocess.run(self._codebuddy_cmd(ws, prompt, ws / 'out',
-                                                  'BW-FB-CB429', plan),
-                              env=self._base_env('fb429', ws, barrier_total=1),
-                              cwd=str(ws), capture_output=True, timeout=120)
-        self.assertEqual(proc.returncode, 3)
-        fail_sha = self._fail_summary(ws, 'fb429')
-        self.assertEqual(len(fail_sha), 64)
+        # BW-WEAK-RESTRUCTURE-20261116: 两内置 Max 已移出弱档、国际 Qwen3.8-Flash 全档
+        # 不可新派——本用例的容量预留与子进程消费整体改在 strong 档（档位文件全程存活）；
+        # 在途两腿改为国际 Max（ia）+ CN 内置 Max（ib，独立 1 槽），接管腿改走另一入口
+        # zcode:GLM-5.3（strong 常态池）——「另一入口接管失败任务」的本意不变。
+        with dispatch_mode('strong'):
+            # 1) 先跑一个 CodeBuddy 429 任务并保存失败 summary + hash（fallback 前留证）。
+            ws = self._mk_workspace('fb429')
+            prompt = self._write('prompt-fb429.txt', 'CodeBuddy 失败演练任务。\n')
+            plan = self._plan('T-FB429', 'BW-FB-CB429', 'codebuddy', 'CB-PARR-429', ws,
+                              prompt, ['Read'])
+            proc = subprocess.run(self._codebuddy_cmd(ws, prompt, ws / 'out',
+                                                      'BW-FB-CB429', plan),
+                                  env=self._base_env('fb429', ws, barrier_total=1),
+                                  cwd=str(ws), capture_output=True, timeout=120)
+            self.assertEqual(proc.returncode, 3)
+            fail_sha = self._fail_summary(ws, 'fb429')
+            self.assertEqual(len(fail_sha), 64)
 
-        # Keep the failed task's barrier evidence, but give the fallback cohort its
-        # own barrier. A completed failure is not one of its three live members.
-        self.barrier = self.base / 'barrier-fallback'
-        self.barrier.mkdir()
+            # Keep the failed task's barrier evidence, but give the fallback cohort its
+            # own barrier. A completed failure is not one of its three live members.
+            self.barrier = self.base / 'barrier-fallback'
+            self.barrier.mkdir()
 
-        # 2) 起两个 Qoder 成功任务（barrier_total=3），此刻它们仍卡在 barrier 内。
-        #    BW-POOL-SPLIT-20261010-S3：国际 Qwen4-Max-Preview 只有 1 槽，故 ia 占主力 Max、
-        #    ib 走同级国际 Flash。各腿本就显式 claim，绝不突破任一池上限；本 cohort 不派
-        #    zcode（BW-ZCODE-RESTORE-1-20261022 后其容量为 1，但不在本用例路径内）。
-        inflight = {}
-        for tag, stage, qmodel in (('ia', 'BW-FB-IA', 'Qwen4-Max-Preview'),
-                                   ('ib', 'BW-FB-IB', 'Qwen3.8-Flash')):
-            wsi = self._mk_workspace(tag)
-            pi = self._write(f'prompt-{tag}.txt', f'Qoder {tag} 在途任务。\n')
-            pl = self._plan('T-' + tag.upper(), stage, 'qoder', qmodel, wsi,
-                            pi, ['Read'])
-            claim = self._reserve('T-' + tag.upper(), 'qoder', qmodel, wsi,
-                                  pi, stage)
-            outi = wsi / 'out'
-            pr = subprocess.Popen(self._qoder_cmd(wsi, pi, outi, stage, pl,
+            # 2) 起两个 Qoder 家族成功任务（barrier_total=3），此刻它们仍卡在 barrier 内。
+            #    BW-WEAK-RESTRUCTURE-20261116：国际 Max 与 CN 内置 Max 各自独立 1 槽
+            #    （strong 常态、无时段门），ia 走国际、ib 走 CN。各腿本就显式 claim，
+            #    绝不突破任一池上限。
+            inflight = {}
+            for tag, stage, runtime, qmodel, cmd_builder in (
+                    ('ia', 'BW-FB-IA', 'qoder', 'Qwen4-Max-Preview', self._qoder_cmd),
+                    ('ib', 'BW-FB-IB', 'qodercn', 'Qwen4-Max-Preview',
+                     self._qodercn_cmd)):
+                wsi = self._mk_workspace(tag)
+                pi = self._write(f'prompt-{tag}.txt', f'Qoder {tag} 在途任务。\n')
+                pl = self._plan('T-' + tag.upper(), stage, runtime, qmodel, wsi,
+                                pi, ['Read'])
+                claim = self._reserve('T-' + tag.upper(), runtime, qmodel, wsi,
+                                      pi, stage)
+                outi = wsi / 'out'
+                pr = subprocess.Popen(cmd_builder(wsi, pi, outi, stage, pl,
                                                   qmodel, claim),
-                                  env=self._base_env(tag, wsi,
-                                                     self._write(f'report-{tag}.txt',
-                                                                 build_bound_report(
-                                                                     stage, str(wsi))),
-                                                     barrier_total=3),
-                                  cwd=str(wsi), stdout=subprocess.PIPE,
-                                  stderr=subprocess.PIPE)
-            self._live_procs.append(pr)
-            inflight[tag] = (pr, outi)
+                                      env=self._base_env(tag, wsi,
+                                                         self._write(f'report-{tag}.txt',
+                                                                     build_bound_report(
+                                                                         stage, str(wsi))),
+                                                         barrier_total=3),
+                                      cwd=str(wsi), stdout=subprocess.PIPE,
+                                      stderr=subprocess.PIPE)
+                self._live_procs.append(pr)
+                inflight[tag] = (pr, outi)
 
-        # Wait for the real child markers, not merely adapter request files: both
-        # independent tasks must be held until the fallback itself starts.
-        import time as _t
-        for tag, (pr, outi) in inflight.items():
-            req = outi / 'request.json'
-            for _ in range(200):
-                if req.is_file() and (self.barrier / ('started-' + tag)).is_file():
-                    break
-                _t.sleep(0.05)
-            self.assertTrue(req.is_file(), f'{tag} request.json not written')
-            self.assertTrue((self.barrier / ('started-' + tag)).is_file())
-            self.assertIsNone(pr.poll(), f'{tag} finished before fallback dispatch')
-            self.assertFalse((self.barrier / ('finished-' + tag)).exists())
-        self.assertEqual(len(list(self.barrier.glob('started-*'))), 2)
+            # Wait for the real child markers, not merely adapter request files: both
+            # independent tasks must be held until the fallback itself starts.
+            import time as _t
+            for tag, (pr, outi) in inflight.items():
+                req = outi / 'request.json'
+                for _ in range(200):
+                    if req.is_file() and (self.barrier / ('started-' + tag)).is_file():
+                        break
+                    _t.sleep(0.05)
+                self.assertTrue(req.is_file(), f'{tag} request.json not written')
+                self.assertTrue((self.barrier / ('started-' + tag)).is_file())
+                self.assertIsNone(pr.poll(), f'{tag} finished before fallback dispatch')
+                self.assertFalse((self.barrier / ('finished-' + tag)).exists())
+            self.assertEqual(len(list(self.barrier.glob('started-*'))), 2)
 
-        # 快照两个在途任务的 prompt_sha256 + request.json 原字节哈希（fallback 前）。
-        before = {}
-        for tag, (pr, outi) in inflight.items():
-            raw = (outi / 'request.json').read_bytes()
-            before[tag] = {'raw_sha': _sha(raw),
-                           'prompt_sha256': json.loads(raw.decode('utf-8'))['prompt_sha256']}
+            # 快照两个在途任务的 prompt_sha256 + request.json 原字节哈希（fallback 前）。
+            before = {}
+            for tag, (pr, outi) in inflight.items():
+                raw = (outi / 'request.json').read_bytes()
+                before[tag] = {'raw_sha': _sha(raw),
+                               'prompt_sha256': json.loads(raw.decode('utf-8'))['prompt_sha256']}
 
-        # 3) 客户已准许的 fallback：以另一入口（Qoder ok stub）接管失败任务，用新 task_id
-        #    （不与失败的 T-FB429 同 id 重发），第三个 barrier 成员放行全部在途任务。
-        wsfb = self._mk_workspace('fbtake')
-        pfb = self._write('prompt-fbtake.txt', 'Qoder 接管 fallback 任务。\n')
-        plfb = self._plan('T-FB-TAKE', 'BW-FB-TAKE', 'qoder', 'Qwen3.8-Flash', wsfb,
-                          pfb, ['Read'])
-        # 主力 Qwen4-Max-Preview 已被 ia/ib 占满，接管任务显式预留溢出 Qwen3.8-Flash 名额。
-        fb_claim = self._reserve('T-FB-TAKE', 'qoder', 'Qwen3.8-Flash', wsfb, pfb,
-                                 'BW-FB-TAKE')
-        fb_report = self._write('report-fbtake.txt',
-                                build_bound_report('BW-FB-TAKE', str(wsfb)))
-        fb_proc = subprocess.run(self._qoder_cmd(wsfb, pfb, wsfb / 'out',
-                                                 'BW-FB-TAKE', plfb, 'Qwen3.8-Flash',
-                                                 fb_claim),
-                                 env=self._base_env('fbtake', wsfb, fb_report,
-                                                    barrier_total=3),
-                                 cwd=str(wsfb), capture_output=True, timeout=120)
-        self.assertEqual(fb_proc.returncode, 0,
-                         fb_proc.stderr.decode('utf-8', 'replace'))
-        fb_summary = json.loads((wsfb / 'out' / 'summary.json').read_text(encoding='utf-8'))
-        self.assertTrue(fb_summary['report_bound'])
-        fallback_started = float((self.barrier / 'started-fbtake').read_text())
+            # 3) 客户已准许的 fallback：以另一入口接管失败任务，用新 task_id
+            #    （不与失败的 T-FB429 同 id 重发），第三个 barrier 成员放行全部在途任务。
+            #    BW-WEAK-RESTRUCTURE-20261116：接管腿从国际 Flash（已全档不可新派）改为
+            #    zcode:GLM-5.3（strong 常态池；zcode 入口同样是与失败 CB 不同的另一入口）。
+            wsfb = self._mk_workspace('fbtake')
+            pfb = self._write('prompt-fbtake.txt', 'ZCode 接管 fallback 任务。\n')
+            plfb = self._plan('T-FB-TAKE', 'BW-FB-TAKE', 'zcode', 'GLM-5.3', wsfb,
+                              pfb, ['Read'])
+            # 主力两槽已被 ia/ib 占满，接管任务显式预留 zcode:GLM-5.3 名额（另一入口）。
+            fb_claim = self._reserve('T-FB-TAKE', 'zcode', 'GLM-5.3', wsfb, pfb,
+                                     'BW-FB-TAKE')
+            fb_report = self._write('report-fbtake.txt',
+                                    build_bound_report('BW-FB-TAKE', str(wsfb)))
+            fb_proc = subprocess.run(self._zcode_cmd(wsfb, pfb, wsfb / 'out',
+                                                     'BW-FB-TAKE', plfb, 'GLM-5.3',
+                                                     fb_claim),
+                                     env=self._base_env('fbtake', wsfb, fb_report,
+                                                        barrier_total=3),
+                                     cwd=str(wsfb), capture_output=True, timeout=120)
+            self.assertEqual(fb_proc.returncode, 0,
+                             fb_proc.stderr.decode('utf-8', 'replace'))
+            fb_summary = json.loads((wsfb / 'out' / 'summary.json').read_text(encoding='utf-8'))
+            self.assertTrue(fb_summary['report_bound'])
+            fallback_started = float((self.barrier / 'started-fbtake').read_text())
 
-        # 4) join 两个在途任务；证明 fallback 期间它们的 prompt/request 哈希一字未改。
-        for tag, (pr, outi) in inflight.items():
-            out, err = pr.communicate(timeout=120)
-            self.assertEqual(pr.returncode, 0, err.decode('utf-8', 'replace'))
-            self.assertGreaterEqual(float((self.barrier / ('finished-' + tag)).read_text()), fallback_started)
-            raw_after = (outi / 'request.json').read_bytes()
-            self.assertEqual(_sha(raw_after), before[tag]['raw_sha'],
-                             f'{tag} request.json bytes changed during fallback')
-            self.assertEqual(json.loads(raw_after.decode('utf-8'))['prompt_sha256'],
-                             before[tag]['prompt_sha256'],
-                             f'{tag} prompt hash changed during fallback')
-        # 失败任务 summary 哈希仍在 fallback 之前保存，未被覆盖。
-        saved = (self.base / 'failure-evidence-fb429' / 'summary-sha256.txt').read_text()
-        self.assertEqual(saved.strip(), fail_sha)
+            # 4) join 两个在途任务；证明 fallback 期间它们的 prompt/request 哈希一字未改。
+            for tag, (pr, outi) in inflight.items():
+                out, err = pr.communicate(timeout=120)
+                self.assertEqual(pr.returncode, 0, err.decode('utf-8', 'replace'))
+                self.assertGreaterEqual(float((self.barrier / ('finished-' + tag)).read_text()), fallback_started)
+                raw_after = (outi / 'request.json').read_bytes()
+                self.assertEqual(_sha(raw_after), before[tag]['raw_sha'],
+                                 f'{tag} request.json bytes changed during fallback')
+                self.assertEqual(json.loads(raw_after.decode('utf-8'))['prompt_sha256'],
+                                 before[tag]['prompt_sha256'],
+                                 f'{tag} prompt hash changed during fallback')
+            # 失败任务 summary 哈希仍在 fallback 之前保存，未被覆盖。
+            saved = (self.base / 'failure-evidence-fb429' / 'summary-sha256.txt').read_text()
+            self.assertEqual(saved.strip(), fail_sha)
 
     def test_plan_rejections_sent_false(self):
         # 同 task_id 在途：锁定 prompt 不得重发/改 prompt
@@ -739,32 +811,35 @@ class ParallelRehearsalTests(unittest.TestCase):
         # Popen 前被容量门拒绝（claim_invalid），零输出目录、零子进程，原预留仍 reserved
         # （漂移拒绝绝不消费/释放名额，也绝不改派绕过）。这同时证明 --chat-id 确实被
         # 透传进 consume_for_entry 并参与精确绑定校验。
-        ws = self._mk_workspace('chatdrift')
-        prompt = self._write('prompt-chatdrift.txt', 'Qoder chat 漂移演练任务。\n')
-        stage = 'BW-FB-CHATDRIFT'
-        plan = self._plan('T-CHAT', stage, 'qoder', 'Qwen4-Max-Preview', ws, prompt, ['Read'])
-        res = dp.reserve(self.dispatch_store, task_id='T-CHAT', runtime='qoder',
-                         model='Qwen4-Max-Preview', workspace=str(ws),
-                         prompt_sha256=hashlib.sha256(prompt.read_bytes()).hexdigest(),
-                         stage=stage, chat_id='C-ORIG', executor='qoder', now=WINDOW_T0)
-        self.assertTrue(res['allowed'], res)
-        out = ws / 'out'
-        cmd = self._qoder_cmd(ws, prompt, out, stage, plan, 'Qwen4-Max-Preview', res['token'])
-        cmd += ['--chat-id', 'C-WRONG']
-        proc = subprocess.run(cmd, env=self._base_env('chatdrift', ws), cwd=str(ws),
-                              capture_output=True, timeout=120)
-        self.assertEqual(proc.returncode, 2, proc.stderr.decode('utf-8', 'replace'))
-        self.assertFalse(out.exists())  # 零 Popen：门禁在建输出目录之前拒绝
-        payload = json.loads(proc.stdout.decode('utf-8', 'replace'))
-        self.assertTrue(payload['capacity_gate_rejected'])
-        self.assertFalse(payload['sent'])
-        self.assertEqual(payload['reason'], 'claim_invalid')
-        with closing(dp.connect(self.dispatch_store)) as conn:
-            row = conn.execute('SELECT state FROM attempts WHERE token=?',
-                               (res['token'],)).fetchone()
-        self.assertEqual(row['state'], 'reserved')
-        self.assertEqual(
-            dp.status(self.dispatch_store)['pools']['qoder:Qwen4-Max-Preview']['active'], 1)
+        # BW-WEAK-RESTRUCTURE-20261116: qoder:Qwen4-Max-Preview 已移出弱档，本用例改在
+        # strong 档验证（子进程消费窗口内档位文件持续存在）。
+        with dispatch_mode('strong'):
+            ws = self._mk_workspace('chatdrift')
+            prompt = self._write('prompt-chatdrift.txt', 'Qoder chat 漂移演练任务。\n')
+            stage = 'BW-FB-CHATDRIFT'
+            plan = self._plan('T-CHAT', stage, 'qoder', 'Qwen4-Max-Preview', ws, prompt, ['Read'])
+            res = dp.reserve(self.dispatch_store, task_id='T-CHAT', runtime='qoder',
+                             model='Qwen4-Max-Preview', workspace=str(ws),
+                             prompt_sha256=hashlib.sha256(prompt.read_bytes()).hexdigest(),
+                             stage=stage, chat_id='C-ORIG', executor='qoder', now=WINDOW_T0)
+            self.assertTrue(res['allowed'], res)
+            out = ws / 'out'
+            cmd = self._qoder_cmd(ws, prompt, out, stage, plan, 'Qwen4-Max-Preview', res['token'])
+            cmd += ['--chat-id', 'C-WRONG']
+            proc = subprocess.run(cmd, env=self._base_env('chatdrift', ws), cwd=str(ws),
+                                  capture_output=True, timeout=120)
+            self.assertEqual(proc.returncode, 2, proc.stderr.decode('utf-8', 'replace'))
+            self.assertFalse(out.exists())  # 零 Popen：门禁在建输出目录之前拒绝
+            payload = json.loads(proc.stdout.decode('utf-8', 'replace'))
+            self.assertTrue(payload['capacity_gate_rejected'])
+            self.assertFalse(payload['sent'])
+            self.assertEqual(payload['reason'], 'claim_invalid')
+            with closing(dp.connect(self.dispatch_store)) as conn:
+                row = conn.execute('SELECT state FROM attempts WHERE token=?',
+                                   (res['token'],)).fetchone()
+            self.assertEqual(row['state'], 'reserved')
+            self.assertEqual(
+                dp.status(self.dispatch_store)['pools']['qoder:Qwen4-Max-Preview']['active'], 1)
 
 
 if __name__ == '__main__':

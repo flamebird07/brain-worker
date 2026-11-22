@@ -42,13 +42,21 @@ OUT_0800 = datetime(2026, 10, 9, 0, 0, 0, tzinfo=timezone.utc)    # 北京 08:00
 FIVE_POOLS = {'zcode:GLM-5.3', 'claude:deepseek-flash', 'qoder:Qwen4-Max-Preview',
               'qodercn:Qwen4-Max-Preview', 'qodercn:Qwen-3.8-Max'}
 # BW-STRONG-SONUS-20261024：qoder:Sonus（国际 Qoder CLI --list-models 核验字面名）是
-# strong 专属独立 1 槽；strong 可派集合 = 五池 + Sonus，medium/weak 仍各为五池/11 池。
+# strong 专属独立 1 槽；strong 可派集合 = 五池 + Sonus。
 SONUS_KEY = 'qoder:Sonus'
 SIX_POOLS = FIVE_POOLS | {SONUS_KEY}
-ELEVEN_POOLS = FIVE_POOLS | {
-    'codebuddy:deepseek-v4.1-flash', 'opencode:deepseek-v4.1-flash-free',
-    'opencode:glm-5.3-flash-free', 'codebuddy:glm-5.3-flash',
-    'qoder:Qwen3.8-Flash', 'qodercn:Qwen3.8-Flash'}
+# BW-WEAK-RESTRUCTURE-20261116：弱档可新派 5 池——两 OpenCode 免费模型／CodeBuddy GLM／
+# Claude／ZCode GLM-5.3-Flash（新独立池键）；全部 Qoder 池与 codebuddy deepseek 移出弱档
+# （weak 一律 mode_excluded），zcode:GLM-5.3 仅 strong/medium 保留。
+WEAK_FIVE_POOLS = {'opencode:deepseek-v4.1-flash-free', 'opencode:glm-5.3-flash-free',
+                   'codebuddy:glm-5.3-flash', 'claude:deepseek-flash',
+                   'zcode:GLM-5.3-Flash'}
+# BW-WEAK-RESTRUCTURE-20261116：dm.ALL_POOL_KEYS 语义改为「全档位策略池并集」12 池 =
+# 弱档新 5 池 + 移出弱档但仍在 strong/medium 或留有历史在途的 7 池。
+ALL_POLICY_POOLS = WEAK_FIVE_POOLS | {
+    'qodercn:Qwen-3.8-Max', 'qodercn:Qwen4-Max-Preview', 'qoder:Qwen4-Max-Preview',
+    'codebuddy:deepseek-v4.1-flash', 'qoder:Qwen3.8-Flash', 'qodercn:Qwen3.8-Flash',
+    'zcode:GLM-5.3'}
 
 
 class StateFileTests(unittest.TestCase):
@@ -164,15 +172,15 @@ class ModePolicyTests(unittest.TestCase):
                          FIVE_POOLS - {dm.QMAX_CN_CUSTOM_POOL_KEY})
         self.assertEqual(set(dm.allowed_pools_for_mode('medium')),
                          FIVE_POOLS - {dm.QMAX_CN_CUSTOM_POOL_KEY})
-        self.assertEqual(set(dm.allowed_pools_for_mode('weak')),
-                         ELEVEN_POOLS - {dm.QMAX_CN_CUSTOM_POOL_KEY})
+        # BW-WEAK-RESTRUCTURE-20261116：弱档收窄为新 5 池（QMax 两内置／Qwen-3.8-Max
+        # 自定义／codebuddy deepseek／两 Flash／zcode:GLM-5.3 全部 mode_excluded）。
+        self.assertEqual(set(dm.allowed_pools_for_mode('weak')), WEAK_FIVE_POOLS)
         for m in ('strong', 'medium', 'weak'):
             self.assertNotIn(SONUS_KEY, dm.allowed_pools_for_mode(m), m)
-        # 非法档位按默认 weak 口径给全表；缺省读当前档（conftest 隔离下 weak）。
-        self.assertEqual(set(dm.allowed_pools_for_mode('ultra')),
-                         ELEVEN_POOLS - {dm.QMAX_CN_CUSTOM_POOL_KEY})
-        self.assertEqual(set(dm.allowed_pools_for_mode()),
-                         ELEVEN_POOLS - {dm.QMAX_CN_CUSTOM_POOL_KEY})
+        # 非法档位按默认 weak 口径给弱档新 5 池；缺省读当前档（conftest 隔离下 weak）。
+        # BW-WEAK-RESTRUCTURE-20261116:
+        self.assertEqual(set(dm.allowed_pools_for_mode('ultra')), WEAK_FIVE_POOLS)
+        self.assertEqual(set(dm.allowed_pools_for_mode()), WEAK_FIVE_POOLS)
 
     def test_strong_priority_table(self):
         # 强档新派：两路内置 Max 并列第一，Claude 第二，ZCode 最后。
@@ -201,36 +209,45 @@ class ModePolicyTests(unittest.TestCase):
         })
 
     def test_weak_priority_table(self):
+        # BW-WEAK-RESTRUCTURE-20261116：弱档 5 池——全部 Qoder 与 codebuddy deepseek
+        # 移出，ZCode 只用 GLM-5.3-Flash（新独立池键），Claude 倒数第二、Flash 最后。
         self.assertEqual(dm.priority_map_for_mode('weak'), {
-            'qodercn:Qwen-3.8-Max': 1,
-            'qodercn:Qwen4-Max-Preview': 1,
-            'zcode:GLM-5.3': 9,
+            'opencode:deepseek-v4.1-flash-free': 1,
+            'opencode:glm-5.3-flash-free': 1,
+            'codebuddy:glm-5.3-flash': 2,
             'claude:deepseek-flash': 3,
-            'qoder:Qwen4-Max-Preview': 4,
-            'codebuddy:deepseek-v4.1-flash': 5,
-            'opencode:deepseek-v4.1-flash-free': 6,
-            'opencode:glm-5.3-flash-free': 6,
-            'codebuddy:glm-5.3-flash': 7,
-            'qoder:Qwen3.8-Flash': 8,
-            'qodercn:Qwen3.8-Flash': 8,
+            'zcode:GLM-5.3-Flash': 4,
         })
 
     def test_priority_maps_are_copies(self):
         first = dm.priority_map_for_mode('weak')
-        first['zcode:GLM-5.3'] = 99
-        self.assertEqual(dm.priority_map_for_mode('weak')['zcode:GLM-5.3'], 9)
+        first['claude:deepseek-flash'] = 99
+        self.assertEqual(dm.priority_map_for_mode('weak')['claude:deepseek-flash'], 3)
 
     def test_pool_key_literals_match_dispatch_pool(self):
         # 键名漂移守卫：dispatch_mode 的独立字面量必须与 dispatch_pool 真实池表一致。
-        # BW-STRONG-SONUS-20261024：MAIN_FORCE 含 strong 专属的 qoder:Sonus，但它不在
-        # weak 全候选（ALL_POOL_KEYS 保持 11 池）——known = 全表 ∪ strong 专属池。
+        # BW-WEAK-RESTRUCTURE-20261116：ALL_POOL_KEYS 语义改为「全档位策略池并集」
+        # （12 池 = weak 新 5 池 + 曾属弱档/其他档位的 7 池）——是 MAIN|OVERFLOW 的
+        # 子集（不再相等：MAIN 新增 zcode:GLM-5.3-Flash 且旧弱档池仍登记）。
         self.assertEqual(set(dm.ALL_POOL_KEYS),
-                         (set(dp.MAIN_FORCE_KEYS) | set(dp.OVERFLOW_KEYS))
-                         - set(dm.STRONG_ONLY_POOL_KEYS))
+                         set(dp.WEAK_POOL_KEYS)
+                         | ((set(dp.MAIN_FORCE_KEYS) | set(dp.OVERFLOW_KEYS))
+                            - set(dp.WEAK_POOL_KEYS)
+                            - set(dm.STRONG_ONLY_POOL_KEYS)))
         self.assertTrue(set(dm.ALL_POOL_KEYS) <= set(dp.CAPACITY))
         self.assertTrue(set(dm.STRONG_ONLY_POOL_KEYS) <= set(dp.CAPACITY))
+        # BW-WEAK-RESTRUCTURE-20261116: KNOWN = 策略并集 ∪ strong 专属 Sonus；
+        # MAIN|OVERFLOW 正常池枚举 = KNOWN 去掉弱档新池 zcode:GLM-5.3-Flash（该池已在
+        # CAPACITY 真实登记 1 槽，但尚未进 MAIN_FORCE_POOLS 候选枚举——引擎侧疑点另行
+        # 报告，这里只锁登记事实与集合关系）。
         self.assertEqual(set(dm.KNOWN_POLICY_POOL_KEYS),
-                         set(dp.MAIN_FORCE_KEYS) | set(dp.OVERFLOW_KEYS))
+                         ALL_POLICY_POOLS | {SONUS_KEY})
+        # zcode:GLM-5.3-Flash 已入 MAIN_FORCE_POOLS——MAIN|OVERFLOW 与 KNOWN_POLICY
+        # 重新相等（13 键 = 12 并集 + Sonus）。
+        self.assertEqual(set(dp.MAIN_FORCE_KEYS) | set(dp.OVERFLOW_KEYS),
+                         set(dm.KNOWN_POLICY_POOL_KEYS))
+        self.assertIn(dp.ZCODE_FLASH_POOL_KEY, dp.CAPACITY)
+        self.assertIn(dp.ZCODE_FLASH_POOL_KEY, dp.MAIN_FORCE_KEYS)
         self.assertEqual(set(dm.NARROW_POOL_KEYS), FIVE_POOLS)
         self.assertEqual(set(dm.STRONG_POOL_KEYS), SIX_POOLS)
         self.assertEqual(dm.STRONG_ONLY_POOL_KEYS, (SONUS_KEY,))
@@ -244,17 +261,21 @@ class ModePolicyTests(unittest.TestCase):
         self.assertEqual(set(dm.MAX_POOL_KEYS),
                          {'qoder:Qwen4-Max-Preview', 'qodercn:Qwen4-Max-Preview',
                           'qodercn:Qwen-3.8-Max'})
-        # 容量口径：全局物理总 16；weak 可新派容量仍为原 15（Sonus 不参与 weak）。
-        self.assertEqual(dp.DOMESTIC_TOTAL_CAPACITY, 16)
+        # BW-WEAK-RESTRUCTURE-20261116：zcode:GLM-5.3-Flash 新独立 1 槽 → 物理总 17；
+        # ALL_POOL_KEYS 12 池容量合计 16（weak 6 + 移出弱档但仍登记的 10）。
+        self.assertEqual(dp.DOMESTIC_TOTAL_CAPACITY, 17)
+        self.assertEqual(dp.capacity_for('zcode:GLM-5.3-Flash'), 1)
         weak_slots = sum(dp.capacity_for(k) for k in dm.ALL_POOL_KEYS)
-        self.assertEqual(weak_slots, 15, weak_slots)
+        self.assertEqual(weak_slots, 16, weak_slots)
 
     def test_gated_pools_per_mode(self):
         self.assertEqual(tuple(dm.window_gated_pools_for_mode('strong')), ())
-        for m in ('medium', 'weak'):
-            self.assertEqual(set(dm.window_gated_pools_for_mode(m)),
-                             {'qoder:Qwen4-Max-Preview', 'qodercn:Qwen4-Max-Preview',
-                              'qodercn:Qwen-3.8-Max', 'claude:deepseek-flash'}, m)
+        self.assertEqual(set(dm.window_gated_pools_for_mode('medium')),
+                         {'qoder:Qwen4-Max-Preview', 'qodercn:Qwen4-Max-Preview',
+                          'qodercn:Qwen-3.8-Max', 'claude:deepseek-flash'}, 'medium')
+        # BW-WEAK-RESTRUCTURE-20261116：弱档只剩 Claude 高峰门（全部 Qoder 已移出）。
+        self.assertEqual(tuple(dm.window_gated_pools_for_mode('weak')),
+                         ('claude:deepseek-flash',), 'weak')
 
     def test_night_window_boundaries(self):
         # 北京 22:00（含）开、21:59 关；08:00（不含）关、07:59 开。
@@ -267,8 +288,9 @@ class ModePolicyTests(unittest.TestCase):
 
     def test_strong_mode_has_no_windows(self):
         # BW-STRONG-SONUS-20261024：strong 对 Sonus 同样不加任何时段门。
+        # BW-WEAK-RESTRUCTURE-20261116: 覆盖面改为全档位策略池并集 12 池 + Sonus。
         for now in (PEAK_AM, PEAK_PM, LUNCH, T0, WEEKEND, OUT_0800):
-            for pk in ELEVEN_POOLS | {SONUS_KEY}:
+            for pk in ALL_POLICY_POOLS | {SONUS_KEY}:
                 self.assertFalse(dm.window_blocks_for_mode(pk, now, 'strong'),
                                  (pk, now))
 
@@ -408,29 +430,38 @@ class SingleModeReadPerAdjudicationTests(_AdjudicationBase):
     **只读一次**并全程线程传递——切档只影响下一次裁决，绝不令同一事务前后不一致。"""
 
     def test_reserve_reads_mode_exactly_once(self):
+        # BW-WEAK-RESTRUCTURE-20261116: 弱档已不含任何 Qoder Max 池——改在中档（T0 为
+        # 北京 23:00 夜窗内）真实 reserve CN 内置 Max，单读语义原样可验。
         calls, counting = self._counting_current_mode()
-        with unittest.mock.patch.object(dm, 'current_mode', counting):
+        with dispatch_mode('medium'), \
+                unittest.mock.patch.object(dm, 'current_mode', counting):
             r = self._reserve('r1', 'qodercn', 'Qwen4-Max-Preview', 'qodercn')
         self.assertTrue(r.get('reserved') or r.get('allowed'), r)
-        self.assertEqual(calls, ['weak'], calls)
+        self.assertEqual(calls, ['medium'], calls)
 
     def test_select_and_claim_reads_mode_exactly_once(self):
+        # BW-WEAK-RESTRUCTURE-20261116: 弱档 Max 全部移出——改在中档复现「请求 CN 内置
+        # Max → 同层 Max 组内子优先轮换 routing 到国际 Max」的 routing verdict；无论
+        # claim 还是 routing，整段裁决只用一次档位读。
         calls, counting = self._counting_current_mode()
-        with unittest.mock.patch.object(dm, 'current_mode', counting):
-            r = dp.select_and_claim(self.store, task_id='s1', runtime='qoder',
+        with dispatch_mode('medium'), \
+                unittest.mock.patch.object(dm, 'current_mode', counting):
+            r = dp.select_and_claim(self.store, task_id='s1', runtime='qodercn',
                                     model='Qwen4-Max-Preview',
                                     workspace=str(self._ws('s1')),
                                     prompt_sha256='p', now=T0, _preclaim=False)
-        # 夜间 weak 档 1:1 轮换首选 CN 自定义 Max：请求国际 Max 得到 routing verdict
-        # ——无论 claim 还是 routing，整段裁决只用一次档位读。
         self.assertTrue(r.get('routing_required'), r)
-        self.assertEqual(r['selected']['pool_key'], 'qodercn:Qwen4-Max-Preview', r)
-        self.assertEqual(calls, ['weak'], calls)
+        self.assertEqual(r['selected']['pool_key'], 'qoder:Qwen4-Max-Preview', r)
+        self.assertEqual(calls, ['medium'], calls)
 
     def test_consume_reads_mode_exactly_once(self):
-        tok = self._reserve('c1', 'qodercn', 'Qwen4-Max-Preview', 'qodercn')['token']
+        # BW-WEAK-RESTRUCTURE-20261116: 同上改中档真实 reserve + consume。
+        with dispatch_mode('medium'):
+            tok = self._reserve('c1', 'qodercn', 'Qwen4-Max-Preview',
+                                'qodercn')['token']
         calls, counting = self._counting_current_mode()
-        with unittest.mock.patch.object(dm, 'current_mode', counting):
+        with dispatch_mode('medium'), \
+                unittest.mock.patch.object(dm, 'current_mode', counting):
             out = dp.consume_for_entry(self.store, task_id='c1',
                                        runtime='qodercn', model='Qwen4-Max-Preview',
                                        workspace=str(self._ws('c1')),
@@ -438,7 +469,7 @@ class SingleModeReadPerAdjudicationTests(_AdjudicationBase):
                                        wrapper_pid=4321, wrapper_created='w1',
                                        now=T0)
         self.assertTrue(out['allowed'], out)
-        self.assertEqual(calls, ['weak'], calls)
+        self.assertEqual(calls, ['medium'], calls)
 
     def test_claim_due_reads_mode_exactly_once(self):
         # Luna 状态机回归只在测试进程内显式解锁（与 test_dispatch_pool.py 同口径），
@@ -457,32 +488,47 @@ class SingleModeReadPerAdjudicationTests(_AdjudicationBase):
                 dp.CAPACITY.pop(dp.LUNA_KEY, None)
 
         self.addCleanup(_restore_luna)
-        # 补满全部 15 个国内名额（显式 executor 逐一真实 claim，确定性填充）。
-        self._reserve('cb1', 'codebuddy', 'deepseek-v4.1-flash', 'codebuddy')
+        # BW-WEAK-RESTRUCTURE-20261116: 物理总 17。可新派集合收窄后，弱档只够真实
+        # reserve 5 槽（两 OpenCode／CodeBuddy GLM／Claude×2），zcode:GLM-5.3 与两内置
+        # Qwen4-Max-Preview 改经 strong 档逐一真实 claim；codebuddy deepseek／两 Flash／
+        # CN 自定义 Max×2／zcode:GLM-5.3-Flash（尚未接入 MAIN_FORCE_POOLS 候选枚举的
+        # 引擎疑点池）与 Sonus 已不在任何档位可新派集合——按既有「strong 遗留在途」
+        # 真实形态直插 reserved 行（切档不追杀、不假释放、照常计数）。
         self._reserve('cbg', 'codebuddy', 'glm-5.3-flash', 'codebuddy', glm=True)
-        self._reserve('z1', 'zcode', 'GLM-5.3', 'zcode')
-        self._reserve('m1', 'qoder', 'Qwen4-Max-Preview', 'qoder')
-        self._reserve('m2', 'qodercn', 'Qwen4-Max-Preview', 'qodercn')
-        with unittest.mock.patch.object(dm, 'USER_DISABLED_POOL_KEYS', frozenset()):
-            self._reserve('m3', 'qodercn', 'Qwen-3.8-Max', 'qodercn')
-            self._reserve('m4', 'qodercn', 'Qwen-3.8-Max', 'qodercn')
         self._reserve('cl1', 'claude', 'deepseek-flash', 'claude')
         self._reserve('cl2', 'claude', 'deepseek-flash', 'claude')
-        self._reserve('f1', 'qoder', 'Qwen3.8-Flash', 'qoder')
-        self._reserve('f2', 'qoder', 'Qwen3.8-Flash', 'qoder')
-        self._reserve('f3', 'qodercn', 'Qwen3.8-Flash', 'qodercn')
-        self._reserve('f4', 'qodercn', 'Qwen3.8-Flash', 'qodercn')
         self._reserve('o1', 'opencode', dp.OPENCODE_DEEPSEEK_MODEL, 'opencode')
         self._reserve('o2', 'opencode', dp.OPENCODE_GLM_MODEL, 'opencode')
-        # BW-STRONG-SONUS-20261024：物理总量 16。weak 档无法新派 Sonus（档位硬排除），
-        # 第 16 个名额只能由「strong 派出后仍在途的 Sonus」占住——这里按该真实形态直插
-        # 一条 strong 时代遗留的 Sonus reserved 行（切档不追杀、不假释放）。
+        with dispatch_mode('strong'):
+            self._reserve('z1', 'zcode', 'GLM-5.3', 'zcode')
+            self._reserve('m1', 'qoder', 'Qwen4-Max-Preview', 'qoder')
+            self._reserve('m2', 'qodercn', 'Qwen4-Max-Preview', 'qodercn')
         with closing(dp.connect(self.store)) as conn:
-            conn.execute(
-                'INSERT INTO attempts(token, task_id, runtime, model, pool_key, state, '
-                "reserved_at_utc) VALUES(?,?,?,?,?,?,?)",
-                ('sonus-fixture', 'sonus-fixture-task', 'qoder', 'Sonus',
-                 dp.SONUS_POOL_KEY, 'reserved', dp._iso(T0)))
+            for tok, task, runtime, model, pool in (
+                    ('cb1-fixture', 'cb1', 'codebuddy', 'deepseek-v4.1-flash',
+                     'codebuddy:deepseek-v4.1-flash'),
+                    ('f1-fixture', 'f1', 'qoder', 'Qwen3.8-Flash',
+                     'qoder:Qwen3.8-Flash'),
+                    ('f2-fixture', 'f2', 'qoder', 'Qwen3.8-Flash',
+                     'qoder:Qwen3.8-Flash'),
+                    ('f3-fixture', 'f3', 'qodercn', 'Qwen3.8-Flash',
+                     'qodercn:Qwen3.8-Flash'),
+                    ('f4-fixture', 'f4', 'qodercn', 'Qwen3.8-Flash',
+                     'qodercn:Qwen3.8-Flash'),
+                    ('m3-fixture', 'm3', 'qodercn', 'Qwen-3.8-Max',
+                     'qodercn:Qwen-3.8-Max'),
+                    ('m4-fixture', 'm4', 'qodercn', 'Qwen-3.8-Max',
+                     'qodercn:Qwen-3.8-Max'),
+                    ('zf-fixture', 'zf', 'zcode', 'GLM-5.3-Flash',
+                     'zcode:GLM-5.3-Flash'),
+                    # BW-STRONG-SONUS-20261024：weak 档无法新派 Sonus（档位硬排除），
+                    # 该名额只能由「strong 派出后仍在途的 Sonus」占住。
+                    ('sonus-fixture', 'sonus-fixture-task', 'qoder', 'Sonus',
+                     dp.SONUS_POOL_KEY)):
+                conn.execute(
+                    'INSERT INTO attempts(token, task_id, runtime, model, pool_key, '
+                    'state, reserved_at_utc) VALUES(?,?,?,?,?,?,?)',
+                    (tok, task, runtime, model, pool, 'reserved', dp._iso(T0)))
             active = conn.execute(
                 "SELECT COUNT(*) AS n FROM attempts WHERE state IN "
                 "('reserved','running','unknown')").fetchone()['n']
@@ -508,9 +554,10 @@ class SonusRemoved20261115Tests(_AdjudicationBase):
     口径：SONUS_TEMP_DISABLED=True（持久事实）——三档（含 strong）可新派集合全部剔除
     Sonus；AUTO/显式 reserve/select-and-claim/claim-due/正式入口一律 mode_excluded
     （sent=false、零新占位、文案明确「removed from new dispatch ... user instruction」）；
-    strong 新派 4 池/5 槽；容量登记/优先级表历史层号/物理总容量 16/历史 attempt 全部
-    保留；遗留 reserved 的 Sonus 精确 claim 不再放行 consume（安全释放 start_failed，
-    真实释放、不泄漏容量）；running/unknown 在途不追杀、不假释放。"""
+    strong 新派 4 池/5 槽；容量登记/优先级表历史层号/物理总容量（BW-WEAK-RESTRUCTURE-
+    20261116 起 17）/历史 attempt 全部保留；遗留 reserved 的 Sonus 精确 claim 不再放行
+    consume（安全释放 start_failed，真实释放、不泄漏容量）；running/unknown 在途不追杀、
+    不假释放。"""
 
     def test_flag_and_registration_facts(self):
         self.assertTrue(dm.SONUS_TEMP_DISABLED)
@@ -519,17 +566,19 @@ class SonusRemoved20261115Tests(_AdjudicationBase):
         self.assertEqual(dp.capacity_for(SONUS_KEY), 1)
         self.assertEqual(dm.STRONG_PRIORITY[SONUS_KEY], 1)
         self.assertNotIn(SONUS_KEY, dp.LEGACY_RETIRED_POOL_KEYS)
-        # 物理总守卫仍为 16；Sonus 去除后 strong 新派口径 = medium（4 池/5 槽），weak 13。
-        self.assertEqual(dp.DOMESTIC_TOTAL_CAPACITY, 16)
+        # BW-WEAK-RESTRUCTURE-20261116: 物理总守卫 16→17（弱档新独立池
+        # zcode:GLM-5.3-Flash 登记 1 槽）；Sonus 去除后 strong 新派口径 = medium
+        # （4 池/5 槽），weak 收窄为 5 池/6 槽。
+        self.assertEqual(dp.DOMESTIC_TOTAL_CAPACITY, 17)
         self.assertEqual(sum(dp.capacity_for(k)
                              for k in dm.allowed_pools_for_mode('strong')), 5)
         self.assertEqual(sum(dp.capacity_for(k)
                              for k in dm.allowed_pools_for_mode('medium')), 5)
         self.assertEqual(sum(dp.capacity_for(k)
-                             for k in dm.allowed_pools_for_mode('weak')), 13)
+                             for k in dm.allowed_pools_for_mode('weak')), 6)
         self.assertEqual(len(dm.allowed_pools_for_mode('strong')), 4)
         self.assertEqual(len(dm.allowed_pools_for_mode('medium')), 4)
-        self.assertEqual(len(dm.allowed_pools_for_mode('weak')), 10)
+        self.assertEqual(len(dm.allowed_pools_for_mode('weak')), 5)
         # 强档无时段门。Sonus 的历史层号不参与派发。
         strong = dm.priority_map_for_mode('strong')
         self.assertEqual(strong[SONUS_KEY], 1)
@@ -631,19 +680,22 @@ class SonusRemoved20261115Tests(_AdjudicationBase):
         self.assertNotEqual(out.get('pool_key'), SONUS_KEY, out)
 
     def test_other_mode_excluded_pools_release_semantics_unchanged(self):
-        """对照：非 Sonus 的 mode_excluded 池（strong 下的 CodeBuddy）consume 仍按既有
-        语义把本 token reserved 释放为 start_failed 并拒绝——Sonus 去除不影响该口径。"""
-        with dispatch_mode('weak'):
-            r = dp.reserve(self.store, task_id='cb1', runtime='codebuddy',
-                           model='deepseek-v4.1-flash',
-                           workspace=str(self._ws('cb1')), prompt_sha256='p',
-                           executor='codebuddy', now=T0)
+        """对照：非 Sonus 的 mode_excluded 池 consume 仍按既有语义把本 token reserved
+        释放为 start_failed 并拒绝——Sonus 去除不影响该口径。
+        BW-WEAK-RESTRUCTURE-20261116: CodeBuddy 两模型已从所有档位移除新派资格，改用
+        zcode:GLM-5.3（strong/medium 可新派、weak mode_excluded）复现同一条 release
+        语义：strong 真实 reserve → 切 weak 消费 → mode_excluded + start_failed。"""
+        with dispatch_mode('strong'):
+            r = dp.reserve(self.store, task_id='z1', runtime='zcode',
+                           model='GLM-5.3',
+                           workspace=str(self._ws('z1')), prompt_sha256='p',
+                           executor='zcode', now=T0)
         self.assertTrue(r.get('allowed'), r)
         tok = r['token']
-        with dispatch_mode('strong'):
-            out = dp.consume_for_entry(self.store, task_id='cb1', runtime='codebuddy',
-                                       model='deepseek-v4.1-flash',
-                                       workspace=str(self._ws('cb1')),
+        with dispatch_mode('weak'):
+            out = dp.consume_for_entry(self.store, task_id='z1', runtime='zcode',
+                                       model='GLM-5.3',
+                                       workspace=str(self._ws('z1')),
                                        prompt_sha256='p', claim_token=tok,
                                        wrapper_pid=5321, wrapper_created='c1', now=T0)
         self.assertFalse(out.get('allowed'), out)
@@ -659,8 +711,9 @@ class Qwen4RenameLegacyCompatTests(_AdjudicationBase):
     """BW-QWEN4-SONUS-REMOVE-20261115：内置 Max 改名 Qwen4-Max-Preview 的旧池兼容回归。
 
     口径：旧池键 qoder:Qwen3.8-Max / qodercn:Qwen3.8-Max 以 0 容量 legacy-retired 登记
-    ——任何新派一律拒绝；旧池在途 attempt 继续安全计数（计入物理总 16 守卫）并可自然
-    终态结算，绝不丢失；带短横线的 qodercn:Qwen-3.8-Max 仍为独立已禁用自定义池。"""
+    ——任何新派一律拒绝；旧池在途 attempt 继续安全计数（计入物理总守卫，BW-WEAK-
+    RESTRUCTURE-20261116 起 17）并可自然终态结算，绝不丢失；带短横线的
+    qodercn:Qwen-3.8-Max 仍为独立已禁用自定义池。"""
 
     def test_legacy_registration_facts(self):
         for legacy in (dm.QMAX_INTL_LEGACY_POOL_KEY, dm.QMAX_CN_LEGACY_POOL_KEY):
@@ -670,12 +723,14 @@ class Qwen4RenameLegacyCompatTests(_AdjudicationBase):
             self.assertNotIn(legacy, dm.MAX_POOL_KEYS)
             for m in ('strong', 'medium', 'weak'):
                 self.assertNotIn(legacy, dm.allowed_pools_for_mode(m), (m, legacy))
-        # 新池正常登记：两内置 Qwen4-Max-Preview 各 1 槽、参与三档。
+        # 新池正常登记：两内置 Qwen4-Max-Preview 各 1 槽、参与 strong/medium。
+        # BW-WEAK-RESTRUCTURE-20261116: 全部 Qoder 池（含两内置 Max）已移出弱档——
+        # weak 必须 mode_excluded，绝不静默换模型。
         for new_key in (dm.QMAX_INTL_POOL_KEY, dm.QMAX_CN_POOL_KEY):
             self.assertEqual(dp.capacity_for(new_key), 1)
             self.assertIn(new_key, dm.allowed_pools_for_mode('strong'))
             self.assertIn(new_key, dm.allowed_pools_for_mode('medium'))
-            self.assertIn(new_key, dm.allowed_pools_for_mode('weak'))
+            self.assertNotIn(new_key, dm.allowed_pools_for_mode('weak'))
         # 带短横线自定义池独立保留：禁用、不与新内置名冲突。
         self.assertEqual(dm.QMAX_CN_CUSTOM_POOL_KEY, 'qodercn:Qwen-3.8-Max')
         self.assertIn(dm.QMAX_CN_CUSTOM_POOL_KEY, dm.USER_DISABLED_POOL_KEYS)
@@ -705,15 +760,17 @@ class Qwen4RenameLegacyCompatTests(_AdjudicationBase):
         conn = dp.connect(self.store)
         self.assertEqual(dp._domestic_active(conn), 1)
         self.assertEqual(dp._count_active(conn, 'qoder:Qwen3.8-Max'), 1)
-        # 旧池在途占位参与总守卫：直插满 16 后新国内 claim 被拒。
+        # 旧池在途占位参与总守卫：BW-WEAK-RESTRUCTURE-20261116 物理总 17——直插满
+        # 16 行（合计 17）后新国内 claim 被拒；zcode:GLM-5.3 已移出弱档，改在 strong
+        # 档（无时段门）验证 capacity_full 总守卫。
         with closing(conn):
-            for i in range(15):
+            for i in range(16):
                 conn.execute(
                     'INSERT INTO attempts(token, task_id, runtime, model, pool_key, '
                     "state, reserved_at_utc) VALUES(?,?,?,?,?,?,?)",
                     (f'fill-{i}', f'fill-{i}', 'zcode', 'GLM-5.3',
                      'zcode:GLM-5.3', 'reserved', dp._iso(T0)))
-        with dispatch_mode('weak'):
+        with dispatch_mode('strong'):
             r = dp.reserve(self.store, task_id='blocked', runtime='zcode',
                            model='GLM-5.3', workspace=str(self._ws('blocked')),
                            prompt_sha256='p', executor='zcode', now=T0)
@@ -724,7 +781,7 @@ class Qwen4RenameLegacyCompatTests(_AdjudicationBase):
         finish = dp.finish(self.store, token='legacy-run',
                            terminal='cancelled', now=T0)
         self.assertTrue(finish.get('released'), finish)
-        self.assertEqual(dp._domestic_active(dp.connect(self.store)), 15)
+        self.assertEqual(dp._domestic_active(dp.connect(self.store)), 16)
 
     def test_custom_max_disabled_identity_preserved(self):
         # 带短横线的 CN 自定义池：独立已禁用身份原样保留，禁用前合法 reserved claim

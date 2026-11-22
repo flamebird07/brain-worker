@@ -13,9 +13,8 @@ BW-WORKER-WIDGET-20261018-S2 边界（必须遵守）：
   另一个真 running 掩盖），只有创建身份匹配的活 PID 才显示「运行中」。
 - 两个 CodeBuddy 模型（deepseek-v4.1-flash / glm-5.3-flash）与两个 OpenCode 免费模型
   （deepseek-v4.1-flash-free / glm-5.3-flash-free）**各自独立 1 槽、互不占位互斥**，
-  各行独立计数；物理总 16（`dp.DOMESTIC_TOTAL_CAPACITY`，BW-ZCODE-RESTORE-1-20261022
-  起 ZCode 恢复为正常可派主力 1 槽；BW-STRONG-SONUS-20261024 起 qoder:Sonus 另加强档
-  专属独立 1 槽）。
+  各行独立计数；物理总 17（`dp.DOMESTIC_TOTAL_CAPACITY`；BW-WEAK-RESTRUCTURE-20261116
+  起 ZCode 弱档专用 GLM-5.3-Flash 另有独立 1 槽，16→17）。
 - Luna 不显示为生产行；真正退役池（qodercn:DeepSeek-Flash）的旧在途仅通过汇总字段
   `retired_active` 保留审计口径。
 - 界面不显示 token、argv、prompt、原始错误正文或任何秘密；`--once` 输出的 JSON
@@ -68,10 +67,11 @@ import stage_selection as ss  # noqa: E402
 import dispatch_mode as dmode  # noqa: E402  手动三档（strong/medium/weak）共享策略
 
 # ------------------------------------------------------------------ 展示常量
-# 12 个已知池行：weak/medium/strong 各按**当前档**动态排序（read_snapshot 末尾按
+# 13 个已知池行：weak/medium/strong 各按**当前档**动态排序（read_snapshot 末尾按
 # dispatch_mode.priority_map_for_mode 重排），本表只定名称/注释与 stable-tie 基准序
-# （weak 档层序：CN Max(1) > Claude(3) > 国际 Qoder Max(4) > CodeBuddy
-# DeepSeek(5) > 两 OpenCode(6) > CodeBuddy GLM(7) > 两区 Flash(8) > ZCode(9)；Sonus 不参与 weak）。
+# （BW-WEAK-RESTRUCTURE-20261116 弱档层序：两 OpenCode(1) > CodeBuddy GLM(2) >
+# Claude(3，倒数第二) > ZCode GLM-5.3-Flash(4，最后)；全部 Qoder 池与 codebuddy
+# deepseek 已移出弱档，空闲隐藏、遗留在途标「本档不参与」；Sonus 不参与 weak）。
 # BW-QWEN4-SONUS-REMOVE-20261115（当前权威）：Sonus 从所有档位去除新派——三档空闲一律
 # 整行隐藏（绝不显示可派行）；真实在途（reserved/running/unknown 遗留）整行保留并标
 # 「不接新派（用户指令）」直到真实终态；遗留 reserved 不放行启动（安全释放 start_failed）。
@@ -96,6 +96,8 @@ ROW_DEFS = (
     (dp.QFLASH_POOL_KEY, 'Qoder 国际／Qwen3.8-Flash', '兜底'),
     (dp.CN_FLASH_POOL_KEY, 'Qoder CN／Qwen3.8-Flash', '兜底'),
     (dp.ZCODE_POOL_KEY, 'ZCode／GLM-5.3', '主力 · 全天'),
+    (dp.ZCODE_FLASH_POOL_KEY, 'ZCode／GLM-5.3-Flash',
+     '弱档 · 独立 1 槽 · 无时段门'),
 )
 
 STATE_LABELS = {'running': '运行中', 'unknown': '待核实', 'reserved': '已预留',

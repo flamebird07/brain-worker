@@ -8,7 +8,7 @@
 - 两个 Qoder 内置 Max 改名 **Qwen4-Max-Preview**（qoder:Qwen4-Max-Preview /
   qodercn:Qwen4-Max-Preview，SDK argv 与池键同一字面串）；旧池键 qoder:Qwen3.8-Max /
   qodercn:Qwen3.8-Max 以 0 容量进 QWEN_MAX_LEGACY_POOL_KEYS/LEGACY_RETIRED_POOL_KEYS
-  ——旧池在途 attempt 继续安全计数（_domestic_active/物理总 16）与自然终态结算，绝不
+  ——旧池在途 attempt 继续安全计数（_domestic_active/物理总 17）与自然终态结算，绝不
   丢失；任何新派（AUTO/executor/显式 combo）一律拒绝，绝不把旧键映射到新池。
 - 带短横线的 qodercn:Qwen-3.8-Max 是独立已禁用自定义池（2026-10-28 用户指令），历史身份
   与禁用语义原样保留，与 CN 内置新名 qodercn:Qwen4-Max-Preview 互不冲突、互不映射。
@@ -222,15 +222,21 @@ import dispatch_mode as dm  # noqa: E402
 # AUTO/executor=zcode/显式组合按既有资格门（1800 秒真实限额短窗、availability 诊断、
 # 同工作区单写、容量与总守卫）参与派发；历史 retired_active 语义仍只适用于真正退役池
 # （qodercn:DeepSeek-Flash）。
-# claude 仍 2 槽。物理调度总数 DOMESTIC_TOTAL_CAPACITY = 12(主力，含两个 CodeBuddy 各 1、
-# 两 OpenCode 各 1、ZCode 1 与 Sonus 1) + 4(两地区 Flash) = 16（由 MAIN_FORCE+OVERFLOW
-# 求和自动得出）。BW-STRONG-SONUS-20261024：`qoder:Sonus` 是 strong 专属独立 1 槽正常池
+# claude 仍 2 槽。物理调度总数 DOMESTIC_TOTAL_CAPACITY = 13(主力，含两个 CodeBuddy 各 1、
+# 两 OpenCode 各 1、ZCode GLM-5.3 与 GLM-5.3-Flash 各 1、Sonus 1) + 4(两地区 Flash) = 17
+# （由 MAIN_FORCE+OVERFLOW 求和自动得出；BW-WEAK-RESTRUCTURE-20261116 起含弱档专用
+# zcode:GLM-5.3-Flash 独立 1 槽，16→17）。BW-STRONG-SONUS-20261024：`qoder:Sonus` 是
+# strong 专属独立 1 槽正常池
 # （国际 Qoder CLI --list-models 核验的精确字面名）——strong 新派最优先（层=1）、无时段门、
 # 不纳入任何 Qwen Max 限额标记；medium/weak 一律 mode_excluded（绝不静默换模型）。weak 的
 # 可新派容量仍为原 15：weak 永远不能新派 Sonus，全局总守卫 16 只在 strong 派出的 Sonus
 # 真实在途时才被占到第 16 个（已有在途切档不追杀、不假释放）。
 # WorkBuddy 仍 human-relay、CodeBuddy 其它旧模型（新旧 GLM 之外的组合）仍不恢复。
 MAIN_FORCE_POOLS = (('zcode', 'GLM-5.3'),
+                    # BW-WEAK-RESTRUCTURE-20261116：弱档 ZCode 专用池——不进
+                    # MAIN_FORCE_POOLS 的话 executor='zcode' 显式请求会 executor_conflict、
+                    # AUTO 直接 unknown_pool（登记了容量却不可达）。
+                    ('zcode', 'GLM-5.3-Flash'),
                     ('qoder', 'Qwen4-Max-Preview'),
                     ('qodercn', 'Qwen4-Max-Preview'),
                     ('qodercn', 'Qwen-3.8-Max'),
@@ -241,6 +247,10 @@ MAIN_FORCE_POOLS = (('zcode', 'GLM-5.3'),
                     ('codebuddy', 'glm-5.3-flash'),
                     ('qoder', 'Sonus'))
 MAIN_FORCE_CAPACITY = {'zcode:GLM-5.3': 1,
+                       # BW-WEAK-RESTRUCTURE-20261116：弱档 ZCode 专用 GLM-5.3-Flash
+                       # 独立 1 槽（与 strong/medium 的 zcode:GLM-5.3 各自独立、互不占位；
+                       # 物理总容量 16→17）。
+                       'zcode:GLM-5.3-Flash': 1,
                        'codebuddy:deepseek-v4.1-flash': 1,
                        'codebuddy:glm-5.3-flash': 1,
                        'qoder:Qwen4-Max-Preview': 1,
@@ -263,6 +273,8 @@ OVERFLOW_CAPACITY = {'qoder:Qwen3.8-Flash': 2, 'qodercn:Qwen3.8-Flash': 2}
 # dispatch_mode.WEAK_PRIORITY 完全相同，单一来源在 dispatch_mode）；正式选择一律走
 # `priority_for_pool(pk)` → `dispatch_mode.priority_map_for_mode(当前档)`，绝不读本常量。
 POOL_PRIORITY = dict(dm.WEAK_PRIORITY)
+# BW-WEAK-RESTRUCTURE-20261116：weak 档可新派集合的同步引用（单一来源在 dispatch_mode）。
+WEAK_POOL_KEYS = tuple(dm.WEAK_POOL_KEYS)
 # 强/中档把被排除池统一拒成这一个机器可辨原因（不是 not_authorized、不是 window_closed）。
 MODE_EXCLUDED = 'mode_excluded'
 # BW-POOL-SPLIT-20261010-S2：CN DeepSeek-Flash 从正常池退出，但保留池名与 0 容量条目，
@@ -273,7 +285,7 @@ MODE_EXCLUDED = 'mode_excluded'
 LEGACY_RETIRED_POOL_KEYS = ('qodercn:DeepSeek-Flash',)
 # BW-QWEN4-SONUS-REMOVE-20261115：两个 Qoder 内置 Max 改名 Qwen4-Max-Preview 后，旧池键
 # （qoder:Qwen3.8-Max / qodercn:Qwen3.8-Max）同样以 0 容量 legacy-retired 登记——旧池在途
-# attempt 继续安全计数（计入 _domestic_active/物理总 16 守卫）与结算（finish/reconcile 到
+# attempt 继续安全计数（计入 _domestic_active/物理总 17 守卫）与结算（finish/reconcile 到
 # 自然终态），但不再接任何新派（AUTO/executor/显式 combo 一律拒绝，绝不把旧键映射到新池）。
 # 带短横线的 qodercn:Qwen-3.8-Max 不在此列：它是独立的已禁用自定义池（dm.USER_DISABLED_
 # POOL_KEYS），历史身份与禁用语义原样保留，与内置新名互不冲突。
@@ -283,7 +295,7 @@ LUNA_RUNTIME = 'luna'
 LUNA_MODEL = 'native'
 LUNA_ASK_TIMEOUT_SECONDS = 300
 DOMESTIC_TOTAL_CAPACITY = (sum(MAIN_FORCE_CAPACITY.values())
-                           + sum(OVERFLOW_CAPACITY.values()))  # 12 主力(含 Sonus 1) + 4 Flash = 16
+                           + sum(OVERFLOW_CAPACITY.values()))  # 13 主力(含 Sonus 1 与 zcode Flash 1) + 4 Flash = 17
 
 # pool_key -> capacity（None 表示无上限，仅 Luna；0 表示已退出正常池但保留历史真实在途）。
 CAPACITY = {}
@@ -302,12 +314,13 @@ MODE_POOLS_UNKNOWN = tuple(k for k in (dm.ALL_POOL_KEYS + dm.STRONG_ONLY_POOL_KE
 # 不再把 luna:native 登记为容量池、候选或浮窗行。
 # BW-CLAUDE-DEEPSEEK-S3：claude:deepseek-flash 已并入 MAIN_FORCE_POOLS/CAPACITY（独立第三公平组
 # claude），故其容量已在上面 CAPACITY.update 中登记；BW-CLAUDE-CAPACITY2 起容量为 2。
-# 关键口径（BW-OPENCODE-20261019 现行权威；BW-STRONG-SONUS-20261024 增补）：
-#  - DOMESTIC_TOTAL_CAPACITY = 16：ZCode 1 槽（BW-ZCODE-RESTORE-1-20261022）、两个
-#    CodeBuddy 模型（deepseek-v4.1-flash / glm-5.3-flash）
+# 关键口径（BW-OPENCODE-20261019 现行权威；BW-STRONG-SONUS-20261024 增补；
+# BW-WEAK-RESTRUCTURE-20261116 当前权威）：
+#  - DOMESTIC_TOTAL_CAPACITY = 17：ZCode GLM-5.3 与弱档专用 GLM-5.3-Flash 各 1 槽、
+#    两个 CodeBuddy 模型（deepseek-v4.1-flash / glm-5.3-flash）
 #    与两个 OpenCode 免费模型（deepseek-v4.1-flash-free / glm-5.3-flash-free）
 #    **各独立 1 槽、互不占位互斥**，qoder:Sonus 另有 strong 专属独立 1 槽
-#    （BW-STRONG-SONUS-20261024；medium/weak 不可新派，weak 可新派容量仍为原 15），
+#    （Sonus 现全档禁用，登记保留），
 #    claude 与它们在途都计入国内总在途（_domestic_active 只排除 Luna）；
 #  - _select_main_force 按主力优先级层排序（BW-CLAUDE-ALLDAY-QMAX-AFTER-20261023）：
 #    两个 CN Max > zcode:GLM-5.3（层=2，容量 1）> claude:deepseek-flash（层=3，全天）>
@@ -554,6 +567,18 @@ def _window_closed_reason(pk, now=None, mode=None) -> str:
 
 def _mode_excluded_reason(pk, mode=None) -> str:
     return dm.mode_excluded_reason(pk, mode=mode)
+
+
+def _mode_excluded_verdict_reason(pk, mode=None) -> str:
+    """_domestic_policy 返回 MODE_EXCLUDED 时的诚实文案（BW-WEAK-RESTRUCTURE-20261116
+    配套）：区分「请求池本身不在该档可派集合」与「请求池可派但名额不可得且兜底候选
+    （两 Flash）不在该档集合」——后者绝不再用请求池的名字冒充被排除对象。"""
+    if pk not in dm.allowed_pools_for_mode(mode):
+        return _mode_excluded_reason(pk, mode)
+    return (f'{pk!r} is allowed in the {mode} dispatch mode but no slot could be '
+            f'claimed for it and the overflow/fallback pools are not part of that '
+            f'mode; refusing as mode_excluded with sent=false and zero new '
+            f'placeholders instead of silently swapping to another model')
 
 
 def dispatch_mode_state() -> dict:
@@ -1285,6 +1310,8 @@ def main_force_limits(store_path=None, *, now=None) -> dict:
 # （容量 1、层=2）；本常量供候选/浮窗/新 claim 与历史 availability/quota 诊断共同引用，
 # 派发仍受 1800 秒真实限额短窗、容量与总守卫约束。
 ZCODE_POOL_KEY = 'zcode:GLM-5.3'
+# BW-WEAK-RESTRUCTURE-20261116：weak 档 ZCode 专用池键（独立 1 槽）。
+ZCODE_FLASH_POOL_KEY = 'zcode:GLM-5.3-Flash'
 
 
 def _resolve_quota_store(quota_store=None):
@@ -1569,8 +1596,8 @@ def _domestic_policy(conn, requested_pk, now, executor='auto', eligible=None,
       优先级层 + 真实在途数选择；本池有空也不绕过层序；选中≠请求 → routing；主力都不可用/
       已满 → 当前档允许时两地区 Flash 同级兜底，否则 `mode_excluded`；两 Flash 也满才 full。
     - 迁移债务总额守卫（BW-CLAUDE-DEEPSEEK-S4 起对全部国内池生效，含 claude/codebuddy）：
-      真实国内在途（含在途 retired DeepSeek 与超额旧 Max）已达物理总 16（BW-STRONG-SONUS-
-      20261024）时，即便某池按各自容量看似有空也一律 full，绝不派第 17 个。"""
+      真实国内在途（含在途 retired DeepSeek 与超额旧 Max）已达物理总 17
+      （BW-WEAK-RESTRUCTURE-20261116）时，即便某池按各自容量看似有空也一律 full，绝不派第 18 个。"""
     mode = dm.normalize_mode(mode) if mode is not None else dm.current_mode()
     if requested_pk == LUNA_KEY:
         return 'luna_disabled', None
@@ -1582,9 +1609,9 @@ def _domestic_policy(conn, requested_pk, now, executor='auto', eligible=None,
     if requested_pk in CAPACITY and requested_pk not in dm.allowed_pools_for_mode(mode):
         return MODE_EXCLUDED, None
     # BW-CLAUDE-DEEPSEEK-S4 + BW-CODEBUDDY-MAIN-S3：claude/codebuddy 已计入
-    # DOMESTIC_TOTAL_CAPACITY（BW-STRONG-SONUS-20261024 起物理总 16），总守卫必须同样约束：
+    # DOMESTIC_TOTAL_CAPACITY（BW-WEAK-RESTRUCTURE-20261116 起物理总 17），总守卫必须同样约束：
     # 真实国内在途（含迁移债务/旧超额在途）
-    # 已满 16 时，即便该池按自身容量看似有空也绝不派第 17 个。显式点名 claude
+    # 已满 17 时，即便该池按自身容量看似有空也绝不派第 18 个。显式点名 claude
     # （executor='claude' 或 None）保持
     # 精确组合：限额/总守卫都过且有空位才 claim，否则如实拒绝，绝不回退国内模型；
     # AUTO 请求 claude（executor='auto'）绝不绕过公平选择——落入下方 auto 分支，与
@@ -1665,7 +1692,7 @@ def _domestic_policy(conn, requested_pk, now, executor='auto', eligible=None,
                 return 'claim', requested_pk
             return 'full', None
     # 迁移债务总额守卫（BW-POOL-SPLIT-20261010-S3）：总在途已满 DOMESTIC_TOTAL_CAPACITY
-    # （BW-STRONG-SONUS-20261024 起物理总 16）→ 任何新国内 claim 都不得放行（减少容量不杀
+    # （BW-WEAK-RESTRUCTURE-20261116 起物理总 17）→ 任何新国内 claim 都不得放行（减少容量不杀
     # 老任务，老任务真实终态自然
     # 释放后计数才下降）。
     if _domestic_active(conn) >= DOMESTIC_TOTAL_CAPACITY:
@@ -1759,7 +1786,10 @@ def _domestic_policy(conn, requested_pk, now, executor='auto', eligible=None,
         return 'executor_conflict', None
 
     if executor == 'zcode':
-        if requested_pk != ZCODE_POOL_KEY:
+        # BW-WEAK-RESTRUCTURE-20261116：ZCode 两池各自独立 1 槽——GLM-5.3（strong/
+        # medium 主力）与 GLM-5.3-Flash（weak 层4，最后）都接受 executor='zcode' 的
+        # 精确组合请求，互不占位、互不回落。
+        if requested_pk not in (ZCODE_POOL_KEY, ZCODE_FLASH_POOL_KEY):
             return 'executor_conflict', None
         # BW-ZCODE-RESTORE-1-20261022（用户明确指令）：zcode:GLM-5.3 恢复为正常可派主力池
         # （容量 1）。ZCode 入口是最后的权威原子门：最近一次真实结构化限额在 1800 秒内 →
@@ -1964,7 +1994,7 @@ def select_and_claim(store_path=None, *, task_id, runtime, model, workspace,
             if verdict == MODE_EXCLUDED:
                 conn.execute('ROLLBACK')
                 return _reject(MODE_EXCLUDED, task_id, pk,
-                               [_mode_excluded_reason(pk, mode)],
+                               [_mode_excluded_verdict_reason(pk, mode)],
                                domestic_full=domestic_full)
             if verdict == 'unknown_pool':
                 conn.execute('ROLLBACK')
@@ -2142,7 +2172,7 @@ def reserve(store_path=None, *, task_id, runtime, model, workspace, prompt_sha25
             if verdict == MODE_EXCLUDED:
                 conn.execute('ROLLBACK')
                 return _reject(MODE_EXCLUDED, task_id, pk,
-                               [_mode_excluded_reason(pk, mode)],
+                               [_mode_excluded_verdict_reason(pk, mode)],
                                domestic_full=(_domestic_active(conn) >=
                                               DOMESTIC_TOTAL_CAPACITY))
             if verdict == 'unknown_pool':
@@ -3433,13 +3463,27 @@ def claim_due(store_path=None, *, task_id, now=None, scope=None,
                     allowed = {QMAX_POOL_KEY, QFLASH_POOL_KEY}
                 elif scope_executor == 'zcode':
                     # BW-ZCODE-RESTORE-1-20261022：zcode:GLM-5.3 恢复为正常可派池——
-                    # 原 scope 绑定 ZCode 的票据照旧只回收 ZCode 自身，绝不改派别池、不 Luna。
-                    allowed = {ZCODE_POOL_KEY}
+                    # 原 scope 绑定 ZCode 的票据只回收 ZCode 自身两池，绝不改派别池、不 Luna。
+                    # BW-WEAK-RESTRUCTURE-20261116：弱档 ZCode 专用 GLM-5.3-Flash 独立
+                    # 1 槽——executor=zcode 的票据（未钉死 model 时）两池均可回收候选，
+                    # 钉死 model 的 scope_combo 分支已在上游精确锁定。
+                    allowed = {ZCODE_POOL_KEY, ZCODE_FLASH_POOL_KEY}
                 elif scope_executor == CN_RUNTIME:
                     # CN-bound ticket reclaims only the CN Max (built-in + custom)/Flash pools,
                     # never international/ZCode, never Luna; retired DeepSeek-Flash is not a
                     # reclaim candidate either.
                     allowed = {CN_MAX_POOL_KEY, CN_CUSTOM_MAX_POOL_KEY, CN_FLASH_POOL_KEY}
+                elif scope_executor == 'claude':
+                    # BW-WEAK-RESTRUCTURE-20261116：scope 绑定 claude 的票据只回收
+                    # claude:deepseek-flash 自身——此前 allowed=None 不受约束，回收可能
+                    # 借其它池空位落到 scope 之外池（agent 验收发现的缺口）。
+                    allowed = {CLAUDE_POOL_KEY}
+                elif scope_executor == CODEBUDDY_RUNTIME:
+                    # scope 绑定 codebuddy 的票据只回收两个精确 CodeBuddy 池。
+                    allowed = {CODEBUDDY_POOL_KEY, CODEBUDDY_GLM_POOL_KEY}
+                elif scope_executor == OPENCODE_RUNTIME:
+                    # scope 绑定 opencode 的票据只回收两个精确免费模型池。
+                    allowed = {OPENCODE_DEEPSEEK_POOL_KEY, OPENCODE_GLM_POOL_KEY}
                 if scope_allowlist is not None:
                     # 与 executor/combo 收窄后的候选取交集；无执行器约束时也只允许
                     # 名单内候选参与本任务回收。

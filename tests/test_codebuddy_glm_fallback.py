@@ -19,6 +19,11 @@
   proof 仍可进入配置读取并 Popen；带 proof 的 CLI argv/model/pool/evidence 正确，不硬记
   DeepSeek；
 - 其它旧 CodeBuddy 模型与 WorkBuddy 仍退休。
+- BW-WEAK-RESTRUCTURE-20261116（用户明确指令，本文件按其同步期望）：弱档收窄为 5 池
+  （两 OpenCode 层1 > CodeBuddy GLM 层2 > Claude 层3 > ZCode GLM-5.3-Flash 层4），
+  codebuddy:deepseek-v4.1-flash 从弱档移除且本就不在 strong/medium——无任何档位可新派；
+  原「DeepSeek 真实 claim」类用例改为负例（mode_excluded、sent=false）或按真实形态
+  seed 遗留在途；GLM 兜底层序对照改在新弱档层序下复现，绝不删除测试、绝不弱化断言。
 """
 import io
 import json
@@ -59,11 +64,11 @@ ZCODE = 'zcode:GLM-5.3'
 QFLASH = 'qoder:Qwen3.8-Flash'
 CN_FLASH = 'qodercn:Qwen3.8-Flash'
 MAXES = (QMAX, CN_MAX, CN_CUSTOM_MAX)
-# BW-OPENCODE-20261019：两 OpenCode 免费模型 tier4 高于条件 GLM tier5；GLM 兜底测试必须
-# 把它们也算进"更高优先层"并一并占满，否则 AUTO 会落到仍空的 OpenCode 而非 GLM。
-# 这只是如实反映现有层序（不改 GLM 独立调度规则），非降低排序。
-HIGHER_THAN_GLM = (CB, QMAX, CN_MAX, CN_CUSTOM_MAX, CLAUDE, ZCODE,
-                   dp.OPENCODE_DEEPSEEK_POOL_KEY, dp.OPENCODE_GLM_POOL_KEY)
+# BW-WEAK-RESTRUCTURE-20261116: 弱档层表重排后高于 GLM（层2）的只有两 OpenCode 免费模型
+# （层1）；codebuddy:deepseek-v4.1-flash 与全部 Qoder 池已移出弱档可派集合（列进轮内
+# 失败只作记录，实际由 mode_excluded 排除，不影响层序）。GLM 之下的弱档层是 claude（3）
+# 与 zcode:GLM-5.3-Flash（4）。
+HIGHER_THAN_GLM = (CB, dp.OPENCODE_DEEPSEEK_POOL_KEY, dp.OPENCODE_GLM_POOL_KEY)
 ALL_CANDIDATES = list(dp.MAIN_FORCE_KEYS) + list(dp.OVERFLOW_KEYS)
 SHA = 'p' + '0' * 63
 SECRET = 'SYNTHETIC_SECRET_SHOULD_NOT_BE_ECHOED'
@@ -265,10 +270,13 @@ class TestSelectMainForceDefault(_Base):
         self.assertEqual(reason, 'main_force_selected')
 
     def test_explicit_eligible_without_glm_never_returns_it(self):
+        # BW-WEAK-RESTRUCTURE-20261116: codebuddy:deepseek-v4.1-flash 已不在任何档位可派
+        # 集合（弱档候选也不再含它）——「显式 eligible 不含 GLM 绝不扩权返回 GLM」改用
+        # 弱档层3 claude 复现：范围限定生效，只返回名单内合格池。
         with closing(dp.connect(self.store)) as conn:
             target, _ = dp._select_main_force(
-                conn, GLM, T_NIGHT, eligible={CB})
-        self.assertEqual(target, CB)
+                conn, GLM, T_NIGHT, eligible={CLAUDE})
+        self.assertEqual(target, CLAUDE)
 
 
 class TestPlannerGlmCondition(_Base):
@@ -289,14 +297,26 @@ class TestPlannerGlmCondition(_Base):
             workspace=self.ws('T'), now=T_NIGHT, **kw)
 
     def test_max_still_before_glm_when_evidence_valid(self):
+        # BW-WEAK-RESTRUCTURE-20261116: 三个 Qoder Max 已全部移出弱档——「更高层优先于
+        # GLM（证据有效也不改层序）」的对照改用弱档层1两 OpenCode 复现；GLM（层2）绝不
+        # 越过更高合格层。
         receipt = self.plan(self.auth(),
                             round_failed_candidates=[CB],
                             codebuddy_quota_evidence=self.evidence())
         self.assertTrue(receipt['codebuddy_glm_allowed'], receipt)
-        self.assertIn(receipt['selected']['pool_key'], MAXES, receipt)
+        self.assertIn(receipt['selected']['pool_key'],
+                      (dp.OPENCODE_DEEPSEEK_POOL_KEY, dp.OPENCODE_GLM_POOL_KEY),
+                      receipt)
         self.assertNotEqual(receipt['selected']['pool_key'], GLM)
+        # BW-WEAK-RESTRUCTURE-20261116: 被移出的池在弱档如实标 mode_excluded。
+        for removed in (QMAX, CN_MAX, CN_CUSTOM_MAX, CB, ZCODE):
+            self.assertEqual(receipt['candidate_filters'][removed],
+                             'mode_excluded', receipt)
 
     def test_glm_after_zcode_and_before_flash(self):
+        # BW-WEAK-RESTRUCTURE-20261116: 弱档层序 = 两 OpenCode(1) > GLM(2) > claude(3) >
+        # zcode:GLM-5.3-Flash(4)。更高层（两 OpenCode）轮内失败 → GLM 选中；两地区 Flash
+        # 已移出弱档可派集合（candidate_filters 如实标 mode_excluded，绝不作弱档兜底）。
         receipt = self.plan(self.auth(),
                             round_failed_candidates=list(HIGHER_THAN_GLM),
                             codebuddy_quota_evidence=self.evidence())
@@ -304,9 +324,15 @@ class TestPlannerGlmCondition(_Base):
         self.assertEqual(receipt['selected']['pool_key'], GLM, receipt)
         self.assertEqual(receipt['selected_reason'], 'main_force_selected')
         for flash in (QFLASH, CN_FLASH):
-            self.assertEqual(receipt['candidate_filters'][flash], 'eligible')
+            self.assertEqual(receipt['candidate_filters'][flash], 'mode_excluded')
+        # GLM 之下的弱档层保持 eligible、未被越过选中。
+        self.assertEqual(receipt['candidate_filters'][CLAUDE], 'eligible')
+        self.assertEqual(receipt['candidate_filters'][dp.ZCODE_FLASH_POOL_KEY],
+                         'eligible')
 
     def test_authorization_without_glm_not_expanded(self):
+        # BW-WEAK-RESTRUCTURE-20261116: 两地区 Flash 已移出弱档——未授权 GLM 时不扩权，
+        # 兜底如实落到弱档下一层 claude（main_force_selected），绝不借道被移出的 Flash。
         allowed = [k for k in ALL_CANDIDATES if k != GLM]
         receipt = self.plan(self.auth(allowed),
                             round_failed_candidates=list(HIGHER_THAN_GLM),
@@ -315,7 +341,11 @@ class TestPlannerGlmCondition(_Base):
         self.assertFalse(receipt['codebuddy_glm_allowed'], receipt)
         self.assertFalse(receipt['codebuddy_glm_condition']['authorized'])
         self.assertNotEqual(receipt['selected']['pool_key'], GLM)
-        self.assertEqual(receipt['selected_reason'], 'flash_fallback_selected')
+        self.assertEqual(receipt['selected']['pool_key'], CLAUDE, receipt)
+        self.assertEqual(receipt['selected_reason'], 'main_force_selected', receipt)
+        # 未进授权名单的 GLM 如实标 not_authorized（授权门先于档位标记）。
+        self.assertEqual(receipt['candidate_filters'][GLM], 'not_authorized',
+                         receipt)
 
     def test_new_round_without_evidence_still_enables_glm(self):
         # BW-LIMIT30-20261019-S3：撤销“当轮 DeepSeek 真实限额证据”前置门。
@@ -341,6 +371,9 @@ class TestPlannerGlmCondition(_Base):
         self.assertFalse(receipt['codebuddy_quota_evidence']['required'])
 
     def test_glm_failure_falls_to_flash(self):
+        # BW-WEAK-RESTRUCTURE-20261116: 两地区 Flash 已移出弱档——GLM 轮内失败后的兜底
+        # 改落弱档下一层 claude:deepseek-flash（机制不变：GLM 标记 already_tried_this_
+        # round、绝不复用已失败候选，且绝不借道被移出的 Flash）。
         receipt = self.plan(
             self.auth(),
             round_failed_candidates=list(HIGHER_THAN_GLM) + [GLM],
@@ -348,8 +381,10 @@ class TestPlannerGlmCondition(_Base):
         self.assertTrue(receipt['codebuddy_glm_allowed'], receipt)
         self.assertEqual(receipt['candidate_filters'][GLM],
                          'already_tried_this_round')
-        self.assertIn(receipt['selected']['pool_key'], (QFLASH, CN_FLASH))
-        self.assertEqual(receipt['selected_reason'], 'flash_fallback_selected')
+        self.assertEqual(receipt['selected']['pool_key'], CLAUDE, receipt)
+        self.assertEqual(receipt['selected_reason'], 'main_force_selected', receipt)
+        self.assertEqual(receipt['candidate_filters'][QFLASH], 'mode_excluded',
+                         receipt)
 
     def test_old_db_limit_mark_without_timestamp_does_not_block_glm(self):
         # 旧库只有裸 limited 标记、无可用时间参照 → 1800 秒窗口不成立，不得误挡。
@@ -445,6 +480,10 @@ class TestIndependentModelSlots(_Base):
 
     def test_cross_model_active_does_not_block_reserve(self):
         # GLM 在途不再挡 DeepSeek 自身名额；同模型第 2 个仍拒绝。
+        # BW-WEAK-RESTRUCTURE-20261116: codebuddy:deepseek-v4.1-flash 已无任何档位可
+        # 新派——「跨模型在途」按真实形态 seed 为 DeepSeek 遗留占用（不追杀、不假释放）；
+        # GLM 新派不受影响；显式 DeepSeek 新派请求如实 mode_excluded（sent=false、零占位）。
+        self.seed(CB, 1)
         claimed = dp.reserve(self.store, task_id='g', runtime='codebuddy',
                              model=GLM_MODEL, workspace=self.ws('g'),
                              prompt_sha256=SHA, stage='s', now=T_NIGHT,
@@ -455,7 +494,10 @@ class TestIndependentModelSlots(_Base):
                            model=CB_MODEL, workspace=self.ws('d'),
                            prompt_sha256=SHA, stage='s', now=T_NIGHT,
                            executor='codebuddy', _preclaim=False)
-        self.assertTrue(cb_ok.get('allowed'), cb_ok)
+        self.assertFalse(cb_ok.get('allowed'), cb_ok)
+        self.assertEqual(cb_ok['reason'], 'mode_excluded', cb_ok)
+        self.assertFalse(cb_ok.get('sent'), cb_ok)
+        self.assertIsNone(cb_ok.get('token'), cb_ok)
         glm_again = dp.reserve(self.store, task_id='g2', runtime='codebuddy',
                                model=GLM_MODEL, workspace=self.ws('g2'),
                                prompt_sha256=SHA, stage='s', now=T_NIGHT,
@@ -465,22 +507,20 @@ class TestIndependentModelSlots(_Base):
         self.assertEqual(glm_again['reason'], 'capacity_full', glm_again)
 
     def test_finish_releases_only_own_slot(self):
+        # BW-WEAK-RESTRUCTURE-20261116: DeepSeek 一侧按真实形态 seed 为遗留 reserved 占用
+        # （无任何档位可新派）；GLM 终态释放只影响自己，遗留占用原样保留。
         glm = dp.reserve(self.store, task_id='g', runtime='codebuddy',
                          model=GLM_MODEL, workspace=self.ws('g'),
                          prompt_sha256=SHA, stage='s', now=T_NIGHT,
                          executor='codebuddy', codebuddy_glm_allowed=True,
                          _preclaim=False)
         self.assertTrue(glm.get('allowed'), glm)
-        cb = dp.reserve(self.store, task_id='d', runtime='codebuddy',
-                        model=CB_MODEL, workspace=self.ws('d'),
-                        prompt_sha256=SHA, stage='s', now=T_NIGHT,
-                        executor='codebuddy', _preclaim=False)
-        self.assertTrue(cb.get('allowed'), cb)
+        self.seed(CB, 1, task_prefix='legacy')
         rel = dp.finish(self.store, glm['token'], terminal='cancelled',
                         now=T_NIGHT, wrapper_pid=None)
         self.assertTrue(rel.get('released') or rel.get('settled'), rel)
         with closing(dp.connect(self.store)) as conn:
-            # GLM 结束只释放自己：DeepSeek 在途不受影响。
+            # GLM 结束只释放自己：DeepSeek 遗留在途不受影响。
             self.assertEqual(dp._count_active(conn, GLM), 0)
             self.assertEqual(dp._count_active(conn, CB), 1)
         glm_again = dp.reserve(self.store, task_id='g3', runtime='codebuddy',
@@ -509,6 +549,10 @@ class TestIndependentModelSlots(_Base):
             self.assertEqual(dp._count_active(conn, GLM), 1)
 
     def test_concurrent_two_models_can_both_claim(self):
+        # BW-WEAK-RESTRUCTURE-20261116: DeepSeek 已无任何档位可新派——并发用例改为
+        # 「DeepSeek 并发请求也只得到 mode_excluded（sent=false、零占位、无 token），
+        # GLM 并发请求真实 claim」；两模型独立名额的互不占位语义继续由在途计数断言
+        # 覆盖（DeepSeek 0、GLM 1）。
         def _claim(args):
             tid, model = args
             return dp.reserve(self.store, task_id=tid, runtime='codebuddy',
@@ -520,19 +564,27 @@ class TestIndependentModelSlots(_Base):
         with ThreadPoolExecutor(max_workers=2) as pool:
             results = list(pool.map(_claim, (('x-ds', CB_MODEL),
                                              ('x-glm', GLM_MODEL))))
-        self.assertTrue(all(r.get('allowed') for r in results), results)
+        by_task = {r['task_id']: r for r in results}
+        self.assertTrue(by_task['x-glm'].get('allowed'), results)
+        ds = by_task['x-ds']
+        self.assertFalse(ds.get('allowed'), results)
+        self.assertEqual(ds['reason'], 'mode_excluded', ds)
+        self.assertFalse(ds.get('sent'), ds)
+        self.assertIsNone(ds.get('token'), ds)
         with closing(dp.connect(self.store)) as conn:
-            self.assertEqual(dp._count_active(conn, CB), 1)
+            self.assertEqual(dp._count_active(conn, CB), 0)
             self.assertEqual(dp._count_active(conn, GLM), 1)
 
     def test_total_physical_capacity_16_and_status_independent_counts(self):
         # BW-STRONG-SONUS-20261024：物理总 16（原 15 + strong 专属 Sonus 1 槽）；
-        # 两 OpenCode 免费模型各独立 1 槽、独立计数。弱档不能新派 Sonus，这里按真实
-        # 形态 seed 一条 strong 遗留在途以满足 16/16。
-        self.assertEqual(dp.DOMESTIC_TOTAL_CAPACITY, 16)
+        # BW-WEAK-RESTRUCTURE-20261116: 16→17（新增弱档专用 zcode:GLM-5.3-Flash 独立
+        # 1 槽）。两 OpenCode 免费模型各独立 1 槽、独立计数。弱档不能新派 Sonus，这里
+        # 按真实形态 seed 一条 strong 遗留在途以满足 17/17。
+        self.assertEqual(dp.DOMESTIC_TOTAL_CAPACITY, 17)
         self.assertEqual(dp.CAPACITY[GLM], 1)
         self.assertEqual(dp.MAIN_FORCE_CAPACITY[GLM], 1)
         self.seed(ZCODE, 1)
+        self.seed(dp.ZCODE_FLASH_POOL_KEY, 1)
         self.seed(CB, 1)
         self.seed(GLM, 1)
         self.seed(QMAX, 1)
@@ -545,25 +597,36 @@ class TestIndependentModelSlots(_Base):
         self.seed(CN_FLASH, 2)
         self.seed(dp.SONUS_POOL_KEY, 1)
         st = dp.status(self.store, now=T_NIGHT)
-        self.assertEqual(st['domestic']['capacity'], 16)
-        self.assertEqual(st['domestic']['active'], 16)
+        self.assertEqual(st['domestic']['capacity'], 17)
+        self.assertEqual(st['domestic']['active'], 17)
         self.assertEqual(st['pools'][CB]['active'], 1)
         self.assertEqual(st['pools'][CB]['free'], 0)
         self.assertEqual(st['pools'][GLM]['active'], 1)
         self.assertEqual(st['pools'][GLM]['free'], 0)
+        self.assertEqual(st['pools'][dp.ZCODE_FLASH_POOL_KEY]['active'], 1)
+        self.assertEqual(st['pools'][dp.ZCODE_FLASH_POOL_KEY]['free'], 0)
         self.assertNotIn('shared_active', st['pools'][GLM])
         self.assertNotIn('shared_group', st['pools'][GLM])
         self.assertNotIn('shared_capacity', st['pools'][CB])
-        self.assertEqual(sum(p['active'] for p in st['pools'].values()), 16)
-        for model in (GLM_MODEL, CB_MODEL):
-            out = dp.reserve(self.store, task_id=f'full-{model}',
-                             runtime='codebuddy',
-                             model=model, workspace=self.ws(f'full-{model}'),
-                             prompt_sha256=SHA, stage='s', now=T_NIGHT,
-                             executor='codebuddy', codebuddy_glm_allowed=True,
-                             _preclaim=False)
-            self.assertFalse(out.get('allowed'), out)
-            self.assertEqual(out['reason'], 'capacity_full', out)
+        self.assertEqual(sum(p['active'] for p in st['pools'].values()), 17)
+        # BW-WEAK-RESTRUCTURE-20261116: 满载后 GLM 如实 capacity_full；deepseek 已无
+        # 任何档位可新派——显式请求如实 mode_excluded（sent=false、零占位）。
+        out = dp.reserve(self.store, task_id='full-glm',
+                         runtime='codebuddy',
+                         model=GLM_MODEL, workspace=self.ws('full-glm'),
+                         prompt_sha256=SHA, stage='s', now=T_NIGHT,
+                         executor='codebuddy', codebuddy_glm_allowed=True,
+                         _preclaim=False)
+        self.assertFalse(out.get('allowed'), out)
+        self.assertEqual(out['reason'], 'capacity_full', out)
+        out_ds = dp.reserve(self.store, task_id='full-ds',
+                            runtime='codebuddy',
+                            model=CB_MODEL, workspace=self.ws('full-ds'),
+                            prompt_sha256=SHA, stage='s', now=T_NIGHT,
+                            executor='codebuddy', _preclaim=False)
+        self.assertFalse(out_ds.get('allowed'), out_ds)
+        self.assertEqual(out_ds['reason'], 'mode_excluded', out_ds)
+        self.assertFalse(out_ds.get('sent'), out_ds)
 
 
 def _valid_report(stage, workspace):

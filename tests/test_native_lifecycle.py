@@ -32,7 +32,7 @@ from pathlib import Path
 
 sys.path.insert(0, str(Path(__file__).resolve().parent.parent / 'scripts'))
 sys.path.insert(0, str(Path(__file__).resolve().parent))
-from dispatch_mode_support import user_disabled_pools  # noqa: E402
+from dispatch_mode_support import dispatch_mode  # noqa: E402
 
 import dispatch_pool as dp  # noqa: E402
 from dispatch_mode_support import insert_sonus_leftover  # noqa: E402
@@ -60,40 +60,38 @@ class NativeLifecycleTests(unittest.TestCase):
         self._tmp.cleanup()
 
     # ---------- 夹具：现役全满 → ask → 到期 claim Luna → 登记 agent_id ----------
-    # Z6-A（BW-ZCODE-RESTORE-1-20261022 起现役组合含恢复的 ZCode）：请求顺序服从
-    # 生产轮转，各独立 workspace，逐一核验 allowed/token/pool_key 直至全满。
+    # Z6-A（BW-ZCODE-RESTORE-1-20261022 起现役组合含恢复的 ZCode；BW-WEAK-RESTRUCTURE-
+    # 20261116 起物理总 17、弱档可新派 6 槽）：组合按新三档策略构造——强档真实 reserve
+    # 四窄池（zcode:GLM-5.3×1、两内置 Max 各 1、claude×2；T0=北京周四 23:00，主力时段
+    # 内、claude 离峰、强档无时段门），弱档真实 reserve 弱档专属四池（两 OpenCode 各 1、
+    # CodeBuddy GLM 1（显式当轮额度授权）、zcode:GLM-5.3-Flash 1）；已被移出全部档位
+    # 可派集合的池（codebuddy:deepseek-v4.1-flash、CN 自定义 Max×2、两地区 Flash 各 2
+    # ——weak/strong/medium 均 mode_excluded）与 Sonus 按真实遗留形态直插在途 reserved
+    # （切档不追杀、不假释放；pool_key 均为 CAPACITY 已登记池），合计 9 真实新派 +
+    # 8 遗留 = 物理 17/17 满池基线。每次真实 reserve 核验 allowed/token/pool_key。
     def _fill_domestic(self):
-        # BW-CODEBUDDY-MAIN-S3 + BW-WORKER-WIDGET-20261018-S3 + BW-OPENCODE-20261019-S3
-        # + BW-ZCODE-RESTORE-1-20261022 十五满：codebuddy deepseek×1 + codebuddy GLM×1
-        # （各自独立 1 槽，GLM 需显式当轮额度条件授权）+ zcode×1（恢复可派、容量严格 1）
-        # + 两内置 Max 各 1 + CN 自定义 Max×2 + 两地区 Flash 各 2 + claude:deepseek-flash×2
-        # + 两个 OpenCode 免费模型各 1 独立槽（T0=北京周四 23:00，主力时段内且 claude
-        # offhours，OpenCode 无时段门，真实 API 直接 claim）。
-        # 全部经显式 executor 逐一确定性 claim（CN 池只能 executor='qodercn'，claude 只能
-        # executor='claude'，codebuddy 两模型只能 executor='codebuddy'，OpenCode 经
-        # executor='opencode'，ZCode 经 executor='zcode'，AUTO 轮换不保证落某特定主力），
-        # 每次核验 allowed/token/pool_key。
-        plan = [('codebuddy', 'deepseek-v4.1-flash', 'codebuddy'),
-                ('codebuddy', 'glm-5.3-flash', 'codebuddy'),
-                ('zcode', 'GLM-5.3', 'zcode'),
-                ('qoder', 'Qwen4-Max-Preview', 'qoder'),
-                ('qodercn', 'Qwen4-Max-Preview', 'qodercn'),
-                ('qodercn', 'Qwen-3.8-Max', 'qodercn'),
-                ('qodercn', 'Qwen-3.8-Max', 'qodercn'),
-                ('qoder', 'Qwen3.8-Flash', 'qoder'),
-                ('qoder', 'Qwen3.8-Flash', 'qoder'),
-                ('qodercn', 'Qwen3.8-Flash', 'qodercn'),
-                ('qodercn', 'Qwen3.8-Flash', 'qodercn'),
-                ('claude', 'deepseek-flash', 'claude'),
-                ('claude', 'deepseek-flash', 'claude'),
-                ('opencode', dp.OPENCODE_DEEPSEEK_MODEL, 'opencode'),
-                ('opencode', dp.OPENCODE_GLM_MODEL, 'opencode')]
+        plan_strong = [('zcode', 'GLM-5.3', 'zcode'),
+                       ('qoder', 'Qwen4-Max-Preview', 'qoder'),
+                       ('qodercn', 'Qwen4-Max-Preview', 'qodercn'),
+                       ('claude', 'deepseek-flash', 'claude'),
+                       ('claude', 'deepseek-flash', 'claude')]
+        plan_weak = [('opencode', dp.OPENCODE_DEEPSEEK_MODEL, 'opencode'),
+                     ('opencode', dp.OPENCODE_GLM_MODEL, 'opencode'),
+                     ('codebuddy', 'glm-5.3-flash', 'codebuddy'),
+                     ('zcode', 'GLM-5.3-Flash', 'zcode')]
         tokens = []
-        # BW-QODERCN-TOKEN-MAX-DISABLE-20261028：物理 16/16 满池需要目标池两槽 legacy
-        # 占位——生产禁用期间该池不可再 reserve，这里临时用空禁用集复现禁用前的物理满池
-        # 基线（Luna 生命周期历史场景），fill 结束即恢复真实禁用集；后续断言不变。
-        with user_disabled_pools(frozenset()):
-            for i, (runtime, model, ex) in enumerate(plan):
+        with dispatch_mode('strong'):
+            for i, (runtime, model, ex) in enumerate(plan_strong):
+                out = dp.reserve(self.store, task_id=f'dom-{i}', runtime=runtime,
+                                 model=model, workspace=f'ws-dom-{i}',
+                                 prompt_sha256='d' * 64, executor=ex, now=T0,
+                                 codebuddy_glm_allowed=False)
+                self.assertTrue(out.get('allowed') and out.get('token'), out)
+                self.assertEqual(out['pool_key'], f'{runtime}:{model}', out)
+                tokens.append(out['token'])
+        with dispatch_mode('weak'):
+            for i, (runtime, model, ex) in enumerate(
+                    plan_weak, start=len(plan_strong)):
                 out = dp.reserve(self.store, task_id=f'dom-{i}', runtime=runtime,
                                  model=model, workspace=f'ws-dom-{i}',
                                  prompt_sha256='d' * 64, executor=ex, now=T0,
@@ -101,18 +99,40 @@ class NativeLifecycleTests(unittest.TestCase):
                 self.assertTrue(out.get('allowed') and out.get('token'), out)
                 self.assertEqual(out['pool_key'], f'{runtime}:{model}', out)
                 tokens.append(out['token'])
-        # BW-STRONG-SONUS-20261024：弱档新派上限仍是 15；按真实形态补一条 strong
-        # 遗留 Sonus 在途，使物理在途达到 16/16（切档不追杀）。
+        # BW-WEAK-RESTRUCTURE-20261116：从所有档位可派集合移除的池按真实遗留形态直插
+        # 在途 reserved 行（绝不经 reserve 伪造新派；pool_key 必须已登记）。
+        leftovers = ((dp.CODEBUDDY_POOL_KEY, 1), (dp.CN_CUSTOM_MAX_POOL_KEY, 2),
+                     (dp.QFLASH_POOL_KEY, 2), (dp.CN_FLASH_POOL_KEY, 2))
+        for offset, (pk, slots) in enumerate(
+                leftovers, start=len(plan_strong) + len(plan_weak)):
+            for k in range(slots):
+                self._insert_leftover(f'left-{offset}-{k}', pk)
+        # BW-STRONG-SONUS-20261024：Sonus 已从所有档位去除新派——strong 遗留在途按真实
+        # 形态直插，使物理在途达到 17/17（切档不追杀、不假释放）。
         insert_sonus_leftover(self.store, reserved_at_utc=dp._iso(T0))
         st = dp.status(self.store, now=T0)
         self.assertEqual(st['domestic']['active'], dp.DOMESTIC_TOTAL_CAPACITY,
                          st['domestic'])
-        self.assertEqual(st['domestic']['active'], 16, st['domestic'])
-        # 1 个 zcode（BW-ZCODE-RESTORE-1-20261022 容量严格 1）记 committed_zcode；
-        # Qoder 主力组（两内置 Max + 自定义 Max 合计）记 committed_qoder=4。
+        # BW-WEAK-RESTRUCTURE-20261116：物理总 16→17（新增弱档专用 GLM-5.3-Flash 槽）。
+        self.assertEqual(st['domestic']['active'], 17, st['domestic'])
+        # 1 个 zcode:GLM-5.3（强档真实 reserve）记 committed_zcode；两内置 Max 真实
+        # reserve 记 committed_qoder=2（CN 自定义 Max×2 为直插遗留，不记 rotation）。
         self.assertEqual(st['rotation']['committed_zcode'], 1, st['rotation'])
-        self.assertEqual(st['rotation']['committed_qoder'], 4, st['rotation'])
+        self.assertEqual(st['rotation']['committed_qoder'], 2, st['rotation'])
         return tokens
+
+    def _insert_leftover(self, token, pool_key):
+        """BW-WEAK-RESTRUCTURE-20261116：按真实遗留形态直插一条已登记池的在途 reserved
+        行（仅用于构造物理满池基线；pool_key 必须是 CAPACITY 已登记池，绝不绕过
+        reserve 的档位/容量守卫伪造新派）。"""
+        runtime, model = pool_key.split(':', 1)
+        with dp.closing(dp.connect(self.store)) as conn:
+            conn.execute(
+                'INSERT INTO attempts(token, task_id, runtime, model, pool_key, state, '
+                'reserved_at_utc) VALUES(?,?,?,?,?,?,?)',
+                (token, f'T-{token}', runtime, model, pool_key, 'reserved',
+                 dp._iso(T0)))
+            conn.commit()
 
     def _luna_claimed(self, task_id='task-luna', workspace='ws-luna',
                       agent_id='agent-real-1'):
@@ -166,10 +186,13 @@ class NativeLifecycleTests(unittest.TestCase):
         # executor='qoder' 重新 claim 同一组合（该池容量 1，释放后必空；AUTO 会被改派）。
         dp.finish(self.store, self._qmax_token(), terminal='cancelled',
                   now=T0 + timedelta(seconds=901))
-        out2 = dp.reserve(self.store, task_id='task-luna', runtime='qoder',
-                          model='Qwen4-Max-Preview', workspace='ws-luna',
-                          prompt_sha256='f' * 64, executor='qoder',
-                          now=T0 + timedelta(seconds=902))
+        # BW-WEAK-RESTRUCTURE-20261116：qoder:Qwen4-Max-Preview 已移出弱档（mode_excluded），
+        # 重新 reserve 改在强档（该池可派、无时段门）。
+        with dispatch_mode('strong'):
+            out2 = dp.reserve(self.store, task_id='task-luna', runtime='qoder',
+                              model='Qwen4-Max-Preview', workspace='ws-luna',
+                              prompt_sha256='f' * 64, executor='qoder',
+                              now=T0 + timedelta(seconds=902))
         self.assertTrue(out2.get('token'), out2)
 
     def _qmax_token(self):
@@ -335,9 +358,13 @@ class NativeLifecycleTests(unittest.TestCase):
         # 释放后必空，不因 CodeBuddy 空位被 AUTO 改派）。
         dp.finish(self.store, self._qmax_token(), terminal='cancelled',
                   now=T0 + timedelta(seconds=901))
-        out = dp.reserve(self.store, task_id='dom-n', runtime='qoder',
-                         model='Qwen4-Max-Preview', workspace='ws-n', prompt_sha256='a' * 64,
-                         executor='qoder', now=T0 + timedelta(seconds=902))
+        # BW-WEAK-RESTRUCTURE-20261116：qoder:Qwen4-Max-Preview 已移出弱档
+        # （mode_excluded），真实国内 attempt 改在强档 reserve（可派、无时段门）。
+        with dispatch_mode('strong'):
+            out = dp.reserve(self.store, task_id='dom-n', runtime='qoder',
+                             model='Qwen4-Max-Preview', workspace='ws-n',
+                             prompt_sha256='a' * 64,
+                             executor='qoder', now=T0 + timedelta(seconds=902))
         self.assertTrue(out.get('token'), out)
         dom_tok = out['token']
         later = T0 + timedelta(seconds=903)
@@ -425,9 +452,12 @@ class NativeLifecycleTests(unittest.TestCase):
         # 准备用显式 executor='qoder' 固定现役组合，绕过 AUTO 跨层改派
         # （BW-MAIN-PRIORITY-S1 + BW-ZCODE-RETIRE-20261020：原借退役 zcode 组合已失效）；
         # 国内旧 finish 边界断言原样保留。
-        out = dp.reserve(self.store, task_id='dom-x', runtime='qoder',
-                         model='Qwen4-Max-Preview', workspace='ws-x', prompt_sha256='a' * 64,
-                         executor='qoder', now=T0)
+        # BW-WEAK-RESTRUCTURE-20261116：qoder:Qwen4-Max-Preview 已移出弱档，改在强档
+        # reserve（可派、无时段门、空库必有空位）。
+        with dispatch_mode('strong'):
+            out = dp.reserve(self.store, task_id='dom-x', runtime='qoder',
+                             model='Qwen4-Max-Preview', workspace='ws-x',
+                             prompt_sha256='a' * 64, executor='qoder', now=T0)
         self.assertTrue(out.get('allowed') and out.get('token'), out)
         tok = out['token']
         fin = dp.finish(self.store, tok, terminal='finished', now=T0)

@@ -10,6 +10,10 @@ import subprocess
 import sys
 import tempfile
 import unittest
+
+import sys as _sys
+_sys.path.insert(0, str(__import__("pathlib").Path(__file__).resolve().parent))
+from dispatch_mode_support import dispatch_mode  # noqa: E402
 from datetime import datetime, timezone
 from pathlib import Path
 
@@ -800,13 +804,16 @@ class AdapterDispatchPlanTests(unittest.TestCase):
         # ~/.brain-worker 池，也不继承全局 BRAIN_WORKER_DISPATCH_STORE 的在途名额。
         env['BRAIN_WORKER_DISPATCH_STORE'] = str(self.ws / 'dispatch-pool.sqlite3')
         plan = json.loads(Path(plan_path).read_text(encoding='utf-8'))
-        claim = dp.reserve(
-            env['BRAIN_WORKER_DISPATCH_STORE'], task_id=plan['task_id'],
-            runtime=plan['runtime'], model=plan['model'], workspace=plan['workspace'],
-            prompt_sha256=_sha(self._prompt.read_bytes()), stage=plan['stage'],
-            executor=plan['runtime'], origin='stage-selection',
-            now=datetime(2026, 10, 8, 15, 0, 0, tzinfo=timezone.utc),
-            _preclaim=False)
+        # BW-WEAK-RESTRUCTURE-20261116：Qwen4-Max-Preview 已移出弱档——计划链路测试
+        # 与档位无关，固定 strong 档真实 claim（Qwen4 在 strong 无门）。
+        with dispatch_mode('strong'):
+            claim = dp.reserve(
+                env['BRAIN_WORKER_DISPATCH_STORE'], task_id=plan['task_id'],
+                runtime=plan['runtime'], model=plan['model'], workspace=plan['workspace'],
+                prompt_sha256=_sha(self._prompt.read_bytes()), stage=plan['stage'],
+                executor=plan['runtime'], origin='stage-selection',
+                now=datetime(2026, 10, 8, 15, 0, 0, tzinfo=timezone.utc),
+                _preclaim=False)
         self.assertTrue(claim.get('allowed'), claim)
         cmd = [sys.executable, str(self.runner),
                '--workspace', str(self.ws), '--prompt-file', str(self._prompt),
@@ -816,8 +823,14 @@ class AdapterDispatchPlanTests(unittest.TestCase):
                '--dispatch-claim', claim['token']]
         for rule in allowed:
             cmd += ['--allowed-tools', rule]
-        return subprocess.run(cmd, capture_output=True, env=env, timeout=120,
-                              cwd=str(self.ws))
+        # BW-WEAK-RESTRUCTURE-20261116：子进程 consume_for_entry 也读档位文件——env
+        # 必须在 with 内刷新，否则子进程仍拿弱档路径把 Qwen4 拒成 mode_excluded。
+        with dispatch_mode('strong'):
+            env['BRAIN_WORKER_DISPATCH_MODE_FILE'] = os.environ[
+                'BRAIN_WORKER_DISPATCH_MODE_FILE']
+            proc = subprocess.run(cmd, capture_output=True, env=env, timeout=120,
+                                  cwd=str(self.ws))
+        return proc
 
     def test_rejected_plan_zero_spawn(self):
         self._prompt = self._write_prompt()

@@ -38,6 +38,10 @@ import os
 import sys
 import tempfile
 import threading
+import sys as _sys
+_sys.path.insert(0, str(__import__("pathlib").Path(__file__).resolve().parent))
+from dispatch_mode_support import dispatch_mode  # noqa: E402
+
 import unittest
 from contextlib import closing, redirect_stdout
 from pathlib import Path
@@ -223,10 +227,18 @@ class _CnMainBase(unittest.TestCase):
         return ['--runtime', 'qodercn', '--cn-config', str(cfg),
                 '--workspace', str(ws), '--prompt-file', str(pf),
                 '--output-dir', str(out), '--stage', 'BW-CN-PERM-STOP-' + tag,
-                '--model', 'Qwen3.8-Flash', '--task-id', 'T-' + tag,
+                # BW-WEAK-RESTRUCTURE-20261116：CN Qwen3.8-Flash 无档可派——机制测试改用
+                # CN 内置 Qwen4-Max-Preview（strong 可派）。
+                '--model', 'Qwen4-Max-Preview', '--task-id', 'T-' + tag,
                 '--dispatch-store', self.store, *extra]
 
     def run_main(self, argv):
+        # BW-WEAK-RESTRUCTURE-20261116：Qwen4-Max-Preview 已移出弱档——机制测试固定
+        # strong 档（无时段门）。
+        with dispatch_mode('strong'):
+            return self._run_main_inner(argv)
+
+    def _run_main_inner(self, argv):
         old = sys.argv
         sys.argv = ['qoder_direct.py', *argv]
         printed = io.StringIO()
@@ -378,13 +390,13 @@ class InternationalUnchangedTests(unittest.TestCase):
             sys.argv = ['qoder_direct.py', '--runtime', 'qoder', '--config', str(cfg),
                         '--workspace', str(ws), '--prompt-file', str(pf),
                         '--output-dir', str(out), '--stage', 'BW-CN-PERM-STOP-INTL',
-                        '--model', 'Qwen3.8-Flash', '--task-id', 'T-intl',
+                        '--model', 'Qwen4-Max-Preview', '--task-id', 'T-intl',
                         '--dispatch-store', str(tmp / 'pool.sqlite3'),
                         '--tools', 'Read,Write', '--allowed-tools', 'Read',
                         '--allowed-tools', 'Write']
             printed = io.StringIO()
             try:
-                with redirect_stdout(printed):
+                with dispatch_mode('strong'), redirect_stdout(printed):
                     rc = qd.main()
             finally:
                 sys.argv = old

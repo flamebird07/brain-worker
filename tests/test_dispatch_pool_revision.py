@@ -63,6 +63,9 @@ _HERE = Path(__file__).resolve().parent
 if str(_HERE) not in sys.path:
     sys.path.insert(0, str(_HERE))
 import dispatch_pool as dp  # noqa: E402
+# BW-WEAK-RESTRUCTURE-20261116：medium 档构造 strong/medium 专属池占位、临时清空用户
+# 禁用集复现禁用前物理满池。
+from dispatch_mode_support import dispatch_mode  # noqa: E402
 from dispatch_mode_support import user_disabled_pools  # noqa: E402
 from dispatch_mode_support import insert_sonus_leftover  # noqa: E402
 dp.LUNA_DISABLED = False
@@ -87,9 +90,11 @@ class TempStoreMixin:
         # 本文件的历史层序（Max > claude）与"填满即满"夹具写于 CodeBuddy 恢复之前。
         # BW-ZCODE-RESTORE-1-20261022：ZCode 恢复为正常可派池（容量 1），在途照常计入
         # 国内容量基线。先真实占住 CodeBuddy deepseek 与 GLM 各自的独立 1 槽（GLM 为额度
-        # 条件池，夹具只作占位），使旧层序断言原样成立，且 fill_domestic 补 13 个现役槽
-        # （三 Max + ZCode×1 + claude×2 + 两地区 Flash 各 2 + 两个 OpenCode 免费槽）后
-        # 总量正好 15 = DOMESTIC_TOTAL_CAPACITY（不靠虚拟同一路径、不放宽任何断言）。
+        # 条件池，夹具只作占位；BW-WEAK-RESTRUCTURE-20261116 起 CodeBuddy deepseek 已无
+        # 任何档位可新派，占位只能直插），使旧层序断言原样成立，且 fill_domestic 补
+        # 14 个现役槽（两内置 Max + CN 自定义 Max×2 + ZCode×1 + claude×2 + 两地区 Flash
+        # 各 2 + 两个 OpenCode 免费槽 + zcode:GLM-5.3-Flash）后总量正好
+        # 17 = DOMESTIC_TOTAL_CAPACITY（BW-WEAK-RESTRUCTURE-20261116：16→17）。
         with closing(dp.connect(self.store)) as conn:
             conn.execute('INSERT INTO attempts(token, task_id, runtime, model, pool_key, '
                          "state, reserved_at_utc) VALUES(?,?,?,?,?,?,?)",
@@ -120,20 +125,21 @@ class TempStoreMixin:
                 (token, task_id, runtime, model, pool, state, child_pid, child_created,
                  wrapper_pid, wrapper_created))
 
-    def fill_domestic(self, prefix='seed', n=13):
-        # BW-ZCODE-RESTORE-1-20261022：真实现役主力共 13 槽：两内置 Max 各 1 + CN 自定义
-        # Max×2 + ZCode×1（容量恢复为 1）+ claude:deepseek-flash×2 + 两地区 Flash 各 2 +
-        # 两个 OpenCode 免费模型各 1 独立槽。配合 setUp 的 CodeBuddy 两占位共 15，恰为
-        # DOMESTIC_TOTAL_CAPACITY。绝不删除任何安全断言。
+    def fill_domestic(self, prefix='seed', n=14):
+        # BW-ZCODE-RESTORE-1-20261022 + BW-WEAK-RESTRUCTURE-20261116：真实现役主力共 14
+        # 槽：两内置 Max 各 1 + CN 自定义 Max×2 + ZCode×1（容量 1）+ claude:deepseek-flash×2
+        # + 两地区 Flash 各 2 + 两个 OpenCode 免费模型各 1 独立槽 + zcode:GLM-5.3-Flash×1
+        # （弱档专用独立 1 槽）。配合 setUp 的 CodeBuddy 两占位共 16，再加 strong 遗留
+        # Sonus 1 槽恰为 DOMESTIC_TOTAL_CAPACITY=17。绝不删除任何安全断言。
         pools = ['qoder:Qwen4-Max-Preview'] \
             + ['qodercn:Qwen4-Max-Preview'] + ['qodercn:Qwen-3.8-Max'] * 2 \
             + ['claude:deepseek-flash'] * 2 \
             + ['qoder:Qwen3.8-Flash'] * 2 + ['qodercn:Qwen3.8-Flash'] * 2 \
             + [dp.OPENCODE_DEEPSEEK_POOL_KEY, dp.OPENCODE_GLM_POOL_KEY] \
-            + [dp.ZCODE_POOL_KEY]
+            + [dp.ZCODE_POOL_KEY, 'zcode:GLM-5.3-Flash']
         for i in range(n):
             self.seed_attempt(f'{prefix}-{i}', f'{prefix}-task-{i}', pools[i])
-        # BW-STRONG-SONUS-20261024：弱档无法新派 Sonus；物理总 16 需要一条 strong 时代
+        # BW-STRONG-SONUS-20261024：弱档无法新派 Sonus；物理总 17 需要一条 strong 时代
         # 遗留的 Sonus 在途（切档不追杀、不假释放），按真实形态直插。
         insert_sonus_leftover(self.store, token=f'{prefix}-sonus',
                               task_id=f'{prefix}-sonus-task')
@@ -150,15 +156,16 @@ class TempStoreMixin:
 
 class TestUnifiedPolicy(TempStoreMixin, unittest.TestCase):
     def test_reserve_flash_rejected_on_empty_store(self):
+        # BW-WEAK-RESTRUCTURE-20261116：两地区 Qwen3.8-Flash 已从**所有档位**可新派集合
+        # 移除（纯 mode_excluded）——空库请求 Flash 不再有「routing 到主力」路径，一律
+        # mode_excluded（sent=false、零占位、绝不偷换模型落库）。
         out = dp.reserve(self.store, task_id='t', runtime='qoder', model='Qwen3.8-Flash',
                          workspace='C:/w', prompt_sha256='a' * 64, now=T0,
                          _preclaim=False)
         self.assertFalse(out['allowed'])
-        self.assertTrue(out['routing_required'])
-        # 空库请求 Flash → 优先主力，绝不保留 Flash。BW-QODERCN-TOKEN-MAX-DISABLE-
-        # 20261028 起自定义 CN Max 被用户禁用，Max 层内现行最高是 CN 内置 Max。
-        self.assertIn(out['selected']['pool_key'], dp.MAIN_FORCE_KEYS)
-        self.assertEqual(out['selected']['pool_key'], dp.CN_MAX_POOL_KEY)
+        self.assertEqual(out['reason'], 'mode_excluded')
+        self.assertFalse(out['sent'])
+        self.assertFalse(out.get('routing_required'))
 
     def test_reserve_luna_rejected(self):
         out = dp.reserve(self.store, task_id='t', runtime='luna', model='native',
@@ -175,69 +182,89 @@ class TestUnifiedPolicy(TempStoreMixin, unittest.TestCase):
         self.assertEqual(out['reason'], 'luna_disabled')
 
     def test_fill_all_slots_then_one_more_rejected(self):
-        # BW-ZCODE-RESTORE-1-20261022：现役主力 + 两地区 Flash + 两 OpenCode 免费槽 +
-        # ZCode×1 共 13 槽：经显式 executor 逐槽确定性 claim（各池不超自身容量），每次
-        # assert allowed；配合 setUp 的 CodeBuddy 两占位填满 15 后任何 AUTO 现役国内组合
-        # 才 capacity_full 且 domestic_full。Z4：不同 task 用独立 workspace 目录（真实
-        # 单写入守卫）。
-        fill = [('t2', 'qoder', 'Qwen4-Max-Preview', 'qoder'),
-                ('t3', 'qodercn', 'Qwen4-Max-Preview', 'qodercn'),
-                ('t3a', 'qodercn', 'Qwen-3.8-Max', 'qodercn'),
-                ('t3b', 'qodercn', 'Qwen-3.8-Max', 'qodercn'),
-                ('t3c', 'claude', 'deepseek-flash', 'claude'),
-                ('t3d', 'claude', 'deepseek-flash', 'claude'),
-                ('t4', 'qoder', 'Qwen3.8-Flash', 'qoder'),
-                ('t5', 'qoder', 'Qwen3.8-Flash', 'qoder'),
-                ('t6', 'qodercn', 'Qwen3.8-Flash', 'qodercn'),
-                ('t7', 'qodercn', 'Qwen3.8-Flash', 'qodercn'),
-                ('t8', 'opencode', dp.OPENCODE_DEEPSEEK_MODEL, 'opencode'),
-                ('t9oc', 'opencode', dp.OPENCODE_GLM_MODEL, 'opencode'),
-                ('t1z', 'zcode', 'GLM-5.3', 'zcode')]
-        # BW-QODERCN-TOKEN-MAX-DISABLE-20261028：填满 15 槽需要目标池两槽 legacy 占位，
-        # 临时空禁用集复现禁用前物理满池（fill 结束即恢复真实禁用集，后续断言不变）。
-        with user_disabled_pools(frozenset()):
-            for tid, rt, md, ex in fill:
-                out = dp.select_and_claim(self.store, task_id=tid, runtime=rt, model=md,
-                                          workspace=f'C:/w/{tid}', prompt_sha256='p' * 64,
-                                          executor=ex, now=T0, _preclaim=False)
-                self.assertTrue(out['allowed'], out)
-        # BW-STRONG-SONUS-20261024：物理总 16 含 strong-only Sonus 槽；弱档无法新派，
-        # 用一条 strong 时代遗留的在途 Sonus 占满第 16 槽（切档不追杀、不假释放）。
+        # BW-WEAK-RESTRUCTURE-20261116：物理总 17。strong/medium 专属池经 medium 档显式
+        # executor 逐槽确定性 claim（自定义 Max 需临时空禁用集复现禁用前物理满池）；
+        # weak 可派的两个 OpenCode 免费槽与 zcode:GLM-5.3-Flash 经 weak 真实 claim；
+        # 两地区 Flash 已无任何档位可新派 → 按真实在途形态直插占位。配合 setUp 的
+        # CodeBuddy 两占位与 strong 遗留 Sonus 填满 17。Z4：不同 task 用独立 workspace
+        # 目录（真实单写入守卫）。
+        fill_medium = [('t2', 'qoder', 'Qwen4-Max-Preview', 'qoder'),
+                       ('t3', 'qodercn', 'Qwen4-Max-Preview', 'qodercn'),
+                       ('t3a', 'qodercn', 'Qwen-3.8-Max', 'qodercn'),
+                       ('t3b', 'qodercn', 'Qwen-3.8-Max', 'qodercn'),
+                       ('t3c', 'claude', 'deepseek-flash', 'claude'),
+                       ('t3d', 'claude', 'deepseek-flash', 'claude'),
+                       ('t1z', 'zcode', 'GLM-5.3', 'zcode')]
+        with dispatch_mode('medium'):
+            with user_disabled_pools(frozenset()):
+                for tid, rt, md, ex in fill_medium:
+                    out = dp.select_and_claim(self.store, task_id=tid, runtime=rt, model=md,
+                                              workspace=f'C:/w/{tid}', prompt_sha256='p' * 64,
+                                              executor=ex, now=T0, _preclaim=False)
+                    self.assertTrue(out['allowed'], out)
+        fill_weak = [('t8', 'opencode', dp.OPENCODE_DEEPSEEK_MODEL, 'opencode'),
+                     ('t9oc', 'opencode', dp.OPENCODE_GLM_MODEL, 'opencode'),
+                     ('t1zf', 'zcode', 'GLM-5.3-Flash', 'zcode')]
+        for tid, rt, md, ex in fill_weak:
+            out = dp.select_and_claim(self.store, task_id=tid, runtime=rt, model=md,
+                                      workspace=f'C:/w/{tid}', prompt_sha256='p' * 64,
+                                      executor=ex, now=T0, _preclaim=False)
+            self.assertTrue(out['allowed'], out)
+        self.seed_attempt('f-seed-q0', 'f-seed-q0-task', 'qoder:Qwen3.8-Flash')
+        self.seed_attempt('f-seed-q1', 'f-seed-q1-task', 'qoder:Qwen3.8-Flash')
+        self.seed_attempt('f-seed-cn0', 'f-seed-cn0-task', 'qodercn:Qwen3.8-Flash')
+        self.seed_attempt('f-seed-cn1', 'f-seed-cn1-task', 'qodercn:Qwen3.8-Flash')
+        # BW-STRONG-SONUS-20261024：物理总 17 含 strong-only Sonus 槽；弱档无法新派，
+        # 用一条 strong 时代遗留的在途 Sonus 占满最后一个物理槽（切档不追杀、不假释放）。
         insert_sonus_leftover(self.store, token='t-strong-sonus',
                               task_id='t-strong-sonus')
         self.assertEqual(dp.status(self.store, now=T0)['domestic']['active'],
                          dp.DOMESTIC_TOTAL_CAPACITY)
-        self.assertEqual(dp.status(self.store, now=T0)['domestic']['active'], 16)
-        # 全部槽已满 → 再一个 AUTO 现役国内组合 capacity_full 且 domestic_full；
-        # 点名 ZCode（容量 1 已占满）同样 capacity_full，绝不冒充其它理由。
-        out = dp.select_and_claim(self.store, task_id='t9', runtime='qoder',
-                                  model='Qwen4-Max-Preview', workspace='C:/w/t9',
-                                  prompt_sha256='9' * 64, now=T0, _preclaim=False)
-        self.assertFalse(out['allowed'], out)
-        self.assertEqual(out['reason'], 'capacity_full')
-        self.assertTrue(out['domestic_full'])
-        zfull = dp.select_and_claim(self.store, task_id='t10', runtime='zcode',
-                                    model='GLM-5.3', workspace='C:/w/t10',
-                                    prompt_sha256='a' * 64, now=T0, _preclaim=False)
-        self.assertFalse(zfull['allowed'], zfull)
-        self.assertEqual(zfull['reason'], 'capacity_full', zfull)
-        self.assertTrue(zfull['domestic_full'], zfull)
+        self.assertEqual(dp.status(self.store, now=T0)['domestic']['active'], 17)
+        with dispatch_mode('medium'):
+            # 全部槽已满 → 再一个 AUTO 现役国内组合 capacity_full 且 domestic_full
+            # （物理总守卫 17 先于一切候选选择）；点名 ZCode（容量 1 已占满）同样
+            # capacity_full，绝不冒充其它理由。
+            out = dp.select_and_claim(self.store, task_id='t9', runtime='qoder',
+                                      model='Qwen4-Max-Preview', workspace='C:/w/t9',
+                                      prompt_sha256='9' * 64, now=T0, _preclaim=False)
+            self.assertFalse(out['allowed'], out)
+            self.assertEqual(out['reason'], 'capacity_full', out)
+            self.assertTrue(out['domestic_full'], out)
+            zfull = dp.select_and_claim(self.store, task_id='t10', runtime='zcode',
+                                        model='GLM-5.3', workspace='C:/w/t10',
+                                        prompt_sha256='a' * 64, executor='zcode',
+                                        now=T0, _preclaim=False)
+            self.assertFalse(zfull['allowed'], zfull)
+            self.assertEqual(zfull['reason'], 'capacity_full', zfull)
+            self.assertTrue(zfull['domestic_full'], zfull)
 
     def test_duplicate_task_rejected(self):
         kw = dict(workspace='C:/w', prompt_sha256='a' * 64, now=T0, _preclaim=False)
         # BW-ZCODE-RETIRE-20261020：首占用显式 executor='qoder' 固定现役组合（原借
         # executor='zcode' 固定组合绕过 AUTO 跨层改派，语义不变）；
         # 同 task 第二次请求仍走 AUTO，验证防重先于路由/容量裁决。
-        self.assertTrue(dp.select_and_claim(self.store, task_id='dup', runtime='qoder',
-                                            model='Qwen4-Max-Preview', executor='qoder',
-                                            **kw)['allowed'])
-        out = dp.select_and_claim(self.store, task_id='dup', runtime='qoder',
-                                  model='Qwen4-Max-Preview', **kw)
+        # BW-WEAK-RESTRUCTURE-20261116：qoder Max 已移出弱档，整条链路在 medium 档跑。
+        with dispatch_mode('medium'):
+            self.assertTrue(dp.select_and_claim(self.store, task_id='dup', runtime='qoder',
+                                                model='Qwen4-Max-Preview', executor='qoder',
+                                                **kw)['allowed'])
+            out = dp.select_and_claim(self.store, task_id='dup', runtime='qoder',
+                                      model='Qwen4-Max-Preview', **kw)
         self.assertFalse(out['allowed'])
         self.assertEqual(out['reason'], 'duplicate_task_in_flight')
 
 
 class TestConsume(TempStoreMixin, unittest.TestCase):
+    def setUp(self):
+        # BW-WEAK-RESTRUCTURE-20261116：本类占位/消费组合 qoder:Qwen4-Max-Preview 已移出
+        # 弱档（weak 下 reserve/consume 一律 mode_excluded），整类用例统一在 medium 档
+        # 执行；CAS 单赢家/stage-chat 绑定语义与档位无关，断言原样保留。
+        ctx = dispatch_mode('medium')
+        ctx.__enter__()
+        self.addCleanup(ctx.__exit__, None, None, None)
+        super().setUp()
+
     def _reserve_one(self, task_id='ct'):
         # Z3 修复：consume 现在做严格 stage/chat 绑定校验，reserve 必须带原 stage/chat，
         # 否则合法 consume 会因 None != 's1' 被误判漂移（放松绑定不可取，补齐原字段）。
@@ -280,15 +307,16 @@ class TestConsume(TempStoreMixin, unittest.TestCase):
 
     def test_auto_consume_records_wrapper_identity(self):
         # 无 token 的 AUTO consume：BW-QODERCN-TOKEN-MAX-DISABLE-20261028 起自定义 CN Max
-        # 被用户禁用，本用例改用现行 Max 层内最高的 CN 内置 Max，验证 AUTO 直接选中并
-        # claim，同时记录 wrapper 真实身份。
-        out = dp.consume_for_entry(self.store, task_id='auto1', runtime='qodercn',
+        # 被用户禁用；BW-WEAK-RESTRUCTURE-20261116 起整个 qoder Max 组移出弱档——改用
+        # medium 档层1 的国际 Max（同层平票时请求组合优先），验证 AUTO 直接选中并 claim，
+        # 同时记录 wrapper 真实身份。
+        out = dp.consume_for_entry(self.store, task_id='auto1', runtime='qoder',
                                    model='Qwen4-Max-Preview', workspace='C:/w',
                                    prompt_sha256='b' * 64, stage='s', chat_id='c',
                                    wrapper_pid=777, wrapper_created='auto-created',
                                    now=T0)
         self.assertTrue(out['allowed'])
-        self.assertEqual(out['pool_key'], dp.CN_MAX_POOL_KEY)
+        self.assertEqual(out['pool_key'], dp.QMAX_POOL_KEY)
         row = self.row('attempts', 'token', out['token'])
         self.assertEqual(row['state'], 'running')
         self.assertEqual(row['wrapper_pid'], 777)
@@ -306,6 +334,14 @@ class TestConsume(TempStoreMixin, unittest.TestCase):
 
 
 class TestFinish(TempStoreMixin, unittest.TestCase):
+    def setUp(self):
+        # BW-WEAK-RESTRUCTURE-20261116：本类占位组合 qoder:Qwen4-Max-Preview 已移出弱档，
+        # 占位准备统一在 medium 档执行；finish 释放/child 证据语义与档位无关，断言原样。
+        ctx = dispatch_mode('medium')
+        ctx.__enter__()
+        self.addCleanup(ctx.__exit__, None, None, None)
+        super().setUp()
+
     def _with_child(self, child_pid=555, child_created='cc'):
         # BW-MAIN-PRIORITY-S1 + BW-ZCODE-RETIRE-20261020：显式 executor='qoder' 固定
         # 现役组合，绕过 AUTO 跨层改派，作为 finish 生命周期用例的确定性准备
@@ -362,13 +398,14 @@ class TestFinish(TempStoreMixin, unittest.TestCase):
         self.assertFalse(again['released'])
         self.assertTrue(again.get('idempotent'))
         # 释放后可再 claim（新 attempt 不受旧 token 影响）。BW-QODERCN-TOKEN-MAX-
-        # DISABLE-20261028 起自定义 CN Max 被用户禁用，改用现行 Max 层内最高的 CN
-        # 内置 Max 验证 AUTO 重新选中并 claim。
-        out = dp.select_and_claim(self.store, task_id='nc2', runtime='qodercn',
+        # DISABLE-20261028 起自定义 CN Max 被用户禁用；BW-WEAK-RESTRUCTURE-20261116 起
+        # 整个 qoder Max 组移出弱档——改用 medium 档层1 国际 Max 验证 AUTO 重新选中并
+        # claim。
+        out = dp.select_and_claim(self.store, task_id='nc2', runtime='qoder',
                                   model='Qwen4-Max-Preview', workspace='C:/w',
                                   prompt_sha256='c' * 64, now=T0, _preclaim=False)
         self.assertTrue(out['allowed'], out)
-        self.assertEqual(out['pool_key'], dp.CN_MAX_POOL_KEY)
+        self.assertEqual(out['pool_key'], dp.QMAX_POOL_KEY)
 
 
 class TestReconcile(TempStoreMixin, unittest.TestCase):
@@ -540,7 +577,10 @@ class TestClaimDue(TempStoreMixin, unittest.TestCase):
         self._ticket()
         due = T0 + timedelta(seconds=301)
         # 六满记录票据后，真实释放一个国内槽（seed 无 child：cancelled 即确认取消释放）。
-        self.assertTrue(dp.finish(self.store, 'seed-dt-0', terminal='cancelled',
+        # BW-WEAK-RESTRUCTURE-20261116：弱档回收候选只剩 5 个可派池——改释放 claude 槽
+        # （fill 顺序 seed-dt-4 = claude:deepseek-flash，T0 北京 23:00 在其工作日高峰门
+        # 外），qoder Max 槽已不在弱档候选、释放它不会触发弱档回收。
+        self.assertTrue(dp.finish(self.store, 'seed-dt-4', terminal='cancelled',
                                   now=due)['released'])
         first = dp.claim_due(self.store, task_id='dt', now=due,
                              scope=json.dumps(_scope('dt')), _preclaim=False)
@@ -626,9 +666,17 @@ class TestClaimDue(TempStoreMixin, unittest.TestCase):
 
 
 class TestMainForceRotationZ2(TempStoreMixin, unittest.TestCase):
-    """BW-MAIN-PRIORITY-S1：主力分配按优先级层选择（三 Qoder Max > ZCode > claude）。
-    BW-ZCODE-RESTORE-1-20261022：ZCode 恢复为正常可派池（容量 1）——点名 Z 的 AUTO
-    请求经既有授权门后可 claim ZCode 本组合；层内轮转语义原样保留。"""
+    """BW-MAIN-PRIORITY-S1：主力分配按优先级层选择。
+    BW-ZCODE-RESTORE-1-20261022：ZCode 恢复为正常可派池（容量 1）——点名 Z 的请求经
+    既有授权门后可 claim ZCode 本组合；层内轮转语义原样保留。
+    BW-WEAK-RESTRUCTURE-20261116：三 Max/zcode:GLM-5.3 已移出弱档——本类层序断言改在
+    medium 档执行（medium 层序：三 Max(1) > claude(2) > zcode(3)）。"""
+
+    def setUp(self):
+        ctx = dispatch_mode('medium')
+        ctx.__enter__()
+        self.addCleanup(ctx.__exit__, None, None, None)
+        super().setUp()
 
     def test_z_request_claims_zcode_capacity_one(self):
         kw = dict(workspace='C:/w', prompt_sha256='a' * 64, now=T0, _preclaim=False)
@@ -646,23 +694,24 @@ class TestMainForceRotationZ2(TempStoreMixin, unittest.TestCase):
         self.assertFalse(second['allowed'], second)
         self.assertEqual(second['reason'], 'capacity_full', second)
         # 现役 AUTO 请求仍按最高优先层正常 claim（层序不受影响；独立 workspace）。
-        # BW-QODERCN-TOKEN-MAX-DISABLE-20261028：自定义 CN Max 现行被禁用，AUTO 断言
-        # 改用 CN 内置 Max（仍是现役主力）。
-        live = dp.select_and_claim(self.store, task_id='r2', runtime='qodercn',
+        # BW-QODERCN-TOKEN-MAX-DISABLE-20261028：自定义 CN Max 现行被禁用；
+        # BW-WEAK-RESTRUCTURE-20261116：medium 层1 三 Max 平票时请求组合优先——AUTO 断言
+        # 改用国际 Max（仍是现役主力）。
+        live = dp.select_and_claim(self.store, task_id='r2', runtime='qoder',
                                    model='Qwen4-Max-Preview', prompt_sha256='b' * 64,
                                    workspace='C:/w/r2', now=T0, _preclaim=False)
         self.assertTrue(live['allowed'], live)
         self.assertIn(live['pool_key'], dp.MAIN_FORCE_KEYS, live)
 
     def test_idle_consecutive_auto_requests_stay_in_max_tier(self):
-        # 连续 AUTO 请求：首个在最高 Max 层内消化（1:1 轮转如实路由到该层空位池）；
+        # 连续请求：首个在最高 Max 层内消化（medium 层1 三 Max 平票时请求组合优先，
+        # 空池直接 claim 请求的国际 Max，绝不跨层偷换）；
         # ZCode 请求恢复后正常 claim ZCode 本组合，绝无跨层偷换。
         kw = dict(workspace='C:/w', prompt_sha256='a' * 64, now=T0, _preclaim=False)
         a = dp.select_and_claim(self.store, task_id='a1', runtime='qoder',
                                 model='Qwen4-Max-Preview', **kw)
-        self.assertFalse(a['allowed'], a)
-        self.assertTrue(a['routing_required'], a)
-        self.assertIn(a['selected']['pool_key'],
+        self.assertTrue(a['allowed'], a)
+        self.assertIn(a['pool_key'],
                       [dp.QMAX_POOL_KEY, dp.CN_MAX_POOL_KEY,
                        dp.CN_CUSTOM_MAX_POOL_KEY], a)
         b = dp.select_and_claim(self.store, task_id='a2', runtime='zcode',
@@ -674,16 +723,18 @@ class TestMainForceRotationZ2(TempStoreMixin, unittest.TestCase):
 
 
 class TestOverflowNotSubstitutedZ2(TempStoreMixin, unittest.TestCase):
-    """Z2-2：全部主力满时请求现役主力必须 routing_required，绝不偷换成 Flash 落库。
-    BW-ZCODE-RESTORE-1-20261022：ZCode 恢复为正常主力候选（容量 1）——填满夹具含
-    ZCode 槽；全满后点名 Z 同样 capacity_full，回落 Flash 的验证由现役 QMAX 请求承担，
+    """Z2-2：全部主力满时请求现役主力绝不偷换成 Flash 落库。
+    BW-WEAK-RESTRUCTURE-20261116：两地区 Qwen3.8-Flash 已从所有档位可新派集合移除
+    （纯 mode_excluded）——「主力全满 → routing Flash」路径随溢出池移除而消失；
+    现行语义为主力全满 + 兜底不在档 → mode_excluded（sent=false、零新占位），
     "绝不偷换落库"断言原样保留。"""
 
     def _fill_mains(self):
         # 全部现役主力填满：两内置 Max 各 1 + CN 自定义 Max×2 + ZCode×1 + claude×2
-        # （BW-CLAUDE-CAPACITY2：claude 容量由 1 增至 2，须一并占满才回落到
-        # Flash）+ 两个 OpenCode 免费模型各 1 独立槽（BW-OPENCODE-20261019-S3：tier 5 主力，
-        # 不占满则 AUTO 会如实路由到 OpenCode 而非 Flash，回落断言语义不变、不放宽）。
+        # （BW-CLAUDE-CAPACITY2：claude 容量由 1 增至 2，须一并占满）+ 两个 OpenCode
+        # 免费模型各 1 独立槽（BW-OPENCODE-20261019-S3：不占满则 AUTO 会如实路由到
+        # OpenCode 而非兜底拒绝，断言语义不变、不放宽）+ zcode:GLM-5.3-Flash×1
+        # （BW-WEAK-RESTRUCTURE-20261116：弱档层4，不占满则 weak AUTO 会路由到它）。
         # BW-ZCODE-RESTORE-1-20261022：ZCode×1 恢复进主力基线（容量 1）。
         for i, pool in enumerate(['qoder:Qwen4-Max-Preview']
                                  + ['qodercn:Qwen4-Max-Preview']
@@ -691,17 +742,19 @@ class TestOverflowNotSubstitutedZ2(TempStoreMixin, unittest.TestCase):
                                  + [dp.ZCODE_POOL_KEY]
                                  + ['claude:deepseek-flash'] * 2
                                  + [dp.OPENCODE_DEEPSEEK_POOL_KEY,
-                                    dp.OPENCODE_GLM_POOL_KEY]):
+                                    dp.OPENCODE_GLM_POOL_KEY]
+                                 + ['zcode:GLM-5.3-Flash']):
             self.seed_attempt(f'm-{i}', f'm-task-{i}', pool)
 
-    def test_select_and_claim_main_full_routes_to_flash_no_substitution(self):
+    def test_select_and_claim_main_full_no_cross_mode_fallback_no_substitution(self):
         self._fill_mains()
-        out = dp.select_and_claim(self.store, task_id='ov1', runtime='qoder',
-                                  model='Qwen4-Max-Preview', workspace='C:/w',
+        # weak 档可派的 claude 请求：主力全满且两 Flash 兜底不在该档 → mode_excluded。
+        out = dp.select_and_claim(self.store, task_id='ov1', runtime='claude',
+                                  model='deepseek-flash', workspace='C:/w',
                                   prompt_sha256='c' * 64, now=T0, _preclaim=False)
         self.assertFalse(out['allowed'])
-        self.assertTrue(out['routing_required'])
-        self.assertEqual(out['selected']['pool_key'], 'qoder:Qwen3.8-Flash')
+        self.assertEqual(out['reason'], 'mode_excluded', out)
+        self.assertFalse(out['sent'], out)
         # 原主力计数绝不超各自容量，且没有任何请求被偷换记到 Flash 池。
         self.assertEqual(self.active_count(dp.CLAUDE_POOL_KEY), 2)
         self.assertEqual(self.active_count('qoder:Qwen4-Max-Preview'), 1)
@@ -710,23 +763,27 @@ class TestOverflowNotSubstitutedZ2(TempStoreMixin, unittest.TestCase):
             rows = conn.execute('SELECT runtime, model, pool_key FROM attempts '
                                 "WHERE pool_key='qoder:Qwen3.8-Flash'").fetchall()
         self.assertEqual(rows, [])
-        # 点名 ZCode（容量 1 已被 m-3 占满）：诚实 overflow 路由到 Flash 入口，
-        # 绝无任何 attempt 被偷换记到 Flash 池（池表必须仍为空）。
+        # 点名 ZCode（容量 1 已被 m-3 占满；BW-WEAK-RESTRUCTURE-20261116 起该池已移出
+        # 弱档）：绝不偷换、绝无任何 attempt 被记到 Flash 池（池表必须仍为空）。
         zfull = dp.select_and_claim(self.store, task_id='ov1z', runtime='zcode',
                                     model='GLM-5.3', workspace='C:/w/ov1z',
                                     prompt_sha256='f' * 64, now=T0, _preclaim=False)
         self.assertFalse(zfull['allowed'], zfull)
-        self.assertTrue(zfull['routing_required'], zfull)
-        self.assertEqual(zfull['selected']['pool_key'], 'qoder:Qwen3.8-Flash', zfull)
+        self.assertEqual(zfull['reason'], 'mode_excluded', zfull)
+        with closing(dp.connect(self.store)) as conn:
+            rows = conn.execute('SELECT runtime, model, pool_key FROM attempts '
+                                "WHERE pool_key='qoder:Qwen3.8-Flash'").fetchall()
+        self.assertEqual(rows, [])
 
-    def test_reserve_main_full_routes_to_flash_no_substitution(self):
+    def test_reserve_main_full_no_cross_mode_fallback_no_substitution(self):
         self._fill_mains()
-        out = dp.reserve(self.store, task_id='ov2', runtime='qoder', model='Qwen4-Max-Preview',
+        out = dp.reserve(self.store, task_id='ov2', runtime='claude',
+                         model='deepseek-flash',
                          workspace='C:/w', prompt_sha256='d' * 64, now=T0,
                          _preclaim=False)
         self.assertFalse(out['allowed'])
-        self.assertTrue(out['routing_required'])
-        self.assertEqual(out['selected']['pool_key'], 'qoder:Qwen3.8-Flash')
+        self.assertEqual(out['reason'], 'mode_excluded', out)
+        self.assertFalse(out['sent'], out)
         self.assertEqual(self.active_count('qoder:Qwen4-Max-Preview'), 1)
         self.assertEqual(self.active_count('qodercn:Qwen4-Max-Preview'), 1)
         with closing(dp.connect(self.store)) as conn:
@@ -734,15 +791,18 @@ class TestOverflowNotSubstitutedZ2(TempStoreMixin, unittest.TestCase):
                                 "WHERE pool_key='qoder:Qwen3.8-Flash'").fetchall()
         self.assertEqual(rows, [])
 
-    def test_real_flash_request_claimed_when_mains_full(self):
+    def test_real_flash_request_never_claimed_even_when_mains_full(self):
+        # BW-WEAK-RESTRUCTURE-20261116：Flash 请求（即便主力全满）一律 mode_excluded，
+        # 绝不 claim、绝不落库。
         self._fill_mains()
         out = dp.select_and_claim(self.store, task_id='ov3', runtime='qoder',
                                   model='Qwen3.8-Flash', workspace='C:/w',
                                   prompt_sha256='e' * 64, now=T0, _preclaim=False)
-        self.assertTrue(out['allowed'])
-        self.assertEqual(out['pool_key'], 'qoder:Qwen3.8-Flash')
-        row = self.row('attempts', 'token', out['token'])
-        self.assertEqual(row['pool_key'], f"{row['runtime']}:{row['model']}")
+        self.assertFalse(out['allowed'])
+        self.assertEqual(out['reason'], 'mode_excluded', out)
+        self.assertFalse(out['sent'], out)
+        self.assertIsNone(out.get('token'))
+        self.assertEqual(self.active_count('qoder:Qwen3.8-Flash'), 0)
 
 
 class TestDomesticRescueCancelsTicketZ2(TempStoreMixin, unittest.TestCase):
@@ -751,15 +811,19 @@ class TestDomesticRescueCancelsTicketZ2(TempStoreMixin, unittest.TestCase):
     def test_domestic_claim_cancels_pending_and_blocks_later_luna(self):
         # BW-ZCODE-RETIRE-20261020：救回/补位请求由退役 ZCode 换成现役 QMAX，
         # refill 也换成对应现役槽，"同事务取消旧票 + 到期不得 Luna"语义原样保留。
+        # BW-WEAK-RESTRUCTURE-20261116：qoder Max 已移出弱档——救回 claim 在 medium 档
+        # 真实执行（claim_due 票据裁决本身与档位无关）。
         self.fill_domestic()
         self.assertTrue(dp.ask_record(self.store, task_id='rt', scope=_scope('rt'),
                                       ask_message_id='msg-1', now=T0)['recorded'])
         self.assertTrue(dp.finish(self.store, 'seed-0', terminal='cancelled',
                                   now=T0 + timedelta(seconds=30))['released'])
-        out = dp.select_and_claim(self.store, task_id='rt', runtime='qoder',
-                                  model='Qwen4-Max-Preview', workspace='C:/w',
-                                  prompt_sha256='p' * 64, now=T0 + timedelta(seconds=31),
-                                  _preclaim=False)
+        with dispatch_mode('medium'):
+            out = dp.select_and_claim(self.store, task_id='rt', runtime='qoder',
+                                      model='Qwen4-Max-Preview', workspace='C:/w',
+                                      prompt_sha256='p' * 64,
+                                      now=T0 + timedelta(seconds=31),
+                                      _preclaim=False)
         self.assertTrue(out['allowed'], out)
         ticket = self.row('luna_tickets', 'task_id', 'rt')
         self.assertEqual(ticket['state'], 'cancelled')
@@ -798,7 +862,9 @@ class TestClaimDueScopeZ2(TempStoreMixin, unittest.TestCase):
         self.assertTrue(dp.ask_record(self.store, task_id='sc', scope=sc,
                                       ask_message_id='msg-1', now=T0)['recorded'])
         # 询问仅 30 秒：国内释放 → 立即 domestic_reclaim（不必等到期）。
-        self.assertTrue(dp.finish(self.store, 'seed-0', terminal='cancelled',
+        # BW-WEAK-RESTRUCTURE-20261116：弱档回收候选只剩 5 个可派池——改释放 claude 槽
+        # （fill 顺序 seed-4 = claude:deepseek-flash，T0 北京 23:00 在其工作日高峰门外）。
+        self.assertTrue(dp.finish(self.store, 'seed-4', terminal='cancelled',
                                   now=T0 + timedelta(seconds=30))['released'])
         out = dp.claim_due(self.store, task_id='sc', now=T0 + timedelta(seconds=30),
                            _preclaim=False)
@@ -821,17 +887,19 @@ class TestClaimDueScopeZ2(TempStoreMixin, unittest.TestCase):
         self.assertTrue(cons['allowed'], cons)
         # 任何字段漂移（stage）必须拒绝：再造一张票走一次完整回收。
         sc2 = _scope('sc2')
-        # Z3 修复：释放 seed-1 后再补一个真实在途 attempt，使国内回到满容量（总 8，
-        # BW-QODER-CN-20261010-A2 起含 2 个 CN 补充候选）；sc2 的票据必须在确实满容量时
-        # 询问（未满询问会被正确拒绝）。
+        # Z3 修复：释放 seed-1 后再补一个真实在途 attempt，使国内回到满容量（物理总
+        # 17，BW-WEAK-RESTRUCTURE-20261116）；sc2 的票据必须在确实满容量时询问（未满
+        # 询问会被正确拒绝）。
         with closing(dp.connect(self.store)) as conn:
             conn.execute("UPDATE attempts SET state='cancelled' WHERE token='seed-1'")
         self.seed_attempt('refill-sc2', 'refill-sc2-task', 'qoder:Qwen3.8-Flash')
         self.assertTrue(dp.ask_record(self.store, task_id='sc2', scope=sc2,
                                       ask_message_id='msg-2',
                                       now=T0 + timedelta(seconds=40))['recorded'])
+        # BW-WEAK-RESTRUCTURE-20261116：腾出的回收槽必须是弱档可派池——改释放另一条
+        # claude 在途（seed-5，原 seed-2 是 CN 自定义 Max，该池所有档位均不可回收）。
         with closing(dp.connect(self.store)) as conn:
-            conn.execute("UPDATE attempts SET state='finished' WHERE token='seed-2'")
+            conn.execute("UPDATE attempts SET state='finished' WHERE token='seed-5'")
         out2 = dp.claim_due(self.store, task_id='sc2', now=T0 + timedelta(seconds=41),
                             scope=json.dumps(sc2), _preclaim=False)
         self.assertTrue(out2['claimed'], out2)
@@ -877,7 +945,15 @@ class TestClaimDueScopeZ2(TempStoreMixin, unittest.TestCase):
 
 
 class TestOwnerIdentityZ2(TempStoreMixin, unittest.TestCase):
-    """Z2-6：bind_child/finish 的 owner 身份与 unknown 状态保护。"""
+    """Z2-6：bind_child/finish 的 owner 身份与 unknown 状态保护。
+    BW-WEAK-RESTRUCTURE-20261116：本类占位组合 qodercn/qoder Max 已移出弱档——整类
+    用例统一在 medium 档执行；owner/unknown 保护语义与档位无关，断言原样保留。"""
+
+    def setUp(self):
+        ctx = dispatch_mode('medium')
+        ctx.__enter__()
+        self.addCleanup(ctx.__exit__, None, None, None)
+        super().setUp()
 
     def _owned_attempt(self, wrapper_pid=4321):
         # BW-MAIN-PRIORITY-S1 + BW-ZCODE-RETIRE-20261020：显式 executor='qodercn' 固定
@@ -938,7 +1014,15 @@ class TestOwnerIdentityZ2(TempStoreMixin, unittest.TestCase):
 
 class TestWorkspaceGuardZ4(TempStoreMixin, unittest.TestCase):
     """Z4：同真实 workspace 单写入守卫——select/reserve 拒绝别 task 同目录在途；
-    显式 token consume 同 task 原消费除外，别 task 同目录在途拒绝且 sent=false。"""
+    显式 token consume 同 task 原消费除外，别 task 同目录在途拒绝且 sent=false。
+    BW-WEAK-RESTRUCTURE-20261116：本类占位组合 qoder Max 已移出弱档——整类用例统一在
+    medium 档执行；单写入守卫先于路由/容量裁决（与档位无关），断言原样保留。"""
+
+    def setUp(self):
+        ctx = dispatch_mode('medium')
+        ctx.__enter__()
+        self.addCleanup(ctx.__exit__, None, None, None)
+        super().setUp()
 
     def test_select_and_reserve_reject_other_task_same_workspace(self):
         kw = dict(prompt_sha256='a' * 64, now=T0, _preclaim=False)

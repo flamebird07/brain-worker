@@ -610,8 +610,12 @@ class TaskToolRouteEntryTests(unittest.TestCase):
         env['STUB_MODE'] = 'ok'
         env['STUB_REPORT_FILE'] = str(self.report)
         env.pop('STUB_EVENTS_FILE', None)
+        # BW-WEAK-RESTRUCTURE-20261116: 本组是真实派发链路的入口回归；默认 weak 档下弱档
+        # ZCode 只认 GLM-5.3-Flash（GLM-5.3 会 mode_excluded、退出码 2），显式指
+        # GLM-5.3-Flash 保持「edit 路由/严格路由」的本意。
         cmd = [sys.executable, str(self.script), '--workspace', str(self.work),
                '--prompt-file', str(self.prompt), '--output-dir', str(out),
+               '--model', 'GLM-5.3-Flash',
                '--config', str(self.cfg), '--stage', S2_STAGE, *extra]
         proc = subprocess.run(cmd, capture_output=True, text=True, encoding='utf-8',
                               env=env, timeout=120)
@@ -631,6 +635,42 @@ class TaskToolRouteEntryTests(unittest.TestCase):
                     submits += 1
         return proc, summary, req, submits, out
 
+    def test_preflight_zero_shared_state_writes_survives_unwritable_store(self):
+        # BW-WEAK-RESTRUCTURE-20261116-R2：--preflight-only 零共享状态写入——共享状态
+        # 目录只读时 SDK 注册表预检仍成功，绝不建库（与 app-server 入口同契约）。
+        import os as _os
+        ro = self.root / 'ro-state'
+        ro.mkdir()
+        _os.chmod(ro, 0o555)
+        if _os.getuid() == 0 or _os.access(ro / 'w', _os.W_OK):
+            try:
+                (ro / 'w').touch()
+                _os.chmod(ro, 0o755)
+                self.skipTest('宿主可写只读目录（root/ACL），无法模拟受限会话')
+            except OSError:
+                pass
+        self.addCleanup(_os.chmod, ro, 0o755)
+        out = self.root / 't-preflight-ro'
+        env = os.environ.copy()
+        env['BRAIN_WORKER_QUOTA_STORE'] = str(ro / 'quota-state.sqlite3')
+        env['BRAIN_WORKER_DISPATCH_STORE'] = str(ro / 'dispatch-pool.sqlite3')
+        env['STUB_MODE'] = 'ok'
+        env['STUB_REPORT_FILE'] = str(self.report)
+        cmd = [sys.executable, str(self.script), '--workspace', str(self.work),
+               '--prompt-file', str(self.prompt), '--output-dir', str(out),
+               '--model', 'GLM-5.3-Flash', '--config', str(self.cfg),
+               '--stage', S2_STAGE, '--preflight-only']
+        proc = subprocess.run(cmd, capture_output=True, text=True,
+                              encoding='utf-8', env=env, timeout=120)
+        self.assertEqual(proc.returncode, 0, proc.stdout + proc.stderr)
+        self.assertFalse((ro / 'quota-state.sqlite3').exists(),
+                         'preflight 绝不创建共享额度库')
+        self.assertFalse((ro / 'dispatch-pool.sqlite3').exists(),
+                         'preflight 绝不创建共享调度库')
+        summary = json.loads((out / 'summary.json').read_text(encoding='utf-8'))
+        self.assertTrue(summary['preflight_ok'])
+        self.assertFalse(summary['submitted'])
+
     def test_edit_bash_without_contract_uses_task_tool_route(self):
         proc, summary, req, submits, out = self._run(
             't-normal', extra=['--mode', 'edit', '--tools', 'Read,Glob,Grep,Edit,Write,Bash'])
@@ -644,10 +684,11 @@ class TaskToolRouteEntryTests(unittest.TestCase):
         # present 是派工前 Python 决策；broker_ready/started 等执行载体回声不在离线断言范围。
         self.assertIs(summary['task_tool_authorization_present'], True)
         # 实际发送载荷携带本轮 runtime 与请求模型身份（不读旧提示词推断）。
+        # BW-WEAK-RESTRUCTURE-20261116: 请求模型随弱档专用池改为 GLM-5.3-Flash。
         sent = (out / 'sent-task-payload.bin').read_text(encoding='utf-8')
-        self.assertIn('runtime=zcode；请求模型=GLM-5.3', sent)
+        self.assertIn('runtime=zcode；请求模型=GLM-5.3-Flash', sent)
         self.assertEqual(req['executor_identity']['runtime'], 'zcode')
-        self.assertEqual(req['executor_identity']['request_model'], 'GLM-5.3')
+        self.assertEqual(req['executor_identity']['request_model'], 'GLM-5.3-Flash')
         # 环境值绝不落进任何证据文件。
         for p in out.iterdir():
             if p.is_file():

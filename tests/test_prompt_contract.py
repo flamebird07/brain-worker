@@ -18,6 +18,10 @@
 import hashlib
 import json
 import os
+
+import sys as _sys
+_sys.path.insert(0, str(__import__("pathlib").Path(__file__).resolve().parent))
+from dispatch_mode_support import dispatch_mode  # noqa: E402
 import subprocess
 import sys
 import tempfile
@@ -293,7 +297,10 @@ class QoderSendEvidenceTests(_SubprocessBase):
                '--prompt-file', str(prompt_path), '--output-dir', str(out),
                '--stage', self.stage, '--model', self.model_qoder, '--tools', 'Read',
                '--config', str(cfg), '--dispatch-plan', str(plan)]
-        proc = subprocess.run(cmd, env=self._env(PC_STDIN_FILE=str(stdin_file)),
+        # BW-WEAK-RESTRUCTURE-20261116：Qwen4-Max-Preview 已移出弱档——契约链路测试
+        # 与档位无关，固定 strong 档执行（Qwen4 在 strong 无门）。
+        with dispatch_mode('strong'):
+            proc = subprocess.run(cmd, env=self._env(PC_STDIN_FILE=str(stdin_file)),
                               cwd=str(self.ws), capture_output=True, timeout=120)
         return proc, stdin_file
 
@@ -472,8 +479,13 @@ class ZcodeSendEvidenceTests(_SubprocessBase):
                '--stage', self.stage, '--tools', 'Read', '--config', str(cfg), *extra]
         if plan is not None:
             cmd += ['--dispatch-plan', str(plan)]
-        env = self._env(STUB_MODE=env_mode)
-        proc = subprocess.run(cmd, env=env, cwd=str(self.ws), capture_output=True, timeout=120)
+        # BW-WEAK-RESTRUCTURE-20261116：zcode:GLM-5.3 已移出弱档——契约链路测试
+        # 与档位无关，固定 strong 档执行（zcode:GLM-5.3 在 strong 可派）；env 必须
+        # 在 with 内构造才能继承档位文件路径。
+        with dispatch_mode('strong'):
+            env = self._env(STUB_MODE=env_mode)
+            proc = subprocess.run(cmd, env=env, cwd=str(self.ws),
+                                  capture_output=True, timeout=120)
         return proc
 
     def _receipts(self, out):

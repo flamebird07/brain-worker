@@ -50,6 +50,19 @@
     不支持的请求绝不假装成功）。
 - **turn 结束信号**：`turnEnded`（通知或事件行，`method=='turnEnded'`）。
 
+## `--preflight-only` 契约（BW-WEAK-RESTRUCTURE-20261116-R2）
+
+- **零共享状态写入**：不调 availability/容量/额度三道门，不创建/迁移/WAL 共享数据库；
+  共享状态目录只读（受限会话）时预检仍成功——缺库不建库。预检成功**绝不**代替正式
+  派发或业务验收。
+- **结构化拒绝**：真实派发遇共享状态库打不开/写不进（环境权限、路径问题）→ JSON
+  `{"refused_before_dispatch": true, "sent": false, "shared_state_error": true,
+  "error_class": "shared_state_unwritable", "phase": <availability_gate|capacity_claim|
+  quota_gate>, "store_path": ..., "reasons": [...]}`，退出码 2——绝不误分类为认证、
+  额度、时段或模型错误，绝不输出裸 traceback，零证据目录。
+- SDK 传输（`zcode_direct.py`）同契约：preflight 用占位额度门（`purpose:
+  'registry_preflight'`）+ settle no-op，三个门均有同款结构化防护。
+
 ## 门序列（与 zcode_direct 同口径，不另起炉灶）
 
 Popen/建目录前依次：入口配置加载 → `validate_selection`（复用 zcode_direct）→

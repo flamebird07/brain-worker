@@ -1,5 +1,6 @@
 # 桌面状态浮窗（只读牛马看板）
 
+**BW-WEAK-RESTRUCTURE-20261116 起弱档可见行收窄为 5 池**（两 OpenCode 免费模型 / CodeBuddy GLM / Claude / ZCode GLM-5.3-Flash）：全部 Qoder 池与 codebuddy deepseek 空闲时整行隐藏，有真实在途遗留时整行保留标「本档不参与」；`ZCode／GLM-5.3-Flash` 为新增独立行；总占用显示 x/17。下文历史段落中「weak 显示全部 N 池」「两 Flash 兜底」等表述凡与本段冲突者以本段为准。
 **弱档顺序**：ZCode 排在两路 Qoder Flash 之后，是弱档最后一个自动派发候选。浮窗使用同一优先级。
 
 macOS 版沿用同一共享派发数据库。标题栏省去右上角关闭叉，可用 ⌘Q 退出。

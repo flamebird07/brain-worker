@@ -1178,9 +1178,13 @@ class PrepLeakTests(unittest.TestCase):
         return cbh.replay_dispatch(cbd.build_parser().parse_args())
 
     def _zd_argv(self):
+        # BW-WEAK-RESTRUCTURE-20261116: 本类用例在默认 weak 档做真实派发链路，弱档 ZCode
+        # 只认 GLM-5.3-Flash（GLM-5.3 在 weak 会 mode_excluded、退出码 2），显式指
+        # GLM-5.3-Flash 保持「准备阶段失败 → start_failed 释放」的本意。
         return ['zcode_direct.py', '--workspace', str(self.ws),
                 '--prompt-file', str(self.prompt), '--output-dir', str(self.out),
                 '--stage', 'BW-QUOTA-20261008-S5', '--provider', zd.DEFAULT_PROVIDER,
+                '--model', 'GLM-5.3-Flash',
                 '--config', str(self.z_config), '--quota-store', str(self.store),
                 '--quota-routes', str(self.routes),
                 '--dispatch-store', str(self.tmp / 'dispatch-pool.sqlite3')]
@@ -1296,10 +1300,13 @@ class ZCodeEntryReplayTests(unittest.TestCase):
         # 本回归只验证额度冷却语义，不验证并发轮换：每次回放用**各自独立**的临时容量池
         # （按 out 名派生），避免 1:1 轮换把第二次 zcode 派工路由到 qoder 而干扰断言。
         # 额度 store 仍共享（self.store），冷却/结算语义不变。
+        # BW-WEAK-RESTRUCTURE-20261116: 默认 weak 档下弱档 ZCode 只认 GLM-5.3-Flash
+        # （GLM-5.3 会 mode_excluded），显式指 GLM-5.3-Flash 保持完整派发回放本意。
         out = Path(out)
         return ['zcode_direct.py', '--workspace', str(self.ws),
                 '--prompt-file', str(self.prompt), '--output-dir', str(out),
                 '--stage', 'BW-QUOTA-20261008-S6', '--provider', zd.DEFAULT_PROVIDER,
+                '--model', 'GLM-5.3-Flash',
                 '--config', str(self.z_config), '--quota-store', str(self.store),
                 '--quota-routes', str(self.routes),
                 '--dispatch-store', str(out.parent / f'dispatch-{out.name}.sqlite3')]

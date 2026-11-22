@@ -9,12 +9,21 @@
 - **主脑（ChatGPT 桌面端）Mac 用法**：与 Windows GPT 桌面完全同构——零配置 human-relay（主脑读本仓库 SKILL.md，生成完整可复制阶段提示词，用户转发外部桌面 Agent，原始报告回传验收）；不创建 `config.yaml`，不需要任何 API。Mac 本机依赖（仅运行引擎脚本/浮窗时需要）：`python3`（≥3.10）；浮窗需 `brew install python-tk@3.15`（homebrew Python 默认无 tkinter，缺失时浮窗如实报错不假装运行）；测试 `python3 -m pip install pytest`（建议 venv）。引擎根不落 `~/.ccsc` 时用 `BRAIN_WORKER_HOME` 或 `install_desktop_skill.py --engine-root` 指向本机引擎副本；桌面技能安装目标 `~/.zcode/skills`（ZCode 桌面 Mac 同目录，宿主信号 `ZCODE_APP_VERSION`/`ZCODE_DESKTOP_CONTEXT_PROMPT_ENABLED` 实测注入）。
 - 桌面端自带 `~/.local/share/zcode-cli/zcode.cjs` 实测只能作 CLI（`app-server`/`commands` 等子命令可用），不能作为 SDK bootstrap 模块导入；此为 S2 新增传输的直接动因，SDK 传输的 macOS 构建路径不变。
 
-**2026-11-15 当前权威：BW-QWEN4-SONUS-REMOVE-20261115（用户明确指令）**。两项变更：
+**2026-11-16 当前权威：BW-WEAK-RESTRUCTURE-20261116（用户明确指令）**。弱档重构四项：
+
+1. **全部 Qoder 池从弱档去除**——`qodercn:Qwen4-Max-Preview`、`qoder:Qwen4-Max-Preview`、`qoder:Qwen3.8-Flash`、`qodercn:Qwen3.8-Flash` 在 weak 一律 `mode_excluded`（sent=false、零新占位、绝不静默换模型）；两内置 Qwen4-Max-Preview 在 strong/medium 的资格不变，两个 Qwen3.8-Flash 池自此**无任何档位**可新派（登记与历史在途安全语义原样保留）。
+2. **弱档 ZCode 只用 GLM-5.3-Flash**——新独立池键 `zcode:GLM-5.3-Flash`（容量 1、无时段门），与 strong/medium 的 `zcode:GLM-5.3`（容量 1）各自独立 1 槽、互不占位；`zcode:GLM-5.3` 自 weak 移除（strong/medium 不变）。**物理总容量 16→17**（MAIN_FORCE+OVERFLOW 求和自动得出）。
+3. **Claude Code 调到弱档倒数第二**——`claude:deepseek-flash`（容量 2、工作日高峰门）位于 CodeBuddy GLM 之后、ZCode GLM-5.3-Flash（最后）之前。
+4. **`codebuddy:deepseek-v4.1-flash` 从弱档取消**——同 Qoder 池，自此无任何档位可新派（mode_excluded，登记保留）。
+
+当前新派范围：strong 常态 4 池/5 槽（两内置 Qwen4-Max-Preview > Claude > ZCode，全部无时段门）；medium **4 池/5 槽**（两内置 Qwen4-Max-Preview > Claude > ZCode；Max 夜间门 + Claude 高峰门）；weak **5 池/6 槽**（两 OpenCode 免费模型 > CodeBuddy GLM > Claude > ZCode GLM-5.3-Flash；仅 Claude 高峰门）。物理总容量 **17**。浮窗弱档空闲只显示 5 池，被移出弱档的池有真实在途遗留时整行保留并标「本档不参与」。
+
+**2026-11-15 当前权威：BW-QWEN4-SONUS-REMOVE-20261115（用户明确指令；弱档口径已被上方 BW-WEAK-RESTRUCTURE-20261116 覆盖）**。两项变更：
 
 1. **Sonus 从所有档位去除新派**——唯一权威开关 `scripts/dispatch_mode.py` 的 `SONUS_TEMP_DISABLED = True`（持久事实）。三档（含 strong）可新派集合全部剔除 `qoder:Sonus`：AUTO 不选；显式 reserve/select-and-claim、consume、claim-due 与正式 Qoder `--model Sonus` 一律 `mode_excluded`（sent=false、零新占位、绝不静默换模型）。**遗留 reserved 的 Sonus claim 不再放行 consume**（sonus_legacy_reserved 例外已删除，reserved 安全释放为 start_failed）；已在途 running/unknown 不追杀、不假释放，继续安全计数与自然终态结算。浮窗三档空闲一律整行隐藏；真实在途遗留整行保留并标「不接新派（用户指令）」。容量登记 1、模型字面量、优先级历史层号、宿主递归排除、物理总容量 16 与历史 attempt 全部保留。strong 常态降为 **4 池/5 槽**（两内置 Qwen4-Max-Preview > Claude > ZCode）。
 2. **两个 Qoder 内置 Max 官方显示名改为 Qwen4-Max-Preview**——`qoder:Qwen4-Max-Preview` / `qodercn:Qwen4-Max-Preview`（SDK argv `--model` 与池键同一字面串）；旧池键 `qoder:Qwen3.8-Max` / `qodercn:Qwen3.8-Max` 以 0 容量降为 legacy-retired：不再接任何新派、绝不映射到新池，旧池在途 attempt 继续安全计数（计入物理总 16 守卫）与自然终态结算，绝不丢失。带短横线的 `qodercn:Qwen-3.8-Max` 仍是独立**已禁用**自定义池（BW-QODERCN-TOKEN-MAX-DISABLE-20261028），历史身份与禁用语义原样保留，与 CN 内置新名互不冲突。
 
-当前新派范围：strong 常态 4 池/5 槽（两内置 Qwen4-Max-Preview > Claude > ZCode，全部无时段门）；medium **4 池/5 槽**（两内置 Qwen4-Max-Preview > Claude > ZCode）；weak **10 池/13 槽**（CN 内置 Max > Claude > 国际 Max > CodeBuddy DeepSeek > 两 OpenCode > CodeBuddy GLM > 两 Flash > ZCode）。物理总容量仍 **16**。
+当前新派范围（BW-WEAK-RESTRUCTURE-20261116 前口径，weak 部分已被其覆盖）：strong 常态 4 池/5 槽（两内置 Qwen4-Max-Preview > Claude > ZCode，全部无时段门）；medium **4 池/5 槽**（两内置 Qwen4-Max-Preview > Claude > ZCode）；weak ~~10 池/13 槽~~（**已改为 5 池/6 槽**，见顶部 BW-WEAK-RESTRUCTURE-20261116）。
 
 （历史命名说明：下文 R3/R2/20261028/20261026/20261024 等历史段落中经 2026-11-15 批量改名同步出现的 `Qwen4-Max-Preview` 字样，在各自历史时点实际为 `Qwen3.8-Max`；Sonus 相关历史描述均按当时口径存档。）
 
@@ -210,7 +219,7 @@ Start Plan / Trust Build 免费额度未证实。最终汇报须展示来回总�
 
 ## 桌面状态浮窗（只读牛马看板，2026-10-18）
 
-`pythonw scripts/worker_status_widget.py` 启动一个常驻深色小卡片：默认精简，只列有 `display_state=running` 真实 attempt 的模型行；展开/折叠只由明确单击触发——单击标题栏非按钮区切换，精简态单击运行行=展开并选中该行，展开态单击行=只更新详情选中、绝不折叠，鼠标 Enter/Leave 与子控件间移动绝不改变展开状态（旧 hover 自动展开/200ms 延迟回缩/刷新循环补偿路径已删除），标题/行卡移动超过 3px 只拖动不切换，置顶/关闭/档位按钮/空闲关机勾选/详情滚轮与点击均不误触发；展开显示当前快照可见行（不是固定 12 行：weak 显示当前参与的 10 池；BW-SONUS-TEMP-DISABLE-20261028-R2 起 `qoder:Sonus` 全档暂时禁用，三档空闲时都隐藏；禁用前遗留的 reserved/running/unknown Sonus 在任何档位临时保留整行，按真实状态显示并标「暂时禁用（用户指令）」，真实终态后消失。恢复启用后的常态才是 strong 空闲显示 Sonus 且第一、medium/weak 空闲隐藏——详见本文顶部权威段）、原有详情与空闲关机勾选/计时，以及仅在展开态显示的底部两行页脚（本地只读状态 + 数据源；精简态无行/有运行行/读取失败一并不参与布局，文本保留，展开原样显示，折叠后高度恢复）；精简/展开同宽 480、高度动态并夹紧屏幕（贴底时展开整体上移、完整内容优先，展开即显示当前快照的全部可见行），标题与行卡可拖动，置顶与关闭两种模式都保留，Windows 单实例。每 2 秒经 `mode=ro` 短事务只读共享调度池 SQLite，按现有主力优先级展示各牛马“运行中/已预留/待核实/空闲/时段外”与总占用 x/16（CodeBuddy 两模型各自独立 1 槽、独立计数；两 OpenCode 免费模型行位于 ZCode 之后、条件 CodeBuddy GLM 之前，各独立 1 槽、无时段门）。混池待核优先并带「含运行」徽标，绝不冒充全绿；只有预留/待核不进入精简行，但摘要保留总占用/运行数及非零的待核/预留/近期限额/Luna/其他在途提示；只要该行含真实运行 attempt 就不显示历史限额（运行中不显示限额），原始限额证据与短窗计时不改；未选中行时详情框 2 行高、选中后 6 行可滚轮；主行状态绝不只信 DB running：死 PID/复用/探测未知/未绑定子进程的 running 主行显著「待核实」，只有匹配活 PID 才显示「运行中」；reserved 无子进程仍「已预留」；Luna 原生不套本机探针；占位计数与 DB 状态不改。纯标准库零新依赖，不派工、不改库、不查余额、不扫日志；`--once` 输出安全 JSON 供只读验证。显示状态是占位/本机核对事实，不是业务验收。启动方式、界面语义与离线测试见 [桌面状态浮窗参考](references/desktop-widget.md)。
+`pythonw scripts/worker_status_widget.py` 启动一个常驻深色小卡片：默认精简，只列有 `display_state=running` 真实 attempt 的模型行；展开/折叠只由明确单击触发——单击标题栏非按钮区切换，精简态单击运行行=展开并选中该行，展开态单击行=只更新详情选中、绝不折叠，鼠标 Enter/Leave 与子控件间移动绝不改变展开状态（旧 hover 自动展开/200ms 延迟回缩/刷新循环补偿路径已删除），标题/行卡移动超过 3px 只拖动不切换，置顶/关闭/档位按钮/空闲关机勾选/详情滚轮与点击均不误触发；展开显示当前快照可见行（不是固定 12 行：weak 显示当前参与的全部 5 个可新派池（BW-WEAK-RESTRUCTURE-20261116 起）；BW-SONUS-TEMP-DISABLE-20261028-R2 起 `qoder:Sonus` 全档暂时禁用，三档空闲时都隐藏；禁用前遗留的 reserved/running/unknown Sonus 在任何档位临时保留整行，按真实状态显示并标「暂时禁用（用户指令）」，真实终态后消失。恢复启用后的常态才是 strong 空闲显示 Sonus 且第一、medium/weak 空闲隐藏——详见本文顶部权威段）、原有详情与空闲关机勾选/计时，以及仅在展开态显示的底部两行页脚（本地只读状态 + 数据源；精简态无行/有运行行/读取失败一并不参与布局，文本保留，展开原样显示，折叠后高度恢复）；精简/展开同宽 480、高度动态并夹紧屏幕（贴底时展开整体上移、完整内容优先，展开即显示当前快照的全部可见行），标题与行卡可拖动，置顶与关闭两种模式都保留，Windows 单实例。每 2 秒经 `mode=ro` 短事务只读共享调度池 SQLite，按现有主力优先级展示各牛马“运行中/已预留/待核实/空闲/时段外”与总占用 x/17（CodeBuddy 两模型各自独立 1 槽、独立计数；两 OpenCode 免费模型行位于 ZCode 之后、条件 CodeBuddy GLM 之前，各独立 1 槽、无时段门）。混池待核优先并带「含运行」徽标，绝不冒充全绿；只有预留/待核不进入精简行，但摘要保留总占用/运行数及非零的待核/预留/近期限额/Luna/其他在途提示；只要该行含真实运行 attempt 就不显示历史限额（运行中不显示限额），原始限额证据与短窗计时不改；未选中行时详情框 2 行高、选中后 6 行可滚轮；主行状态绝不只信 DB running：死 PID/复用/探测未知/未绑定子进程的 running 主行显著「待核实」，只有匹配活 PID 才显示「运行中」；reserved 无子进程仍「已预留」；Luna 原生不套本机探针；占位计数与 DB 状态不改。纯标准库零新依赖，不派工、不改库、不查余额、不扫日志；`--once` 输出安全 JSON 供只读验证。显示状态是占位/本机核对事实，不是业务验收。启动方式、界面语义与离线测试见 [桌面状态浮窗参考](references/desktop-widget.md)。
 
 ## 默认安全边界
 
