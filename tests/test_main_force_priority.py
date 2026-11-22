@@ -313,17 +313,25 @@ class WindowAndGateTests(_Base):
 
     def test_claude_gate_is_mode_specific(self):
         # BW-MANUAL-THREE-MODE-20261023：strong 档 claude 全天可派（工作日高峰/午间/夜间/
-        # 08:00 全部在候选里）；weak/medium 恢复工作日高峰门 → PEAK 被挡、GAP/NIGHT 保留。
+        # 08:00 全部在候选里）；medium 恢复工作日高峰门 → PEAK 被挡、GAP/NIGHT 保留。
+        # BW-WEAK-TIER-ENFORCE-20261122: weak 纯优先级队列无任何时段门——claude 高峰
+        # 全候在资格集合（队列接管排序）。
         with dispatch_mode('strong'), closing(dp.connect(self.store)) as conn:
             for now in (PEAK, GAP, NIGHT, DAY_08):
                 self.assertIn(CLAUDE, dp._eligible_main_forces(conn, False, now), now)
-        for mode in ('weak', 'medium'):
-            with dispatch_mode(mode), closing(dp.connect(self.store)) as conn:
-                self.assertNotIn(CLAUDE, dp._eligible_main_forces(conn, False, PEAK), mode)
-                for now in (GAP, NIGHT, DAY_08):
-                    self.assertIn(CLAUDE, dp._eligible_main_forces(conn, False, now),
-                                  (mode, now))
-        self.assertIn(CLAUDE, dp.WINDOW_GATED_MAIN_FORCES)
+        with dispatch_mode('weak'), closing(dp.connect(self.store)) as conn:
+            for now in (PEAK, GAP, NIGHT, DAY_08):
+                self.assertIn(CLAUDE, dp._eligible_main_forces(conn, False, now), 'weak')
+        with dispatch_mode('medium'), closing(dp.connect(self.store)) as conn:
+            self.assertNotIn(CLAUDE, dp._eligible_main_forces(conn, False, PEAK), 'medium')
+            for now in (GAP, NIGHT, DAY_08):
+                self.assertIn(CLAUDE, dp._eligible_main_forces(conn, False, now),
+                              ('medium', now))
+        # BW-WEAK-TIER-ENFORCE-20261122: 弱档改为纯优先级队列——无任何时段门，weak 口径的
+        # WINDOW_GATED_MAIN_FORCES 现在为 ()；「claude 受时段门约束」的档位对照改在 medium
+        # （medium 仍声明 Max 夜间门 + Claude 高峰门）。
+        self.assertEqual(tuple(dp.WINDOW_GATED_MAIN_FORCES), ())
+        self.assertIn(CLAUDE, tuple(dp.window_gated_pools('medium')))
         self.assertEqual(tuple(dp.window_gated_pools('strong')), ())
 
     def test_retired_deepseek_never_candidate_and_no_window_gate(self):
@@ -340,28 +348,32 @@ class HighLevelDispatchTests(_Base):
         # CodeBuddy GLM／ZCode GLM-5.3-Flash（全部 Qoder 池、codebuddy deepseek、
         # zcode:GLM-5.3 已移出弱档；zcode:GLM-5.3-Flash 已入 MAIN_FORCE_POOLS 可真实
         # claim）。「全部主力占满」按弱档真实可占面逐一真实 claim。
-        self.assertTrue(self.reserve('cl0', 'claude', 'deepseek-flash',
-                                     'claude').get('allowed'))
-        self.assertTrue(self.reserve('cl1', 'claude', 'deepseek-flash',
-                                     'claude').get('allowed'))
+        # BW-WEAK-TIER-ENFORCE-20261122: 弱档纯优先级队列——必须按队序（层1 两 OpenCode
+        # → 层2 CodeBuddy GLM → 层3 claude×2 → 层4 zcode flash）占位，跳队请求会被
+        # routing_required 到队首而非 claim。
         self.assertTrue(self.reserve('od1', 'opencode', dp.OPENCODE_DEEPSEEK_MODEL,
                                      'opencode').get('allowed'))
         self.assertTrue(self.reserve('od2', 'opencode', dp.OPENCODE_GLM_MODEL,
                                      'opencode').get('allowed'))
         self.assertTrue(self.reserve('cbg', 'codebuddy', dp.CODEBUDDY_GLM_MODEL,
                                      'codebuddy').get('allowed'))
+        self.assertTrue(self.reserve('cl0', 'claude', 'deepseek-flash',
+                                     'claude').get('allowed'))
+        self.assertTrue(self.reserve('cl1', 'claude', 'deepseek-flash',
+                                     'claude').get('allowed'))
         self.assertTrue(self.reserve('zf1', 'zcode', 'GLM-5.3-Flash',
                                      'zcode').get('allowed'))
 
     def test_flash_only_when_all_mains_unavailable(self):
         # 旧口径：全部主力占满 → 兜底两地区 Flash。BW-WEAK-RESTRUCTURE-20261116: 两
         # Flash（qoder/qodercn:Qwen3.8-Flash）已从**所有档位**（含弱档）移除新派资格
-        # ——弱档主力占满后绝不静默换模型，如实 mode_excluded（sent=false、零新占位）。
+        # ——绝不静默换模型。BW-WEAK-TIER-ENFORCE-20261122: 弱档纯优先级队列——全部
+        # 6 槽占满后队列走完即如实 capacity_full（sent=false、零新占位，绝不借道 Flash）。
         self.occupy_all_mains()
         r = self.claim_auto('auto1', runtime='claude', model='deepseek-flash')
         self.assertFalse(r.get('allowed'), r)
         self.assertFalse(r.get('sent'), r)
-        self.assertEqual(r['reason'], 'mode_excluded', r)
+        self.assertEqual(r['reason'], 'capacity_full', r)
         with closing(dp.connect(self.store)) as conn:
             n = conn.execute('SELECT COUNT(*) AS n FROM attempts '
                              "WHERE task_id='auto1'").fetchone()['n']
@@ -405,6 +417,14 @@ class HighLevelDispatchTests(_Base):
 
     def test_workspace_conflict_guard_unchanged(self):
         # 同工作区单写守卫语义原样：两个不同 task 共享同一真实 workspace 时第二个拒绝。
+        # BW-WEAK-TIER-ENFORCE-20261122: 弱档纯优先级队列——先占满层1-2（两 OpenCode／
+        # CodeBuddy GLM），claude（层3）才是队首可被 claim；单写守卫本意不变。
+        self.assertTrue(self.reserve('oc1', 'opencode', dp.OPENCODE_DEEPSEEK_MODEL,
+                                     'opencode').get('allowed'))
+        self.assertTrue(self.reserve('oc2', 'opencode', dp.OPENCODE_GLM_MODEL,
+                                     'opencode').get('allowed'))
+        self.assertTrue(self.reserve('cbg0', 'codebuddy', dp.CODEBUDDY_GLM_MODEL,
+                                     'codebuddy').get('allowed'))
         shared = self.ws('shared')
         r1 = self.reserve('wa', 'claude', 'deepseek-flash', 'claude', ws=shared)
         self.assertTrue(r1.get('allowed'), r1)
@@ -584,13 +604,16 @@ class ClaudeThenIntlMaxOrderTests(_Base):
                 self.assertEqual(r['candidate_filters'][CLAUDE], 'eligible', r)
 
     def test_weak_peak_claude_is_window_closed(self):
-        # weak（默认）：工作日高峰恢复高峰门 → claude 如实 window_closed（不是 mode_excluded）。
+        # BW-WEAK-TIER-ENFORCE-20261122: weak 纯优先级队列无时段门——工作日高峰不再
+        # window_closed；授权范围只有 claude 时，规划器在授权范围内按队列选中 claude
+        # （refused=None）；正式 claim 的队列接管发生在 dispatch_pool 池层。
         for now in (self.DAY_1000, self.DAY_1500):
             with self.subTest(now=now):
                 auth = self.auth('auto', 'T', 's2', [CLAUDE])
                 r = self.plan(auth, now=now)
-                self.assertEqual(r['candidate_filters'][CLAUDE], 'window_closed', r)
-                self.assertEqual(r['refused'], 'no_eligible_candidate', r)
+                self.assertIsNone(r['refused'], r)
+                self.assertEqual(r['candidate_filters'][CLAUDE], 'eligible', r)
+                self.assertEqual(r['selected']['pool_key'], CLAUDE, r)
 
     def test_auto_authorized_both_picks_claude(self):
         # BW-WEAK-RESTRUCTURE-20261116: 弱档同时授权 claude + 国际 Max → claude 照常

@@ -30,6 +30,9 @@ import continuation_contract as cc  # noqa: E402
 import execution_control as ec  # noqa: E402
 import zcode_direct as zd  # noqa: E402
 import codebuddy_direct as cbd  # noqa: E402
+# BW-WEAK-TIER-ENFORCE-20261122: 弱档纯优先级队列占位（_occupy_higher_weak_slots）需要
+# 直接构造真实 reserve 占位行。
+import dispatch_pool as dp  # noqa: E402
 # 退休的 CodeBuddy 传输链已完整搬出生产模块，只存在于测试专用 harness；PrepLeak 的
 # 入口生命周期回归直接调 harness.replay_dispatch（进程内、合成 noop stub，绝不 Popen）。
 import offline_codebuddy_harness as cbh  # noqa: E402
@@ -41,6 +44,24 @@ EXPECTED_RESET_UTC = datetime(2026, 10, 8, 10, 14, 13, tzinfo=timezone.utc)
 # CB 直连回放统一走仓库唯一可信固定合成 stub tests/offline_codebuddy_stub.py：
 # 行为只由 CODEBUDDY_STUB_SPEC/RECORD 数据参数化，可信字节/哈希由仓库定义，env 无法
 # 声明或放宽白名单（见 offline_codebuddy_harness._trusted_stub_hashes）。
+
+
+def _occupy_higher_weak_slots(store, base_dir):
+    # BW-WEAK-TIER-ENFORCE-20261122: 弱档纯优先级队列——zcode:GLM-5.3-Flash 是层4，
+    # 只有层1-3（两 OpenCode／CodeBuddy GLM／claude×2）全满它才是队首、zcode 入口才能
+    # 真实派发；与 test_zcode_appserver_direct 的 _occupy_higher_weak_slots 同一模式
+    # （真实 reserve 占位、独立任务/工作区，绝不伪造在途形态）。
+    combos = [('opencode', dp.OPENCODE_DEEPSEEK_MODEL),
+              ('opencode', dp.OPENCODE_GLM_MODEL),
+              ('codebuddy', dp.CODEBUDDY_GLM_MODEL),
+              ('claude', 'deepseek-flash'),
+              ('claude', 'deepseek-flash')]
+    for i, (rt, m) in enumerate(combos):
+        r = dp.reserve(str(store), task_id=f'pre-weak-{i}', runtime=rt, model=m,
+                       workspace=str(Path(base_dir) / f'pre-weak-{i}'),
+                       prompt_sha256='1' * 64, stage='pre-weak', executor=rt,
+                       _preclaim=False)
+        assert r.get('allowed'), (rt, m, r)
 
 
 
@@ -1242,6 +1263,9 @@ class PrepLeakTests(unittest.TestCase):
         self.assertFalse(self.out.joinpath('request.json').exists())  # 未写请求、未派发
 
     def test_zcode_mkdir_generic_oserror_releases(self):
+        # BW-WEAK-TIER-ENFORCE-20261122: 弱档纯优先级队列——先占满层1-3，zcode
+        # GLM-5.3-Flash（层4）才是队首可被真实派发。
+        _occupy_higher_weak_slots(self.tmp / 'dispatch-pool.sqlite3', self.tmp)
         patchers = [mock.patch.object(Path, 'mkdir', autospec=True,
                                       side_effect=self._out_only_mkdir(
                                           PermissionError('no perm')))]
@@ -1250,6 +1274,9 @@ class PrepLeakTests(unittest.TestCase):
         self._assert_cleaned(out_text)
 
     def test_zcode_payload_permissionerror_releases(self):
+        # BW-WEAK-TIER-ENFORCE-20261122: 弱档纯优先级队列——先占满层1-3，zcode
+        # GLM-5.3-Flash（层4）才是队首可被真实派发。
+        _occupy_higher_weak_slots(self.tmp / 'dispatch-pool.sqlite3', self.tmp)
         patchers = [mock.patch.object(zd.pc, 'compose_task_payload',
                                       side_effect=PermissionError('disk'))]
         rc, out_text = self._run(self._zd_argv(), zd.main, patchers)
@@ -1326,6 +1353,13 @@ class ZCodeEntryReplayTests(unittest.TestCase):
             pass
 
     def _run(self, out, stdout_bytes, stderr_bytes, rc, counter):
+        # BW-WEAK-TIER-ENFORCE-20261122: 弱档纯优先级队列——每次回放使用按 out 派生的
+        # 独立容量池，先占满层1-3（两 OpenCode／CodeBuddy GLM／claude×2），zcode
+        # GLM-5.3-Flash（层4）才是队首可被真实派发。
+        out = Path(out)
+        _occupy_higher_weak_slots(out.parent / f'dispatch-{out.name}.sqlite3',
+                                  self.tmp)
+
         def _popen(argv, *a, **k):
             counter['n'] += 1
             k['stdout'].write(stdout_bytes)

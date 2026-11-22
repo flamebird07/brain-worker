@@ -22,6 +22,8 @@ sys.path.insert(0, str(SCRIPTS))
 import claude_direct as cd      # noqa: E402
 import dispatch_pool as dp      # noqa: E402
 import prompt_contract as pc    # noqa: E402
+# BW-WEAK-TIER-ENFORCE-20261122: 档位切换工具（claude 机制测试固定 strong 档执行）。
+from dispatch_mode_support import dispatch_mode   # noqa: E402
 
 OFFPEAK = datetime(2026, 10, 8, 15, 0, 0, tzinfo=timezone.utc)
 SECRET = 'sk-BYPASS-SECRET-DO-NOT-LEAK'
@@ -179,14 +181,18 @@ class BypassLifecycleTests(unittest.TestCase):
 
     def _run(self, fake, *, cfg=None, required_tools=None, write_files=None,
              is_eng=True):
-        return cd.run(cfg or _cfg(), workspace=str(self.ws), prompt_file=self.prompt,
-                      out_dir=self.out, stage=STAGE, task_id='t1',
-                      prompt_sha256=self._sha(), now=OFFPEAK, popen_factory=fake,
-                      environ={'ANTHROPIC_API_KEY': SECRET},
-                      dispatch_store=self.store, bind_child_pid=False,
-                      child_prober=lambda pid: {'state': 'dead', 'created': 'c1'},
-                      is_engineering_task=is_eng,
-                      required_tools=required_tools, write_files=write_files)
+        # BW-WEAK-TIER-ENFORCE-20261122: bypass/dontAsk 权限契约与档位无关，固定
+        # strong 档执行（claude 在 strong 层2、无时段门、可显式派；弱档纯优先级队列
+        # 会把显式 claude 请求接管为 routing_required，与本组测试本意无关）。
+        with dispatch_mode('strong'):
+            return cd.run(cfg or _cfg(), workspace=str(self.ws), prompt_file=self.prompt,
+                          out_dir=self.out, stage=STAGE, task_id='t1',
+                          prompt_sha256=self._sha(), now=OFFPEAK, popen_factory=fake,
+                          environ={'ANTHROPIC_API_KEY': SECRET},
+                          dispatch_store=self.store, bind_child_pid=False,
+                          child_prober=lambda pid: {'state': 'dead', 'created': 'c1'},
+                          is_engineering_task=is_eng,
+                          required_tools=required_tools, write_files=write_files)
 
     def _success_stream(self, tool='Read'):
         body = _report_body(STAGE, str(self.ws))

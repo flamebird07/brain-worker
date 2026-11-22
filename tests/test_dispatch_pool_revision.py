@@ -725,9 +725,9 @@ class TestMainForceRotationZ2(TempStoreMixin, unittest.TestCase):
 class TestOverflowNotSubstitutedZ2(TempStoreMixin, unittest.TestCase):
     """Z2-2：全部主力满时请求现役主力绝不偷换成 Flash 落库。
     BW-WEAK-RESTRUCTURE-20261116：两地区 Qwen3.8-Flash 已从所有档位可新派集合移除
-    （纯 mode_excluded）——「主力全满 → routing Flash」路径随溢出池移除而消失；
-    现行语义为主力全满 + 兜底不在档 → mode_excluded（sent=false、零新占位），
-    "绝不偷换落库"断言原样保留。"""
+    （纯 mode_excluded）——「主力全满 → routing Flash」路径随溢出池移除而消失。
+    BW-WEAK-TIER-ENFORCE-20261122：弱档纯优先级队列——弱档六槽全满时队列走完即如实
+    capacity_full（sent=false、零新占位、绝不偷换落库，断言原样保留）。"""
 
     def _fill_mains(self):
         # 全部现役主力填满：两内置 Max 各 1 + CN 自定义 Max×2 + ZCode×1 + claude×2
@@ -749,11 +749,13 @@ class TestOverflowNotSubstitutedZ2(TempStoreMixin, unittest.TestCase):
     def test_select_and_claim_main_full_no_cross_mode_fallback_no_substitution(self):
         self._fill_mains()
         # weak 档可派的 claude 请求：主力全满且两 Flash 兜底不在该档 → mode_excluded。
+        # BW-WEAK-TIER-ENFORCE-20261122: 弱档纯优先级队列——六槽全满时如实 capacity_full
+        # （sent=false、零新占位，绝不借道 Flash 偷换落库）。
         out = dp.select_and_claim(self.store, task_id='ov1', runtime='claude',
                                   model='deepseek-flash', workspace='C:/w',
                                   prompt_sha256='c' * 64, now=T0, _preclaim=False)
         self.assertFalse(out['allowed'])
-        self.assertEqual(out['reason'], 'mode_excluded', out)
+        self.assertEqual(out['reason'], 'capacity_full', out)
         self.assertFalse(out['sent'], out)
         # 原主力计数绝不超各自容量，且没有任何请求被偷换记到 Flash 池。
         self.assertEqual(self.active_count(dp.CLAUDE_POOL_KEY), 2)
@@ -777,12 +779,14 @@ class TestOverflowNotSubstitutedZ2(TempStoreMixin, unittest.TestCase):
 
     def test_reserve_main_full_no_cross_mode_fallback_no_substitution(self):
         self._fill_mains()
+        # BW-WEAK-TIER-ENFORCE-20261122: 弱档纯优先级队列——六槽全满时 reserve 路径同样
+        # 如实 capacity_full（sent=false，绝不借道 Flash 偷换落库）。
         out = dp.reserve(self.store, task_id='ov2', runtime='claude',
                          model='deepseek-flash',
                          workspace='C:/w', prompt_sha256='d' * 64, now=T0,
                          _preclaim=False)
         self.assertFalse(out['allowed'])
-        self.assertEqual(out['reason'], 'mode_excluded', out)
+        self.assertEqual(out['reason'], 'capacity_full', out)
         self.assertFalse(out['sent'], out)
         self.assertEqual(self.active_count('qoder:Qwen4-Max-Preview'), 1)
         self.assertEqual(self.active_count('qodercn:Qwen4-Max-Preview'), 1)

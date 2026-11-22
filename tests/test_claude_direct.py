@@ -536,16 +536,21 @@ class LifecycleTests(unittest.TestCase):
         return hashlib.sha256(self.prompt.read_bytes()).hexdigest()
 
     def run_with(self, fake, *, now=OFFPEAK, is_eng=True, task='t1', out=None,
-                 bind_child_pid=False):
+                 bind_child_pid=False, mode='strong'):
         # 离线 mock 显式注入 bind_child_pid=False（仅离线，绝不作为 CLI 权限开关）；
         # 真实绑定路径由专门的反例测试用注入的 bind_child 覆盖。
-        return cd.run(self.cfg(), workspace=str(self.ws), prompt_file=self.prompt,
-                      out_dir=out or self.out, stage='BW-CLAUDE-DEEPSEEK-S3', task_id=task,
-                      prompt_sha256=self.sha(), now=now, popen_factory=fake,
-                      environ={'ANTHROPIC_API_KEY': SECRET}, dispatch_store=self.store,
-                      child_prober=lambda pid: {'state': 'dead', 'created': 'c1'},
-                      is_engineering_task=is_eng, bind_child_pid=bind_child_pid,
-                      required_tools=['Read'] if is_eng else None)
+        # BW-WEAK-TIER-ENFORCE-20261122: claude 生命周期机制测试与档位无关，固定
+        # strong 档执行（claude 在 strong 层2、无时段门、可显式派）；弱档纯优先级
+        # 队列会把显式 claude 请求接管为 routing_required，与本组测试本意无关。
+        with dispatch_mode(mode):
+            return cd.run(self.cfg(), workspace=str(self.ws), prompt_file=self.prompt,
+                          out_dir=out or self.out, stage='BW-CLAUDE-DEEPSEEK-S3',
+                          task_id=task,
+                          prompt_sha256=self.sha(), now=now, popen_factory=fake,
+                          environ={'ANTHROPIC_API_KEY': SECRET}, dispatch_store=self.store,
+                          child_prober=lambda pid: {'state': 'dead', 'created': 'c1'},
+                          is_engineering_task=is_eng, bind_child_pid=bind_child_pid,
+                          required_tools=['Read'] if is_eng else None)
 
     def success_stream(self):
         body = _report_body('BW-CLAUDE-DEEPSEEK-S3', str(self.ws))
@@ -606,15 +611,18 @@ class LifecycleTests(unittest.TestCase):
                     'tools': ['Read', 'Edit', 'Write', 'Bash'],
                     'allowed_tools': [], 'max_turns': 120,
                     '_max_turns_source': 'fixture.json'})
-        out = cd.run(
-            cfg, workspace=str(self.ws), prompt_file=self.prompt, out_dir=self.out,
-            stage='BW-CLAUDE-DEEPSEEK-S3', task_id='budget', prompt_sha256=self.sha(),
-            now=OFFPEAK, popen_factory=factory,
-            environ={'ANTHROPIC_API_KEY': SECRET}, dispatch_store=self.store,
-            child_prober=lambda pid: {'state': 'dead', 'created': 'c1'},
-            is_engineering_task=True, bind_child_pid=True,
-            write_files=['work.txt'],
-            required_test_commands=['python -m pytest tests/x.py -q'])
+        # BW-WEAK-TIER-ENFORCE-20261122: turn 预算/续跑机制与档位无关，固定 strong
+        # 档执行（claude 在 strong 无门可显式派；弱档队列会把 claude 请求接管）。
+        with dispatch_mode('strong'):
+            out = cd.run(
+                cfg, workspace=str(self.ws), prompt_file=self.prompt, out_dir=self.out,
+                stage='BW-CLAUDE-DEEPSEEK-S3', task_id='budget', prompt_sha256=self.sha(),
+                now=OFFPEAK, popen_factory=factory,
+                environ={'ANTHROPIC_API_KEY': SECRET}, dispatch_store=self.store,
+                child_prober=lambda pid: {'state': 'dead', 'created': 'c1'},
+                is_engineering_task=True, bind_child_pid=True,
+                write_files=['work.txt'],
+                required_test_commands=['python -m pytest tests/x.py -q'])
         self.assertFalse(out['passed'])
         self.assertEqual(out['terminal_class'], 'turn_budget_exhausted')
         self.assertEqual(out['turns_used'], 120)
@@ -656,14 +664,19 @@ class LifecycleTests(unittest.TestCase):
         self.assertEqual(out['reason'], 'output_dir_exists')
         self.assertEqual(self.sink, [])  # 零 Popen
 
-    def test_peak_blocks_before_popen_in_weak_and_runs_in_strong(self):
-        # BW-MANUAL-THREE-MODE-20261023：claude 工作日高峰门**按档**——
-        # weak（默认）：北京周一 09:00 高峰如实拒派，零 Popen（绝不偷偷启动）；
-        # strong：无时段门，必须真实走到 Popen。
+    def test_weak_queue_takes_over_claude_before_popen_and_strong_runs_at_peak(self):
+        # BW-WEAK-TIER-ENFORCE-20261122：弱档已无任何时段门（Claude 高峰门从弱档移除），
+        # 改为**纯优先级队列**——显式 claude 请求一律被队列接管：队首
+        # opencode:deepseek-v4.1-flash-free 有空位 → 请求组合不是队首 →
+        # routing_required 拒绝（回执 selected=队首组合），与时段无关且零 Popen
+        # （绝不偷偷启动）；strong 无时段门，PEAK 必须真实走到 Popen。
         fake = FakePopen(self.success_stream(), sink=self.sink)
-        out = self.run_with(fake, now=PEAK, bind_child_pid=True)
+        out = self.run_with(fake, now=PEAK, bind_child_pid=True, mode='weak')
         self.assertFalse(out['sent'], out)
-        self.assertEqual(out['gate']['reason'], 'main_force_window_closed', out['gate'])
+        self.assertEqual(out['gate']['reason'], 'routing_required', out['gate'])
+        self.assertTrue(out['gate'].get('routing_required'), out['gate'])
+        self.assertEqual(out['gate']['selected']['pool_key'],
+                         'opencode:deepseek-v4.1-flash-free', out['gate'])
         self.assertEqual(self.sink, [])  # 零 Popen
         with dispatch_mode('strong'):
             fake2 = FakePopen(self.success_stream(), sink=self.sink)
@@ -727,13 +740,16 @@ class LifecycleTests(unittest.TestCase):
     def test_bind_failure_required_keeps_unknown_not_passed(self):
         # 生产默认 bind_child_pid=True 且绑定未明确成功 → 不写入子进程、不假释放、不 passed。
         with mock.patch.object(dp, 'bind_child', return_value={'bound': False}):
-            out = cd.run(self.cfg(), workspace=str(self.ws), prompt_file=self.prompt,
-                         out_dir=self.out, stage='BW-CLAUDE-DEEPSEEK-S3', task_id='t1',
-                         prompt_sha256=self.sha(), now=OFFPEAK,
-                         popen_factory=FakePopen(self.success_stream(), sink=self.sink),
-                         environ={'ANTHROPIC_API_KEY': SECRET}, dispatch_store=self.store,
-                         child_prober=lambda pid: {'state': 'dead', 'created': 'c1'},
-                         required_tools=['Read'], bind_child_pid=True)
+            # BW-WEAK-TIER-ENFORCE-20261122: 绑定失败语义与档位无关，固定 strong 档
+            # 执行（claude 在 strong 无门可显式派；弱档队列会把 claude 请求接管）。
+            with dispatch_mode('strong'):
+                out = cd.run(self.cfg(), workspace=str(self.ws), prompt_file=self.prompt,
+                             out_dir=self.out, stage='BW-CLAUDE-DEEPSEEK-S3', task_id='t1',
+                             prompt_sha256=self.sha(), now=OFFPEAK,
+                             popen_factory=FakePopen(self.success_stream(), sink=self.sink),
+                             environ={'ANTHROPIC_API_KEY': SECRET}, dispatch_store=self.store,
+                             child_prober=lambda pid: {'state': 'dead', 'created': 'c1'},
+                             required_tools=['Read'], bind_child_pid=True)
         self.assertFalse(out['sent'])
         self.assertTrue(out.get('launch_unknown'))
         self.assertFalse(out.get('passed', False))
@@ -923,17 +939,22 @@ class TransportRetryTests(unittest.TestCase):
             result])
 
     def run_with(self, factory, *, now=OFFPEAK, is_eng=True, task='t1', out=None,
-                 bind_child_pid=False, retry_delays=(0.0, 0.0), sleeps=None):
+                 bind_child_pid=False, retry_delays=(0.0, 0.0), sleeps=None,
+                 mode='strong'):
         recorded = sleeps if sleeps is not None else []
-        return cd.run(self.cfg(), workspace=str(self.ws), prompt_file=self.prompt,
-                      out_dir=out or self.out, stage=self.STAGE, task_id=task,
-                      prompt_sha256=self.sha(), now=now, popen_factory=factory,
-                      environ={'ANTHROPIC_API_KEY': SECRET}, dispatch_store=self.store,
-                      child_prober=lambda pid: {'state': 'dead', 'created': 'c1'},
-                      is_engineering_task=is_eng, bind_child_pid=bind_child_pid,
-                      required_tools=['Read'] if is_eng else None,
-                      transport_retry_delays=list(retry_delays),
-                      sleeper=recorded.append)
+        # BW-WEAK-TIER-ENFORCE-20261122: 传输层重试机制与档位无关，固定 strong 档执行
+        # （claude 在 strong 层2、无时段门、可显式派；弱档纯优先级队列会把显式 claude
+        # 请求接管为 routing_required，与本组测试本意无关）。
+        with dispatch_mode(mode):
+            return cd.run(self.cfg(), workspace=str(self.ws), prompt_file=self.prompt,
+                          out_dir=out or self.out, stage=self.STAGE, task_id=task,
+                          prompt_sha256=self.sha(), now=now, popen_factory=factory,
+                          environ={'ANTHROPIC_API_KEY': SECRET}, dispatch_store=self.store,
+                          child_prober=lambda pid: {'state': 'dead', 'created': 'c1'},
+                          is_engineering_task=is_eng, bind_child_pid=bind_child_pid,
+                          required_tools=['Read'] if is_eng else None,
+                          transport_retry_delays=list(retry_delays),
+                          sleeper=recorded.append)
 
     def _active(self):
         return dp.status(self.store,

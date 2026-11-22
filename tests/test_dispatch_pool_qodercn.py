@@ -311,7 +311,20 @@ class CapacityAndRotationTests(_Store):
         self.assertEqual(st_before['committed_qoder'], st_after['committed_qoder'])
         # 同语义正向补验：弱档现役的 zcode:GLM-5.3-Flash（独立 1 槽、非 rotation 记分池）
         # 真实 claim 后 rotation 两列同样不动。
+        # BW-WEAK-TIER-ENFORCE-20261122: 弱档纯优先级队列——zcode:GLM-5.3-Flash 是层4，
+        # 先按队序真实占满层1-3（两 OpenCode + claude×2；层2 CodeBuddy GLM 已由夹具
+        # 占位），它才是队首可被 claim。
         with dispatch_mode('weak'):
+            for i, (rt, m) in enumerate((('opencode', dp.OPENCODE_DEEPSEEK_MODEL),
+                                         ('opencode', dp.OPENCODE_GLM_MODEL),
+                                         ('claude', 'deepseek-flash'),
+                                         ('claude', 'deepseek-flash'))):
+                occ = dp.select_and_claim(self.store, task_id=f'pre-weak-{i}',
+                                          runtime=rt, model=m,
+                                          workspace=self.ws(f'pre-weak-{i}'),
+                                          prompt_sha256='p', executor=rt, now=T0,
+                                          _preclaim=False)
+                self.assertTrue(occ['allowed'], (rt, m, occ))
             zf = dp.select_and_claim(self.store, task_id='r-zf', runtime='zcode',
                                      model='GLM-5.3-Flash', workspace=self.ws('r-zf'),
                                      prompt_sha256='p', executor='zcode', now=T0,

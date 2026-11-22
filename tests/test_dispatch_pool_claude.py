@@ -5,10 +5,15 @@
 strong 专属 Sonus 1 槽；现行权威口径）；claude 在 MAIN_FORCE_KEYS 且容量 2（第 2 个请求可认领、
 第 3 个满且绝不回退别模型；完成释放后可再用；同 workspace 仍拒绝；reserved/running/unknown 均
 正确占位）；AUTO 在其它主力占满时可选中 claude（无需用户显式点名）；claude 在途计入国内总在途
-聚合、但绝不污染 committed_qoder；显式 executor='claude' 点名；**时段门已整体解除
-（BW-CLAUDE-ALLDAY-QMAX-AFTER-20261023：任何注入时间都可新派）**、1800 秒真实限额短窗
-照旧；明确限额落标/释放；总 15 守卫包含历史迁移占位且绝不派第 16 个。全部显式临时 sqlite
+聚合、但绝不污染 committed_qoder；显式 executor='claude' 点名；1800 秒真实限额短窗
+照旧；明确限额落标/释放；总 17 守卫包含历史迁移占位且绝不派第 18 个。全部显式临时 sqlite
 store，绝不读写真实 ~/.brain-worker。零网络/零模型。
+
+BW-WEAK-TIER-ENFORCE-20261122（用户指令：简化逻辑——弱档只看优先级）：弱档是**纯优先级
+队列**——按层序取第一个有空位的池，不查 availability/限额短窗/时段门/executor 冲突；
+请求组合不是队首 → routing_required（回执 selected=队首组合）；队列全满 → capacity_full。
+Claude 高峰门已从弱档删除（window_gated_pools('weak') 为空；medium 仍保留）。弱档要真实
+claim claude（层3），必须先按队列序占满层1-2（两 OpenCode + CBGLM）。
 """
 import hashlib
 import sys
@@ -66,22 +71,71 @@ class _ClaudeBase(unittest.TestCase):
                           workspace=self.ws(tid), prompt_sha256='p' + '0' * 63, stage='s',
                           now=now, executor=executor, _preclaim=False)
 
+    # BW-WEAK-TIER-ENFORCE-20261122：弱档纯优先级队列序（唯一判断=层序+空位；同层由
+    # pool_key stable tie 定序，与 _domestic_policy weak 分支同源）：
+    # 层1 opencode:deepseek-free(1) > 层1 opencode:glm-free(1) > 层2 codebuddy:glm(1)
+    # > 层3 claude(2) > 层4 zcode:GLM-5.3-Flash(1)，合计 6 槽。
+    WEAK_QUEUE_COMBOS = (
+        ('opencode', dp.OPENCODE_DEEPSEEK_MODEL),
+        ('opencode', dp.OPENCODE_GLM_MODEL),
+        ('codebuddy', dp.CODEBUDDY_GLM_MODEL),
+        ('claude', 'deepseek-flash'),
+        ('claude', 'deepseek-flash'),
+        ('zcode', 'GLM-5.3-Flash'),
+    )
+
+    def occupy_weak_above(self, target_pk, prefix='weak-above', now=OFFPEAK_NIGHT):
+        """BW-WEAK-TIER-ENFORCE-20261122：弱档纯优先级队列——要把 target_pk 变成队首
+        （显式或 AUTO 请求才能被真实 claim），按队列序经 consume_for_entry（入口同款
+        路径）把排在其前面的全部空槽真实占满（到 running）；已占用槽自动跳过。
+        弱档队列不查 availability/限额短窗/时段门/executor 冲突，占位即真实占位。"""
+        toks = []
+        for rt, m in self.WEAK_QUEUE_COMBOS:
+            pk = dp.pool_key(rt, m)
+            if pk == target_pk:
+                break
+            while dp.status(self.store, now=now)['pools'][pk]['active'] \
+                    < dp.capacity_for(pk):
+                task = f'{prefix}-{len(toks)}'
+                r = dp.consume_for_entry(self.store, task_id=task, runtime=rt, model=m,
+                                         workspace=self.ws(task),
+                                         prompt_sha256='p' + '0' * 63,
+                                         executor=rt, wrapper_pid=4321,
+                                         wrapper_created='w1', now=now)
+                self.assertTrue(r.get('allowed'), r)
+                self.assertEqual(r['pool_key'], pk, r)
+                toks.append(r['token'])
+        return toks
+
+    def _seed_inflight(self, token, task_id, pool, state='running', now=OFFPEAK_NIGHT):
+        """BW-WEAK-TIER-ENFORCE-20261122：弱档纯优先级队列下，队首未到的池（如层4
+        zcode:GLM-5.3-Flash 在 claude 有空位时）无法经队列真实 claim——占位场景按真实
+        在途形态直插（同遗留占位模式），仅用于容量/队列序场景的物理占位，绝不用于
+        伪造可新派断言。"""
+        with closing(dp.connect(self.store)) as conn:
+            runtime, model = pool.split(':', 1)
+            conn.execute('INSERT INTO attempts(token, task_id, runtime, model, pool_key, '
+                         'state, reserved_at_utc) VALUES(?,?,?,?,?,?,?)',
+                         (token, task_id, runtime, model, pool, state, dp._iso(now)))
+            conn.execute('PRAGMA journal_mode=DELETE')
+
     def occupy_non_claude_mains(self, now=OFFPEAK_NIGHT):
         """BW-WEAK-RESTRUCTURE-20261116: 占满全部**非 claude 可真实新派**的主力槽——
-        weak 档 4 槽（两 OpenCode 各 1 + CBGLM 1 + ZCode GLM-5.3-Flash 1，claude 层3 之上
-        是 OpenCode(1)/CBGLM(2)）+ strong 档 5 槽（两内置 Max 各 1 + zcode:GLM-5.3 1 +
-        CN 自定义 Max 2 按禁用前 legacy 占位构造，临时空禁用集）。已移出所有档位的
-        codebuddy:deepseek-v4.1-flash 不在此列（由需要它的用例按遗留形态直插），
-        使 AUTO 在 claude 仍空闲时按现行弱档层序（两 OpenCode(1) > CBGLM(2) > claude(3)
-        > ZCode GLM-5.3-Flash(4)）落到 claude。"""
+        weak 档 4 槽（两 OpenCode 各 1 + CBGLM 1 + ZCode GLM-5.3-Flash 1）+ strong 档
+        5 槽（两内置 Max 各 1 + zcode:GLM-5.3 1 + CN 自定义 Max 2 按禁用前 legacy 占位
+        构造，临时空禁用集）。已移出所有档位的 codebuddy:deepseek-v4.1-flash 不在此列
+        （由需要它的用例按遗留形态直插）。
+        BW-WEAK-TIER-ENFORCE-20261122：弱档纯优先级队列——层1-2（两 OpenCode/CBGLM）
+        按队列序真实 claim；层4 zcode:GLM-5.3-Flash 在 claude 有空位时队首未到、无法经
+        队列 claim，改按真实在途形态直插占位，使 AUTO 在 claude 仍空闲时队首=claude。"""
         self.assertTrue(self._reserve('oc0', 'opencode', dp.OPENCODE_DEEPSEEK_MODEL,
                                       'opencode', now).get('allowed'))
         self.assertTrue(self._reserve('oc1', 'opencode', dp.OPENCODE_GLM_MODEL,
                                       'opencode', now).get('allowed'))
         self.assertTrue(self._reserve('cbg', 'codebuddy', dp.CODEBUDDY_GLM_MODEL,
                                       'codebuddy', now).get('allowed'))
-        self.assertTrue(self._reserve('zcf', 'zcode', 'GLM-5.3-Flash', 'zcode',
-                                      now).get('allowed'))
+        # BW-WEAK-TIER-ENFORCE-20261122：层4 槽按真实在途形态直插（队列序在 claude 之后）。
+        self._seed_inflight('zcf', 'zcf-task', 'zcode:GLM-5.3-Flash', now=now)
         with dispatch_mode('strong'):
             self.assertTrue(self._reserve('qm', 'qoder', 'Qwen4-Max-Preview', 'qoder',
                                           now).get('allowed'))
@@ -116,24 +170,35 @@ class CapacityAndRouting(_ClaudeBase):
                          + sum(dp.OVERFLOW_CAPACITY.values()))
 
     def test_explicit_claude_claim(self):
+        # BW-WEAK-TIER-ENFORCE-20261122：弱档纯优先级队列——claude 是层3，显式 claim 前
+        # 先按队列序排空层1-2（两 OpenCode + CBGLM），队首=claude 才被真实 claim。
+        self.occupy_weak_above(dp.CLAUDE_POOL_KEY, prefix='ex-above')
         r = self.claim_claude('c1')
         self.assertTrue(r.get('allowed'), r)
         self.assertEqual(r['pool_key'], CLAUDE)
 
     def test_two_concurrent_claude_slots_then_third_is_full(self):
+        # BW-WEAK-TIER-ENFORCE-20261122：弱档纯优先级队列——先排空层1-2，claude 两槽
+        # 依次被真实 claim（容量 2 → 第 2 个仍可认领）；层4 zcode:GLM-5.3-Flash 按队列序
+        # 直插占满后队列走完，第 3 个 claude 请求如实 capacity_full（绝不静默换模型）。
+        self.occupy_weak_above(dp.CLAUDE_POOL_KEY, prefix='cap-above')
         r1 = self.claim_claude('a')
         r2 = self.claim_claude('b')   # 容量 2 → 第 2 个并发 claude 仍可认领
-        r3 = self.claim_claude('c')   # 第 3 个满，绝不回退别模型
         self.assertTrue(r1.get('allowed'), r1)
         self.assertTrue(r2.get('allowed'), r2)
         self.assertEqual(r1['pool_key'], CLAUDE)
         self.assertEqual(r2['pool_key'], CLAUDE)
+        self._seed_inflight('zcf', 'zcf-task', 'zcode:GLM-5.3-Flash')
+        r3 = self.claim_claude('c')   # 第 3 个满（弱档队列已走完），绝不回退别模型
         self.assertFalse(r3.get('allowed'), r3)
         self.assertEqual(r3['reason'], 'capacity_full')
         self.assertIn('capacity', r3['reasons'][0].lower())
         self.assertEqual(dp.status(self.store, now=OFFPEAK_NIGHT)['pools'][CLAUDE]['active'], 2)
 
     def test_same_workspace_second_claude_still_refused(self):
+        # BW-WEAK-TIER-ENFORCE-20261122：弱档纯优先级队列——真实 claude claim 前先排空
+        # 层1-2；同 workspace 单写入守卫照常（先于队列裁决）。
+        self.occupy_weak_above(dp.CLAUDE_POOL_KEY, prefix='ws-above')
         ws = self.ws('shared')
         r1 = dp.select_and_claim(self.store, task_id='w1', runtime='claude',
                                  model='deepseek-flash', workspace=ws,
@@ -148,6 +213,9 @@ class CapacityAndRouting(_ClaudeBase):
         self.assertEqual(r2['reason'], 'workspace_in_flight', r2)
 
     def test_terminal_release_allows_claude_reuse(self):
+        # BW-WEAK-TIER-ENFORCE-20261122：弱档纯优先级队列——先排空层1-2；释放后队列
+        # 重新把 claude 排到队首，槽位真实复用。
+        self.occupy_weak_above(dp.CLAUDE_POOL_KEY, prefix='rel-above')
         r1 = self.claim_claude('a')
         r2 = self.claim_claude('b')
         self.assertTrue(r1.get('allowed'), r1)
@@ -160,10 +228,14 @@ class CapacityAndRouting(_ClaudeBase):
         self.assertEqual(dp.status(self.store, now=OFFPEAK_NIGHT)['pools'][CLAUDE]['active'], 2)
 
     def test_reserved_running_unknown_all_occupy_claude_capacity(self):
+        # BW-WEAK-TIER-ENFORCE-20261122：弱档纯优先级队列——先排空层1-2 再真实预留两条
+        # claude；层4 直插占满后队列走完，第 3/4 条请求如实 capacity_full。
+        self.occupy_weak_above(dp.CLAUDE_POOL_KEY, prefix='rru-above')
         r1 = self._reserve('r1', 'claude', 'deepseek-flash', 'claude', OFFPEAK_NIGHT)
         r2 = self._reserve('r2', 'claude', 'deepseek-flash', 'claude', OFFPEAK_NIGHT)
         self.assertTrue(r1.get('allowed'), r1)
         self.assertTrue(r2.get('allowed'), r2)
+        self._seed_inflight('zcf', 'zcf-task', 'zcode:GLM-5.3-Flash')
         # reserved 两条已占满 → 第 3 条拒绝。
         r3 = self.claim_claude('r3')
         self.assertFalse(r3.get('allowed'), r3)
@@ -185,6 +257,8 @@ class CapacityAndRouting(_ClaudeBase):
         # 请求（未点名 claude）：全部非 claude 可派主力槽（两 OpenCode + CBGLM + 该层）
         # 占满、claude 空闲 → 选中 claude。qoder Max 组合已移出弱档，请求组合改用
         # zcode:GLM-5.3-Flash 保持「未点名 claude 的 AUTO 请求」本意。
+        # BW-WEAK-TIER-ENFORCE-20261122：弱档纯优先级队列——层1-2 按队列序真实 claim、
+        # 层4 按真实在途直插（见 occupy_non_claude_mains），队首=claude → routing。
         self.occupy_non_claude_mains()
         r = dp.select_and_claim(self.store, task_id='auto', runtime='zcode',
                                 model='GLM-5.3-Flash', workspace=self.ws('auto'),
@@ -194,14 +268,22 @@ class CapacityAndRouting(_ClaudeBase):
         self.assertEqual(r['selected']['pool_key'], CLAUDE)
 
     def test_claude_inflight_counted_in_domestic_aggregate(self):
+        # BW-WEAK-TIER-ENFORCE-20261122：弱档纯优先级队列——先排空层1-2 再真实 claim。
+        # 占位基数之上两条 claude 在途使国内总数恰好 +2（claude 在途计入国内总数）。
+        self.occupy_weak_above(dp.CLAUDE_POOL_KEY, prefix='agg-above')
+        before = dp.status(self.store, now=OFFPEAK_NIGHT)['domestic']['active']
         self.claim_claude('c1')
         self.claim_claude('c2')
         st = dp.status(self.store, now=OFFPEAK_NIGHT)
-        self.assertEqual(st['domestic']['active'], 2)   # claude 在途计入国内总数
+        self.assertEqual(st['domestic']['active'], before + 2)
         self.assertEqual(st['pools'][CLAUDE]['active'], 2)
 
     def test_claude_does_not_pollute_committed_qoder(self):
-        self.claim_claude('c1')
+        # BW-WEAK-TIER-ENFORCE-20261122：弱档纯优先级队列——先排空层1-2，claude 真实
+        # claim 到位后验证绝不污染 committed 计数。
+        self.occupy_weak_above(dp.CLAUDE_POOL_KEY, prefix='rot-above')
+        r = self.claim_claude('c1')
+        self.assertTrue(r.get('allowed'), r)
         st = dp.status(self.store, now=OFFPEAK_NIGHT)
         self.assertEqual(st['rotation']['committed_qoder'], 0)
         self.assertEqual(st['rotation']['committed_zcode'], 0)
@@ -235,22 +317,22 @@ class CapacityAndRouting(_ClaudeBase):
             self.assertEqual(r['pool_key'], CLAUDE, r)
 
     def test_auto_claude_entry_peak_refused_in_weak_mode(self):
-        # weak（默认）档恢复既有工作日高峰门：高峰 AUTO 的 claude 入口如实
-        # `main_force_window_closed`（sent=false、零占位），离峰则正常可派。
-        # BW-WEAK-RESTRUCTURE-20261116: 现行弱档层序 OpenCode(1) > CBGLM(2) > claude(3)
-        # （旧弱档 claude 层3 之上只有 Max/ZCode，均已移出弱档）——离峰 AUTO 要真实落
-        # claude，必须先占满其上的 OpenCode 两槽与 CBGLM；这些池无时段门，可在高峰时刻
-        # 预先占位。
-        self.assertTrue(self._reserve('hw1', 'opencode', dp.OPENCODE_DEEPSEEK_MODEL,
-                                      'opencode', PEAK_WEEKDAY).get('allowed'))
-        self.assertTrue(self._reserve('hw2', 'opencode', dp.OPENCODE_GLM_MODEL,
-                                      'opencode', PEAK_WEEKDAY).get('allowed'))
-        self.assertTrue(self._reserve('hw3', 'codebuddy', dp.CODEBUDDY_GLM_MODEL,
-                                      'codebuddy', PEAK_WEEKDAY).get('allowed'))
+        # weak（默认）档原恢复既有工作日高峰门；BW-WEAK-TIER-ENFORCE-20261122：弱档改为
+        # 纯优先级队列、**无任何时段门**（window_gated_pools('weak') 为空）——高峰门
+        # 拒绝机制改在 medium 档验证；弱档高峰 AUTO 的 claude 入口按队列接管、如实
+        # routing_required 到队首（层1 opencode:deepseek-free，sent=false、零占位），
+        # 离峰排空上方层后仍真实落 claude（弱档层序 OpenCode(1) > CBGLM(2) > claude(3)）。
         r = self.claim_claude('apw', now=PEAK_WEEKDAY, executor='auto')
         self.assertFalse(r.get('allowed'), r)
-        self.assertEqual(r['reason'], 'main_force_window_closed', r)
+        self.assertTrue(r.get('routing_required'), r)
+        self.assertEqual(r['selected']['pool_key'], dp.OPENCODE_DEEPSEEK_POOL_KEY, r)
         self.assertFalse(r.get('sent', True), r)
+        with dispatch_mode('medium'):
+            rw = self.claim_claude('apw-medium', now=PEAK_WEEKDAY, executor='auto')
+            self.assertFalse(rw.get('allowed'), rw)
+            self.assertEqual(rw['reason'], 'main_force_window_closed', rw)
+            self.assertFalse(rw.get('sent', True), rw)
+        self.occupy_weak_above(dp.CLAUDE_POOL_KEY, prefix='apw-above')
         r2 = self.claim_claude('apw2', now=OFFPEAK_WEEKDAY_1300, executor='auto')
         self.assertTrue(r2.get('allowed'), r2)
         self.assertEqual(r2['pool_key'], CLAUDE, r2)
@@ -294,18 +376,26 @@ class CapacityAndRouting(_ClaudeBase):
         st = dp.status(self.store, now=OFFPEAK_NIGHT)
         self.assertEqual(st['domestic']['active'], 17, st['domestic'])
         self.assertEqual(st['pools'][CLAUDE]['active'], 1, st['pools'][CLAUDE])
-        r = self.claim_claude('late', executor='claude')
+        # BW-WEAK-TIER-ENFORCE-20261122：弱档纯优先级队列不查物理总守卫（超额迁移在途
+        # 让队列仍有空位时物理总已达 17——疑似引擎回归、已单独报告）；「总守卫绝不派
+        # 第 18 个」机制本身与档位无关，改在 medium 档经显式 claude 入口验证。
+        with dispatch_mode('medium'):
+            r = self.claim_claude('late', executor='claude')
         self.assertFalse(r.get('allowed'), r)
         self.assertEqual(r['reason'], 'capacity_full', r)
         self.assertTrue(r.get('domestic_full'), r)
 
 
 class WindowGate(_ClaudeBase):
-    """BW-MANUAL-THREE-MODE-20261023（用户明确指令，当前权威）：claude 的时段门**按档**。
+    """BW-MANUAL-THREE-MODE-20261023（用户明确指令）：claude 的时段门**按档**。
 
     - strong：解除全部派发时段限制（工作日高峰、周末、假日、未知年度都可新派）；
-    - medium/weak（默认 weak）：恢复既有工作日高峰门（北京工作日 09:00–12:00、
-      14:00–18:00 关闭；周末/法定假日/离峰放行；未知年度的工作日高峰保守关闭）。
+    - medium：恢复既有工作日高峰门（北京工作日 09:00–12:00、14:00–18:00 关闭；
+      周末/法定假日/离峰放行；未知年度的工作日高峰保守关闭）；
+    - BW-WEAK-TIER-ENFORCE-20261122（用户指令：简化逻辑——弱档只看优先级）：弱档是
+      **纯优先级队列、无任何时段门**（window_gated_pools('weak') 为空）——Claude 高峰门
+      已从弱档删除；弱档新派与已预留票据的 consume 都只看层序与空位（consume 按当前
+      档裁决，weak 恒放行不释放；跨窗释放语义只在 medium 生效）。
     解除/恢复的只是时段门——1800 秒真实限额短窗、容量 2、总守卫、工作区单写全部照旧。"""
 
     def test_peak_weekday_blocks_only_outside_strong(self):
@@ -316,35 +406,57 @@ class WindowGate(_ClaudeBase):
                     self.assertTrue(r.get('allowed'), r)
                     self.assertEqual(r['pool_key'], CLAUDE, r)
                     dp.finish(self.store, r['token'], terminal='cancelled', now=now)
-                # weak（默认）与 medium：同一高峰时刻如实拒绝，零占位。
-                for mode in ('weak', 'medium'):
-                    with dispatch_mode(mode):
-                        rw = self.claim_claude(f'w-{mode}-{now.hour}', now=now)
-                        self.assertFalse(rw.get('allowed'), rw)
-                        self.assertEqual(rw['reason'], 'main_force_window_closed', rw)
-                        self.assertFalse(rw.get('sent', True), rw)
+                # medium：同一高峰时刻如实拒绝，零占位。
+                # BW-WEAK-TIER-ENFORCE-20261122：Claude 高峰门已从弱档删除——弱档同一
+                # 高峰时刻的 claude 请求不再 main_force_window_closed，而是被纯优先级
+                # 队列接管 routing 到队首（层1 opencode:deepseek-free，sent=false）。
+                with dispatch_mode('medium'):
+                    rw = self.claim_claude(f'w-medium-{now.hour}', now=now)
+                    self.assertFalse(rw.get('allowed'), rw)
+                    self.assertEqual(rw['reason'], 'main_force_window_closed', rw)
+                    self.assertFalse(rw.get('sent', True), rw)
+                with dispatch_mode('weak'):
+                    rwk = self.claim_claude(f'w-weak-{now.hour}', now=now)
+                    self.assertFalse(rwk.get('allowed'), rwk)
+                    self.assertTrue(rwk.get('routing_required'), rwk)
+                    self.assertEqual(rwk['selected']['pool_key'],
+                                     dp.OPENCODE_DEEPSEEK_POOL_KEY, rwk)
+                    self.assertFalse(rwk.get('sent', True), rwk)
 
     def test_weekend_and_holiday_allow_in_every_mode(self):
-        # 周末与 2026 法定假日：三档都放行（strong 本无门；weak/medium 的高峰门只锁工作日高峰）。
+        # 周末与 2026 法定假日：三档都放行（strong 本无门；medium 高峰门只锁工作日高峰；
+        # BW-WEAK-TIER-ENFORCE-20261122 起弱档无任何时段门）。
         for i, now in enumerate((WEEKEND, HOLIDAY_PEAK, OFFPEAK_NIGHT)):
             for mode in ('strong', 'medium', 'weak'):
                 with self.subTest(now=now, mode=mode), dispatch_mode(mode):
+                    # BW-WEAK-TIER-ENFORCE-20261122：弱档纯优先级队列——claude 是层3，
+                    # 真实 claim 前按队列序排空层1-2（队列不看时段门，占位照常）。
+                    if mode == 'weak':
+                        self.occupy_weak_above(dp.CLAUDE_POOL_KEY, prefix=f'wh-{i}')
                     r = self.claim_claude(f'c{i}-{mode}', now=now)
                     self.assertTrue(r.get('allowed'), r)
                     dp.finish(self.store, r['token'], terminal='cancelled', now=now)
 
     def test_unknown_year_peak_is_conservatively_closed_outside_strong(self):
-        # 未知年度的工作日高峰：offpeak 口径保守关闭（无法确认不是法定假日），故 weak/medium
+        # 未知年度的工作日高峰：offpeak 口径保守关闭（无法确认不是法定假日），故 medium
         # 拒绝；strong 无时段门则放行。绝不臆测未知年度为假日。
+        # BW-WEAK-TIER-ENFORCE-20261122：Claude 高峰门已从弱档删除——弱档不再按
+        # main_force_window_closed 拒绝（保守关闭口径只属 medium）；弱档 claude 请求被
+        # 纯优先级队列接管，routing 到队首。
         with dispatch_mode('strong'):
             r = self.claim_claude('u-strong', now=UNKNOWN_YEAR_PEAK)
             self.assertTrue(r.get('allowed'), r)
             dp.finish(self.store, r['token'], terminal='cancelled', now=UNKNOWN_YEAR_PEAK)
-        for mode in ('medium', 'weak'):
-            with dispatch_mode(mode):
-                rw = self.claim_claude(f'u-{mode}', now=UNKNOWN_YEAR_PEAK)
-                self.assertFalse(rw.get('allowed'), rw)
-                self.assertEqual(rw['reason'], 'main_force_window_closed', rw)
+        with dispatch_mode('medium'):
+            rw = self.claim_claude('u-medium', now=UNKNOWN_YEAR_PEAK)
+            self.assertFalse(rw.get('allowed'), rw)
+            self.assertEqual(rw['reason'], 'main_force_window_closed', rw)
+        with dispatch_mode('weak'):
+            rwk = self.claim_claude('u-weak', now=UNKNOWN_YEAR_PEAK)
+            self.assertFalse(rwk.get('allowed'), rwk)
+            self.assertTrue(rwk.get('routing_required'), rwk)
+            self.assertEqual(rwk['selected']['pool_key'],
+                             dp.OPENCODE_DEEPSEEK_POOL_KEY, rwk)
 
     def test_reserve_then_consume_across_peak_keeps_token_in_strong(self):
         # strong：预留发生在 offhours、真正启动跨到工作日高峰 → 无时段门，consume 正常放行，
@@ -361,19 +473,37 @@ class WindowGate(_ClaudeBase):
             self.assertEqual(dp.status(self.store, now=PEAK_WEEKDAY)['pools'][CLAUDE]['active'],
                              1)
 
-    def test_reserve_then_consume_across_peak_releases_in_weak(self):
-        # weak（默认）：预留发生在 offhours、启动已跨到工作日高峰 → 按恢复后的高峰门把本
-        # reserved 真实释放为 start_failed（绝不泄漏、绝不抢占别人的名额），不冒充别的原因。
+    def test_reserve_then_consume_across_peak_releases_in_medium(self):
+        # 预留发生在 offhours、启动已跨到工作日高峰 → 原按恢复后的高峰门把本 reserved
+        # 真实释放为 start_failed（绝不泄漏、绝不抢占别人的名额）——该跨峰释放语义改在
+        # medium 档逐字验证（BW-WEAK-TIER-ENFORCE-20261122: 弱档纯优先级队列、无任何
+        # 时段门，同一跨峰 consume 在 weak 恒放行 allowed=True，见下方对照）。
+        with dispatch_mode('medium'):
+            tok = self._reserve('c1m', 'claude', 'deepseek-flash', 'claude',
+                                OFFPEAK_NIGHT)['token']
+            c = dp.consume_for_entry(self.store, task_id='c1m', runtime='claude',
+                                     model='deepseek-flash', workspace=self.ws('c1m'),
+                                     prompt_sha256='p' + '0' * 63, stage='s',
+                                     claim_token=tok, now=PEAK_WEEKDAY, executor='claude')
+            self.assertFalse(c['allowed'], c)
+            self.assertEqual(c['reason'], 'main_force_window_closed', c)
+            self.assertTrue(c['capacity_released'], c)
+            self.assertEqual(dp.status(self.store,
+                                       now=PEAK_WEEKDAY)['pools'][CLAUDE]['active'], 0)
+        # BW-WEAK-TIER-ENFORCE-20261122: 弱档对照——同一「offhours 预留、跨到工作日
+        # 高峰 consume」不再有门 → 如实放行启动，绝不释放占位；弱档真实预留前先按
+        # 队列序排空层1-2。
+        self.occupy_weak_above(dp.CLAUDE_POOL_KEY, prefix='cross-above')
         tok = self._reserve('c1w', 'claude', 'deepseek-flash', 'claude',
                             OFFPEAK_NIGHT)['token']
-        c = dp.consume_for_entry(self.store, task_id='c1w', runtime='claude',
-                                 model='deepseek-flash', workspace=self.ws('c1w'),
-                                 prompt_sha256='p' + '0' * 63, stage='s',
-                                 claim_token=tok, now=PEAK_WEEKDAY, executor='claude')
-        self.assertFalse(c['allowed'], c)
-        self.assertEqual(c['reason'], 'main_force_window_closed', c)
-        self.assertTrue(c['capacity_released'], c)
-        self.assertEqual(dp.status(self.store, now=PEAK_WEEKDAY)['pools'][CLAUDE]['active'], 0)
+        cw = dp.consume_for_entry(self.store, task_id='c1w', runtime='claude',
+                                  model='deepseek-flash', workspace=self.ws('c1w'),
+                                  prompt_sha256='p' + '0' * 63, stage='s',
+                                  claim_token=tok, now=PEAK_WEEKDAY, executor='claude')
+        self.assertTrue(cw['allowed'], cw)
+        self.assertEqual(cw['pool_key'], CLAUDE, cw)
+        self.assertFalse(cw.get('capacity_released'), cw)
+        self.assertEqual(dp.status(self.store, now=PEAK_WEEKDAY)['pools'][CLAUDE]['active'], 1)
 
     def test_quota_short_window_still_blocks_in_peak(self):
         # "无时段门"不等于无额度限制：strong 档高峰若仍处于 1800 秒真实限额短窗内，必须照常拒绝。
@@ -403,6 +533,9 @@ class QuotaLimitMarker(_ClaudeBase):
         # BW-LIMIT30-20261019-S3：Claude/deepseek-flash 的真实 429/402 落标后 1800 秒内
         # 新派发（含 consume 已预留 token）一律拒绝；恰好 1800 秒及更久按现有优先级重新
         # 可选。原标记/证据不清除，也不需要手动重置。
+        # BW-WEAK-TIER-ENFORCE-20261122：弱档纯优先级队列——真实预留前先按队列序排空
+        # 层1-2；限额短窗在新派队列不看，但已预留票据的 consume 窗口检查照旧生效。
+        self.occupy_weak_above(dp.CLAUDE_POOL_KEY, prefix='qlm-above')
         tok2 = self._reserve('c2', 'claude', 'deepseek-flash', 'claude', OFFPEAK_NIGHT)['token']
         ev_path, ev_sha = self._evidence()
         rec = dp.record_main_force_limit(self.store, CLAUDE, task_id='c2', attempt_token=tok2,
@@ -437,9 +570,11 @@ class WindowGateCaliber(unittest.TestCase):
     """BW-MANUAL-THREE-MODE-20261023：claude 是否可派**按档**决定。
 
     - strong：不套任何时段门（`window_blocks_for_mode` 恒 False，绝不读 offpeak）；
-    - medium/weak：恢复既有工作日高峰门，与 deepseek_offpeak 的纯时间判定完全一致
+    - medium：恢复既有工作日高峰门，与 deepseek_offpeak 的纯时间判定完全一致
       （工作日 09:00–12:00 / 14:00–18:00 关闭；周末/假日/离峰放行；未知年度工作日高峰
-      保守关闭）。该模块只做纯时间判定，不起进程、不联网。"""
+      保守关闭）；weak：BW-WEAK-TIER-ENFORCE-20261122 起纯优先级队列、无任何时段门
+      （`window_blocks_for_mode` 恒 False，不读 offpeak）。该模块只做纯时间判定，
+      不起进程、不联网。"""
 
     def test_strong_ignores_offpeak_and_weak_mirrors_it(self):
         for when in (PEAK_WEEKDAY, PEAK_WEEKDAY_1500, WEEKEND, HOLIDAY_PEAK,
@@ -448,12 +583,14 @@ class WindowGateCaliber(unittest.TestCase):
                 # strong：任何注入时间都不挡。
                 with dispatch_mode('strong'):
                     self.assertFalse(dp._max_window_blocks(CLAUDE, when))
-                # medium/weak：与 offpeak 判定严格互为镜像（允许 ⇔ 不被挡）。
+                # medium：与 offpeak 判定严格互为镜像（允许 ⇔ 不被挡）。
+                # weak（BW-WEAK-TIER-ENFORCE-20261122）：纯优先级队列、恒不挡。
                 expected_blocked = not off.can_dispatch(when)
-                for mode in ('medium', 'weak'):
-                    with dispatch_mode(mode):
-                        self.assertEqual(dp._max_window_blocks(CLAUDE, when),
-                                         expected_blocked, mode)
+                with dispatch_mode('medium'):
+                    self.assertEqual(dp._max_window_blocks(CLAUDE, when),
+                                     expected_blocked, 'medium')
+                with dispatch_mode('weak'):
+                    self.assertFalse(dp._max_window_blocks(CLAUDE, when), 'weak')
         # offpeak 纯函数口径未变：工作日高峰关闭、离峰放行。
         self.assertFalse(off.can_dispatch(PEAK_WEEKDAY))
         self.assertTrue(off.can_dispatch(OFFPEAK_NIGHT))

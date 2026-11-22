@@ -23,6 +23,11 @@ try:  # 源码树运行（python -m unittest tests.test_*）与 discover 运行�
     from tests.test_claude_direct import FakePopen, _jsonl, SECRET, OFFPEAK
 except ImportError:  # discover -s tests 把 tests 目录作为顶层
     from test_claude_direct import FakePopen, _jsonl, SECRET, OFFPEAK
+# BW-WEAK-TIER-ENFORCE-20261122: 档位切换工具（claude 机制测试固定 strong 档执行）。
+try:  # 源码树运行与 discover 运行两种导入路径，与上方 test_claude_direct 一致。
+    from tests.dispatch_mode_support import dispatch_mode
+except ImportError:
+    from dispatch_mode_support import dispatch_mode
 
 
 def _summary(result_event, *, ok=(), session='sess-1', subtype='success',
@@ -329,14 +334,22 @@ class TransportLifecycleTests(unittest.TestCase):
         return hashlib.sha256(self.prompt.read_bytes()).hexdigest()
 
     def run_stream(self, stream):
-        return cd.run(self.cfg(), workspace=str(self.ws), prompt_file=self.prompt,
-                      out_dir=self.out, stage='BW-CLAUDE-TRANSPORT-20261018-S1',
-                      task_id='t1', prompt_sha256=self.sha(), now=OFFPEAK,
-                      popen_factory=FakePopen(stream),
-                      environ={'ANTHROPIC_API_KEY': SECRET}, dispatch_store=self.store,
-                      child_prober=lambda pid: {'state': 'dead', 'created': 'c1'},
-                      is_engineering_task=True, bind_child_pid=True,
-                      required_tools=['Read'])
+        # BW-WEAK-TIER-ENFORCE-20261122: 传输层事实持久化机制与档位无关，固定 strong
+        # 档执行（claude 在 strong 层2、无时段门、可显式派；弱档纯优先级队列会把显式
+        # claude 请求接管为 routing_required，与本组测试本意无关）。
+        # BW-WEAK-TIER-ENFORCE-20261122: strong 档真实走到派发链路后，ECONNRESET 载体
+        # 会触发引擎默认有界重试（5s+15s 真实 sleep）——离线零等待口径注入 0 延迟，
+        # 引擎行为不变（仍是 3 次尝试 + 如实 transport 终态），只是不真实睡眠。
+        with dispatch_mode('strong'):
+            return cd.run(self.cfg(), workspace=str(self.ws), prompt_file=self.prompt,
+                          out_dir=self.out, stage='BW-CLAUDE-TRANSPORT-20261018-S1',
+                          task_id='t1', prompt_sha256=self.sha(), now=OFFPEAK,
+                          popen_factory=FakePopen(stream),
+                          environ={'ANTHROPIC_API_KEY': SECRET}, dispatch_store=self.store,
+                          child_prober=lambda pid: {'state': 'dead', 'created': 'c1'},
+                          is_engineering_task=True, bind_child_pid=True,
+                          required_tools=['Read'],
+                          transport_retry_delays=[0.0, 0.0])
 
     def _active(self):
         return dp.status(self.store, now=OFFPEAK)['pools']['claude:deepseek-flash']['active']
@@ -456,14 +469,17 @@ class TransportLifecycleTests(unittest.TestCase):
     def test_existing_unknown_placeholder_not_released(self):
         # 已有 unknown 生命周期保持不变：communicate 异常 ⇒ 保留占位，绝不假释放。
         fake = FakePopen('', raise_comm=RuntimeError('interrupted'))
-        out = cd.run(self.cfg(), workspace=str(self.ws), prompt_file=self.prompt,
-                     out_dir=self.out, stage='BW-CLAUDE-TRANSPORT-20261018-S1',
-                     task_id='t1', prompt_sha256=self.sha(), now=OFFPEAK,
-                     popen_factory=fake,
-                     environ={'ANTHROPIC_API_KEY': SECRET}, dispatch_store=self.store,
-                     child_prober=lambda pid: {'state': 'dead', 'created': 'c1'},
-                     is_engineering_task=True, bind_child_pid=False,
-                     required_tools=['Read'])
+        # BW-WEAK-TIER-ENFORCE-20261122: unknown 生命周期语义与档位无关，固定 strong
+        # 档执行（claude 在 strong 无门可显式派；弱档队列会把 claude 请求接管）。
+        with dispatch_mode('strong'):
+            out = cd.run(self.cfg(), workspace=str(self.ws), prompt_file=self.prompt,
+                         out_dir=self.out, stage='BW-CLAUDE-TRANSPORT-20261018-S1',
+                         task_id='t1', prompt_sha256=self.sha(), now=OFFPEAK,
+                         popen_factory=fake,
+                         environ={'ANTHROPIC_API_KEY': SECRET}, dispatch_store=self.store,
+                         child_prober=lambda pid: {'state': 'dead', 'created': 'c1'},
+                         is_engineering_task=True, bind_child_pid=False,
+                         required_tools=['Read'])
         self.assertTrue(out.get('launch_unknown'), out)
         self.assertFalse(out['sent'])
         self.assertEqual(self._active(), 1)

@@ -92,12 +92,17 @@ class AppServerTransportTests(unittest.TestCase):
         return [row['recv'].get('method') for row in self._stub_rows()
                 if 'recv' in row and isinstance(row.get('recv'), dict)]
 
-    def _attempts(self):
+    def _attempts(self, task_id=None):
+        # BW-WEAK-TIER-ENFORCE-20261122：弱档队列占位（pre-weak-*）与被测任务行共存，
+        # 断言一律按 task_id 过滤（None=不过滤）。
         with contextlib.closing(sqlite3.connect(str(self.dispatch))) as conn:
             conn.row_factory = sqlite3.Row
             try:
+                if task_id is None:
+                    return [dict(r) for r in conn.execute(
+                        'SELECT * FROM attempts').fetchall()]
                 return [dict(r) for r in conn.execute(
-                    'SELECT * FROM attempts').fetchall()]
+                    'SELECT * FROM attempts WHERE task_id=?', (task_id,)).fetchall()]
             except sqlite3.OperationalError:
                 return []  # 从未触库（如预检路径）：无表即无行。
 
@@ -116,6 +121,7 @@ class AppServerTransportTests(unittest.TestCase):
 
     # ---------------- happy path ----------------
     def test_happy_path_full_loop_and_binding(self):
+        self._occupy_higher_weak_slots()
         proc = self._run()
         self.assertEqual(proc.returncode, 0,
                          proc.stdout.decode('utf-8', 'replace')
@@ -155,7 +161,7 @@ class AppServerTransportTests(unittest.TestCase):
         self.assertIn('WORKER_REPORT_START', saw['send_content'])
         self.assertTrue(saw['close'])
         # 容量已以真实终态释放。
-        rows = self._attempts()
+        rows = self._attempts(task_id='mac-transport-s1')
         self.assertEqual(len(rows), 1, rows)
         self.assertEqual(rows[0]['state'], 'finished')
         # 协议原件有双向记录。
@@ -165,6 +171,7 @@ class AppServerTransportTests(unittest.TestCase):
         self.assertTrue(any(e['dir'] == 'recv' for e in events))
 
     def test_edit_mode_maps_to_edit_session_mode(self):
+        self._occupy_higher_weak_slots()
         self._write_config('ok')
         proc = self._run('--mode', 'edit')
         self.assertEqual(proc.returncode, 0, proc.stdout.decode('utf-8'))
@@ -172,6 +179,7 @@ class AppServerTransportTests(unittest.TestCase):
 
     # ---------------- 权限 fail-closed ----------------
     def test_permission_request_denied_by_default_and_recorded(self):
+        self._occupy_higher_weak_slots()
         self._write_config('permission_request')
         proc = self._run()
         self.assertEqual(proc.returncode, 0, proc.stdout.decode('utf-8'))
@@ -188,6 +196,7 @@ class AppServerTransportTests(unittest.TestCase):
         self.assertEqual(len(summary['permission_events']), 1)
 
     def test_allow_tools_grants_allowonce_only_for_listed_tool(self):
+        self._occupy_higher_weak_slots()
         self._write_config('permission_request')
         proc = self._run('--allow-tools', 'Bash')
         self.assertEqual(proc.returncode, 0, proc.stdout.decode('utf-8'))
@@ -200,6 +209,7 @@ class AppServerTransportTests(unittest.TestCase):
         self.assertEqual(reply['result']['kind'], 'allowOnce')
 
     def test_runtime_preferences_reply_carries_failclosed_defaults(self):
+        self._occupy_higher_weak_slots()
         self._write_config('runtime_prefs')
         proc = self._run()
         self.assertEqual(proc.returncode, 0, proc.stdout.decode('utf-8'))
@@ -210,6 +220,7 @@ class AppServerTransportTests(unittest.TestCase):
         self.assertEqual(reply['result']['toolSearchMode'], 'off')
 
     def test_unknown_server_request_gets_error_reply(self):
+        self._occupy_higher_weak_slots()
         self._write_config('unknown_request')
         proc = self._run()
         self.assertEqual(proc.returncode, 0, proc.stdout.decode('utf-8'))
@@ -232,6 +243,23 @@ class AppServerTransportTests(unittest.TestCase):
         proc = self._run('--config', str(self.tmp / 'nope.json'))
         self.assertEqual(proc.returncode, 2)
         self.assertFalse(self._out().exists())
+
+    def _occupy_higher_weak_slots(self):
+        # BW-WEAK-TIER-ENFORCE-20261122：弱档纯优先级队列——先占满层1-3（两 OpenCode/
+        # CodeBuddy GLM/Claude×2 共 5 槽），zcode:GLM-5.3-Flash 才成为队首可被本传输
+        # 真实 claim；队列判断只看层序与空位。
+        combos = [('opencode', dp.OPENCODE_DEEPSEEK_MODEL),
+                  ('opencode', dp.OPENCODE_GLM_MODEL),
+                  ('codebuddy', dp.CODEBUDDY_GLM_MODEL),
+                  ('claude', 'deepseek-flash'),
+                  ('claude', 'deepseek-flash')]
+        for i, (rt, m) in enumerate(combos):
+            r = dp.consume_for_entry(
+                str(self.dispatch), task_id=f'pre-weak-{i}', runtime=rt, model=m,
+                workspace=str(self.tmp / f'pre-weak-{i}'),
+                prompt_sha256='1' * 64, stage='pre-weak', executor=rt,
+                quota_store=str(self.quota))
+            assert r.get('allowed'), (rt, m, r)
 
     def _readonly_state_dir(self):
         """共享状态隔离目录：只读（模拟受限会话对 ~/.brain-worker 的权限形态）。"""
@@ -290,6 +318,7 @@ class AppServerTransportTests(unittest.TestCase):
     def test_capacity_full_refused_with_zero_dir_and_no_placeholder(self):
         # BW-WEAK-RESTRUCTURE-20261116：弱档 ZCode 只认 GLM-5.3-Flash——先占满
         # zcode:GLM-5.3-Flash（容量 1）：用另一个 task 的真实 running attempt。
+        self._occupy_higher_weak_slots()
         blocker = dp.consume_for_entry(
             str(self.dispatch), task_id='blocker', runtime='zcode',
             model='GLM-5.3-Flash', workspace=str(self.tmp / 'other'),
@@ -303,22 +332,24 @@ class AppServerTransportTests(unittest.TestCase):
         self.assertTrue(payload.get('capacity_gate_rejected'))
         self.assertFalse(payload['sent'])
         # blocker 的占位仍在（绝不误释放别人）。
-        states = [r['state'] for r in self._attempts()]
+        states = [r['state'] for r in self._attempts(task_id='blocker')]
         self.assertEqual(states, ['running'], states)
 
     # ---------------- Popen 后拒绝 / 真实失败 ----------------
     def test_setmodel_refusal_settles_start_failed_and_releases(self):
+        self._occupy_higher_weak_slots()
         self._write_config('model_refuse')
         proc = self._run()
         self.assertEqual(proc.returncode, 3)
         payload = json.loads(proc.stdout.decode('utf-8'))
         self.assertFalse(payload['sent'])
         self.assertTrue(payload['capacity_released'], payload)
-        rows = self._attempts()
+        rows = self._attempts(task_id='mac-transport-s1')
         self.assertEqual([r['state'] for r in rows], ['start_failed'], rows)
         self.assertFalse(self._stub_saw().get('send_content'))
 
     def test_timeout_kills_child_settles_real_exit(self):
+        self._occupy_higher_weak_slots()
         self._write_config('hang')
         proc = self._run('--timeout', '3', timeout=60)
         self.assertEqual(proc.returncode, 3)
@@ -328,10 +359,12 @@ class AppServerTransportTests(unittest.TestCase):
         self.assertTrue(summary['submitted'])
         self.assertFalse(summary['protocol_success'])
         self.assertTrue(summary['capacity_released'])
-        self.assertEqual(self._attempts()[0]['state'], 'finished')
+        rows = self._attempts(task_id='mac-transport-s1')
+        self.assertEqual([r['state'] for r in rows], ['finished'], rows)
         self.assertNotIn('429', json.dumps(summary))
 
     def test_crash_after_send_is_real_failure_and_releases(self):
+        self._occupy_higher_weak_slots()
         self._write_config('crash_after_send')
         proc = self._run()
         self.assertEqual(proc.returncode, 3)

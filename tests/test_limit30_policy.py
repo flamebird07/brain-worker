@@ -246,8 +246,11 @@ class TestQuotaLimitWindow(_PoolBase):
         self.insert_attempt(tok, 'b-z', ZC, 'running', ended=T0)
         self.mark(ZC, 'b-z', tok)
         # ZCode 限额绝不连带 Claude：1799 秒时 Claude 正常可选。
-        ok = self.claim('c-free', 'claude', 'deepseek-flash', 'claude',
-                        T0 + timedelta(seconds=1799))
+        # BW-WEAK-TIER-ENFORCE-20261122: 弱档纯优先级队列不查限额短窗——「窗口独立性」
+        # 的真实新派裁决改在 strong 档复现（与本文件其它窗口用例同一口径）。
+        with dispatch_mode('strong'):
+            ok = self.claim('c-free', 'claude', 'deepseek-flash', 'claude',
+                            T0 + timedelta(seconds=1799))
         self.assertTrue(ok.get('allowed'), ok)
 
     def test_other_process_other_workspace_same_store_also_refused(self):
@@ -393,6 +396,16 @@ class TestCodeBuddyIndependentOfWindow(_PoolBase):
         # reserve/consume）；codebuddy:deepseek-v4.1-flash 已无任何档位可新派——弱档
         # 显式 DeepSeek 请求如实 mode_excluded（sent=false、零占位），GLM 槽位独立性
         # 不受影响。
+        # BW-WEAK-TIER-ENFORCE-20261122: 弱档纯优先级队列——先按队序占满层1 两 OpenCode，
+        # GLM（层2）才是队首可被真实 claim；GLM 占用后再占满层3/层4（claude×2、zcode
+        # flash），同模型第 2 个请求面对全满队列才如实 capacity_full（而非被队列改派）。
+        for i, (rt, m) in enumerate((('opencode', dp.OPENCODE_DEEPSEEK_MODEL),
+                                     ('opencode', dp.OPENCODE_GLM_MODEL))):
+            occ = dp.reserve(self.store, task_id=f'pre-weak-{i}', runtime=rt,
+                             model=m, workspace=self.ws(f'pre-weak-{i}'),
+                             prompt_sha256=SHA64, stage='pre-weak', executor=rt,
+                             _preclaim=False)
+            assert occ.get('allowed'), (rt, m, occ)
         r = dp.reserve(self.store, task_id='glm1', runtime='codebuddy',
                        model='glm-5.3-flash', workspace=self.ws('glm1'),
                        prompt_sha256=SHA64, stage='s', now=T0,
@@ -414,7 +427,16 @@ class TestCodeBuddyIndependentOfWindow(_PoolBase):
         self.assertEqual(d['reason'], 'mode_excluded', d)
         self.assertFalse(d.get('sent'), d)
         self.assertIsNone(d.get('token'), d)
-        # 同模型第 2 个仍 capacity_full（各 1 独立槽，不减容量）。
+        # BW-WEAK-TIER-ENFORCE-20261122: GLM 已占用（glm1 在途）——再按队序占满层3/层4，
+        # 队列全满后同模型第 2 个请求才如实 capacity_full（各 1 独立槽，不减容量）。
+        for i, (rt, m) in enumerate((('claude', 'deepseek-flash'),
+                                     ('claude', 'deepseek-flash'),
+                                     ('zcode', 'GLM-5.3-Flash'))):
+            occ = dp.reserve(self.store, task_id=f'pre-weak-tail-{i}', runtime=rt,
+                             model=m, workspace=self.ws(f'pre-weak-tail-{i}'),
+                             prompt_sha256=SHA64, stage='pre-weak', executor=rt,
+                             _preclaim=False)
+            assert occ.get('allowed'), (rt, m, occ)
         again = dp.reserve(self.store, task_id='glm2', runtime='codebuddy',
                            model='glm-5.3-flash', workspace=self.ws('glm2'),
                            prompt_sha256=SHA64, stage='s', now=T0,

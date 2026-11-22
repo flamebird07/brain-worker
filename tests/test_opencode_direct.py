@@ -627,12 +627,24 @@ class LifecycleTests(unittest.TestCase):
         self.assertEqual(request['timeout_seconds'], od.DEFAULT_TIMEOUT_SECONDS)
 
     def test_glm_model_claims_only_its_own_pool(self):
+        # BW-WEAK-TIER-ENFORCE-20261122: 弱档纯优先级队列——层1 内 deepseek-free 按
+        # pool_key 排序在 glm-free 之前，deepseek 有空位时 glm 请求只会被 routing_required
+        # 到队首；先以独立 task/workspace 真实占住 deepseek 槽，glm-free 才是队首可被
+        # claim。用例结束真实终态释放占位，两池计数归零（断言原样保留、不放宽）。
+        holder = dp.reserve(self.store, task_id='hold-ds', runtime='opencode',
+                            model=DEEPSEEK, workspace=str(self.base / 'ws-hold-ds'),
+                            prompt_sha256=self.sha(), stage=STAGE,
+                            executor='opencode', now=NOW, _preclaim=False)
+        self.assertTrue(holder.get('allowed'), holder)
         tok = self.claim(model=GLM)
         fake = FakePopen(success_stream(workspace=str(self.ws)), sink=self.sink)
         out = self.run_entry(fake, model=GLM, claim_token=tok)
         self.assertEqual(out['pool_key'], GPOOL)
         self.assertTrue(out['passed'], out)
         self.assertIn(f'opencode/{GLM}', fake.argv)
+        rel = dp.finish(self.store, holder['token'], terminal='cancelled', now=NOW,
+                        wrapper_pid=None)
+        self.assertTrue(rel.get('released') or rel.get('settled'), rel)
         self.assertEqual(self.active(GPOOL), 0)
         self.assertEqual(self.active(DPOOL), 0)
 

@@ -95,7 +95,7 @@ MODE_LABELS = {'strong': '强', 'medium': '中', 'weak': '弱'}
 MODE_NOTES = {
     'strong': '强档 · 两内置 Qwen4-Max-Preview／Claude／ZCode · 全部无时段门',
     'medium': '中档 · 仅 ZCode／Claude／两内置 Qwen4-Max-Preview · Max 夜间门 + Claude 高峰门',
-    'weak': '弱档 · 5 个可新派池 · Claude 高峰门',
+    'weak': '弱档 · 5 个可新派池 · 纯优先级队列（无时段门）',
 }
 # 每档可新派范围的纯文字描述（回执/浮窗文案用，绝不承载数字层号/容量，防漂移）。
 # BW-QWEN4-SONUS-REMOVE-20261115：Sonus 已从所有档位去除；两内置 Max 改为 Qwen4-Max-Preview。
@@ -373,13 +373,14 @@ def pool_allowed(pk, mode=None) -> bool:
 
 def window_gated_pools_for_mode(mode=None) -> tuple:
     """该档位受时段门约束的池（strong 为空；medium 为三个 Max + Claude；
-    BW-WEAK-RESTRUCTURE-20261116 起 weak 只剩 Claude 高峰门——全部 Qoder 池已移出弱档）。"""
+    BW-WEAK-TIER-ENFORCE-20261122 起 weak 为**纯优先级队列**——无任何时段门，
+    唯一判断是层序与空位，不参照 availability/限额短窗/时段门等其它判断）。"""
     m = normalize_mode(mode) if mode is not None else current_mode()
     if m == 'strong':
         return ()
     if m == 'medium':
         return tuple(MAX_POOL_KEYS) + (CLAUDE_POOL_KEY,)
-    return (CLAUDE_POOL_KEY,)
+    return ()
 
 
 def window_blocks_for_mode(pk, now, mode=None) -> bool:
@@ -388,11 +389,13 @@ def window_blocks_for_mode(pk, now, mode=None) -> bool:
     - strong：可派池全部无门 → 恒 False（Sonus 无任何门，Claude 不套高峰门，
       三个 Max 不套夜间门）；
     - medium：三个 Max 受北京 22:00–08:00 夜间门；Claude 受既有工作日高峰门；
-    - weak（BW-WEAK-RESTRUCTURE-20261116）：全部 Qoder 池已移出弱档，只剩 Claude 既有
-      工作日高峰门；其它弱档池（ZCode GLM-5.3-Flash / CodeBuddy GLM / 两 OpenCode）
-      保持无时段门——被移出的池在 weak 是 mode_excluded 排除，时段门永不先于档位硬
-      策略生效。"""
+    - weak（BW-WEAK-TIER-ENFORCE-20261122）：纯优先级队列，无任何时段门——唯一判断
+      是层序与空位；被移出弱档的池是 mode_excluded 排除，其它判断永不生效。"""
     m = normalize_mode(mode) if mode is not None else current_mode()
+    # BW-WEAK-TIER-ENFORCE-20261122：weak = 纯优先级队列，无任何时段门（含 consume
+    # 释放语义）——唯一判断是层序与空位。
+    if m == 'weak':
+        return False
     if m == 'strong':
         return False
     if pk in MAX_POOL_KEYS:

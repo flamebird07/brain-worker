@@ -162,6 +162,15 @@ class _PoolBase(unittest.TestCase):
         d.mkdir(parents=True, exist_ok=True)
         return str(d)
 
+    def occupy_layer1_weak_slots(self):
+        # BW-WEAK-TIER-ENFORCE-20261122: 弱档纯优先级队列——层1 两 OpenCode 未满时，
+        # 层2 codebuddy:glm-5.3-flash 请求一律被队列接管（routing_required 到队首）；
+        # 要真实 claim GLM 必须先占满层1 两 OpenCode（与 test_zcode_appserver_direct
+        # 的 _occupy_higher_weak_slots 同一模式）。
+        for i, m in enumerate((dp.OPENCODE_DEEPSEEK_MODEL, dp.OPENCODE_GLM_MODEL)):
+            r = self.reserve(f'pre-weak-oc-{i}', 'opencode', m, 'opencode')
+            assert r.get('allowed'), (m, r)
+
     def seed(self, pk, n=1, state='reserved', task_prefix=None):
         runtime, model = pk.split(':', 1)
         with closing(dp.connect(self.store)) as conn:
@@ -237,8 +246,9 @@ class TestCodebuddyPoolPriority(_PoolBase):
     def test_auto_lands_codebuddy_after_max_zcode_and_claude_full(self):
         # BW-WEAK-RESTRUCTURE-20261116: 弱档收窄为 5 池——「更高层满后 AUTO 走位」在弱档
         # 新层序下完整复现：两 OpenCode（层1）满 → CodeBuddy GLM（层2）→ claude（层3，
-        # 2 槽）满 → ZCode GLM-5.3-Flash（层4）满 → 无候选即 mode_excluded（两地区 Flash
-        # 与 codebuddy:deepseek 都不在弱档可派集合，绝不借道改派）。
+        # 2 槽）满 → ZCode GLM-5.3-Flash（层4）满。
+        # BW-WEAK-TIER-ENFORCE-20261122: 弱档纯优先级队列——队列走完全满即如实
+        # capacity_full（不再是 mode_excluded；被移出弱档的池由入口档位硬门单独拒）。
         self.reserve('o1', 'opencode', 'deepseek-v4.1-flash-free', 'opencode')
         self.reserve('o2', 'opencode', 'glm-5.3-flash-free', 'opencode')
         out = self.reserve('t3', 'opencode', 'deepseek-v4.1-flash-free', 'auto')
@@ -257,7 +267,8 @@ class TestCodebuddyPoolPriority(_PoolBase):
         self.reserve('zf1', 'zcode', 'GLM-5.3-Flash', 'zcode')
         out4 = self.reserve('t6', 'opencode', 'deepseek-v4.1-flash-free', 'auto')
         self.assertFalse(out4.get('allowed'), out4)
-        self.assertEqual(out4['reason'], 'mode_excluded', out4)
+        # BW-WEAK-TIER-ENFORCE-20261122: 弱档队列全满 → 如实 capacity_full（sent=false）。
+        self.assertEqual(out4['reason'], 'capacity_full', out4)
         self.assertFalse(out4.get('sent'), out4)
         self.assertIsNone(out4.get('token'), out4)
         # BW-WEAK-RESTRUCTURE-20261116 负例：弱档显式 CodeBuddy deepseek 请求一律
@@ -312,8 +323,15 @@ class TestCodebuddyPoolPriority(_PoolBase):
         # BW-WEAK-RESTRUCTURE-20261116: 换到弱档层2的 codebuddy:glm-5.3-flash（独立 1 槽）
         # 等价复现「唯一名额、第二个拒绝、文案含 capacity of 1」；deepseek 池已无任何
         # 档位可新派，不能再作此机制的载体。
+        # BW-WEAK-TIER-ENFORCE-20261122: 弱档纯优先级队列——先占满层1 两 OpenCode 才能
+        # claim 层2 GLM；要让第二个 GLM 请求如实 capacity_full（而非被队列改派到层3/层4
+        # 空位），还需占满 claude×2 与 zcode GLM-5.3-Flash，队列全满才拒绝。
+        self.occupy_layer1_weak_slots()
         first = self.reserve('a', 'codebuddy', CB_GLM_MODEL, 'codebuddy')
         self.assertTrue(first.get('allowed'), first)
+        self.reserve('cl1', 'claude', 'deepseek-flash', 'claude')
+        self.reserve('cl2', 'claude', 'deepseek-flash', 'claude')
+        self.reserve('zf1', 'zcode', 'GLM-5.3-Flash', 'zcode')
         second = self.reserve('b', 'codebuddy', CB_GLM_MODEL, 'codebuddy')
         self.assertFalse(second.get('allowed'), second)
         self.assertEqual(second['reason'], 'capacity_full')
@@ -345,11 +363,15 @@ class TestCodebuddyPoolPriority(_PoolBase):
             self.assertNotIn(CB, elig,
                              'deepseek must stay mode-excluded from weak candidates')
             self.assertFalse(dp._max_window_blocks(CB_GLM, now))
-        # 对照（BW-MANUAL-THREE-MODE-20261023 + BW-WEAK-RESTRUCTURE-20261116）：weak 档
-        # 只剩 claude 工作日高峰门——PEAK 的 claude 不在候选；三个 Max 与 zcode:GLM-5.3
-        # 已整档移出弱档，任何时刻都不在 weak 候选（时段门永不先于档位硬策略生效）。
+        # 对照（BW-WEAK-TIER-ENFORCE-20261122: 弱档纯优先级队列、无任何时段门）——PEAK
+        # 的 claude 在弱档照常在候选（高峰门已从弱档删除、恒放行）；Claude 高峰门机制
+        # 本身改在 medium 档验证（同一 PEAK 时刻 claude 不在 medium 候选）；三个 Max 与
+        # zcode:GLM-5.3 已整档移出弱档，任何时刻都不在 weak 候选（档位硬策略先于一切）。
         with closing(dp.connect(self.store)) as conn:
+            self.assertIn(CLAUDE, dp._eligible_main_forces(conn, False, PEAK))
+        with dispatch_mode('medium'), closing(dp.connect(self.store)) as conn:
             self.assertNotIn(CLAUDE, dp._eligible_main_forces(conn, False, PEAK))
+        with closing(dp.connect(self.store)) as conn:
             for pk in (CN_MAX, QMAX, CN_CUSTOM_MAX, dp.ZCODE_POOL_KEY):
                 self.assertNotIn(pk, dp._eligible_main_forces(conn, False, DAY))
         # BW-QODERCN-TOKEN-MAX-DISABLE-20261028：「strong 档三个 Max 全天无门」对照属
@@ -391,6 +413,9 @@ class TestCodebuddyPoolPriority(_PoolBase):
     def test_workspace_conflict_and_unknown_not_bypassed_for_codebuddy(self):
         # BW-WEAK-RESTRUCTURE-20261116: 换到弱档层2的 codebuddy:glm-5.3-flash 复现
         # 同 workspace 单写守卫（deepseek 池已无任何档位可新派）。
+        # BW-WEAK-TIER-ENFORCE-20261122: 弱档纯优先级队列——先占满层1 两 OpenCode，
+        # 层2 GLM 才是队首、首个请求才能真实 claim。
+        self.occupy_layer1_weak_slots()
         shared = self.ws('shared')
         r1 = dp.reserve(self.store, task_id='w1', runtime='codebuddy',
                         model=CB_GLM_MODEL,
@@ -407,6 +432,9 @@ class TestCodebuddyPoolPriority(_PoolBase):
     def test_release_allows_reuse_of_codebuddy_slot(self):
         # BW-WEAK-RESTRUCTURE-20261116: 换到弱档层2的 codebuddy:glm-5.3-flash 复现
         # 「终态释放后同槽可复用」。
+        # BW-WEAK-TIER-ENFORCE-20261122: 弱档纯优先级队列——先占满层1 两 OpenCode，
+        # 层2 GLM 才是队首可被 claim；释放后队首仍为 GLM，同槽可复用。
+        self.occupy_layer1_weak_slots()
         first = self.reserve('r1', 'codebuddy', CB_GLM_MODEL, 'codebuddy')
         self.assertTrue(first.get('allowed'), first)
         # 终态释放本次 reserved 占位（无 child 的合法取消路径）。
@@ -475,6 +503,23 @@ class TestLiveTransport(unittest.TestCase):
             dp._rotation_row(conn)
             conn.execute('PRAGMA journal_mode=DELETE')
         self.cfg = {'node': 'node', 'cli': 'cli.js'}
+        # BW-WEAK-TIER-ENFORCE-20261122: 弱档纯优先级队列——层1 两 OpenCode 未满时，
+        # glm-5.3-flash（层2）请求一律被队列接管（routing_required 到队首），正式传输
+        # 无法真实 claim；先占满层1，层2 才是队首可被派发（回执/证据/超时/起止时间等
+        # 纯机制用例的载体前提）。
+        self._occupy_higher_weak_slots()
+
+    def _occupy_higher_weak_slots(self, store=None):
+        # BW-WEAK-TIER-ENFORCE-20261122: 弱档纯优先级队列——占满层1 两 OpenCode（独立
+        # 工作区、独立任务），使层2 codebuddy:glm-5.3-flash 成为队首；与
+        # test_zcode_appserver_direct 的 _occupy_higher_weak_slots 同一模式。
+        for i, m in enumerate((dp.OPENCODE_DEEPSEEK_MODEL, dp.OPENCODE_GLM_MODEL)):
+            r = dp.reserve(store or self.store, task_id=f'pre-weak-oc-{i}',
+                           runtime='opencode', model=m,
+                           workspace=str(self.base / f'pre-weak-oc-{i}'),
+                           prompt_sha256='1' * 64, stage='pre-weak',
+                           executor='opencode', _preclaim=False)
+            assert r.get('allowed'), (m, r)
 
     def _prompt_file(self):
         pf = self.base / 'prompt.txt'
@@ -926,6 +971,9 @@ class TestLiveTransport(unittest.TestCase):
                                                       'message': 'rate limited'}])
         pf = self._prompt_file()
         out_dir = self.base / 'envstore'
+        # BW-WEAK-TIER-ENFORCE-20261122: 该用例的容量门走 env_store（≠ self.store），
+        # 弱档纯优先级队列同样要求层1 两 OpenCode 先满，层2 GLM 才可被真实 claim。
+        self._occupy_higher_weak_slots(store=env_store)
         factory = stub.make_popen_factory(stdout=stream, returncode=1)
         with mock.patch.dict(os.environ, {'BRAIN_WORKER_DISPATCH_STORE': env_store}):
             result = cl.run(self.cfg, workspace=str(self.work), prompt_file=pf,

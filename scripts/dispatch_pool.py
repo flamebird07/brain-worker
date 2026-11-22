@@ -1569,7 +1569,10 @@ def _domestic_policy(conn, requested_pk, now, executor='auto', eligible=None,
       medium/weak 的 qoder:Sonus）无论 AUTO / 显式 executor / fallback / 显式 combo
       一律返回 `mode_excluded`（sent=false、零新占位、绝不改派到其它池），绝不冒充
       not_authorized 或 window_closed；
-    - weak：可派集合为全部当前牛马，行为与上一阶段一致（除时段门恢复，见下）；
+    - weak（BW-WEAK-TIER-ENFORCE-20261122，用户指令：简化逻辑）：**纯优先级队列**——
+      按 weak 层序取第一个有空位的池，不参照 availability/限额短窗/时段门/executor
+      冲突/入口运行时等任何其它判断；请求组合不是队首 → routing_required 到队首
+      （绝不跳队直派 zcode）；队列全满 → full；
     - 时段门按档：strong 五个池全无门；medium/weak 三个 Max 恢复北京 22:00–08:00 夜间门、
       Claude 恢复工作日高峰门；ZCode 与其它池保持无门；
     - 档位切换只影响**新裁决**：已存在的 running/unknown 原样保留，reserved 在 consume 时
@@ -1608,6 +1611,35 @@ def _domestic_policy(conn, requested_pk, now, executor='auto', eligible=None,
     # 零占位）。完全未知的组合仍走下方 unknown_pool，绝不把未知冒充成档位排除。
     if requested_pk in CAPACITY and requested_pk not in dm.allowed_pools_for_mode(mode):
         return MODE_EXCLUDED, None
+    # BW-WEAK-TIER-ENFORCE-20261122（用户指令：简化逻辑——弱档只看优先级，不参照其它
+    # 判断）：weak = **纯优先级队列**。按 weak 层序取第一个有空位的池——不查
+    # availability、不查限额短窗、不看时段门、不看 executor 组合冲突、不看入口运行时。
+    # 请求组合不是当前队首 → routing_required 到队首（绝不跳队直派 zcode——Cursor/
+    # Codex 等宿主直接调 zcode 入口也会被队列接管）；队列走完全满 → full（物理总守卫
+    # 在弱档为冗余：17 个登记槽全占才可能全满）。请求池不在弱档集合 → 上方
+    # mode_excluded 已拒；legacy-retired → 上方 unknown_pool 已拒；Luna → 上方已拒。
+    if mode == 'weak':
+        # BW-WEAK-TIER-ENFORCE-20261122-R2（agent 验收发现的两个缺口）：
+        # ① 完全未知的组合（不在 CAPACITY）必须 unknown_pool 拒绝——绝不静默改派队首
+        #   （拼错的模型名不能被队列吞掉）；legacy-retired 已在上方 unknown_pool 拒。
+        if requested_pk not in CAPACITY:
+            return 'unknown_pool', None
+        # ② 物理总守卫照常：存在超额迁移在途（如 retired DeepSeek-Flash 的 0 容量历史
+        #   行）时物理在途可达 17 而弱档 6 槽仍有空——队列绝不派第 18 个。
+        if _domestic_active(conn) >= DOMESTIC_TOTAL_CAPACITY:
+            return 'full', None
+        winner = None
+        for _wk in sorted(dm.WEAK_POOL_KEYS,
+                          key=lambda k: (dm.priority_for_pool(k, 'weak') or 99, k)):
+            _wcap = capacity_for(_wk)
+            if _wcap is not None and _count_active(conn, _wk) < _wcap:
+                winner = _wk
+                break
+        if winner is None:
+            return 'full', None
+        if requested_pk == winner:
+            return 'claim', requested_pk
+        return 'routing', winner
     # BW-CLAUDE-DEEPSEEK-S4 + BW-CODEBUDDY-MAIN-S3：claude/codebuddy 已计入
     # DOMESTIC_TOTAL_CAPACITY（BW-WEAK-RESTRUCTURE-20261116 起物理总 17），总守卫必须同样约束：
     # 真实国内在途（含迁移债务/旧超额在途）

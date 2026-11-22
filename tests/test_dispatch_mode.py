@@ -273,9 +273,9 @@ class ModePolicyTests(unittest.TestCase):
         self.assertEqual(set(dm.window_gated_pools_for_mode('medium')),
                          {'qoder:Qwen4-Max-Preview', 'qodercn:Qwen4-Max-Preview',
                           'qodercn:Qwen-3.8-Max', 'claude:deepseek-flash'}, 'medium')
-        # BW-WEAK-RESTRUCTURE-20261116：弱档只剩 Claude 高峰门（全部 Qoder 已移出）。
-        self.assertEqual(tuple(dm.window_gated_pools_for_mode('weak')),
-                         ('claude:deepseek-flash',), 'weak')
+        # BW-WEAK-TIER-ENFORCE-20261122: 弱档纯优先级队列——无任何时段门（Claude 高峰门
+        # 已从弱档移除），weak 的受门池集合为空；claude 高峰门的档位声明移到 medium。
+        self.assertEqual(tuple(dm.window_gated_pools_for_mode('weak')), (), 'weak')
 
     def test_night_window_boundaries(self):
         # 北京 22:00（含）开、21:59 关；08:00（不含）关、07:59 开。
@@ -300,28 +300,32 @@ class ModePolicyTests(unittest.TestCase):
                    'opencode:deepseek-v4.1-flash-free',
                    'opencode:glm-5.3-flash-free', 'codebuddy:glm-5.3-flash',
                    'qoder:Qwen3.8-Flash', 'qodercn:Qwen3.8-Flash')
-        for m in ('medium', 'weak'):
-            # 三个 Max：夜间门——白天/周末关、北京 23:00 开。
-            for pk in maxes:
-                for now in (PEAK_AM, LUNCH, WEEKEND, OUT_0800):
-                    self.assertTrue(dm.window_blocks_for_mode(pk, now, m),
-                                   (pk, m, now))
-                self.assertFalse(dm.window_blocks_for_mode(pk, T0, m), (pk, m))
-            # claude：工作日高峰门——09:00-12:00 / 14:00-18:00 关，
-            # 午休/夜间/周末/法定假日开。
+        # BW-WEAK-TIER-ENFORCE-20261122：weak 为纯优先级队列、无任何时段门——
+        # 时段门断言只保留 medium；weak 对任何池恒 False。
+        for pk in maxes:
+            for now in (PEAK_AM, LUNCH, WEEKEND, OUT_0800):
+                self.assertTrue(dm.window_blocks_for_mode(pk, now, 'medium'),
+                               (pk, 'medium', now))
+            self.assertFalse(dm.window_blocks_for_mode(pk, T0, 'medium'), (pk,))
+        for pk in maxes + ungated + (dm.CLAUDE_POOL_KEY,):
+            for now in (PEAK_AM, LUNCH, WEEKEND, OUT_0800, T0):
+                self.assertFalse(dm.window_blocks_for_mode(pk, now, 'weak'),
+                                 (pk, 'weak', now))
+            # claude：工作日高峰门（仅 medium）——09:00-12:00 / 14:00-18:00 关，
+            # 午休/夜间/周末/法定假日开。weak 无门（BW-WEAK-TIER-ENFORCE-20261122）。
             self.assertTrue(
-                dm.window_blocks_for_mode(dm.CLAUDE_POOL_KEY, PEAK_AM, m), m)
+                dm.window_blocks_for_mode(dm.CLAUDE_POOL_KEY, PEAK_AM, 'medium'), 'medium')
             self.assertTrue(
-                dm.window_blocks_for_mode(dm.CLAUDE_POOL_KEY, PEAK_PM, m), m)
+                dm.window_blocks_for_mode(dm.CLAUDE_POOL_KEY, PEAK_PM, 'medium'), 'medium')
             for now in (LUNCH, T0, WEEKEND, HOLIDAY):
                 self.assertFalse(
-                    dm.window_blocks_for_mode(dm.CLAUDE_POOL_KEY, now, m),
-                    (m, now))
-            # 其它池：任何时刻无门。
+                    dm.window_blocks_for_mode(dm.CLAUDE_POOL_KEY, now, 'medium'),
+                    ('medium', now))
+            # 其它池：任何时刻无门（medium）。
             for pk in ungated:
                 for now in (PEAK_AM, T0, WEEKEND):
-                    self.assertFalse(dm.window_blocks_for_mode(pk, now, m),
-                                     (pk, m, now))
+                    self.assertFalse(dm.window_blocks_for_mode(pk, now, 'medium'),
+                                     (pk, 'medium', now))
 
 
 class ClaudeGateFailClosedTests(unittest.TestCase):
@@ -332,11 +336,11 @@ class ClaudeGateFailClosedTests(unittest.TestCase):
         with unittest.mock.patch.dict(sys.modules, {'deepseek_offpeak': None}):
             self.assertFalse(dm._claude_peak_open(T0))
             # 即便此刻本应离峰放行（北京 23:00），依赖坏了也一律当作窗口关闭。
-            for m in ('weak', 'medium'):
+            # BW-WEAK-TIER-ENFORCE-20261122：weak 纯优先级队列无时段门——fail-closed
+            # 语义只属于 medium（weak 的 window_blocks_for_mode 恒 False）。
+            for now in (T0, LUNCH):
                 self.assertTrue(
-                    dm.window_blocks_for_mode(dm.CLAUDE_POOL_KEY, T0, m), m)
-                self.assertTrue(
-                    dm.window_blocks_for_mode(dm.CLAUDE_POOL_KEY, LUNCH, m), m)
+                    dm.window_blocks_for_mode(dm.CLAUDE_POOL_KEY, now, 'medium'), now)
             # strong 档不调用该门：依赖故障绝不波及 strong 的「无门」口径。
             self.assertFalse(
                 dm.window_blocks_for_mode(dm.CLAUDE_POOL_KEY, T0, 'strong'))
@@ -347,9 +351,9 @@ class ClaudeGateFailClosedTests(unittest.TestCase):
                                         side_effect=RuntimeError('boom')):
             self.assertFalse(dm._claude_peak_open(T0))
             self.assertTrue(
-                dm.window_blocks_for_mode(dm.CLAUDE_POOL_KEY, T0, 'weak'))
+                dm.window_blocks_for_mode(dm.CLAUDE_POOL_KEY, T0, 'medium'))
             self.assertTrue(
-                dm.window_blocks_for_mode(dm.CLAUDE_POOL_KEY, PEAK_AM, 'weak'))
+                dm.window_blocks_for_mode(dm.CLAUDE_POOL_KEY, PEAK_AM, 'medium'))
 
     def test_gate_delegates_to_offpeak_when_healthy(self):
         import deepseek_offpeak as offpeak
@@ -357,12 +361,12 @@ class ClaudeGateFailClosedTests(unittest.TestCase):
                                         return_value=False):
             self.assertFalse(dm._claude_peak_open(T0))
             self.assertTrue(
-                dm.window_blocks_for_mode(dm.CLAUDE_POOL_KEY, T0, 'weak'))
+                dm.window_blocks_for_mode(dm.CLAUDE_POOL_KEY, T0, 'medium'))
         with unittest.mock.patch.object(offpeak, 'can_dispatch',
                                         return_value=True):
             self.assertTrue(dm._claude_peak_open(PEAK_AM))
             self.assertFalse(
-                dm.window_blocks_for_mode(dm.CLAUDE_POOL_KEY, PEAK_AM, 'weak'))
+                dm.window_blocks_for_mode(dm.CLAUDE_POOL_KEY, PEAK_AM, 'medium'))
         # 真实纯时间判定：工作日高峰关、午休/夜间/周末/假日开。
         self.assertFalse(dm._claude_peak_open(PEAK_AM))
         self.assertFalse(dm._claude_peak_open(PEAK_PM))
@@ -376,13 +380,17 @@ class ClaudeGateFailClosedTests(unittest.TestCase):
         # 依赖故障只关 claude 一个池。
         with unittest.mock.patch.dict(sys.modules, {'deepseek_offpeak': None}):
             self.assertTrue(
-                dm.window_blocks_for_mode('qoder:Qwen4-Max-Preview', PEAK_AM, 'weak'))
+                dm.window_blocks_for_mode('qoder:Qwen4-Max-Preview', PEAK_AM,
+                                          'medium'))
             self.assertFalse(
-                dm.window_blocks_for_mode('qoder:Qwen4-Max-Preview', T0, 'weak'))
+                dm.window_blocks_for_mode('qoder:Qwen4-Max-Preview', T0, 'medium'))
             for pk in ('zcode:GLM-5.3', 'opencode:glm-5.3-flash-free',
                        'qodercn:Qwen3.8-Flash'):
                 self.assertFalse(
-                    dm.window_blocks_for_mode(pk, PEAK_AM, 'weak'), pk)
+                    dm.window_blocks_for_mode(pk, PEAK_AM, 'medium'), pk)
+        # BW-WEAK-TIER-ENFORCE-20261122：weak 纯队列无门——依赖故障不影响其恒 False。
+        for pk in ('qoder:Qwen4-Max-Preview', 'claude:deepseek-flash'):
+            self.assertFalse(dm.window_blocks_for_mode(pk, PEAK_AM, 'weak'), pk)
 
 
 class _AdjudicationBase(unittest.TestCase):
@@ -494,11 +502,14 @@ class SingleModeReadPerAdjudicationTests(_AdjudicationBase):
         # CN 自定义 Max×2／zcode:GLM-5.3-Flash（尚未接入 MAIN_FORCE_POOLS 候选枚举的
         # 引擎疑点池）与 Sonus 已不在任何档位可新派集合——按既有「strong 遗留在途」
         # 真实形态直插 reserved 行（切档不追杀、不假释放、照常计数）。
+        # BW-WEAK-TIER-ENFORCE-20261122: 弱档纯优先级队列——真实 reserve 必须按队序
+        # （层1 两 OpenCode → 层2 CodeBuddy GLM → 层3 claude×2），跳队请求会被
+        # routing_required 到队首而非 claim。
+        self._reserve('o1', 'opencode', dp.OPENCODE_DEEPSEEK_MODEL, 'opencode')
+        self._reserve('o2', 'opencode', dp.OPENCODE_GLM_MODEL, 'opencode')
         self._reserve('cbg', 'codebuddy', 'glm-5.3-flash', 'codebuddy', glm=True)
         self._reserve('cl1', 'claude', 'deepseek-flash', 'claude')
         self._reserve('cl2', 'claude', 'deepseek-flash', 'claude')
-        self._reserve('o1', 'opencode', dp.OPENCODE_DEEPSEEK_MODEL, 'opencode')
-        self._reserve('o2', 'opencode', dp.OPENCODE_GLM_MODEL, 'opencode')
         with dispatch_mode('strong'):
             self._reserve('z1', 'zcode', 'GLM-5.3', 'zcode')
             self._reserve('m1', 'qoder', 'Qwen4-Max-Preview', 'qoder')

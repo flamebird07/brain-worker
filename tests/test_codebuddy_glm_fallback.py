@@ -149,6 +149,26 @@ class _Base(unittest.TestCase):
                         encoding='utf-8')
         return str(path)
 
+    def occupy_layer1_weak_slots(self, store=None):
+        # BW-WEAK-TIER-ENFORCE-20261122: 弱档纯优先级队列——层1 两 OpenCode 未满时，
+        # 层2 codebuddy:glm-5.3-flash 请求一律被队列接管（routing_required 到队首）；
+        # 要真实 claim GLM 必须先占满层1 两 OpenCode（与 test_zcode_appserver_direct
+        # 的 _occupy_higher_weak_slots 同一模式）。
+        for i, m in enumerate((dp.OPENCODE_DEEPSEEK_MODEL, dp.OPENCODE_GLM_MODEL)):
+            r = dp.reserve(store or self.store, task_id=f'pre-weak-oc-{i}',
+                           runtime='opencode', model=m,
+                           workspace=self.ws(f'pre-weak-oc-{i}'),
+                           prompt_sha256=SHA, stage='pre-weak',
+                           executor='opencode', _preclaim=False)
+            assert r.get('allowed'), (m, r)
+
+    def fill_below_layer2_weak_slots(self):
+        # BW-WEAK-TIER-ENFORCE-20261122: 弱档纯优先级队列——GLM（层2）满后，要让下一个
+        # GLM 请求如实 capacity_full（而非被队列改派到层3/层4 空位），必须同时占满
+        # claude×2（层3）与 zcode:GLM-5.3-Flash（层4），队列全满才拒绝。
+        self.seed(CLAUDE, 2, task_prefix='pre-weak-cl')
+        self.seed(dp.ZCODE_FLASH_POOL_KEY, 1, task_prefix='pre-weak-zf')
+
 
 class TestQuotaEvidenceSanitized(_Base):
     def test_cli_exit_zero_real_error_envelope_passes(self):
@@ -412,6 +432,9 @@ class TestFormalGateConsistency(_Base):
             workspace=self.ws('T'), now=T_NIGHT)
         self.assertEqual(receipt['selected']['pool_key'], GLM, receipt)
         self.assertTrue(receipt['codebuddy_glm_allowed'], receipt)
+        # BW-WEAK-TIER-ENFORCE-20261122: 弱档纯优先级队列——先占满层1 两 OpenCode，
+        # 层2 GLM 才是队首、正式 reserve 才能真实 claim（与 planner 裁决一致）。
+        self.occupy_layer1_weak_slots()
         # 正式 reserve：无证据、无条件布尔 → 与 planner 一致允许。
         claimed = dp.reserve(self.store, task_id='f1', runtime='codebuddy',
                              model=GLM_MODEL, workspace=self.ws('f1'),
@@ -483,6 +506,10 @@ class TestIndependentModelSlots(_Base):
         # BW-WEAK-RESTRUCTURE-20261116: codebuddy:deepseek-v4.1-flash 已无任何档位可
         # 新派——「跨模型在途」按真实形态 seed 为 DeepSeek 遗留占用（不追杀、不假释放）；
         # GLM 新派不受影响；显式 DeepSeek 新派请求如实 mode_excluded（sent=false、零占位）。
+        # BW-WEAK-TIER-ENFORCE-20261122: 弱档纯优先级队列——先占满层1 两 OpenCode 才能
+        # claim 层2 GLM；要让「同模型第 2 个仍拒绝」如实 capacity_full（而非被队列改派
+        # 到层3/层4 空位），还需占满 claude×2 与 zcode GLM-5.3-Flash。
+        self.occupy_layer1_weak_slots()
         self.seed(CB, 1)
         claimed = dp.reserve(self.store, task_id='g', runtime='codebuddy',
                              model=GLM_MODEL, workspace=self.ws('g'),
@@ -490,6 +517,7 @@ class TestIndependentModelSlots(_Base):
                              executor='codebuddy', codebuddy_glm_allowed=True,
                              _preclaim=False)
         self.assertTrue(claimed.get('allowed'), claimed)
+        self.fill_below_layer2_weak_slots()
         cb_ok = dp.reserve(self.store, task_id='d', runtime='codebuddy',
                            model=CB_MODEL, workspace=self.ws('d'),
                            prompt_sha256=SHA, stage='s', now=T_NIGHT,
@@ -509,6 +537,9 @@ class TestIndependentModelSlots(_Base):
     def test_finish_releases_only_own_slot(self):
         # BW-WEAK-RESTRUCTURE-20261116: DeepSeek 一侧按真实形态 seed 为遗留 reserved 占用
         # （无任何档位可新派）；GLM 终态释放只影响自己，遗留占用原样保留。
+        # BW-WEAK-TIER-ENFORCE-20261122: 弱档纯优先级队列——先占满层1 两 OpenCode，
+        # 层2 GLM 才是队首可被 claim；释放后队首仍为 GLM，可再次 claim。
+        self.occupy_layer1_weak_slots()
         glm = dp.reserve(self.store, task_id='g', runtime='codebuddy',
                          model=GLM_MODEL, workspace=self.ws('g'),
                          prompt_sha256=SHA, stage='s', now=T_NIGHT,
@@ -531,6 +562,12 @@ class TestIndependentModelSlots(_Base):
         self.assertTrue(glm_again.get('allowed'), glm_again)
 
     def test_concurrent_same_model_has_exactly_one_winner(self):
+        # BW-WEAK-TIER-ENFORCE-20261122: 弱档纯优先级队列——并发同模型竞速前先占满
+        # 层1 两 OpenCode + 层3 claude×2 + 层4 zcode flash，使 GLM 是唯一空位：并发
+        # 两请求恰好一个赢家，落败者面对全满队列如实 capacity_full（而非被改派）。
+        self.occupy_layer1_weak_slots()
+        self.fill_below_layer2_weak_slots()
+
         def _claim(tid):
             return dp.reserve(self.store, task_id=tid, runtime='codebuddy',
                               model=GLM_MODEL, workspace=self.ws(tid),
@@ -553,6 +590,10 @@ class TestIndependentModelSlots(_Base):
         # 「DeepSeek 并发请求也只得到 mode_excluded（sent=false、零占位、无 token），
         # GLM 并发请求真实 claim」；两模型独立名额的互不占位语义继续由在途计数断言
         # 覆盖（DeepSeek 0、GLM 1）。
+        # BW-WEAK-TIER-ENFORCE-20261122: 弱档纯优先级队列——先占满层1 两 OpenCode，
+        # 层2 GLM 才是队首，并发 GLM 请求才能真实 claim。
+        self.occupy_layer1_weak_slots()
+
         def _claim(args):
             tid, model = args
             return dp.reserve(self.store, task_id=tid, runtime='codebuddy',
@@ -666,6 +707,10 @@ class TestFormalLiveGlm(_Base):
         self.stage = 'BW-CB-GLM-LIVE'
         self.report = _valid_report(self.stage, str(self.work))
         self.cfg = {'node': 'node', 'cli': 'cli.js'}
+        # BW-WEAK-TIER-ENFORCE-20261122: 弱档纯优先级队列——先占满层1 两 OpenCode，
+        # 层2 codebuddy:glm-5.3-flash 才是队首、正式传输才能真实 claim（GLM 兜底派发
+        # 用例的载体前提；不影响 mode_excluded 负例与零占位断言）。
+        self.occupy_layer1_weak_slots()
 
     def _prompt(self):
         p = self.base / 'prompt.txt'

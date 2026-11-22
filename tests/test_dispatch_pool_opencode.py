@@ -89,15 +89,19 @@ class _PoolBase(unittest.TestCase):
     def fill_non_opencode_weak_pools(self):
         """BW-WEAK-RESTRUCTURE-20261116: 弱档收窄为 5 池（两 OpenCode(1) > CBGLM(2) >
         Claude(3) > ZCode GLM-5.3-Flash(4)）；OpenCode 之上不再有旧弱档的 Max/ZCode/
-        CodeBuddy deepseek 层。本方法真实占满**全部非 OpenCode 弱档池**（CBGLM 1 +
-        claude 2 + ZCode GLM-5.3-Flash 1 = 4），全部经显式 executor 逐一 claim 保证
-        确定性；此后 AUTO 只可能落到两 OpenCode 免费槽。"""
-        toks = [self.reserve('cbg', 'codebuddy', dp.CODEBUDDY_GLM_MODEL,
-                             executor='codebuddy')]
-        toks.append(self.reserve('cl1', 'claude', 'deepseek-flash', executor='claude'))
-        toks.append(self.reserve('cl2', 'claude', 'deepseek-flash', executor='claude'))
-        toks.append(self.reserve('zcf1', 'zcode', 'GLM-5.3-Flash', executor='zcode'))
-        return toks
+        CodeBuddy deepseek 层。BW-WEAK-TIER-ENFORCE-20261122：弱档是**纯优先级队列**——
+        非 OpenCode 池在两 OpenCode 有空位时队首未到、无法经队列真实 claim；「非 OpenCode
+        弱档池全满、OpenCode 空闲」场景只能按真实在途形态直插占位（同遗留占位模式，
+        仅作物理占位、绝不伪造可新派断言），此后 AUTO 只可能落到两 OpenCode 免费槽。"""
+        seeded = [('cbg', 'cbg-task', dp.CODEBUDDY_GLM_POOL_KEY, 'codebuddy',
+                   dp.CODEBUDDY_GLM_MODEL),
+                  ('cl1', 'cl1-task', dp.CLAUDE_POOL_KEY, 'claude', 'deepseek-flash'),
+                  ('cl2', 'cl2-task', dp.CLAUDE_POOL_KEY, 'claude', 'deepseek-flash'),
+                  ('zcf1', 'zcf1-task', dp.ZCODE_FLASH_POOL_KEY, 'zcode', 'GLM-5.3-Flash')]
+        for token, task, pool, runtime, model in seeded:
+            insert_legacy_inflight(self.store, token=token, task_id=task,
+                                   pool_key=pool, runtime=runtime, model=model)
+        return [entry[0] for entry in seeded]
 
 
 class CapacityConstantTests(_PoolBase):
@@ -118,16 +122,24 @@ class CapacityConstantTests(_PoolBase):
 class IndependentSlotTests(_PoolBase):
     def test_one_model_full_does_not_block_the_other(self):
         self.reserve('d1', 'opencode', DEEPSEEK)
-        # 同池第二个 → 拒；另一免费模型独立槽照常 claim。
+        # 另一免费模型独立槽照常 claim（互不占位）——BW-WEAK-TIER-ENFORCE-20261122：
+        # 弱档纯优先级队列下 DPOOL 满时队首轮到 GPOOL，先验证独立槽 claim 再占满全队列。
+        self.reserve('g1', 'opencode', GLM)
+        self.assertEqual(self.active(DPOOL), 1)
+        self.assertEqual(self.active(GPOOL), 1)
+        # BW-WEAK-TIER-ENFORCE-20261122：弱档纯优先级队列——同池第二个请求在队列尚有
+        # 空位时被接管为 routing；要复现「同池第二个如实 capacity_full」，按队列序占满
+        # 其余弱档槽（CBGLM/claude×2/zcode-flash），队列走完 → capacity_full。
+        self.reserve('cbg', 'codebuddy', dp.CODEBUDDY_GLM_MODEL, executor='codebuddy')
+        self.reserve('cl1', 'claude', 'deepseek-flash', executor='claude')
+        self.reserve('cl2', 'claude', 'deepseek-flash', executor='claude')
+        self.reserve('zcf', 'zcode', 'GLM-5.3-Flash', executor='zcode')
         r = dp.reserve(self.store, task_id='d2', runtime='opencode', model=DEEPSEEK,
                        workspace=str(self._ws_for('d2')), prompt_sha256='p',
                        executor='opencode', now=NIGHT, _preclaim=False)
         self.assertFalse(r.get('allowed'), r)
         self.assertEqual(r.get('reason'), 'capacity_full')
         self.assertFalse(r.get('sent', True), r)
-        self.reserve('g1', 'opencode', GLM)
-        self.assertEqual(self.active(DPOOL), 1)
-        self.assertEqual(self.active(GPOOL), 1)
 
     def test_release_frees_only_own_slot(self):
         tok_d = self.reserve('d1', 'opencode', DEEPSEEK)
@@ -149,6 +161,14 @@ class IndependentSlotTests(_PoolBase):
         self.assertFalse(mk.get('released'))
         self.assertTrue(mk.get('capacity_held'))
         self.assertEqual(self.active(DPOOL), 1)
+        # BW-WEAK-TIER-ENFORCE-20261122：弱档纯优先级队列——unknown 占位绝不抢占的
+        # capacity_full 断言需队列走完：按队列序占满其余弱档槽（GPOOL/CBGLM/claude×2/
+        # zcode-flash）后再请求 DPOOL。
+        self.reserve('g1', 'opencode', GLM)
+        self.reserve('cbg', 'codebuddy', dp.CODEBUDDY_GLM_MODEL, executor='codebuddy')
+        self.reserve('cl1', 'claude', 'deepseek-flash', executor='claude')
+        self.reserve('cl2', 'claude', 'deepseek-flash', executor='claude')
+        self.reserve('zcf', 'zcode', 'GLM-5.3-Flash', executor='zcode')
         r = dp.reserve(self.store, task_id='d2', runtime='opencode', model=DEEPSEEK,
                        workspace=str(self._ws_for('d2')), prompt_sha256='p',
                        executor='opencode', now=NIGHT, _preclaim=False)
@@ -171,18 +191,28 @@ class IndependentSlotTests(_PoolBase):
 
 class ExactDesignationTests(_PoolBase):
     def test_executor_conflict_never_crosses(self):
-        r = dp.reserve(self.store, task_id='x1', runtime='opencode', model=DEEPSEEK,
-                       workspace=str(self._ws_for('x1')), prompt_sha256='p',
-                       executor='qoder', now=NIGHT, _preclaim=False)
-        self.assertFalse(r.get('allowed'), r)
-        self.assertEqual(r.get('reason'), 'executor_conflict')
-        r2 = dp.reserve(self.store, task_id='x2', runtime='opencode', model='glm-5.3-flash',
-                        workspace=str(self._ws_for('x2')), prompt_sha256='p',
-                        executor='opencode', now=NIGHT, _preclaim=False)
-        self.assertFalse(r2.get('allowed'), r2)
-        # 非精确 opencode 组合 + 显式 executor='opencode'：正式原因是 executor_conflict
-        # （绝不悄悄改派到别的池），而不是 unknown_pool。
-        self.assertEqual(r2.get('reason'), 'executor_conflict')
+        # BW-WEAK-TIER-ENFORCE-20261122：弱档纯优先级队列接管一切显式 executor 请求
+        # （不看 executor 组合冲突）——「executor 冲突/非精确组合一律拒绝、绝不跨执行器
+        # 改派」的拒绝语义与档位无关，改在 medium 档验证：OpenCode 精确组合在 medium
+        # 本就档位排除（mode_excluded 优先于 executor 判断、零占位、绝不改派）；非精确
+        # opencode 组合 + 显式 executor='opencode' 仍如实 executor_conflict。
+        with dispatch_mode('medium'):
+            r = dp.reserve(self.store, task_id='x1', runtime='opencode', model=DEEPSEEK,
+                           workspace=str(self._ws_for('x1')), prompt_sha256='p',
+                           executor='qoder', now=NIGHT, _preclaim=False)
+            self.assertFalse(r.get('allowed'), r)
+            self.assertEqual(r.get('reason'), 'mode_excluded', r)
+            self.assertFalse(r.get('sent', True), r)
+            r2 = dp.reserve(self.store, task_id='x2', runtime='opencode',
+                            model='glm-5.3-flash',
+                            workspace=str(self._ws_for('x2')), prompt_sha256='p',
+                            executor='opencode', now=NIGHT, _preclaim=False)
+            self.assertFalse(r2.get('allowed'), r2)
+            # 非精确 opencode 组合 + 显式 executor='opencode'：正式原因是 executor_conflict
+            # （绝不悄悄改派到别的池），而不是 unknown_pool。
+            self.assertEqual(r2.get('reason'), 'executor_conflict')
+        # 两笔请求零占位（绝不跨执行器改派落库）。
+        self.assertEqual(dp.status(self.store, now=NIGHT)['domestic']['active'], 0)
 
     def test_other_executors_never_route_to_opencode(self):
         # BW-WEAK-RESTRUCTURE-20261116: qoder:Qwen4-Max-Preview 已移出弱档（weak 一律
@@ -252,18 +282,23 @@ class NoWindowNoQuotaGateTests(_PoolBase):
     def test_no_codebuddy_quota_precondition(self):
         # BW-LIMIT30-20261019-S3：GLM 额度独立、不再需要当轮 DeepSeek 限额证据，
         # 无 codebuddy_glm_allowed 即可 claim；两个 OpenCode 免费模型同样无任何额度前提。
-        r = dp.reserve(self.store, task_id='glm1', runtime='codebuddy',
-                       model=dp.CODEBUDDY_GLM_MODEL, workspace=str(self._ws_for('glm1')),
-                       prompt_sha256='p', executor='codebuddy', now=DAY,
-                       _preclaim=False)
-        self.assertTrue(r.get('allowed'), r)
-        self.assertEqual(r['pool_key'], dp.CODEBUDDY_GLM_POOL_KEY)
+        # BW-WEAK-TIER-ENFORCE-20261122：弱档纯优先级队列——先按队列序验证 OpenCode
+        # 免费槽无额度前提的真实 claim（层1 deepseek 满后队首=glm-free），再排空层1
+        # 两槽使 CBGLM（层2）成为队首被真实 claim。
+        self.reserve('ocd0', 'opencode', DEEPSEEK, now=DAY)
         tok = self.reserve('oc1', 'opencode', GLM, now=DAY)
         res = dp.consume_for_entry(self.store, task_id='oc1', runtime='opencode',
                                    model=GLM, workspace=str(self._ws_for('oc1')),
                                    prompt_sha256='p', claim_token=tok, now=DAY,
                                    executor='opencode')
         self.assertTrue(res.get('allowed'), res)
+        # 层1 两 OpenCode 槽均已占满（ocd0 + oc1）→ 队首=CBGLM（层2）被真实 claim。
+        r = dp.reserve(self.store, task_id='glm1', runtime='codebuddy',
+                       model=dp.CODEBUDDY_GLM_MODEL, workspace=str(self._ws_for('glm1')),
+                       prompt_sha256='p', executor='codebuddy', now=DAY,
+                       _preclaim=False)
+        self.assertTrue(r.get('allowed'), r)
+        self.assertEqual(r['pool_key'], dp.CODEBUDDY_GLM_POOL_KEY)
 
 
 class AutoTierOrderTests(_PoolBase):
@@ -288,6 +323,8 @@ class AutoTierOrderTests(_PoolBase):
         # BW-WEAK-RESTRUCTURE-20261116: 弱档 ZCode 只用 GLM-5.3-Flash(tier4)，
         # zcode:GLM-5.3 已移出弱档（mode_excluded）。本用例改验：显式 zcode:GLM-5.3 请求
         # 在 weak 被拒；非 OpenCode 弱档池全满后 AUTO 仍落到 OpenCode(tier1)、先于 CBGLM。
+        # BW-WEAK-TIER-ENFORCE-20261122：纯优先级队列下非 OpenCode 槽按真实在途直插
+        # （见 fill_non_opencode_weak_pools）。
         r_zc = dp.reserve(self.store, task_id='zc0', runtime='zcode', model='GLM-5.3',
                           workspace=str(self._ws_for('zc0')), prompt_sha256='p',
                           executor='zcode', now=NIGHT, _preclaim=False)

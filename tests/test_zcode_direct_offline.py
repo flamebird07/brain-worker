@@ -573,7 +573,28 @@ import shutil  # noqa: E402
 import tempfile  # noqa: E402
 import unittest  # noqa: E402
 
+sys.path.insert(0, str(ROOT / 'scripts'))
+import dispatch_pool as dp  # noqa: E402
+
 S2_STAGE = 'BW-ZCODE-TASK-TOOLS-S2-OFFTEST'
+
+
+def _occupy_higher_weak_slots(store):
+    # BW-WEAK-TIER-ENFORCE-20261122: 弱档纯优先级队列——zcode:GLM-5.3-Flash 是层4，只有
+    # 层1-3（两 OpenCode／CodeBuddy GLM／claude×2）全满它才是队首、zcode 入口才能真实
+    # 派发；与 test_zcode_appserver_direct 的 _occupy_higher_weak_slots 同一模式（真实
+    # reserve 占位、独立任务/工作区，绝不伪造在途形态）。
+    combos = [('opencode', dp.OPENCODE_DEEPSEEK_MODEL),
+              ('opencode', dp.OPENCODE_GLM_MODEL),
+              ('codebuddy', dp.CODEBUDDY_GLM_MODEL),
+              ('claude', 'deepseek-flash'),
+              ('claude', 'deepseek-flash')]
+    for i, (rt, m) in enumerate(combos):
+        r = dp.reserve(str(store), task_id=f'pre-weak-{i}', runtime=rt, model=m,
+                       workspace=f'{store}.pre-weak-{i}',
+                       prompt_sha256='1' * 64, stage='pre-weak', executor=rt,
+                       _preclaim=False)
+        assert r.get('allowed'), (rt, m, r)
 
 
 class TaskToolRouteEntryTests(unittest.TestCase):
@@ -613,6 +634,9 @@ class TaskToolRouteEntryTests(unittest.TestCase):
         # BW-WEAK-RESTRUCTURE-20261116: 本组是真实派发链路的入口回归；默认 weak 档下弱档
         # ZCode 只认 GLM-5.3-Flash（GLM-5.3 会 mode_excluded、退出码 2），显式指
         # GLM-5.3-Flash 保持「edit 路由/严格路由」的本意。
+        # BW-WEAK-TIER-ENFORCE-20261122: 弱档纯优先级队列——先占满层1-3，zcode
+        # GLM-5.3-Flash（层4）才是队首、入口才能真实派发。
+        _occupy_higher_weak_slots(self.root / f'disp-{out_name}.sqlite3')
         cmd = [sys.executable, str(self.script), '--workspace', str(self.work),
                '--prompt-file', str(self.prompt), '--output-dir', str(out),
                '--model', 'GLM-5.3-Flash',

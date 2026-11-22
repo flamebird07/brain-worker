@@ -22,6 +22,8 @@ sys.path.insert(0, str(SCRIPTS))
 import claude_direct as cd      # noqa: E402
 import dispatch_pool as dp      # noqa: E402
 import prompt_contract as pc    # noqa: E402
+# BW-WEAK-TIER-ENFORCE-20261122: 档位切换工具（claude 机制测试固定 strong 档执行）。
+from dispatch_mode_support import dispatch_mode   # noqa: E402
 
 OFFPEAK = datetime(2026, 10, 8, 15, 0, 0, tzinfo=timezone.utc)
 SECRET = 'sk-STOP-SECRET-DO-NOT-LEAK'
@@ -255,14 +257,21 @@ class PermissionStopTests(unittest.TestCase):
                 'credential_source': {'mode': 'token_env', 'env': 'ANTHROPIC_API_KEY'}}
 
     def _run(self, fake):
-        return cd.run(self._cfg(), workspace=str(self.ws), prompt_file=self.prompt,
-                      out_dir=self.base / 'out', stage=self.STAGE, task_id='t1',
-                      prompt_sha256=hashlib.sha256(self.prompt.read_bytes()).hexdigest(),
-                      now=OFFPEAK, popen_factory=fake,
-                      environ={'ANTHROPIC_API_KEY': SECRET},
-                      dispatch_store=self.store, bind_child_pid=True,
-                      child_prober=lambda pid: {'state': 'dead', 'created': 'c1'},
-                      required_tools=['Read'])
+        # BW-WEAK-TIER-ENFORCE-20261122: 权限停止/停止后行为机制与档位无关，固定
+        # strong 档执行（claude 在 strong 层2、无时段门、可显式派；弱档纯优先级队列
+        # 会把显式 claude 请求接管为 routing_required，与本组测试本意无关）。
+        # BW-WEAK-TIER-ENFORCE-20261122: strong 档下传输错误载体会触发引擎默认有界
+        # 重试（5s+15s 真实 sleep）——离线零等待口径注入 0 延迟，引擎行为不变。
+        with dispatch_mode('strong'):
+            return cd.run(self._cfg(), workspace=str(self.ws), prompt_file=self.prompt,
+                          out_dir=self.base / 'out', stage=self.STAGE, task_id='t1',
+                          prompt_sha256=hashlib.sha256(self.prompt.read_bytes()).hexdigest(),
+                          now=OFFPEAK, popen_factory=fake,
+                          environ={'ANTHROPIC_API_KEY': SECRET},
+                          dispatch_store=self.store, bind_child_pid=True,
+                          child_prober=lambda pid: {'state': 'dead', 'created': 'c1'},
+                          required_tools=['Read'],
+                          transport_retry_delays=[0.0, 0.0])
 
     def _read_tool_result(self, content, is_error=False, tool_id='r1'):
         return {'type': 'user', 'message': {'content': [

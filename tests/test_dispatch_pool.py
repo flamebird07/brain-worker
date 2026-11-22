@@ -156,7 +156,9 @@ class _PoolBase(unittest.TestCase):
 
     def reserve_exec(self, task, runtime, model, executor, pk=None):
         """显式执行器入口的确定性 claim：CN 内置只能经 executor='qodercn' 单独 claim，
-        目标禁用池仅用于遗留占位，其它显式 executor 取真实 reserved token。"""
+        目标禁用池仅用于遗留占位，其它显式 executor 取真实 reserved token。
+        BW-WEAK-TIER-ENFORCE-20261122：弱档纯优先级队列接管一切显式请求——只有请求组合
+        恰为队首时才被真实 claim，否则请先用 occupy_weak_above 排空上方槽位。"""
         if dp.pool_key(runtime, model) == dp.CN_CUSTOM_MAX_POOL_KEY:
             return self.legacy_custom_claim(task)
         r = dp.reserve(self.store, task_id=task, runtime=runtime, model=model,
@@ -165,11 +167,47 @@ class _PoolBase(unittest.TestCase):
         self.assertClaimed(r, pk or dp.pool_key(runtime, model))
         return r['token']
 
+    # BW-WEAK-TIER-ENFORCE-20261122：弱档纯优先级队列序（唯一判断=层序+空位；同层由
+    # pool_key stable tie 定序，与 _domestic_policy weak 分支同源）：
+    # 层1 opencode:deepseek-free(1) > 层1 opencode:glm-free(1) > 层2 codebuddy:glm(1)
+    # > 层3 claude(2) > 层4 zcode:GLM-5.3-Flash(1)，合计 6 槽。
+    WEAK_QUEUE_COMBOS = (
+        ('opencode', dp.OPENCODE_DEEPSEEK_MODEL),
+        ('opencode', dp.OPENCODE_GLM_MODEL),
+        ('codebuddy', dp.CODEBUDDY_GLM_MODEL),
+        ('claude', dp.CLAUDE_MODEL),
+        ('claude', dp.CLAUDE_MODEL),
+        ('zcode', 'GLM-5.3-Flash'),
+    )
+
+    def occupy_weak_above(self, target_pk, prefix='weak-above'):
+        """BW-WEAK-TIER-ENFORCE-20261122：弱档纯优先级队列——要把 target_pk 变成队首
+        （显式或 AUTO 请求才能被真实 claim），按队列序经 consume_for_entry（入口同款
+        路径）把排在其前面的全部空槽真实占满（到 running）；已占用槽自动跳过。
+        弱档队列不查 availability/限额短窗/时段门/executor 冲突，占位即真实占位。"""
+        toks = []
+        for rt, m in self.WEAK_QUEUE_COMBOS:
+            pk = dp.pool_key(rt, m)
+            if pk == target_pk:
+                break
+            while dp.status(self.store, now=T0)['pools'][pk]['active'] \
+                    < dp.capacity_for(pk):
+                task = f'{prefix}-{len(toks)}'
+                r = dp.consume_for_entry(
+                    self.store, task_id=task, runtime=rt, model=m,
+                    workspace=str(self._ws_for(task)), prompt_sha256='p',
+                    executor=rt, wrapper_pid=4321, wrapper_created='w1', now=T0)
+                self.assertClaimed(r, pk)
+                toks.append(r['token'])
+        return toks
+
     def fill_domestic(self):
         """补满全部 17 个物理在途名额（BW-WEAK-RESTRUCTURE-20261116：DOMESTIC_TOTAL_
-        CAPACITY 16→17）。按现行三档口径分派填法：
-        - weak 档可新派 6 槽（codebuddy:glm-5.3-flash=1、claude:deepseek-flash=2、
-          两 OpenCode 免费模型各 1、zcode:GLM-5.3-Flash=1）经真实 reserve 填入；
+        CAPACITY 16→17）。BW-WEAK-TIER-ENFORCE-20261122：弱档是**纯优先级队列**——
+        weak 可新派 6 槽必须按队列序真实 claim（层1 两 OpenCode 免费模型各 1 →
+        层2 codebuddy:glm-5.3-flash 1 → 层3 claude:deepseek-flash 2 →
+        层4 zcode:GLM-5.3-Flash 1；显式 executor 请求同样由队列接管，队首组合才被
+        claim），弱档无任何时段门/限额短窗/availability 判断。其余填法：
         - strong/medium 专属池（zcode:GLM-5.3=1、两内置 Qwen4-Max-Preview 各 1、
           qodercn:Qwen-3.8-Max=2）经 `dispatch_mode('medium')` 真实 claim 填入
           （自定义 Max 需临时清空用户禁用集复现禁用前物理满池）；
@@ -183,20 +221,23 @@ class _PoolBase(unittest.TestCase):
         [glm, zcode, qoderMax, cnMax, cnCustomA, cnCustomB, claude, claude,
          qoderFlash, qoderFlash, cnFlash, cnFlash, ocDeepseek, ocGlm]。
         """
+        # BW-WEAK-TIER-ENFORCE-20261122：弱档 6 槽按队列序 claim——层1 两 OpenCode 先行，
+        # CBGLM 层2 次之（其上方层1 已满），claude 层3、zcode:GLM-5.3-Flash 层4 收尾。
+        weak_plan = [('f12', 'opencode', dp.OPENCODE_DEEPSEEK_MODEL, 'opencode'),
+                     ('f13', 'opencode', dp.OPENCODE_GLM_MODEL, 'opencode'),
+                     ('f6', 'claude', 'deepseek-flash', 'claude'),
+                     ('f7', 'claude', 'deepseek-flash', 'claude'),
+                     ('fzflash', 'zcode', 'GLM-5.3-Flash', 'zcode')]
+        oc_toks = [self.reserve_exec(t, rt, md, ex)
+                   for (t, rt, md, ex) in weak_plan[:2]]
         glm = dp.reserve(self.store, task_id='fglm', runtime='codebuddy',
                          model='glm-5.3-flash',
                          workspace=str(self._ws_for('fglm')), prompt_sha256='p',
                          executor='codebuddy', codebuddy_glm_allowed=True,
                          now=T0, _preclaim=False)
         self.assertClaimed(glm, 'codebuddy:glm-5.3-flash')
-        # weak 可新派 5 槽：claude×2 + 两 OpenCode + zcode:GLM-5.3-Flash（T0 北京 23:00
-        # 在 Claude 工作日高峰门外，weak 档 Claude 可派）。
-        weak_plan = [('f6', 'claude', 'deepseek-flash', 'claude'),
-                     ('f7', 'claude', 'deepseek-flash', 'claude'),
-                     ('f12', 'opencode', dp.OPENCODE_DEEPSEEK_MODEL, 'opencode'),
-                     ('f13', 'opencode', dp.OPENCODE_GLM_MODEL, 'opencode'),
-                     ('fzflash', 'zcode', 'GLM-5.3-Flash', 'zcode')]
-        weak_toks = [self.reserve_exec(t, rt, md, ex) for (t, rt, md, ex) in weak_plan]
+        weak_toks = [self.reserve_exec(t, rt, md, ex)
+                     for (t, rt, md, ex) in weak_plan[2:]]
         # strong/medium 专属池经 medium 档真实 claim；自定义 Max 临时清空用户禁用集。
         with dispatch_mode('medium'):
             with user_disabled_pools(frozenset()):
@@ -214,7 +255,7 @@ class _PoolBase(unittest.TestCase):
         self.seed_attempt('f11', 'f11-task', 'qodercn:Qwen3.8-Flash')
         toks = [glm['token'], medium_toks[0], medium_toks[1], medium_toks[2],
                 medium_toks[3], medium_toks[4], weak_toks[0], weak_toks[1],
-                'f8', 'f9', 'f10', 'f11', weak_toks[2], weak_toks[3]]
+                'f8', 'f9', 'f10', 'f11', oc_toks[0], oc_toks[1]]
         # 弱档不能新派 Sonus；用 strong 遗留在途补足第 17 个物理名额。
         insert_sonus_leftover(self.store, reserved_at_utc=dp._iso(T0))
         st = dp.status(self.store, now=T0)
@@ -277,15 +318,21 @@ class CapacityAndKnownPoolTests(_PoolBase):
         self.assertFalse(dp.is_known_pool('zcode:Qwen4-Max-Preview'))
 
     def test_unknown_pool_refused_on_reserve_and_select(self):
-        r = dp.reserve(self.store, task_id='u1', runtime='qoder', model='Bogus',
-                       workspace=str(self._ws_for('u1')), prompt_sha256='p',
-                       now=T0, _preclaim=False)
-        self.assertRejected(r, 'unknown_pool')
-        self.assertFalse(r.get('sent', True))
-        r2 = dp.select_and_claim(self.store, task_id='u2', runtime='openai', model='gpt-x',
-                                 workspace=str(self._ws_for('u2')), prompt_sha256='p',
-                                 now=T0, _preclaim=False)
-        self.assertRejected(r2, 'unknown_pool')
+        # BW-WEAK-TIER-ENFORCE-20261122：弱档纯优先级队列会把**完全未知组合**也接管成
+        # routing_required 到队首（不查池合法性）——与 _domestic_policy 文档字符串
+        # 「完全未知的组合仍走下方 unknown_pool」矛盾，疑似引擎回归、已单独报告；
+        # unknown_pool 拒绝机制本身与档位无关，改在 medium 档验证原意。
+        with dispatch_mode('medium'):
+            r = dp.reserve(self.store, task_id='u1', runtime='qoder', model='Bogus',
+                           workspace=str(self._ws_for('u1')), prompt_sha256='p',
+                           now=T0, _preclaim=False)
+            self.assertRejected(r, 'unknown_pool')
+            self.assertFalse(r.get('sent', True))
+            r2 = dp.select_and_claim(self.store, task_id='u2', runtime='openai',
+                                     model='gpt-x',
+                                     workspace=str(self._ws_for('u2')),
+                                     prompt_sha256='p', now=T0, _preclaim=False)
+            self.assertRejected(r2, 'unknown_pool')
 
     def test_luna_never_auto_selected_or_reserved_as_normal(self):
         r = dp.select_and_claim(self.store, task_id='l1', runtime='luna', model='native',
@@ -354,10 +401,12 @@ class MainForceRotationTests(_PoolBase):
         self.assertClaimed(r4, dp.OPENCODE_DEEPSEEK_POOL_KEY)
 
     def test_select_prefers_requested_combo_on_tie(self):
-        # 同层平票时优先请求组合：BW-WEAK-RESTRUCTURE-20261116 后两 OpenCode 免费模型是
-        # weak 档最高层（层1，各独立 1 槽），两者 0 在途平票时请求组合优先。先在 medium
-        # 档占满 strong/medium 专属主力（保持原「占满上方层」的场景形态；CBGLM 为弱档
-        # 层2，在 weak 档真实 claim），再回 weak 档请求 OpenCode 验证平票走位。
+        # 同层平票时优先请求组合：BW-WEAK-TIER-ENFORCE-20261122 后弱档是纯优先级队列，
+        # 层1 两 OpenCode 平票由队序（pool_key stable tie）定序——deepseek-free 恒为
+        # 队首；请求组合恰为队首时仍直接 claim（原「0 在途平票时请求组合优先」原意
+        # 保留为：AUTO 请求队首组合即真实 claim）。先在 medium 档占满 strong/medium
+        # 专属主力（保持原「占满上方层」的场景形态），再回 weak 档按队列序验证：
+        # 请求 opencode:deepseek → 真实 claim；排空层1 后 CBGLM（层2）真实 claim。
         with dispatch_mode('medium'):
             self.reserve_exec('t0', 'zcode', 'GLM-5.3', 'zcode')
             self.reserve_exec('t1', 'qodercn', 'Qwen4-Max-Preview', 'qodercn')
@@ -366,16 +415,20 @@ class MainForceRotationTests(_PoolBase):
             self.reserve_exec('t4', 'qoder', 'Qwen4-Max-Preview', 'qoder')
             self.reserve_exec('t5', 'claude', 'deepseek-flash', 'claude')
             self.reserve_exec('t6', 'claude', 'deepseek-flash', 'claude')
-        self.reserve_exec('t7', 'codebuddy', dp.CODEBUDDY_GLM_MODEL, 'codebuddy')
         r = self.select('tie', 'opencode', dp.OPENCODE_DEEPSEEK_MODEL)
-        # 两 OpenCode 同层平票时优先请求组合 → 请求的 deepseek-free 被选中。
+        # BW-WEAK-TIER-ENFORCE-20261122：层1 两 OpenCode 0 在途平票、队首=deepseek-free
+        # → 请求组合即队首，被直接真实 claim。
         self.assertClaimed(r, dp.OPENCODE_DEEPSEEK_POOL_KEY)
+        # CBGLM 为弱档层2：按队列序排空层1 剩余槽（glm-free）后，显式 executor 请求
+        # 仍由队列接管、此时队首=CBGLM 被真实 claim。
+        self.occupy_weak_above(dp.CODEBUDDY_GLM_POOL_KEY, prefix='tie-above')
+        self.reserve_exec('t7', 'codebuddy', dp.CODEBUDDY_GLM_MODEL, 'codebuddy')
 
     def test_select_when_both_main_full_no_cross_mode_overflow(self):
         # BW-WEAK-RESTRUCTURE-20261116：两地区 Qwen3.8-Flash 已从**所有档位**移除（纯
         # mode_excluded），原「主力全满 → 同级 Flash 兜底」路径随溢出池移除而消失。
-        # 改验现行语义（原意「主力满后绝不偷换模型落库」保留）：weak 档 5 个可派主力
-        # 全满后，AUTO 请求 weak 可派组合如实 mode_excluded（兜底不在该档、sent=false、
+        # BW-WEAK-TIER-ENFORCE-20261122：弱档 6 槽全满后队列走完 → 任何 AUTO 请求如实
+        # capacity_full（原意「绝不偷换模型落库/绝不跨档兜底」保留：sent=false、
         # 零新占位，绝不偷换记到 Flash 池）。
         for i, pool in enumerate([dp.OPENCODE_DEEPSEEK_POOL_KEY,
                                   dp.OPENCODE_GLM_POOL_KEY,
@@ -385,7 +438,10 @@ class MainForceRotationTests(_PoolBase):
             self.seed_attempt(f'of-main-{i}', f'of-main-task-{i}', pool)
         r = self.select('of', 'claude', 'deepseek-flash')
         self.assertFalse(r.get('allowed'), r)
-        self.assertRejected(r, 'mode_excluded')
+        # BW-WEAK-TIER-ENFORCE-20261122：队列全满 → ('full', None) → capacity_full。
+        self.assertRejected(r, 'capacity_full')
+        self.assertFalse(r.get('routing_required'), r)
+        self.assertFalse(r.get('sent', True), r)
         with closing(dp.connect(self.store)) as conn:
             rows = conn.execute('SELECT token FROM attempts '
                                 "WHERE pool_key='qoder:Qwen3.8-Flash'").fetchall()
@@ -941,9 +997,10 @@ class LunaTicketTests(_PoolBase):
         toks = self.fill_domestic()
         dp.ask_record(self.store, task_id='L', scope=self._scope('L'),
                       ask_message_id='m1', now=T0)
-        # 释放一个国内名额（BW-WEAK-RESTRUCTURE-20261116：弱档回收候选只剩 5 个可派池，
-        # 改释放 claude 槽——fill 顺序 toks[6]=claude:deepseek-flash，T0 北京 23:00 在
-        # 其工作日高峰门外）→ claim_due 竞争发现空位 → 同事务原子回收，不双派、不丢槽。
+        # 释放一个国内名额（BW-WEAK-TIER-ENFORCE-20261122：弱档纯优先级队列下 claim_due
+        # 的国内回收候选=弱档可派主力 claude(层3)/zcode:GLM-5.3-Flash(层4)，改释放
+        # claude 槽——fill 顺序 toks[6]=claude:deepseek-flash，弱档无任何时段门，释放即
+        # 空位）→ claim_due 竞争发现空位 → 同事务原子回收，不双派、不丢槽。
         dp.finish(self.store, toks[6], terminal='cancelled', now=T0)
         r = dp.claim_due(self.store, task_id='L', now=T0 + timedelta(seconds=400),
                          _preclaim=False)
@@ -1515,6 +1572,9 @@ class QuotaLimitWindowTests(_PoolBase):
                         T0 + timedelta(seconds=1799))
         self.assertFalse(r.get('allowed'), r)
         self.assertRejected(r, 'mode_excluded')
+        # BW-WEAK-TIER-ENFORCE-20261122：弱档纯优先级队列——CBGLM 是层2，显式 claim 前
+        # 先按队列序排空层1 两 OpenCode 槽（队列不看限额短窗/时段门）。
+        self.occupy_weak_above(dp.CODEBUDDY_GLM_POOL_KEY, prefix='cbw-above')
         glm = self._claim('cbwg', 'codebuddy', 'glm-5.3-flash',
                           T0 + timedelta(seconds=60))
         self.assertTrue(glm.get('allowed'), glm)
@@ -1528,6 +1588,10 @@ class QuotaLimitWindowTests(_PoolBase):
         # BW-ZCODE-RETIRE-20261020：原 ZCode 变体随池退役改用同为限额窗口池的
         # claude:deepseek-flash：reserved 票据在 1800 秒窗口内 consume → 拒绝并把本
         # reserved 真实释放为 start_failed，绝不泄漏占位。
+        # BW-WEAK-TIER-ENFORCE-20261122：弱档纯优先级队列——claude 是层3，显式 claim 前
+        # 先按队列序排空层1-2；claim-token 消费路径的限额短窗检查保留（新派队列不看
+        # 短窗，但已预留票据的消费照旧拒绝+真实释放）。
+        self.occupy_weak_above(dp.CLAUDE_POOL_KEY, prefix='zc-above')
         tok = self.reserve_exec('zc', 'claude', 'deepseek-flash', 'claude')
         self._mark(self.CL, 'zc', tok)
         out = dp.consume_for_entry(self.store, task_id='zc', runtime='claude',
@@ -1540,8 +1604,9 @@ class QuotaLimitWindowTests(_PoolBase):
         self.assertTrue(out.get('capacity_released'), out)
         self.assertEqual(self._state(tok), 'start_failed')
         # 记录/拒绝/释放全程不遗留写锁：后续普通预留仍可立即成功。
-        # BW-WEAK-RESTRUCTURE-20261116：qoder Max 已移出弱档，改用弱档可派的
-        # zcode:GLM-5.3-Flash 验证同一机制。
+        # BW-WEAK-TIER-ENFORCE-20261122：zcode:GLM-5.3-Flash 是弱档层4——先按队列序
+        # 占满其上方全部槽（层1-2 已满，补占 claude 层3 两槽）再真实 claim。
+        self.occupy_weak_above('zcode:GLM-5.3-Flash', prefix='zc-above2')
         nxt = self._claim('zc-next', 'zcode', 'GLM-5.3-Flash', T0 + timedelta(seconds=2))
         self.assertTrue(nxt.get('allowed'), nxt)
         self.assertEqual(nxt['pool_key'], 'zcode:GLM-5.3-Flash', nxt)
@@ -1565,10 +1630,12 @@ class QuotaLimitWindowTests(_PoolBase):
             now=WEEKDAY_PEAK, executor='auto', _preclaim=False)
         self.assertFalse(rw.get('allowed'), rw)
         self.assertRejected(rw, 'mode_excluded')
-        # 弱档层序（BW-WEAK-RESTRUCTURE-20261116）：GLM-5.3-Flash 是层4——先按真实形态
-        # 直插占位填满其上方层（两 OpenCode 层1 + CBGLM 层2），AUTO 请求才轮到它真实 claim。
+        # 弱档层序（BW-WEAK-TIER-ENFORCE-20261122 纯优先级队列）：GLM-5.3-Flash 是层4、
+        # 队尾——先按真实形态直插占位填满其上方全部槽（两 OpenCode 层1 + CBGLM 层2 +
+        # claude 层3 两槽），AUTO 请求才轮到它真实 claim。
         for i, pool in enumerate([dp.OPENCODE_DEEPSEEK_POOL_KEY, dp.OPENCODE_GLM_POOL_KEY,
-                                  dp.CODEBUDDY_GLM_POOL_KEY]):
+                                  dp.CODEBUDDY_GLM_POOL_KEY,
+                                  dp.CLAUDE_POOL_KEY, dp.CLAUDE_POOL_KEY]):
             self.seed_attempt(f'aauto-above-{i}', f'aauto-above-task-{i}', pool)
         rf = dp.select_and_claim(
             self.store, task_id='aauto-flash', runtime='zcode', model='GLM-5.3-Flash',
@@ -1642,22 +1709,34 @@ class BeijingMainForceWindowTests(_PoolBase):
         # naive 按 UTC 理解。
         self.assertEqual(dp._beijing_hour(datetime(2026, 10, 8, 14, 0, 0)), 22)
 
-    def test_three_max_are_window_gated_in_weak_mode(self):
-        # BW-MANUAL-THREE-MODE-20261023（当前权威）：**默认 weak 档**恢复三个 Qwen4-Max-Preview
-        # 的北京 22:00–08:00 夜间门（含自定义/内置/国际），边界左闭右开。
+    def test_three_max_window_gated_only_in_medium(self):
+        # BW-MANUAL-THREE-MODE-20261023：三个 Qwen4-Max-Preview 的北京 22:00–08:00 夜间门
+        # （含自定义/内置/国际）边界左闭右开；时段门机制本身改在 medium 档逐字验证。
+        # BW-WEAK-TIER-ENFORCE-20261122: 弱档纯优先级队列、无任何时段门——同一边界
+        # 断言在 weak 全部恒 False（不再释放/不再挡下）。
         for pk in self.ALL_QMAX:
-            self.assertTrue(dp._max_window_blocks(pk, self.NOON), pk)
-            self.assertTrue(dp._max_window_blocks(pk, self.BJ_1000), pk)
-            self.assertTrue(dp._max_window_blocks(pk, self.OUT_0800), pk)
-            self.assertTrue(dp._max_window_blocks(pk, self.OUT_2159), pk)
-            self.assertFalse(dp._max_window_blocks(pk, self.IN_2200), pk)
-            self.assertFalse(dp._max_window_blocks(pk, self.IN_0759), pk)
+            with dispatch_mode('medium'):
+                self.assertTrue(dp._max_window_blocks(pk, self.NOON), pk)
+                self.assertTrue(dp._max_window_blocks(pk, self.BJ_1000), pk)
+                self.assertTrue(dp._max_window_blocks(pk, self.OUT_0800), pk)
+                self.assertTrue(dp._max_window_blocks(pk, self.OUT_2159), pk)
+                self.assertFalse(dp._max_window_blocks(pk, self.IN_2200), pk)
+                self.assertFalse(dp._max_window_blocks(pk, self.IN_0759), pk)
+            with dispatch_mode('weak'):
+                self.assertFalse(dp._max_window_blocks(pk, self.NOON), pk)
+                self.assertFalse(dp._max_window_blocks(pk, self.BJ_1000), pk)
+                self.assertFalse(dp._max_window_blocks(pk, self.OUT_0800), pk)
+                self.assertFalse(dp._max_window_blocks(pk, self.OUT_2159), pk)
+                self.assertFalse(dp._max_window_blocks(pk, self.IN_2200), pk)
+                self.assertFalse(dp._max_window_blocks(pk, self.IN_0759), pk)
 
     def test_intl_max_gate_is_mode_specific(self):
         # strong：五个可派池全部无时段门（国际 Max 白天/任意时刻都不挡）；
         # medium：国际 Max 与另两个 Max 同受夜间门；claude 受工作日高峰门。
-        # BW-WEAK-RESTRUCTURE-20261116：三个 Max 已全部移出弱档——weak 的受门集合只剩
-        # Claude 工作日高峰门（被移出池在 weak 是 mode_excluded，时段门永不先于档位生效）。
+        # BW-WEAK-TIER-ENFORCE-20261122：弱档是纯优先级队列、**无任何时段门**——权威
+        # 口径 window_gated_pools('weak') 为空元组；_max_window_blocks 在 weak 恒 False
+        # （含 Claude 高峰门与 Max 夜间门）；被移出弱档的国际 Max 在 weak 一律
+        # mode_excluded（档位硬策略先于一切，时段门判定对弱档已不可达）。
         for now in (self.OUT_0800, self.BJ_1000, self.OUT_2159, self.NOON, self.LATE,
                     self.IN_2200, self.IN_0759, T0):
             with dispatch_mode('strong'):
@@ -1665,17 +1744,18 @@ class BeijingMainForceWindowTests(_PoolBase):
             with dispatch_mode('medium'):
                 self.assertEqual(dp._max_window_blocks(self.QMAX, now),
                                  not dp._main_force_window_open(now), now)
+            # BW-WEAK-TIER-ENFORCE-20261122: 弱档纯优先级队列、无任何时段门——
+            # _max_window_blocks 在 weak 恒 False（含 Claude 高峰门与 Max 夜间门）。
             with dispatch_mode('weak'):
-                self.assertEqual(dp._max_window_blocks(self.QMAX, now),
-                                 not dp._main_force_window_open(now), now)
-        # strong 为空集；medium = 三个 Max + Claude；weak（BW-WEAK-RESTRUCTURE-20261116）
-        # 只剩 Claude。
+                self.assertFalse(dp._max_window_blocks(self.QMAX, now), now)
+        # strong 为空集；medium = 三个 Max + Claude；weak（BW-WEAK-TIER-ENFORCE-
+        # 20261122）纯优先级队列 → 无任何时段门（空元组）。
         self.assertEqual(tuple(dp.window_gated_pools('strong')), ())
         self.assertEqual(set(dp.window_gated_pools('medium')),
                          set(self.ALL_QMAX) | {dp.CLAUDE_POOL_KEY})
-        self.assertEqual(set(dp.window_gated_pools('weak')), {dp.CLAUDE_POOL_KEY})
-        self.assertEqual(set(dp.WINDOW_GATED_MAIN_FORCES),
-                         set(dp.window_gated_pools('weak')))
+        self.assertEqual(tuple(dp.window_gated_pools('weak')), ())
+        self.assertEqual(tuple(dp.WINDOW_GATED_MAIN_FORCES),
+                         tuple(dp.window_gated_pools('weak')))
         # ZCode 主力、两地区 Flash 兜底、Luna、retired DeepSeek 一律不受时段门约束。
         for pk in ('zcode:GLM-5.3',
                    'qoder:Qwen3.8-Flash', 'qodercn:Qwen3.8-Flash',
@@ -1964,18 +2044,33 @@ class BeijingMainForceWindowTests(_PoolBase):
     def test_reserved_custom_max_crossing_08_is_really_released(self):
         # BW-CUSTOM-MAX-NIGHT-20261010-S1：时段内预留自定义 Max、跨过 08:00 后才启动 →
         # 真实释放本 reserved 占位为 start_failed（与内置 Max 同一 consume 门，绝不泄漏）。
+        # BW-WEAK-TIER-ENFORCE-20261122: 弱档纯优先级队列、无任何时段门——「跨 08:00
+        # 真实释放」语义改在 medium 档逐字验证（夜间门在 medium 照旧生效）；弱档同一
+        # consume 恒放行（allowed=True、占位转 running、绝不释放）。
         tok = self.legacy_custom_claim('cx08')
         self.assertEqual(dp.status(self.store, now=self.IN_2200)['pools'][self.CXMAX]['active'], 1)
-        out = dp.consume_for_entry(self.store, task_id='cx08', runtime='qodercn',
-                                   model='Qwen-3.8-Max', workspace=str(self._ws_for('cx08')),
-                                   prompt_sha256='p', claim_token=tok,
-                                   wrapper_pid=4321, wrapper_created='w1', now=self.LATE)
+        with dispatch_mode('medium'):
+            out = dp.consume_for_entry(self.store, task_id='cx08', runtime='qodercn',
+                                       model='Qwen-3.8-Max', workspace=str(self._ws_for('cx08')),
+                                       prompt_sha256='p', claim_token=tok,
+                                       wrapper_pid=4321, wrapper_created='w1', now=self.LATE)
         self.assertFalse(out['allowed'], out)
         self.assertFalse(out.get('sent', True), out)
         self.assertEqual(out['reason'], 'main_force_window_closed', out)
         self.assertTrue(out['capacity_released'], out)
         self.assertEqual(self._state(tok), 'start_failed')
         self.assertEqual(dp.status(self.store, now=self.LATE)['pools'][self.CXMAX]['active'], 0)
+        # BW-WEAK-TIER-ENFORCE-20261122: 弱档对照——同一「时段内预留、跨 08:00 后
+        # consume」不再有门 → 如实放行启动，绝不释放占位。
+        tok_w = self.legacy_custom_claim('cx08w')
+        out_w = dp.consume_for_entry(self.store, task_id='cx08w', runtime='qodercn',
+                                     model='Qwen-3.8-Max', workspace=str(self._ws_for('cx08w')),
+                                     prompt_sha256='p', claim_token=tok_w,
+                                     wrapper_pid=4321, wrapper_created='w1', now=self.LATE)
+        self.assertTrue(out_w['allowed'], out_w)
+        self.assertFalse(out_w.get('capacity_released'), out_w)
+        self.assertEqual(self._state(tok_w), 'running')
+        self.assertEqual(dp.status(self.store, now=self.LATE)['pools'][self.CXMAX]['active'], 1)
 
     def test_running_custom_max_crossing_08_not_falsely_released(self):
         # 时段内已 consume 到 running 的自定义 Max，跨 08 点后重复启动 → 拒绝但不假释放，

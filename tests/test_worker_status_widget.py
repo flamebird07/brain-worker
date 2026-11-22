@@ -473,16 +473,20 @@ class TestSnapshotStates(_WidgetBase):
             snap = self._snap(now=PEAK, probe=probe)
             cn = self._row(snap, dp.CN_MAX_POOL_KEY)
             self.assertEqual(cn['state'], 'running')
-            self.assertTrue(cn['window_blocked'])
+            self.assertFalse(cn['window_blocked'],
+                             'BW-WEAK-TIER-ENFORCE-20261122: weak 无任何时段门')
             self.assertTrue(cn['mode_excluded'])
             self.assertEqual(cn['mode_excluded_label'], '本档不参与')
             # 空闲的被移出弱档池（CN 自定义 Max / 国际 Max）整行隐藏。
             for pk in (dp.CN_CUSTOM_MAX_POOL_KEY, dp.QMAX_POOL_KEY):
                 self.assertNotIn(pk, {r['pool_key'] for r in snap['rows']}, pk)
             row = self._row(snap, dp.CLAUDE_POOL_KEY)
-            self.assertEqual(row['state'], 'window_closed')
-            self.assertTrue(row['window_blocked'])
-            self.assertEqual(row['state_label'], wsw.CLAUDE_PEAK_CLOSED_LABEL)
+            # BW-WEAK-TIER-ENFORCE-20261122: 弱档纯优先级队列——无任何时段门，claude
+            # 空闲行如实显示「空闲」（工作日高峰富标签口径移到中档，见下方 medium
+            # 分支断言），`window_blocked` 恒 False。
+            self.assertEqual(row['state'], 'idle')
+            self.assertFalse(row['window_blocked'])
+            self.assertEqual(row['state_label'], wsw.STATE_LABELS['idle'])
             # BW-WEAK-RESTRUCTURE-20261116：弱档无时段门的可派池空闲即「空闲」——
             # CodeBuddy GLM（弱档层2）原样无时段门（被移出的 CodeBuddy DeepSeek 空闲
             # 整行隐藏，改用仍参与弱档的无门池验证同一语义）。
@@ -1871,11 +1875,14 @@ class TestWindowClosedLabels(unittest.TestCase):
         utc22 = datetime(2026, 10, 7, 14, 0, tzinfo=timezone.utc)
         utc08 = datetime(2026, 10, 8, 0, 0, tzinfo=timezone.utc)
         max_pools = (dp.QMAX_POOL_KEY, dp.CN_MAX_POOL_KEY, dp.CN_CUSTOM_MAX_POOL_KEY)
-        for mode in ('medium', 'weak'):
-            for pk in max_pools:
-                self.assertFalse(dp._max_window_blocks(pk, utc22, mode), (pk, mode))
-                self.assertTrue(dp._max_window_blocks(pk, utc08, mode), (pk, mode))
         for pk in max_pools:
+            self.assertFalse(dp._max_window_blocks(pk, utc22, 'medium'), (pk, 'medium'))
+            self.assertTrue(dp._max_window_blocks(pk, utc08, 'medium'), (pk, 'medium'))
+        # BW-WEAK-TIER-ENFORCE-20261122: weak 纯优先级队列无任何时段门（两区 Qwen3.8-
+        # Flash 池也已移出弱档）；strong 无门。
+        for pk in max_pools:
+            self.assertFalse(dp._max_window_blocks(pk, utc22, 'weak'), (pk, 'weak'))
+            self.assertFalse(dp._max_window_blocks(pk, utc08, 'weak'), (pk, 'weak'))
             self.assertFalse(dp._max_window_blocks(pk, utc22, 'strong'), pk)
             self.assertFalse(dp._max_window_blocks(pk, utc08, 'strong'), pk)
 
@@ -1889,23 +1896,33 @@ class TestWindowClosedLabels(unittest.TestCase):
                       datetime(2026, 10, 1, 2, 0, tzinfo=timezone.utc),    # 北京十一 10:00
                       datetime(2026, 10, 8, 5, 0, tzinfo=timezone.utc),    # 北京周四 13:00
                       datetime(2026, 10, 8, 15, 0, tzinfo=timezone.utc))   # 北京 23:00
-        for mode in ('medium', 'weak'):
-            for now in peak_times:
-                self.assertTrue(dp._max_window_blocks(dp.CLAUDE_POOL_KEY, now, mode),
-                                (mode, now))
-                self.assertEqual(
-                    wsw.window_closed_display_label(dp.CLAUDE_POOL_KEY, now, mode),
-                    wsw.CLAUDE_PEAK_CLOSED_LABEL, (mode, now))
-            for now in open_times:
-                self.assertFalse(dp._max_window_blocks(dp.CLAUDE_POOL_KEY, now, mode),
-                                 (mode, now))
-                # 非时段外时绝不进入「时段外」展示分支（标签函数只对已判时段外的行调用）。
-                self.assertEqual(
-                    wsw.window_closed_display_label(dp.CLAUDE_POOL_KEY, now, mode),
-                    wsw.CLAUDE_PEAK_CLOSED_LABEL, (mode, now))
+        for now in peak_times:
+            self.assertTrue(dp._max_window_blocks(dp.CLAUDE_POOL_KEY, now, 'medium'),
+                            ('medium', now))
+        for now in open_times:
+            self.assertFalse(dp._max_window_blocks(dp.CLAUDE_POOL_KEY, now, 'medium'),
+                             ('medium', now))
+        # BW-WEAK-TIER-ENFORCE-20261122: weak 纯优先级队列无任何时段门——恒 False。
+        for now in peak_times + open_times:
+            self.assertFalse(dp._max_window_blocks(dp.CLAUDE_POOL_KEY, now, 'weak'),
+                             ('weak', now))
+        # BW-WEAK-TIER-ENFORCE-20261122: 弱档纯优先级队列——无任何时段门，weak 不再声明
+        # 受门池（window_gated_pools_for_mode('weak')==()），claude 的「工作日高峰」富
+        # 标签口径移到 medium；weak 显示层恒为通用「时段外」（标签函数只对已判时段外的
+        # 行调用，open_times 仅验证纯函数确定性，不改判定语义）。
+        for now in peak_times + open_times:
+            self.assertEqual(
+                wsw.window_closed_display_label(dp.CLAUDE_POOL_KEY, now, 'weak'),
+                wsw.STATE_LABELS['window_closed'], now)
+            self.assertEqual(
+                wsw.window_closed_display_label(dp.CLAUDE_POOL_KEY, now, 'medium'),
+                wsw.CLAUDE_PEAK_CLOSED_LABEL, now)
         for now in peak_times + open_times:
             self.assertFalse(dp._max_window_blocks(dp.CLAUDE_POOL_KEY, now, 'strong'), now)
-        self.assertIn(dp.CLAUDE_POOL_KEY, dp.WINDOW_GATED_MAIN_FORCES)
+        # BW-WEAK-TIER-ENFORCE-20261122: claude 的受门声明移到 medium；weak 口径常量为空。
+        self.assertNotIn(dp.CLAUDE_POOL_KEY, dp.WINDOW_GATED_MAIN_FORCES)
+        self.assertEqual(tuple(dp.WINDOW_GATED_MAIN_FORCES), ())
+        self.assertIn(dp.CLAUDE_POOL_KEY, dp.window_gated_pools('medium'))
         self.assertNotIn(dp.CLAUDE_POOL_KEY, dp.window_gated_pools('strong'))
 
     def test_display_only_no_state_gate_mutation(self):
@@ -1913,10 +1930,12 @@ class TestWindowClosedLabels(unittest.TestCase):
         now = datetime(2026, 10, 8, 2, 0, tzinfo=timezone.utc)  # 北京周四 10:00
         gated = (dp.CLAUDE_POOL_KEY, dp.CN_MAX_POOL_KEY,
                  dp.CN_CUSTOM_MAX_POOL_KEY, dp.QMAX_POOL_KEY)
-        for mode in ('medium', 'weak'):
-            for pk in gated:
-                self.assertTrue(dp._max_window_blocks(pk, now, mode), (pk, mode))
-            self.assertFalse(dp._max_window_blocks(dp.CODEBUDDY_POOL_KEY, now, mode))
+        for pk in gated:
+            self.assertTrue(dp._max_window_blocks(pk, now, 'medium'), (pk, 'medium'))
+        # BW-WEAK-TIER-ENFORCE-20261122: weak 无任何时段门——恒 False。
+        for pk in gated:
+            self.assertFalse(dp._max_window_blocks(pk, now, 'weak'), (pk, 'weak'))
+        self.assertFalse(dp._max_window_blocks(dp.CODEBUDDY_POOL_KEY, now, 'medium'))
         for pk in gated + (dp.CODEBUDDY_POOL_KEY,):
             self.assertFalse(dp._max_window_blocks(pk, now, 'strong'), pk)
         # 纯函数只读：取标签不改变任何判定。

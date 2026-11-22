@@ -170,13 +170,16 @@ class AuthorizationTests(_Base):
             self.assertIn(r['selected']['pool_key'], dp.OPENCODE_POOL_KEYS, r)
             eligible = {x['pool_key']: x for x in r['eligible_candidates']}
             # BW-WEAK-RESTRUCTURE-20261116: 弱档 ZCode 只剩 GLM-5.3-Flash（层=4、独立 1 槽）；
-            # CodeBuddy GLM 层=2、claude 层=3（白天被高峰门关住）。
+            # CodeBuddy GLM 层=2。BW-WEAK-TIER-ENFORCE-20261122: weak 无时段门——claude
+            # 白天也合格（层=3、容量 2），不再被高峰门关住。
             self.assertEqual(eligible[dp.ZCODE_FLASH_POOL_KEY]['priority'], 4)
             self.assertEqual(eligible[dp.ZCODE_FLASH_POOL_KEY]['capacity'], 1)
             self.assertEqual(eligible[dp.OPENCODE_DEEPSEEK_POOL_KEY]['priority'], 1)
             self.assertEqual(eligible[dp.CODEBUDDY_GLM_POOL_KEY]['priority'], 2)
             self.assertEqual(eligible[dp.CODEBUDDY_GLM_POOL_KEY]['capacity'], 1)
-            for pk in (dp.CLAUDE_POOL_KEY, dp.QMAX_POOL_KEY, dp.CN_MAX_POOL_KEY,
+            self.assertEqual(eligible[dp.CLAUDE_POOL_KEY]['priority'], 3)
+            self.assertEqual(eligible[dp.CLAUDE_POOL_KEY]['capacity'], 2)
+            for pk in (dp.QMAX_POOL_KEY, dp.CN_MAX_POOL_KEY,
                        dp.CN_CUSTOM_MAX_POOL_KEY, dp.ZCODE_POOL_KEY, dp.SONUS_POOL_KEY):
                 self.assertNotIn(pk, eligible, pk)
             excluded = {x['pool_key']: x for x in r['excluded_candidates_with_reason']}
@@ -185,8 +188,9 @@ class AuthorizationTests(_Base):
             # 也如实 mode_excluded，绝不冒充 main_force_limited）。
             self.assertEqual(excluded[dp.CODEBUDDY_POOL_KEY]['reason'],
                              'mode_excluded')
-            self.assertEqual(excluded[dp.CLAUDE_POOL_KEY]['reason'], 'window_closed',
-                             excluded)
+            # BW-WEAK-TIER-ENFORCE-20261122: weak 无时段门——claude 合格进 eligible，
+            # 不再出现在 excluded（旧口径的 window_closed 已不存在）。
+            self.assertNotIn(dp.CLAUDE_POOL_KEY, excluded)
             # BW-WEAK-RESTRUCTURE-20261116: 全部 Qoder 池与 zcode:GLM-5.3 已移出弱档，
             # 时段门不再对它们生效（档位排除先于时段门）。
             for pk in (dp.QMAX_POOL_KEY, dp.CN_MAX_POOL_KEY, dp.CN_CUSTOM_MAX_POOL_KEY,
@@ -698,9 +702,9 @@ class WindowAndLimitTests(_Base):
     def test_day_peak_gates_close_max_and_claude_select_opencode(self):
         self.build_store()
         r = self.plan(self.auth('auto', 'T', 's2', LEGACY_MAINS + ALL_FLASH), now=T_DAY)
-        # BW-WEAK-RESTRUCTURE-20261116: 白天弱档只剩 claude 高峰门；全部 Qoder 池与
-        # zcode:GLM-5.3 已移出弱档 → mode_excluded（档位硬策略先于时段门）。
-        self.assertEqual(r['candidate_filters'][dp.CLAUDE_POOL_KEY], 'window_closed', r)
+        # BW-WEAK-TIER-ENFORCE-20261122: 白天弱档纯优先级队列、无任何时段门——claude
+        # 合格；全部 Qoder 池与 zcode:GLM-5.3 已移出弱档 → mode_excluded（档位硬策略）。
+        self.assertEqual(r['candidate_filters'][dp.CLAUDE_POOL_KEY], 'eligible', r)
         self.assertEqual(r['candidate_filters']['qoder:Qwen4-Max-Preview'],
                          'mode_excluded')
         self.assertEqual(r['candidate_filters'][dp.CN_MAX_POOL_KEY], 'mode_excluded')
@@ -715,7 +719,8 @@ class WindowAndLimitTests(_Base):
         r2 = self.plan(self.auth('auto', 'T2', 's2', LEGACY_MAINS + ALL_FLASH),
                        task='T2', now=T_DAY)
         self.assertEqual(r2['selected']['pool_key'], dp.OPENCODE_GLM_POOL_KEY, r2)
-        self.assertEqual(r2['candidate_filters'][dp.CLAUDE_POOL_KEY], 'window_closed', r2)
+        # BW-WEAK-TIER-ENFORCE-20261122: weak 无时段门——claude 合格。
+        self.assertEqual(r2['candidate_filters'][dp.CLAUDE_POOL_KEY], 'eligible', r2)
 
     def test_weak_auto_prefers_flash_to_zcode(self):
         self.build_store()
@@ -782,11 +787,14 @@ class WindowAndLimitTests(_Base):
         # 占满两 OpenCode(层1)、CodeBuddy GLM(层2)、claude(层3) 全部槽位后，最高可用层
         # 落到 zcode:GLM-5.3-Flash(层4)；被移出的旧主力/两区 Flash 绝不参与
         # （mode_excluded，绝不借道兜底）。
-        self.reserve('a', 'claude', 'deepseek-flash', executor='claude')
-        self.reserve('b', 'claude', 'deepseek-flash', executor='claude')
+        # BW-WEAK-TIER-ENFORCE-20261122: 弱档纯优先级队列——真实 reserve 必须按队序
+        # （层1 两 OpenCode → 层2 CodeBuddy GLM → 层3 claude×2）占位，跳队请求会被
+        # routing_required 到队首而非 claim。
         self.reserve('o1', 'opencode', dp.OPENCODE_DEEPSEEK_MODEL, executor='opencode')
         self.reserve('o2', 'opencode', dp.OPENCODE_GLM_MODEL, executor='opencode')
         self.reserve('g1', 'codebuddy', 'glm-5.3-flash', executor='codebuddy')
+        self.reserve('a', 'claude', 'deepseek-flash', executor='claude')
+        self.reserve('b', 'claude', 'deepseek-flash', executor='claude')
         r = self.plan(self.auth('auto', 'T', 's2', ALL_MAINS + ALL_FLASH), now=T_NIGHT)
         self.assertEqual(r['candidate_filters'][dp.CLAUDE_POOL_KEY], 'capacity_full')
         self.assertEqual(r['candidate_filters'][dp.CODEBUDDY_GLM_POOL_KEY],
@@ -1224,7 +1232,8 @@ class PermissionGrantsTests(_Base):
                          'permission_incompatible')
         self.assertEqual(r['candidate_filters'][dp.ZCODE_FLASH_POOL_KEY],
                          'permission_incompatible')
-        self.assertEqual(r['candidate_filters'][dp.CLAUDE_POOL_KEY], 'window_closed')
+        # BW-WEAK-TIER-ENFORCE-20261122: weak 无时段门——claude 合格（队列接管排序）。
+        self.assertEqual(r['candidate_filters'][dp.CLAUDE_POOL_KEY], 'eligible')
         self.assertEqual(r['candidate_filters'][dp.ZCODE_POOL_KEY], 'mode_excluded', r)
         self.assertEqual(r['candidate_filters'][dp.QFLASH_POOL_KEY], 'mode_excluded')
         self.assertNotEqual(r['selected']['runtime'], 'zcode')
@@ -1287,11 +1296,14 @@ class PermissionGrantsTests(_Base):
                          'permission_incompatible')
         self.assertEqual(r['candidate_filters'][dp.OPENCODE_DEEPSEEK_POOL_KEY],
                          'permission_incompatible')
-        self.assertEqual(r['candidate_filters'][dp.CLAUDE_POOL_KEY], 'window_closed')
+        # BW-WEAK-TIER-ENFORCE-20261122: weak 无时段门，且 claude 支持 read_dirs 授权
+        # （能力过滤独立于档位/时段——本用例的本意）——claude 合格并当选；其余弱档池
+        # permission_incompatible，档外池 mode_excluded。
+        self.assertEqual(r['candidate_filters'][dp.CLAUDE_POOL_KEY], 'eligible')
         self.assertEqual(r['candidate_filters'][dp.CODEBUDDY_POOL_KEY], 'mode_excluded')
         self.assertEqual(r['candidate_filters'][dp.ZCODE_POOL_KEY], 'mode_excluded')
-        self.assertEqual(r['refused'], 'no_eligible_candidate', r)
-        self.assertIsNone(r['selected'], r)
+        self.assertIsNone(r['refused'], r)
+        self.assertEqual(r['selected']['pool_key'], dp.CLAUDE_POOL_KEY, r)
         # BW-WEAK-RESTRUCTURE-20261116: read_dirs 能力候选（qoder Max 层=1）在 strong
         # 白天（无时段门）真实选中——能力过滤与档位/时段各自如实、互不冒充。
         with dispatch_mode('strong'):
@@ -1466,7 +1478,8 @@ class PermissionGrantsTests(_Base):
                          'permission_incompatible')
         self.assertEqual(r['candidate_filters'][dp.ZCODE_FLASH_POOL_KEY],
                          'permission_incompatible')
-        self.assertEqual(r['candidate_filters'][dp.CLAUDE_POOL_KEY], 'window_closed')
+        # BW-WEAK-TIER-ENFORCE-20261122: weak 无时段门——claude 合格（队列接管排序）。
+        self.assertEqual(r['candidate_filters'][dp.CLAUDE_POOL_KEY], 'eligible')
         self.assertEqual(r['candidate_filters'][dp.ZCODE_POOL_KEY], 'mode_excluded')
         self.assertEqual(r['selected']['pool_key'], dp.CODEBUDDY_GLM_POOL_KEY, r)
         self.assertEqual(r['selected_reason'], 'main_force_selected', r)

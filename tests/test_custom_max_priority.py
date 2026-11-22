@@ -175,16 +175,21 @@ class CustomMaxPriorityTests(_Base):
         self.assertEqual(target, ZCODE)
 
     def test_day_all_max_excluded_in_weak_mode(self):
-        # BW-WEAK-RESTRUCTURE-20261116: 弱档只剩 Claude 高峰门——白天三个 Max 与
-        # zcode:GLM-5.3 都整档不在 weak 候选（档位排除先于时段门）；弱档 ZCode 用
-        # zcode:GLM-5.3-Flash；claude 工作日 10:00 属高峰 → 高峰门照旧关。
+        # BW-WEAK-RESTRUCTURE-20261116: 白天三个 Max 与 zcode:GLM-5.3 都整档不在 weak
+        # 候选（档位排除先于一切）；弱档 ZCode 用 zcode:GLM-5.3-Flash。
+        # BW-WEAK-TIER-ENFORCE-20261122: 弱档纯优先级队列、无任何时段门——claude 在
+        # weak 任何时刻（含工作日 10:00 高峰）都恒在候选；Claude 高峰门机制本身改在
+        # medium 档验证（同一时刻 claude 不在 medium 候选）。
         self.fill_codebuddy()
         with closing(dp.connect(self.store)) as conn:
             elig = dp._eligible_main_forces(conn, False, DAY)
         for pk in (CN_MAX, CN_CUSTOM_MAX, QMAX, ZCODE, CODEBUDDY):
             self.assertNotIn(pk, elig)
         self.assertIn(dp.ZCODE_FLASH_POOL_KEY, elig)
-        self.assertNotIn(CLAUDE, elig)  # 工作日 10:00 属高峰 → claude 恢复高峰门
+        self.assertIn(CLAUDE, elig)  # 弱档无高峰门 → 工作日 10:00 也恒在候选
+        with dispatch_mode('medium'), closing(dp.connect(self.store)) as conn:
+            elig_m = dp._eligible_main_forces(conn, False, DAY)
+        self.assertNotIn(CLAUDE, elig_m)  # 工作日 10:00 属高峰 → medium 高峰门照旧关
         self.assertIn(self.select(ZCODE, DAY)[0], dp.OPENCODE_POOL_KEYS)
 
     def test_day_max_all_day_in_strong_mode(self):
@@ -272,6 +277,12 @@ class SameOrderAndGuardsTests(_Base):
         # 同受单写守卫约束）。BW-WEAK-RESTRUCTURE-20261116: codebuddy:deepseek-v4.1-flash
         # 已无任何档位可新派——单写守卫用仍处弱档层2的 codebuddy:glm-5.3-flash 复现
         # （同 workspace 第二请求仍拒）。
+        # BW-WEAK-TIER-ENFORCE-20261122: 弱档纯优先级队列——先按队序占满层1 两 OpenCode，
+        # 层2 codebuddy:glm-5.3-flash 才是队首可被 claim（与 test_zcode_appserver_direct
+        # 的 _occupy_higher_weak_slots 同一模式）；单写守卫本意不变。
+        for i, m in enumerate((dp.OPENCODE_DEEPSEEK_MODEL, dp.OPENCODE_GLM_MODEL)):
+            occ = self.reserve(f'pre-weak-oc-{i}', 'opencode', m, executor='opencode')
+            self.assertTrue(occ.get('allowed'), (m, occ))
         shared = self.ws('shared')
         r1 = self.reserve('w1', 'codebuddy', 'glm-5.3-flash',
                           executor='codebuddy', ws=shared)

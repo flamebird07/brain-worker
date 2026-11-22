@@ -16,7 +16,9 @@
 3. **Claude Code 调到弱档倒数第二**——`claude:deepseek-flash`（容量 2、工作日高峰门）位于 CodeBuddy GLM 之后、ZCode GLM-5.3-Flash（最后）之前。
 4. **`codebuddy:deepseek-v4.1-flash` 从弱档取消**——同 Qoder 池，自此无任何档位可新派（mode_excluded，登记保留）。
 
-当前新派范围：strong 常态 4 池/5 槽（两内置 Qwen4-Max-Preview > Claude > ZCode，全部无时段门）；medium **4 池/5 槽**（两内置 Qwen4-Max-Preview > Claude > ZCode；Max 夜间门 + Claude 高峰门）；weak **5 池/6 槽**（两 OpenCode 免费模型 > CodeBuddy GLM > Claude > ZCode GLM-5.3-Flash；仅 Claude 高峰门）。物理总容量 **17**。浮窗弱档空闲只显示 5 池，被移出弱档的池有真实在途遗留时整行保留并标「本档不参与」。
+**2026-11-22 当前权威：BW-WEAK-TIER-ENFORCE-20261122（用户明确指令：简化逻辑——弱档只看优先级）**。weak = **纯优先级队列**：按层序取第一个有空位的池（两 OpenCode 免费模型 > CodeBuddy GLM > Claude > ZCode GLM-5.3-Flash），**不参照 availability、限额短窗、时段门、executor 组合冲突、入口运行时等任何其它判断**；请求组合不是队首 → routing_required 到队首（Cursor/Codex 等宿主直接调 zcode 入口也会被队列接管，绝不跳队直派 zcode）；队列全满 → capacity_full。弱档**无任何时段门**（Claude 高峰门从弱档移除，仅存于 medium）。物理总容量 **17**。浮窗弱档空闲只显示 5 池，被移出弱档的池有真实在途遗留时整行保留并标「本档不参与」。
+
+当前新派范围：strong 常态 4 池/5 槽（两内置 Qwen4-Max-Preview > Claude > ZCode，全部无时段门）；medium **4 池/5 槽**（两内置 Qwen4-Max-Preview > Claude > ZCode；Max 夜间门 + Claude 高峰门）；weak **5 池/6 槽**（纯优先级队列，见上）。物理总容量 **17**。
 
 **2026-11-15 当前权威：BW-QWEN4-SONUS-REMOVE-20261115（用户明确指令；弱档口径已被上方 BW-WEAK-RESTRUCTURE-20261116 覆盖）**。两项变更：
 
