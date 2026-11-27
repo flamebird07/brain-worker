@@ -2141,7 +2141,7 @@ def reserve(store_path=None, *, task_id, runtime, model, workspace, prompt_sha25
             stage=None, chat_id=None, token=None, now=None, origin='reserve',
             executor='auto', quota_store=None, quota_routes=None,
             probe_ticket=None, codebuddy_glm_allowed=False,
-            _preclaim=True) -> dict:
+            _preclaim=True, _planned_mode=None) -> dict:
     """为确切 (runtime, model) 预留一个 claim。修订后与 select-and-claim 共用统一国内
     策略（_domestic_policy）：空库/主力有空时 reserve Flash 一律 routing_required 到
     主力（不保留任何绕过主力顺序的口子）；reserve Luna 一律拒绝（只能经 ask 票据 +
@@ -2184,18 +2184,29 @@ def reserve(store_path=None, *, task_id, runtime, model, workspace, prompt_sha25
             if busy is not None:
                 conn.execute('ROLLBACK')
                 return _workspace_busy_reject(task_id, pk, busy)
-            zcode_blocked = _zcode_availability_blocked(quota_store, now=now,
-                                                        routes_path=quota_routes)
-            eligible = _eligible_main_forces(conn, zcode_blocked, now,
-                                             codebuddy_glm_allowed=codebuddy_glm_allowed,
-                                             mode=mode)
-            probe_allowed = _probe_allowed(quota_store, probe_ticket, now=now)
-            verdict, target = _domestic_policy(conn, pk, now, executor=executor,
-                                               eligible=eligible,
-                                               zcode_blocked=zcode_blocked,
-                                               probe_allowed=probe_allowed,
-                                               codebuddy_glm_allowed=codebuddy_glm_allowed,
-                                               mode=mode)
+            if _planned_mode is not None and mode != _planned_mode:
+                conn.execute('ROLLBACK')
+                return _reject('dispatch_mode_changed', task_id, pk,
+                               ['dispatch mode changed after planning; replan before reserving'])
+            if _planned_mode == 'weak' and pk in dm.allowed_pools_for_mode(mode):
+                # The planner already ordered the task's authorized, eligible candidates.
+                # Recheck capacity atomically for that exact pool; never route outside the scope.
+                has_room = (_domestic_active(conn) < DOMESTIC_TOTAL_CAPACITY
+                            and _has_own_capacity(conn, pk))
+                verdict, target = ('claim', pk) if has_room else ('full', None)
+            else:
+                zcode_blocked = _zcode_availability_blocked(quota_store, now=now,
+                                                            routes_path=quota_routes)
+                eligible = _eligible_main_forces(conn, zcode_blocked, now,
+                                                 codebuddy_glm_allowed=codebuddy_glm_allowed,
+                                                 mode=mode)
+                probe_allowed = _probe_allowed(quota_store, probe_ticket, now=now)
+                verdict, target = _domestic_policy(conn, pk, now, executor=executor,
+                                                   eligible=eligible,
+                                                   zcode_blocked=zcode_blocked,
+                                                   probe_allowed=probe_allowed,
+                                                   codebuddy_glm_allowed=codebuddy_glm_allowed,
+                                                   mode=mode)
             if verdict == MODE_EXCLUDED:
                 conn.execute('ROLLBACK')
                 return _reject(MODE_EXCLUDED, task_id, pk,

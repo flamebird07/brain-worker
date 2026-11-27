@@ -180,6 +180,25 @@ class PureFunctionTests(unittest.TestCase):
             proc.communicate(timeout=2)
         self.assertLess(__import__('time').monotonic() - started, 1.5)
 
+    def test_workspace_boundary_event_stops_real_child_even_without_idle_watch(self):
+        with tempfile.TemporaryDirectory() as tmp:
+            workspace = Path(tmp).resolve()
+            raw = _jsonl([ev_tool(status='error',
+                                  error='Permission denied [{"permission":"external_directory"}]',
+                                  input={'filePath': str(workspace / 'input.txt')})]) + b'\n'
+            process = subprocess.Popen(
+                [sys.executable, '-c',
+                 f'import sys,time; sys.stdout.buffer.write({raw!r}); sys.stdout.flush(); time.sleep(20)'],
+                stdin=subprocess.PIPE, stdout=subprocess.PIPE, stderr=subprocess.PIPE)
+            try:
+                with self.assertRaises(od.WorkspaceBoundaryDenied):
+                    od._communicate_with_no_progress_watch(
+                        process, b'', total_seconds=5, idle_seconds=0, workspace=workspace)
+            finally:
+                process.kill()
+                process.communicate(timeout=5)
+            self.assertFalse(od._workspace_boundary_denied(raw, workspace / 'other'))
+
     def test_build_argv_shape_and_model_hard_gate(self):
         argv = od.build_argv('C:/tools/opencode.exe', DEEPSEEK)
         self.assertEqual(argv, ['C:/tools/opencode.exe', 'run', '--pure', '--model',
@@ -201,6 +220,7 @@ class PureFunctionTests(unittest.TestCase):
         self.assertEqual(cfg.get('allowed_tools'), [])
         content = od.build_opencode_config(cfg)
         self.assertEqual(content['share'], 'disabled')
+        self.assertIs(content['snapshot'], False)
         self.assertEqual(content['mcp'], {})
         self.assertEqual(content['plugin'], [])
 
@@ -540,7 +560,8 @@ class LifecycleTests(unittest.TestCase):
         kwargs = dict(workspace=str(self.ws), prompt_file=self.prompt,
                       out_dir=self.out, stage=STAGE, task_id=task, model=model,
                       prompt_sha256=self.sha(), claim_token=token, now=NOW,
-                      popen_factory=fake, environ={'PATH': 'C:/x'},
+                      popen_factory=fake, environ={'PATH': 'C:/x', 'PWD': str(self.base),
+                                                'OLDPWD': str(self.base)},
                       dispatch_store=self.store,
                       child_prober=lambda pid: {'state': 'dead', 'created': 'c1'})
         kwargs.update(over)
@@ -569,7 +590,9 @@ class LifecycleTests(unittest.TestCase):
         # argv / cwd / 单次 CLI 调用
         self.assertEqual(fake.argv, [sys.executable, 'run', '--pure', '--model',
                                      f'opencode/{DEEPSEEK}', '--format', 'json'])
-        self.assertEqual(fake.cwd, str(self.ws))
+        self.assertEqual(fake.cwd, str(self.ws.resolve()))
+        self.assertEqual(fake.env['PWD'], fake.cwd)
+        self.assertNotIn('OLDPWD', fake.env)
         self.assertEqual(len(self.sink), 1)
         # stdin：完整九节契约（含本轮身份）+ 任务原文，不裁剪
         sent = fake.stdin_data
@@ -581,6 +604,7 @@ class LifecycleTests(unittest.TestCase):
         # env 隔离
         content = json.loads(fake.env['OPENCODE_CONFIG_CONTENT'])
         self.assertEqual(content['share'], 'disabled')
+        self.assertIs(content['snapshot'], False)
         self.assertEqual(content['permission'],
                          {'*': 'deny', 'read': 'allow', 'edit': 'allow',
                           'external_directory': 'deny'})
@@ -624,6 +648,16 @@ class LifecycleTests(unittest.TestCase):
         self.assertEqual(request['sent_payload_sha256'],
                          hashlib.sha256(sent).hexdigest())
         self.assertEqual(request['timeout_seconds'], od.DEFAULT_TIMEOUT_SECONDS)
+
+    def test_boundary_denial_with_late_success_is_failed_and_released(self):
+        denial = ev_tool(status='error',
+                         error='Permission denied [{"permission":"external_directory"}]',
+                         input={'filePath': str(self.ws.resolve() / 'input.txt')})
+        raw = _jsonl([denial]) + b'\n' + success_stream(workspace=str(self.ws))
+        result = self.run_entry(FakePopen(raw, sink=self.sink))
+        self.assertTrue(result['workspace_boundary_denied'])
+        self.assertFalse(result['passed'])
+        self.assertTrue(result['capacity_release']['released'])
 
     def test_retired_glm_is_refused_before_dispatch(self):
         fake = FakePopen(b'', sink=self.sink)

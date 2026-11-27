@@ -1236,7 +1236,10 @@ def main():
     child = None
     try:
         with (out / 'stdout.json').open('wb') as stdout, (out / 'stderr.log').open('wb') as stderr:
-            child = subprocess.Popen(argv, stdin=subprocess.PIPE, stdout=stdout, stderr=stderr)
+            child_env = dict(os.environ, PWD=str(work))
+            child_env.pop('OLDPWD', None)
+            child = subprocess.Popen(argv, cwd=str(work), env=child_env,
+                                     stdin=subprocess.PIPE, stdout=stdout, stderr=stderr)
             bind = dp.bind_child(dispatch_store, claim_token, child.pid,
                                  wrapper_pid=wrapper_pid, wrapper_created=wrapper_created)
             if not bind.get('bound'):

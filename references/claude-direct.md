@@ -53,8 +53,8 @@ python scripts/claude_direct.py \
 - runtime `claude`，池 `claude:deepseek-flash`，`CLAUDE_CAPACITY = 2`（BW-CLAUDE-CAPACITY2 由 1 增至 2），
   `MAIN_FORCE_CAPACITY[CLAUDE_POOL_KEY] = 2`。
 - **已登记入主力体系**：`claude:deepseek-flash` 在 `MAIN_FORCE_POOLS`/`MAIN_FORCE_KEYS`/
-  `MAIN_FORCE_CAPACITY` 内，`DOMESTIC_TOTAL_CAPACITY = 15`（含 ZCode 恢复的 1 槽与两个
-  CodeBuddy 精确模型各 1 槽，由 `MAIN_FORCE+OVERFLOW` 求和自动得出）；
+  `MAIN_FORCE_CAPACITY` 内。国内总容量由 `dispatch_pool.DOMESTIC_TOTAL_CAPACITY` 提供，
+  当前为 16。
   `_domestic_active` 统计所有非 Luna 在途 attempt，**claude 在途计入国内总额**。
 - **独立组 claude**：committed 由 attempts 真实提交历史
   `_count_committed_claude` 统计，**绝不污染** committed_zcode/committed_qoder；

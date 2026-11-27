@@ -1,41 +1,17 @@
-"""entry runtime 实存探针（BW-UNIFIED-DESKTOP-ENTRY-20261020 R1）。
+"""Read-only discovery of default worker entry configuration and runtime files.
 
-根因回顾：stage_selection 裁决候选时从不校验执行器配置的运行时是否真实存在，把死
-通道当合格候选选中，白烧一轮才在派发预检炸出 FileNotFoundError；round_failed_candidates
-被 structured_limit_window_expired_no_inflight 清空后同一死执行器又按优先级 0 被重新选中。
-
-本模块**只做只读可见性，不做资格门**：`_zcode_availability_blocked()` 已被用户的
-BW-SIMPLE-PRIORITY-RETRY-S4 政策刻意中和为恒返回 None（绝不因本函数而永久或到期后挡
-新轮真实尝试）；把 runtime 缺失做成硬资格门会与该现行用户决定直接冲突，升级需用户单独
-拍板。因此探针结果只进回执两个附加字段，绝不影响 selected / selected_reason / 过滤。
-
-三态口径：
-- ``present``：该 runtime 的入口配置可加载，且其声明的运行时文件逐个存在；
-- ``missing``：入口配置**存在**、但其指向的运行时文件**确定不存在**（加载器
-  FileNotFoundError 或本探针的路径实存校验不过）——这正是本轮真实事故的形态，也是
-  **唯一可作硬资格门依据**的状态；
-- ``unknown``：无法判定——**入口配置文件本身不存在**（该引擎副本未配置该执行器；
-  正式入口还支持 --config 显式传参，无缺省配置绝不等于死通道）、配置结构坏、非
-  FileNotFoundError 的加载器异常、或依赖环境的解析失败（PATH/OPENCODE_EXE 发现、
-  相对可执行名）。**unknown 绝不能被读成「正常」，也绝不能作为硬门依据。**
-
-（R1G 修订，2026-10-20：最初版本把「配置文件不存在」也归 missing，导致无私有配置的
-裸仓库/CI 环境里硬门把全部候选挡成 no_eligible_candidate——60 项规划器测试实爆。
-环境相关性是判定边界：只有配置在、文件不在才是物理事实。）
-
-复用各入口自己的加载器（load_entry_config / load_zcode_config / load_cn_config /
-resolve_executable），不另写一套解析，规则天然与真实派发预检同源。特别注意 claude：
-其 ``load_entry_config()`` 只校验 JSON 对象存在，真实运行时是 ``build_argv()`` 用的
-``executable`` 与 ``launcher_args`` 里的绝对路径，必须额外逐个校验存在，否则探针会误报
-present（本轮 Claude 事故：cli.js 整树被清而配置 JSON 完好）。
-
-安全边界：纯只读——只调用加载器与路径 stat/which，零子进程、零写入；绝不读取或回显
-``credential_source`` / token，绝不调用 ``claude_direct.resolve_token()``。任何异常都
-在内部消化为 unknown，绝不让探针把规划器搞崩。同一次调用内按 runtime 缓存（两个
-codebuddy 池共用同一 runtime 与配置，只探一次）。本文件导入即无副作用。
+present means the configured or discovered runtime is available locally.
+missing means a configuration points to a missing runtime file.
+unconfigured means default configuration/discovery supplied no runtime.
+unknown means runtime availability could not be determined. Explicit launch
+configs may differ from the defaults inspected here. This probe never resolves
+credentials, starts an executor, or writes state.
 """
 from __future__ import annotations
 
+import argparse
+import json
+import os
 import shutil
 import sys
 from pathlib import Path
@@ -54,6 +30,7 @@ import zcode_direct       # noqa: E402
 PRESENT = 'present'
 MISSING = 'missing'
 UNKNOWN = 'unknown'
+UNCONFIGURED = 'unconfigured'
 
 
 def _load_status(load):
@@ -69,12 +46,12 @@ def _load_status(load):
     return PRESENT, cfg
 
 
-def _configured_load_status(config_path, load):
+def _configured_load_status(config_path, load, fallback=None):
     """R1G 判定边界：入口配置文件本身不存在 = 该引擎副本未配置该执行器 →
-    (UNKNOWN, None)，绝不判 missing（正式入口支持 --config 显式传参，无缺省配置
+    (UNCONFIGURED, None)，绝不判 missing（正式入口支持 --config 显式传参，无缺省配置
     不是物理死通道；否则裸仓库/CI 会被硬门清场）。配置存在才交给加载器判定。"""
-    if not Path(config_path).is_file():
-        return UNKNOWN, None
+    if not Path(config_path).is_file() and (fallback is None or not fallback().is_file()):
+        return UNCONFIGURED, None
     return _load_status(load)
 
 
@@ -87,14 +64,16 @@ def _probe_codebuddy() -> str:
 
 def _probe_qoder() -> str:
     # 同上：node、qodercli 绝对且存在。
-    status, _ = _configured_load_status(qd.DEFAULT_CONFIG, qd.load_entry_config)
+    status, _ = _configured_load_status(qd.DEFAULT_CONFIG, qd.load_entry_config,
+                                        qd.installed_engine_config)
     return status
 
 
 def _probe_qodercn() -> str:
     # cli 存在文件、config_dir 存在目录、model_ids 非空——加载器已全部强制；
     # model_ids 结构坏抛 ValueError，如实归 unknown 而非 missing。
-    status, _ = _configured_load_status(qd.DEFAULT_CN_CONFIG, qd.load_cn_config)
+    status, _ = _configured_load_status(qd.DEFAULT_CN_CONFIG, qd.load_cn_config,
+                                        qd.installed_engine_cn_config)
     return status
 
 
@@ -140,13 +119,11 @@ def _probe_claude() -> str:
 
 
 def _probe_opencode() -> str:
-    cfg_path = Path(opencode_direct.DEFAULT_CONFIG)
-    cfg = {}
-    if cfg_path.is_file():
-        status, loaded = _load_status(opencode_direct.load_entry_config)
-        if status is not PRESENT:
-            return status
-        cfg = loaded or {}
+    configured = (Path(opencode_direct.DEFAULT_CONFIG).is_file()
+                  or opencode_direct.installed_engine_entry_config().is_file())
+    status, cfg = _load_status(opencode_direct.load_entry_config)
+    if status != PRESENT:
+        return status
     # 无配置是合法形态（{} 走 PATH 发现）。判定链：cfg.executable/exe →
     # OPENCODE_EXE → PATH。只有「配置显式给出绝对路径而该文件不存在」才是确凿
     # missing；无配置/相对名/PATH、OPENCODE_EXE 的环境性成败一律不作 missing。
@@ -157,7 +134,9 @@ def _probe_opencode() -> str:
     try:
         opencode_direct.resolve_executable(cfg)
     except ValueError:
-        return MISSING if absolute_configured else UNKNOWN
+        if absolute_configured:
+            return MISSING
+        return UNKNOWN if configured or os.environ.get('OPENCODE_EXE') else UNCONFIGURED
     except Exception:
         return UNKNOWN
     return PRESENT
@@ -204,3 +183,32 @@ def probe_entry_runtimes(pool_keys) -> tuple[dict, list]:
         status_map[pk] = probe_runtime(runtime, _cache=cache)
     missing = [pk for pk, s in status_map.items() if s == MISSING]
     return status_map, missing
+
+
+def opencode_tool_profile():
+    """Report only effective tool names and whether Bash is enabled."""
+    try:
+        config = opencode_direct.build_opencode_config(opencode_direct.load_entry_config())
+    except (ValueError, OSError):
+        return None
+    tools = sorted(name for name, rule in config['permission'].items() if rule == 'allow')
+    return {'allowed_tools': tools, 'command_execution': 'bash' in tools}
+
+
+def main(argv=None):
+    parser = argparse.ArgumentParser(description='Inspect configured worker runtimes without launching them')
+    parser.add_argument('runtimes', nargs='*', help='executor names; default: all configured executor types')
+    parser.add_argument('--json', action='store_true', help='emit JSON for scripts')
+    args = parser.parse_args(argv)
+    names = args.runtimes or list(RUNTIME_PROBES)
+    results = {name: probe_runtime(name) for name in names}
+    if args.json:
+        print(json.dumps(results, sort_keys=True))
+    else:
+        for name, status in results.items():
+            print(f'{name}: {status}')
+    return 0
+
+
+if __name__ == '__main__':
+    raise SystemExit(main())

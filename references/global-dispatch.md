@@ -2,6 +2,24 @@
 
 **2026-11-27 用户指令**：`opencode:glm-5.3-flash-free` 已退役。正式入口和所有档位仅保留 OpenCode 的 `deepseek-v4.1-flash-free`。退役池不显示在浮窗，历史在途继续计入总占用并按原流程结算。弱档为 4 池、5 槽，国内总容量为 16。此处覆盖下方历史口径。
 
+### 规划、认领与同轮重试
+
+- `stage_selection.py --claim` 按与只读预览相同的授权、能力和档位规则选出精确池。弱档在
+  本任务有效候选集内按优先级选取；认领事务复核档位、容量、任务去重和工作区占用。
+  原始 `reserve` 和无票据的入口保留全局队列策略。
+- 先预览再认领时，把预览回执的 `engine_revision` 用 `--expected-engine-revision`
+  传给 `--claim`。版本不符时重新预览；认领前发现同一进程中版本改变也会拒绝。
+  在途期间在隔离副本修改引擎，等当前任务结束后再更新运行中的引擎副本。
+- 同轮入口或独立验收失败时，用 `--failed-candidate <pool_key>` 重跑规划和认领。
+  如有入口回执的 `round_failed_event`，也可直接保留在授权对象的
+  `round_failed_candidates` 数组里。该列表随当前轮传入，新一轮清空。
+- `--task-scope-json`、`--previous-json` 都接收扁平 JSON 对象。
+  `entry_runtime_probe.py --json` 可单独核查本机配置状态。回执的
+  `entry_runtime_unconfigured` 标出缺省未配置的候选，正式调用须核查实际入口配置。
+  `candidate_tool_profiles` 提供 OpenCode 生效的工具权限，`command_execution=false`
+  时由主脑跑测试；其他入口以实际调用参数和预检回执为准。
+
+
 **2026-11-16 当前权威：BW-WEAK-RESTRUCTURE-20261116（用户明确指令，覆盖本文下方一切弱档口径）**。弱档重构四项：① 全部 Qoder 池（`qodercn:Qwen4-Max-Preview`、`qoder:Qwen4-Max-Preview`、`qoder:Qwen3.8-Flash`、`qodercn:Qwen3.8-Flash`）从弱档移除，weak 一律 `mode_excluded`（sent=false、零新占位、绝不静默换模型）；② 弱档 ZCode 只用 **`zcode:GLM-5.3-Flash`**（新独立池键、容量 1、无时段门，已入 MAIN_FORCE_POOLS/KEYS——executor='zcode' 精确请求与 AUTO 均可达；与 strong/medium 的 `zcode:GLM-5.3` 各自独立 1 槽互不占位，物理总容量 16→**17**）；③ **Claude Code 调到弱档倒数第二**（层=3，保留工作日高峰门）；④ **`codebuddy:deepseek-v4.1-flash` 从弱档移除**（自此无任何档位可新派，登记保留）。当前弱档 **5 池/6 槽**，层序：两 OpenCode 免费模型=1 > CodeBuddy GLM=2 > Claude=3 > ZCode GLM-5.3-Flash=4；弱档为**纯优先级队列**（BW-WEAK-TIER-ENFORCE-20261122：只看层序与空位，不参照 availability/限额短窗/时段门/executor 冲突/入口运行时；请求组合不是队首 → routing_required 到队首，绝不跳队直派 zcode），无任何时段门。两区 Flash 兜底（`_flash_fallback_or_full`）在所有档位均为 mode_excluded——「主力满→Flash 兜底」机制随本决策退役。浮窗：weak 空闲显示 5 池，被移出池有真实在途遗留时整行保留标「本档不参与」；总占用显示 x/17。
 
 **强档优先级（2026-11-15）**：Qoder 国际和 CN 内置 `Qwen4-Max-Preview` 并列第一，其次 Claude，最后 ZCode。强档派发与浮窗行序使用这套共享策略。
@@ -696,8 +714,8 @@ CodeBuddy deepseek > Max > Claude > ZCode > 两 OpenCode 免费模型（同层�
      "quote": "本轮真实原话", "authorization_scope": {"task_id": "T", "stage": "s2"}}}
   ```
   ```json
-  {"previous": {"task_id": "T", "stage": "s1", "state": "finished",
-                "acceptance_reviewed": true}}
+  {"task_id": "T", "stage": "s1", "state": "finished",
+   "acceptance_reviewed": true}
   ```
   此时 receipt 的 `selection_mode`/`authorization_quote`/`authorization_scope`/
   `allowed_candidates` 体现**本轮有效父授权**，旧值仅在 `source_*` 与 `fallback_scope` 追溯。
@@ -822,9 +840,9 @@ grants；`permission_grants` 仍是必须强制的运行时硬合同，两者同
 或"无调用"等叙述不进入本入口，quota 仍只认既有 availability 口径。
 
 ```json
-{"task_scope": {"edits": ["source/f1.cjs", "source/f2.cjs"],
-                "bash": ["python -m unittest discover -s tests -p test_app.py"],
-                "read_dirs": ["references/"]}}
+{"edits": ["source/f1.cjs", "source/f2.cjs"],
+ "bash": ["python -m unittest discover -s tests -p test_app.py"],
+ "read_dirs": ["references/"]}
 ```
 
 主脑后续按选中 runtime 生成 formal plan 时：**用普通 task_scope 选 ZCode 的普通任务，

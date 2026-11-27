@@ -267,6 +267,8 @@ def run(cfg, *, workspace, prompt_file, out_dir, stage, task_id, model, tools_it
     sent_payload = pc.compose_task_payload(contract_text, task_text).encode('utf-8')
 
     child_env = build_subprocess_env(environ)
+    child_env['PWD'] = str(Path(workspace).resolve())
+    child_env.pop('OLDPWD', None)
 
     started = False
     child_verified = False

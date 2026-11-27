@@ -115,6 +115,31 @@ class NoProgressExpired(Exception):
     """OpenCode 子进程仍存活，但连续一段时间没有任何有效 JSON 事件。"""
 
 
+class WorkspaceBoundaryDenied(Exception):
+    """OpenCode rejected a file inside its assigned workspace as external."""
+
+
+def _workspace_boundary_denied(raw: bytes, workspace: Path) -> bool:
+    for line in (raw or b'').splitlines():
+        if b'external_directory' not in line:
+            continue
+        try:
+            event = json.loads(line)
+            state = event['part']['state']
+            inputs = state['input']
+            error = state['error']
+            if (event.get('type') != 'tool_use' or state.get('status') != 'error'
+                    or not isinstance(error, str)
+                    or not re.search(r'"permission"\s*:\s*"external_directory"', error)):
+                continue
+            target = inputs.get('filePath') or inputs.get('file_path') or inputs.get('path')
+            if target and (workspace / target).resolve().is_relative_to(workspace):
+                return True
+        except (KeyError, AttributeError, TypeError, ValueError, OSError, RuntimeError):
+            continue
+    return False
+
+
 def _json_progress_count(raw) -> int:
     """只计数可解析且带 type 的 JSONL 事件；普通噪声/半行不冒充进展。"""
     if not raw:
@@ -133,16 +158,18 @@ def _json_progress_count(raw) -> int:
 
 
 def _communicate_with_no_progress_watch(proc, payload, total_seconds, idle_seconds,
-                                        monotonic=time.monotonic):
+                                        monotonic=time.monotonic, *, workspace=None):
     """用短等待片段观察 stdout JSONL；总墙钟和无进展墙钟彼此独立。"""
     started = monotonic()
     last_progress = started
     observed = 0
+    boundary_offset = 0
     first = True
     while True:
         current = monotonic()
         total_left = total_seconds - (current - started)
-        idle_left = idle_seconds - (current - last_progress)
+        idle_left = (idle_seconds - (current - last_progress)
+                     if idle_seconds else float('inf'))
         if total_left <= 0:
             raise subprocess.TimeoutExpired(getattr(proc, 'args', 'opencode'), total_seconds)
         if idle_left <= 0:
@@ -153,6 +180,12 @@ def _communicate_with_no_progress_watch(proc, payload, total_seconds, idle_secon
         except subprocess.TimeoutExpired as exc:
             first = False
             partial = exc.output or b''
+            if workspace is not None:
+                end = partial.rfind(b'\n', boundary_offset) + 1
+                if end > boundary_offset:
+                    if _workspace_boundary_denied(partial[boundary_offset:end], workspace):
+                        raise WorkspaceBoundaryDenied() from exc
+                    boundary_offset = end
             progress = _json_progress_count(partial)
             if progress > observed:
                 observed = progress
@@ -243,7 +276,8 @@ def build_opencode_config(cfg=None) -> dict:
         permission[name] = 'allow'
     # external_directory 始终保持 deny；配置不能把它打开。
     permission['external_directory'] = 'deny'
-    return {'share': 'disabled', 'permission': permission, 'mcp': {}, 'plugin': []}
+    return {'share': 'disabled', 'snapshot': False, 'permission': permission,
+            'mcp': {}, 'plugin': []}
 
 
 def build_private_dirs(out_dir) -> dict:
@@ -261,9 +295,14 @@ def build_private_dirs(out_dir) -> dict:
     return {k: str(v) for k, v in dirs.items()}
 
 
-def build_subprocess_env(cfg=None, private_dirs=None, environ=None) -> dict:
+def build_subprocess_env(cfg=None, private_dirs=None, environ=None, *, workspace=None) -> dict:
     """宿主 environ 副本 + 强制隔离项。绝不注入/复制凭据，绝不改用户全局。"""
     env = dict(os.environ if environ is None else environ)
+    env.pop('OLDPWD', None)
+    if workspace is not None:
+        env['PWD'] = str(workspace)
+    else:
+        env.pop('PWD', None)
     env['OPENCODE_CONFIG_CONTENT'] = json.dumps(build_opencode_config(cfg),
                                                 ensure_ascii=False,
                                                 separators=(',', ':'))
@@ -561,6 +600,9 @@ def run(cfg, *, workspace, prompt_file, out_dir, stage, task_id, model,
 
     # (2) 提示词/argv/可执行文件/配置：全部在认领与 Popen 之前。
     try:
+        workspace = Path(workspace).resolve(strict=True)
+        if not workspace.is_dir():
+            raise ValueError('workspace must be a directory')
         prompt_bytes = Path(prompt_file).read_bytes()
         actual_prompt_sha = _sha(prompt_bytes)
         if prompt_sha256 and str(prompt_sha256).lower() != actual_prompt_sha:
@@ -613,6 +655,7 @@ def run(cfg, *, workspace, prompt_file, out_dir, stage, task_id, model,
     child_done = False
     timed_out = False
     stalled_no_progress = False
+    workspace_boundary_denied = False
     proc = None
     stdout_bytes = b''
     stderr_bytes = b''
@@ -624,7 +667,7 @@ def run(cfg, *, workspace, prompt_file, out_dir, stage, task_id, model,
     try:
         out.mkdir(parents=True, exist_ok=False)
         private_dirs = build_private_dirs(out)
-        child_env = build_subprocess_env(cfg, private_dirs, environ)
+        child_env = build_subprocess_env(cfg, private_dirs, environ, workspace=workspace)
         started_at_utc = now if clock_injected else _now_utc()
         proc = popen_factory(argv, cwd=str(workspace), stdin=subprocess.PIPE,
                              stdout=subprocess.PIPE, stderr=subprocess.PIPE,
@@ -663,13 +706,15 @@ def run(cfg, *, workspace, prompt_file, out_dir, stage, task_id, model,
             # 生产 Popen 走事件级看门狗；测试/显式注入的 Popen 工厂保留一次 communicate
             # 契约，避免把测试替身的一次 TimeoutExpired 误解为“随后恢复”。看门狗本身另有
             # 真实短生命周期子进程回归。
-            if no_progress_timeout_seconds and popen_factory is subprocess.Popen:
+            if popen_factory is subprocess.Popen:
                 stdout_bytes, stderr_bytes = _communicate_with_no_progress_watch(
-                    proc, sent_payload, timeout_seconds, no_progress_timeout_seconds)
+                    proc, sent_payload, timeout_seconds, no_progress_timeout_seconds,
+                    workspace=workspace)
             else:
                 stdout_bytes, stderr_bytes = proc.communicate(input=sent_payload,
                                                               timeout=timeout_seconds)
-        except (subprocess.TimeoutExpired, NoProgressExpired) as timeout_exc:
+        except (subprocess.TimeoutExpired, NoProgressExpired, WorkspaceBoundaryDenied) as timeout_exc:
+            workspace_boundary_denied = isinstance(timeout_exc, WorkspaceBoundaryDenied)
             timed_out = isinstance(timeout_exc, subprocess.TimeoutExpired)
             stalled_no_progress = isinstance(timeout_exc, NoProgressExpired)
             proc.kill()
@@ -702,6 +747,7 @@ def run(cfg, *, workspace, prompt_file, out_dir, stage, task_id, model,
                         'pool_key': pool_key, 'child_verified': child_verified,
                         'timed_out': timed_out, 'post_kill_grace_stuck': True,
                         'stalled_no_progress': stalled_no_progress,
+                        'workspace_boundary_denied': workspace_boundary_denied,
                         'unknown_guard': unknown_guard, 'business_verified': False}
         exit_code = getattr(proc, 'returncode', None)
         finished_at_utc = now if clock_injected else _now_utc()
@@ -743,8 +789,10 @@ def run(cfg, *, workspace, prompt_file, out_dir, stage, task_id, model,
         (out / 'events.jsonl').write_bytes(stdout_bytes)
         (out / 'sent-payload-stdin.bin').write_bytes(sent_payload)
         parsed = parse_events(stdout_bytes)
+        workspace_boundary_denied |= _workspace_boundary_denied(stdout_bytes, workspace)
         protocol_success = bool(parsed['protocol_success'] and ec_exit == 0
-                                and not timed_out and not stalled_no_progress)
+                                and not timed_out and not stalled_no_progress
+                                and not workspace_boundary_denied)
         if ec_exit != 0:
             parsed['parse_errors'].append(f'process exited non-zero: {ec_exit}')
         if timed_out:
@@ -796,6 +844,7 @@ def run(cfg, *, workspace, prompt_file, out_dir, stage, task_id, model,
             'termination_reason': ('stalled_no_progress' if stalled_no_progress else
                                    ('wall_clock_timeout' if timed_out else None)),
             'protocol_success': protocol_success,
+            'workspace_boundary_denied': workspace_boundary_denied,
             'report_bound': bool(binding.get('bound')),
             'engineering_success': passed,
             'business_verified': False,
@@ -875,7 +924,8 @@ def run(cfg, *, workspace, prompt_file, out_dir, stage, task_id, model,
         report_text = report_text or ''
 
     protocol_success = bool(parsed.get('protocol_success') and ec_exit == 0
-                            and not timed_out and not stalled_no_progress)
+                            and not timed_out and not stalled_no_progress
+                            and not workspace_boundary_denied)
     execution_evidence_ok = bool(parsed.get('execution_evidence_ok'))
     success = bool(protocol_success and binding.get('bound') and execution_evidence_ok
                    and not timed_out and not stalled_no_progress)
@@ -891,6 +941,7 @@ def run(cfg, *, workspace, prompt_file, out_dir, stage, task_id, model,
             'child_verified': child_verified, 'token': claim, 'exit_code': exit_code,
             'pool_key': pool_key, 'protocol_success': protocol_success,
             'stalled_no_progress': stalled_no_progress,
+            'workspace_boundary_denied': workspace_boundary_denied,
             'report_bound': bool(binding.get('bound')),
             'execution_evidence_ok': execution_evidence_ok,
             'timed_out': timed_out, 'evidence': evidence, 'launched': True,
@@ -978,6 +1029,11 @@ def main(argv=None) -> int:
               plan=plan, active_tasks=active_tasks,
               timeout_seconds=args.timeout_seconds,
               no_progress_timeout_seconds=args.no_progress_timeout_seconds)
+    if out.get('sent') and not out.get('passed') and out.get('finished_at_utc'):
+        out['round_failed_event'] = {
+            'pool_key': out['pool_key'], 'failure_class': 'entry_validation_failed',
+            'failed_at_utc': out['finished_at_utc'],
+        }
     print(json.dumps(out, ensure_ascii=False))
     if not out.get('dispatched'):
         return 2

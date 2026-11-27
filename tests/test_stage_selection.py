@@ -277,6 +277,42 @@ class AuthorizationTests(_Base):
         self.assertIn('Bash(python -m unittest tests.test_main)',
                       plan['allowed_tools'])
 
+    def test_planned_claim_respects_scope_and_round_failure_in_weak_mode(self):
+        self.build_store()
+        deepseek = dp.OPENCODE_DEEPSEEK_POOL_KEY
+        cases = (
+            ('auto', [dp.CLAUDE_POOL_KEY], {}, []),
+            ('executor', [deepseek, dp.CLAUDE_POOL_KEY], {'executor': 'claude'}, []),
+            ('auto', [deepseek, dp.CLAUDE_POOL_KEY], {}, [deepseek]),
+        )
+        with dispatch_mode('weak'):
+            for n, (mode, candidates, extra, failed) in enumerate(cases):
+                task = f'claim-{n}'
+                authorization = self.auth(mode, task, 's2', candidates, **extra)
+                receipt = ss.plan_and_claim_stage(
+                    authorization, prompt_sha256='p', task_id=task, stage='s2',
+                    workspace=self._ws(task), store_path=self.store, now=T_NIGHT,
+                    round_failed_candidates=failed)
+                self.assertEqual(receipt['selected']['pool_key'], dp.CLAUDE_POOL_KEY, receipt)
+                claim = receipt['dispatch_claim']
+                self.assertTrue(claim['allowed'], claim)
+                self.assertTrue(dp.finish(self.store, claim['token'], terminal='cancelled',
+                                          now=T_NIGHT)['released'])
+
+    def test_claim_refuses_engine_revision_mismatch_before_allocating(self):
+        self.build_store()
+        authorization = self.auth('auto', 'T', 's2', [dp.OPENCODE_DEEPSEEK_POOL_KEY])
+        preview = self.plan(authorization)
+        self.assertEqual(len(preview['engine_revision']), 64)
+        self.assertEqual(preview['candidate_tool_profiles'][dp.OPENCODE_DEEPSEEK_POOL_KEY],
+                         {'allowed_tools': ['edit', 'read'], 'command_execution': False})
+        claimed = ss.plan_and_claim_stage(
+            authorization, prompt_sha256='p', task_id='T', stage='s2',
+            workspace=self._ws('T'), store_path=self.store, now=T_NIGHT,
+            expected_engine_revision='unexpected-old-version')
+        self.assertEqual(claimed['refused'], 'engine_revision_changed')
+        self.assertIsNone(claimed['dispatch_claim'])
+
     def test_existing_allowlist_filters_retired_opencode_glm(self):
         self.build_store()
         allowed = [dp.OPENCODE_GLM_POOL_KEY, dp.OPENCODE_DEEPSEEK_POOL_KEY]

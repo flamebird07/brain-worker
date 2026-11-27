@@ -65,6 +65,11 @@ brain-worker 的派发档位是**全宿主共享的手动三档**：strong（强
 - 正式派发：只用所选执行器已有的正式 `*_direct.py` 入口。先读该入口的 `--help` 和 `<engine_root>/references/` 中对应文件，再构造参数；不凭经验混用 `--tools` 与 `--allowed-tools`。
 - 执行器约束细节按需读取 `<engine_root>/references/`。不要一次性读取完整的大型主 Skill，也不要把历史事故段落当成当前状态。
 
+有正式派发在途时，先在隔离副本修改引擎，待在途结束后同步。先预览再认领时将回执
+`engine_revision` 传给 `--claim --expected-engine-revision`。同轮入口或独立验收失败后，
+重新规划时用 `--failed-candidate` 指明实际失败的组合。以回执
+`candidate_tool_profiles` 核对 OpenCode 能否执行命令，缺 Bash 时由主脑跑测试。
+
 派发前若规划回执显示某候选的入口运行时在本机缺失，如实报告该事实并按引擎裁决继续，不私自重装运行时、不改私有入口配置、不凭猜测改指向。
 
 ## 每轮必须遵守的行为约束

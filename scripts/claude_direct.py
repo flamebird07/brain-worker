@@ -1719,6 +1719,8 @@ def run(cfg: dict, *, workspace: str, prompt_file: Path, out_dir: Path, stage: s
                 'reasons': [f'credential resolution failed before any claim: {exc!r}']}
 
     child_env = build_subprocess_env(effective_cfg, token, environ)
+    child_env['PWD'] = str(Path(workspace).resolve())
+    child_env.pop('OLDPWD', None)
     secret = child_env.get('ANTHROPIC_API_KEY', '')
 
     # (3b) 连接类故障有界重试参数（BW-CLAUDE-RETRY-FIX）：默认 5s/15s 至多 2 次额外

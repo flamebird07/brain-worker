@@ -15,6 +15,15 @@
 - DeepSeek 在弱档排第一，无时段门或 CodeBuddy 额度前提，仍受国内总容量、
   task ID 去重、同一工作区单写与 unknown 保占位约束。见 [全局派工](global-dispatch.md)。
 
+## 工作区与快照
+
+可从任意目录运行 `python /engine/brain-worker/scripts/opencode_direct.py`，并传
+绝对 `--workspace /project`、`--prompt-file /path/to/task.md` 和
+`--output-dir /path/to/new-evidence`。子进程 cwd 和 PWD 均固定为工作区真实路径。
+工作区内文件若被 CLI 误判为 `external_directory`，入口中止该轮并保留原始证据，
+确认进程退出后释放槽位。入口配置关闭 OpenCode 快照；CLI 自身的项目 ID 缓存
+`.git/opencode` 是独立行为，首次使用 Git 工作区时仍可能写入。
+
 ## CLI 形态与传输
 
 - argv：`<executable> run --pure --model opencode/<ID> --format json`，`shell=False`；

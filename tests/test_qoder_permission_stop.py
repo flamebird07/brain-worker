@@ -1047,7 +1047,7 @@ class RealSubprocessStopTests(_CnMainBase):
         holder = {}
 
         def script_popen(argv, *a, **k):
-            env = dict(os.environ)
+            env = dict(k.pop('env', os.environ))
             env['BRAIN_FAKE_CN_SPEC'] = json.dumps(spec)
             child = real_popen([sys.executable, str(script)] + list(argv[1:]),
                                *a, env=env, **k)

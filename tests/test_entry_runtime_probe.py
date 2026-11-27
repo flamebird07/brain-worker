@@ -85,11 +85,11 @@ class CodeBuddyProbeTests(_CfgBase):
         self._patch_default(codebuddy_direct, cfg)
         self.assertEqual(erp.probe_runtime('codebuddy'), erp.MISSING)
 
-    def test_unknown_when_config_absent(self):
+    def test_unconfigured_when_config_absent(self):
         # R1G 判定边界：入口配置本身不存在 = 未配置（入口还支持 --config 显式传参），
         # 绝不判 missing——否则裸仓库/CI 里硬门会清场全部候选。
         self._patch_default(codebuddy_direct, self.base / 'nope.json')
-        self.assertEqual(erp.probe_runtime('codebuddy'), erp.UNKNOWN)
+        self.assertEqual(erp.probe_runtime('codebuddy'), erp.UNCONFIGURED)
 
     def test_unknown_malformed_json(self):
         p = self.base / 'cb-bad.json'
@@ -216,6 +216,25 @@ class OpenCodeProbeTests(_CfgBase):
         cfg = self._write_cfg('oc.json', {'executable': 5})
         self._patch_default(opencode_direct, cfg)
         self.assertEqual(erp.probe_runtime('opencode'), erp.UNKNOWN)
+
+    def test_cli_distinguishes_unconfigured_and_unknown(self):
+        from contextlib import redirect_stdout
+        from io import StringIO
+        buf = StringIO()
+        with redirect_stdout(buf):
+            self.assertEqual(erp.main(['--json', 'codebuddy', 'not-an-executor']), 0)
+        self.assertEqual(json.loads(buf.getvalue()),
+                         {'codebuddy': 'unconfigured', 'not-an-executor': 'unknown'})
+
+    def test_opencode_tool_profile_uses_effective_permissions(self):
+        cfg = self._write_cfg('oc.json', {'allowed_tools': []})
+        self._patch_default(opencode_direct, cfg)
+        self.assertEqual(erp.opencode_tool_profile(),
+                         {'allowed_tools': ['edit', 'read'], 'command_execution': False})
+        cfg.write_text(json.dumps({'allowed_tools': ['bash', 'external_directory']}),
+                       encoding='utf-8')
+        self.assertEqual(erp.opencode_tool_profile(),
+                         {'allowed_tools': ['bash', 'edit', 'read'], 'command_execution': True})
 
     def test_path_discovery_via_opencode_exe(self):
         # 配置缺省（{} 走发现链）时再查 OPENCODE_EXE → PATH；环境性解析成败都

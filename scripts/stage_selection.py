@@ -21,6 +21,7 @@ dispatch_pool 的权威方法（`CAPACITY`/`MAIN_FORCE_KEYS`/`OVERFLOW_KEYS`/`ca
 from __future__ import annotations
 
 import argparse
+import hashlib
 import json
 import sqlite3
 import sys
@@ -444,6 +445,16 @@ def _relational_select(conn, mode, auth, allowed, passed, now, dispatch_mode=Non
     return None, 'no_eligible_candidate'
 
 
+def engine_revision():
+    """Identify dispatch source across separate preview and claim processes."""
+    digest = hashlib.sha256()
+    for path in sorted(_SCRIPTS.iterdir()):
+        if path.suffix in ('.py', '.mjs', '.cjs') and path.is_file():
+            digest.update(path.name.encode('utf-8') + b'\0')
+            digest.update(hashlib.sha256(path.read_bytes()).digest())
+    return digest.hexdigest()
+
+
 def plan_stage_selection(authorization, *, previous=None, store_path=None, quota_store=None,
                          task_id=None, stage=None, workspace=None, now=None,
                          permission_grants=None, task_scope=None,
@@ -510,6 +521,10 @@ def plan_stage_selection(authorization, *, previous=None, store_path=None, quota
             receipt['refused_detail'] = detail
         return receipt
 
+    try:
+        receipt['engine_revision'] = engine_revision()
+    except OSError:
+        return _refuse('engine_revision_unavailable')
     if not isinstance(authorization, dict):
         return _refuse('missing_authorization')
     # 本轮失败列表 BW-SIMPLE-PRIORITY-RETRY-S3：优先取调用方显式关键字入参，否则从
@@ -876,6 +891,15 @@ def plan_stage_selection(authorization, *, previous=None, store_path=None, quota
         # 体现，两者同源同一次探测，绝不影响授权集合回显。
         receipt['entry_runtime_status'] = entry_status
         receipt['entry_runtime_missing'] = entry_missing
+        receipt['entry_runtime_unconfigured'] = [
+            pk for pk, status in entry_status.items() if status == erp.UNCONFIGURED
+        ]
+        opencode_tools = erp.opencode_tool_profile() if any(
+            k in dp.OPENCODE_POOL_KEYS for k in eff_allowed) else None
+        receipt['candidate_tool_profiles'] = {
+            pk: opencode_tools if pk in dp.OPENCODE_POOL_KEYS else None
+            for pk in eff_allowed
+        }
 
         if eff_mode == 'fixed':
             pk = dp.pool_key(str(eff_auth.get('runtime')), str(eff_auth.get('model')))
@@ -949,7 +973,7 @@ def plan_stage_selection(authorization, *, previous=None, store_path=None, quota
 def plan_and_claim_stage(authorization, *, prompt_sha256, previous=None,
                          store_path=None, quota_store=None, task_id, stage,
                          workspace, permission_grants=None, task_scope=None,
-                         now=None):
+                         now=None, round_failed_candidates=None, expected_engine_revision=None):
     """按一次权威选择结果直接取得正式入口 claim。
 
     普通 AUTO 仍由 dispatch_pool 的同一套优先级原子复核；用户明确点名的 fixed/executor
@@ -961,10 +985,21 @@ def plan_and_claim_stage(authorization, *, prompt_sha256, previous=None,
         authorization, previous=previous, store_path=store_path,
         quota_store=quota_store, task_id=task_id, stage=stage,
         workspace=workspace, permission_grants=permission_grants,
-        task_scope=task_scope, now=now)
+        task_scope=task_scope, now=now, round_failed_candidates=round_failed_candidates)
     selected = receipt.get('selected')
     if not selected:
         receipt['dispatch_claim'] = None
+        return receipt
+
+    try:
+        revision_matches = receipt['engine_revision'] == engine_revision()
+    except OSError:
+        revision_matches = False
+    if (not revision_matches or (expected_engine_revision is not None
+                                 and expected_engine_revision != receipt['engine_revision'])):
+        receipt.update(selected=None, selected_reason=None, dispatch_claim=None,
+                       refused='engine_revision_changed',
+                       refusal_reason='engine_revision_changed')
         return receipt
 
     # 规划已在授权集合内完成唯一一次优先级裁决；这里按回执精确预留，不能再用全池 AUTO
@@ -975,7 +1010,7 @@ def plan_and_claim_stage(authorization, *, prompt_sha256, previous=None,
         model=selected['model'], workspace=workspace,
         prompt_sha256=prompt_sha256, stage=stage, now=now,
         origin='stage-selection', executor=executor,
-        quota_store=quota_store)
+        quota_store=quota_store, _planned_mode=receipt['dispatch_mode'])
     receipt['dispatch_claim'] = claim
     if not claim.get('allowed'):
         # 原子复核时状态变化就诚实返回失败；不进行第二次选型或偷偷改派。
@@ -998,11 +1033,15 @@ def _load_json_arg(raw):
 def main(argv=None) -> int:
     ap = argparse.ArgumentParser(
         prog='stage_selection',
-        description='read-only next-stage dispatch planner (never claims; preview_only)')
+        description='Preview next-stage dispatch or reserve the selected authorized pool')
     ap.add_argument('--authorization-json', dest='authorization_json', default=None)
     ap.add_argument('--permission-grants-json', dest='permission_grants_json', default=None)
-    ap.add_argument('--task-scope-json', dest='task_scope_json', default=None)
-    ap.add_argument('--previous-json', dest='previous_json', default=None)
+    ap.add_argument('--task-scope-json', default=None, help='flat JSON object: edits/bash/read_dirs')
+    ap.add_argument('--previous-json', default=None, help='flat prior-stage JSON record')
+    ap.add_argument('--failed-candidate', action='append', default=[],
+                    help='pool key rejected in this round; repeat for multiple pools')
+    ap.add_argument('--expected-engine-revision',
+                    help='with --claim, require the revision printed by the preview')
     ap.add_argument('--task-id', dest='task_id', required=True)
     ap.add_argument('--stage', required=True)
     ap.add_argument('--workspace', required=True)
@@ -1021,11 +1060,18 @@ def main(argv=None) -> int:
         permission_grants=_load_json_arg(args.permission_grants_json),
         task_scope=_load_json_arg(args.task_scope_json))
     authorization = _load_json_arg(args.authorization_json)
+    if args.failed_candidate and isinstance(authorization, dict):
+        prior = authorization.get('round_failed_candidates')
+        if prior is None or isinstance(prior, list):
+            common['round_failed_candidates'] = [*(prior or []), *args.failed_candidate]
+    if args.expected_engine_revision and not args.claim:
+        ap.error('--expected-engine-revision requires --claim')
     if args.claim:
         if not args.prompt_sha256:
             ap.error('--prompt-sha256 is required with --claim')
         receipt = plan_and_claim_stage(
-            authorization, prompt_sha256=args.prompt_sha256, **common)
+            authorization, prompt_sha256=args.prompt_sha256,
+            expected_engine_revision=args.expected_engine_revision, **common)
     else:
         receipt = plan_stage_selection(authorization, **common)
     print(json.dumps(receipt, ensure_ascii=False, indent=2))
