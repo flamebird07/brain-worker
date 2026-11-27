@@ -718,18 +718,16 @@ class TestFormalLiveGlm(_Base):
 
     def test_missing_proof_reaches_config_load_without_quota_refusal(self):
         # BW-LIMIT30-20261019-S3：缺证据不再在读取配置前拒绝；入口直接进入配置读取。
-        # 配置不存在 → FileNotFoundError，且 stdout 没有任何 quota 拒绝 JSON、outdir 未创建、
-        # 零占位（证明旧前置门已撤销，且仍不产生副作用）。
+        # 配置不存在 → 结构化启动失败，输出目录未创建，额度占用不变。
         argv = ['--workspace', str(self.work),
-                '--prompt-file', str(self.base / 'missing-prompt.txt'),
+                '--prompt-file', str(self._prompt()),
                 '--output-dir', str(self.base / 'never-created'),
                 '--stage', self.stage, '--task-id', 't', '--model', GLM_MODEL,
                 '--config', str(self.base / 'no-such-config.json')]
         buf = io.StringIO()
         with redirect_stdout(buf):
-            with self.assertRaises(FileNotFoundError):
-                cl.main(argv)
-        self.assertEqual(buf.getvalue(), '')
+            self.assertEqual(cl.main(argv), 2)
+        self.assertEqual(json.loads(buf.getvalue())['reason'], 'entry_config_missing')
         self.assertFalse((self.base / 'never-created').exists())
         with closing(dp.connect(self.store)) as conn:
             self.assertEqual(dp._count_active(conn, GLM), 0)

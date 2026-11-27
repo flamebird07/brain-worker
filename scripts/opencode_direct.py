@@ -115,6 +115,30 @@ class NoProgressExpired(Exception):
     """OpenCode 子进程仍存活，但连续一段时间没有任何有效 JSON 事件。"""
 
 
+class FreeQuotaExhausted(Exception):
+    """The selected free model reported exhaustion in its private runtime log."""
+
+
+def _free_quota_exhausted(log_path):
+    if log_path is None:
+        return False
+    try:
+        with log_path.open('rb') as log:
+            log.seek(max(0, log.seek(0, os.SEEK_END) - 65536))
+            for line in log:
+                metadata, _, error = line.partition(b' error.error=')
+                fields = metadata.split()
+                if (b'level=ERROR' in fields and b'message="stream error"' in metadata
+                        and b'providerID=opencode' in fields
+                        and b'modelID=deepseek-v4.1-flash-free' in fields
+                        and b'agent=title' not in fields
+                        and b'Free usage limit reached' in error):
+                    return True
+            return False
+    except OSError:
+        return False
+
+
 class WorkspaceBoundaryDenied(Exception):
     """OpenCode rejected a file inside its assigned workspace as external."""
 
@@ -158,7 +182,7 @@ def _json_progress_count(raw) -> int:
 
 
 def _communicate_with_no_progress_watch(proc, payload, total_seconds, idle_seconds,
-                                        monotonic=time.monotonic, *, workspace=None, stdout_path=None):
+                                        monotonic=time.monotonic, *, workspace=None, stdout_path=None, quota_log=None):
     """用短等待片段观察 stdout JSONL；总墙钟和无进展墙钟彼此独立。"""
     started = monotonic()
     last_progress = started
@@ -179,6 +203,8 @@ def _communicate_with_no_progress_watch(proc, payload, total_seconds, idle_secon
             return proc.communicate(input=payload if first else None, timeout=wait_for)
         except subprocess.TimeoutExpired as exc:
             first = False
+            if _free_quota_exhausted(quota_log):
+                raise FreeQuotaExhausted() from exc
             partial = stdout_path.read_bytes() if stdout_path is not None else (exc.output or b'')
             if workspace is not None:
                 end = partial.rfind(b'\n', boundary_offset) + 1
@@ -656,6 +682,8 @@ def run(cfg, *, workspace, prompt_file, out_dir, stage, task_id, model,
     timed_out = False
     stalled_no_progress = False
     workspace_boundary_denied = False
+    free_quota_exhausted = False
+    quota_log = None
     proc = None
     stdout_bytes = b''
     stderr_bytes = b''
@@ -667,6 +695,7 @@ def run(cfg, *, workspace, prompt_file, out_dir, stage, task_id, model,
     try:
         out.mkdir(parents=True, exist_ok=False)
         private_dirs = build_private_dirs(out)
+        quota_log = Path(private_dirs['XDG_DATA_HOME']) / 'opencode/log/opencode.log'
         child_env = build_subprocess_env(cfg, private_dirs, environ, workspace=workspace)
         started_at_utc = now if clock_injected else _now_utc()
         stdout_path = out / 'stdout.jsonl' if popen_factory is subprocess.Popen else None
@@ -716,11 +745,13 @@ def run(cfg, *, workspace, prompt_file, out_dir, stage, task_id, model,
             if popen_factory is subprocess.Popen:
                 stdout_bytes, stderr_bytes = _communicate_with_no_progress_watch(
                     proc, sent_payload, timeout_seconds, no_progress_timeout_seconds,
-                    workspace=workspace, stdout_path=stdout_path)
+                    workspace=workspace, stdout_path=stdout_path, quota_log=quota_log)
             else:
                 stdout_bytes, stderr_bytes = proc.communicate(input=sent_payload,
                                                               timeout=timeout_seconds)
-        except (subprocess.TimeoutExpired, NoProgressExpired, WorkspaceBoundaryDenied) as timeout_exc:
+        except (subprocess.TimeoutExpired, NoProgressExpired, WorkspaceBoundaryDenied,
+                FreeQuotaExhausted) as timeout_exc:
+            free_quota_exhausted = isinstance(timeout_exc, FreeQuotaExhausted)
             workspace_boundary_denied = isinstance(timeout_exc, WorkspaceBoundaryDenied)
             timed_out = isinstance(timeout_exc, subprocess.TimeoutExpired)
             stalled_no_progress = isinstance(timeout_exc, NoProgressExpired)
@@ -800,9 +831,14 @@ def run(cfg, *, workspace, prompt_file, out_dir, stage, task_id, model,
         (out / 'sent-payload-stdin.bin').write_bytes(sent_payload)
         parsed = parse_events(stdout_bytes)
         workspace_boundary_denied |= _workspace_boundary_denied(stdout_bytes, workspace)
+        if ec_exit != 0 or not parsed['protocol_success']:
+            free_quota_exhausted |= _free_quota_exhausted(quota_log)
+        if free_quota_exhausted:
+            parsed['failure_classification']['quota'] = True
+            parsed['failure_classification']['model_execution_failure'] = False
         protocol_success = bool(parsed['protocol_success'] and ec_exit == 0
                                 and not timed_out and not stalled_no_progress
-                                and not workspace_boundary_denied)
+                                and not workspace_boundary_denied and not free_quota_exhausted)
         if ec_exit != 0:
             parsed['parse_errors'].append(f'process exited non-zero: {ec_exit}')
         if timed_out:
@@ -851,11 +887,13 @@ def run(cfg, *, workspace, prompt_file, out_dir, stage, task_id, model,
                                 'backend/account identity'),
             'exit_code': exit_code, 'timed_out': timed_out,
             'stalled_no_progress': stalled_no_progress,
-            'termination_reason': ('workspace_boundary_denied' if workspace_boundary_denied else
+            'termination_reason': ('free_quota_exhausted' if free_quota_exhausted else
+                                   'workspace_boundary_denied' if workspace_boundary_denied else
                                    'stalled_no_progress' if stalled_no_progress else
                                    ('wall_clock_timeout' if timed_out else None)),
             'protocol_success': protocol_success,
             'workspace_boundary_denied': workspace_boundary_denied,
+            'free_quota_exhausted': free_quota_exhausted,
             'report_bound': bool(binding.get('bound')),
             'engineering_success': passed,
             'business_verified': False,
@@ -936,7 +974,7 @@ def run(cfg, *, workspace, prompt_file, out_dir, stage, task_id, model,
 
     protocol_success = bool(parsed.get('protocol_success') and ec_exit == 0
                             and not timed_out and not stalled_no_progress
-                            and not workspace_boundary_denied)
+                            and not workspace_boundary_denied and not free_quota_exhausted)
     execution_evidence_ok = bool(parsed.get('execution_evidence_ok'))
     success = bool(protocol_success and binding.get('bound') and execution_evidence_ok
                    and not timed_out and not stalled_no_progress)
@@ -953,6 +991,7 @@ def run(cfg, *, workspace, prompt_file, out_dir, stage, task_id, model,
             'pool_key': pool_key, 'protocol_success': protocol_success,
             'stalled_no_progress': stalled_no_progress,
             'workspace_boundary_denied': workspace_boundary_denied,
+            'free_quota_exhausted': free_quota_exhausted,
             'report_bound': bool(binding.get('bound')),
             'execution_evidence_ok': execution_evidence_ok,
             'timed_out': timed_out, 'evidence': evidence, 'launched': True,
@@ -1042,7 +1081,9 @@ def main(argv=None) -> int:
               no_progress_timeout_seconds=args.no_progress_timeout_seconds)
     if out.get('sent') and not out.get('passed') and out.get('finished_at_utc'):
         out['round_failed_event'] = {
-            'pool_key': out['pool_key'], 'failure_class': 'entry_validation_failed',
+            'pool_key': out['pool_key'],
+            'failure_class': ('free_quota_exhausted' if out.get('free_quota_exhausted')
+                              else 'entry_validation_failed'),
             'failed_at_utc': out['finished_at_utc'],
         }
     print(json.dumps(out, ensure_ascii=False))

@@ -262,6 +262,17 @@ def _dpapi_reveal(cipher_path: str, pwsh_path: str = 'powershell') -> str:
     return proc.stdout.strip()
 
 
+def keychain_lookup_args(source, *, reveal=False):
+    if sys.platform != 'darwin':
+        raise ValueError('keychain credential source requires macOS')
+    service = source.get('service')
+    account = source.get('account')
+    if not all(isinstance(x, str) and x.strip() for x in (service, account)):
+        raise ValueError('keychain credential source requires service and account')
+    args = ['/usr/bin/security', 'find-generic-password', '-s', service, '-a', account]
+    return args + ['-w'] if reveal else args
+
+
 def resolve_token(cfg: dict, environ=None) -> str:
     """按 cfg['credential_source'] 解析出凭据明文（不落任何证据）。
 
@@ -277,6 +288,12 @@ def resolve_token(cfg: dict, environ=None) -> str:
         if not tok:
             raise KeyError(f'credential_source.mode=token_env but env {var!r} is unset/empty')
         return str(tok)
+    if mode == 'keychain':
+        proc = subprocess.run(keychain_lookup_args(cs, reveal=True), check=False,
+                              capture_output=True, text=True, timeout=8)
+        if proc.returncode or not proc.stdout.strip():
+            raise RuntimeError('DeepSeek credential unavailable in macOS Keychain')
+        return proc.stdout.strip()
     if mode == 'credential_file':
         path = cs.get('path')
         if not path:
@@ -1716,7 +1733,7 @@ def run(cfg: dict, *, workspace: str, prompt_file: Path, out_dir: Path, stage: s
     except Exception as exc:  # noqa: BLE001
         return {'dispatch_failed': True, 'sent': False, 'dispatched': False,
                 'reason': 'credential_unavailable', 'error_class': type(exc).__name__,
-                'reasons': [f'credential resolution failed before any claim: {exc!r}']}
+                'reasons': [f'credential resolution failed before any claim ({type(exc).__name__})']}
 
     child_env = build_subprocess_env(effective_cfg, token, environ)
     child_env['PWD'] = str(Path(workspace).resolve())
@@ -2196,15 +2213,37 @@ def main(argv=None) -> int:
                                       f'got {args.model!r}; no model substitution']},
                          ensure_ascii=False))
         return 2
+    def report_result(out, prompt_sha256=None):
+        out.setdefault('dispatched', False)
+        if not out.get('dispatched') and args.dispatch_claim:
+            out['prestart_release'] = dp.release_unstarted_claim(
+                args.dispatch_store, args.dispatch_claim, task_id=args.task_id,
+                runtime=RUNTIME, model=args.model, workspace=args.workspace,
+                stage=args.stage, prompt_sha256=prompt_sha256)
+        print(json.dumps(out, ensure_ascii=False))
+        if not out.get('dispatched'):
+            return 2
+        return 0 if out.get('passed') else 3
+
     try:
         required_tools = normalize_required_tools(args.required_tools)
     except ValueError as exc:
-        print(json.dumps({'dispatch_failed': True, 'sent': False, 'dispatched': False,
-                          'reason': 'required_tools_invalid', 'reasons': [str(exc)]},
-                         ensure_ascii=False))
-        return 2
+        return report_result({'dispatch_failed': True, 'sent': False,
+                              'reason': 'required_tools_invalid', 'reasons': [str(exc)]})
+
+    try:
+        prompt_bytes = Path(args.prompt_file).read_bytes()
+    except OSError as exc:
+        return report_result({'dispatch_failed': True, 'sent': False,
+                              'reason': 'prompt_unavailable', 'error_class': type(exc).__name__})
+    prompt_sha = _sha(prompt_bytes)
     config_path = str(Path(args.config or str(DEFAULT_CONFIG)).resolve())
-    cfg = load_entry_config(config_path)
+    try:
+        cfg = load_entry_config(config_path)
+    except (OSError, ValueError, TypeError, KeyError) as exc:
+        reason = 'entry_config_missing' if isinstance(exc, FileNotFoundError) else 'entry_config_invalid'
+        return report_result({'dispatch_failed': True, 'sent': False, 'reason': reason,
+                              'error_class': type(exc).__name__}, prompt_sha)
     cfg.setdefault('model', args.model)
     if args.max_turns is not None:
         cfg['max_turns'] = args.max_turns
@@ -2215,22 +2254,23 @@ def main(argv=None) -> int:
         cfg['closeout_reserve_turns'] = args.closeout_reserve_turns
     plan = None
     active_tasks = None
-    if args.dispatch_plan:
-        plan = json.loads(Path(args.dispatch_plan).read_text(encoding='utf-8'))
-        if args.active_tasks:
-            active_tasks = json.loads(Path(args.active_tasks).read_text(encoding='utf-8'))
-    prompt_bytes = Path(args.prompt_file).read_bytes()
+    try:
+        if args.dispatch_plan:
+            plan = json.loads(Path(args.dispatch_plan).read_text(encoding='utf-8'))
+            if args.active_tasks:
+                active_tasks = json.loads(Path(args.active_tasks).read_text(encoding='utf-8'))
+    except (OSError, ValueError) as exc:
+        return report_result({'dispatch_failed': True, 'sent': False,
+                              'reason': 'precheck_failed', 'error_class': type(exc).__name__},
+                             prompt_sha)
     out = run(cfg, workspace=args.workspace, prompt_file=Path(args.prompt_file),
               out_dir=Path(args.output_dir), stage=args.stage, task_id=args.task_id,
-              prompt_sha256=_sha(prompt_bytes), claim_token=args.dispatch_claim,
+              prompt_sha256=prompt_sha, claim_token=args.dispatch_claim,
               is_engineering_task=not args.not_engineering_task,
               dispatch_store=args.dispatch_store, plan=plan, active_tasks=active_tasks,
               required_tools=required_tools, write_files=args.write_files,
               required_test_commands=args.required_test_commands)
-    print(json.dumps(out, ensure_ascii=False))
-    if not out.get('dispatched'):
-        return 2  # not dispatched (precheck/credential/gate)
-    return 0 if out.get('passed') else 3  # 3: dispatched but failed (protocol/binding/exec)
+    return report_result(out, prompt_sha)
 
 
 if __name__ == '__main__':

@@ -180,6 +180,27 @@ class PureFunctionTests(unittest.TestCase):
             proc.communicate(timeout=2)
         self.assertLess(__import__('time').monotonic() - started, 1.5)
 
+    def test_private_free_quota_log_stops_a_silent_child(self):
+        with tempfile.TemporaryDirectory() as tmp:
+            log = Path(tmp) / 'opencode.log'
+            line = (b'level=ERROR message="stream error" providerID=opencode '
+                    b'modelID=deepseek-v4.1-flash-free agent=build error.error="Free usage limit reached"\n')
+            log.write_bytes(line.replace(b'level=ERROR', b'level=INFO'))
+            self.assertFalse(od._free_quota_exhausted(log))
+            log.write_bytes(line.replace(b'agent=build', b'agent=title'))
+            self.assertFalse(od._free_quota_exhausted(log))
+            proc = subprocess.Popen(
+                [sys.executable, '-c',
+                 f'from pathlib import Path; import time; Path({str(log)!r}).write_bytes({line!r}); time.sleep(15)'],
+                stdin=subprocess.PIPE, stdout=subprocess.PIPE, stderr=subprocess.PIPE)
+            try:
+                with self.assertRaises(od.FreeQuotaExhausted):
+                    od._communicate_with_no_progress_watch(
+                        proc, b'', total_seconds=8, idle_seconds=6, quota_log=log)
+            finally:
+                proc.kill()
+                proc.communicate(timeout=5)
+
     def test_workspace_boundary_event_stops_real_child_even_without_idle_watch(self):
         with tempfile.TemporaryDirectory() as tmp:
             workspace = Path(tmp).resolve()

@@ -161,6 +161,10 @@ python scripts/claude_direct.py \
 
 ## 5. 凭据与配置边界
 
+- macOS 使用 `credential_source: {"mode":"keychain","service":"brain-worker.deepseek","account":"claude"}`。
+  入口通过系统 `security` 读取对应登录钥匙串项目，密钥只传给 Claude 子进程环境。
+  用 `entry_runtime_probe.py --json --credentials` 检查凭据是否存在；该检查不读取密钥，
+  连通性以正式入口调用为准。Windows 的 DPAPI 和原有环境变量来源继续有效。
 - 私有配置 `scripts/claude-entry.local.json`（DPAPI 指针 / token env）**由 root 本机填写、
   worker 工具不读**；`.gitignore` 已加入该文件；仓库只提供并只提交
   `scripts/claude-entry.json.example`（占位符、无密钥；示例结构为 `node.exe` +

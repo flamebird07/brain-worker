@@ -622,6 +622,20 @@ class CodeBuddyDirectTests(unittest.TestCase):
         self.assertEqual(res['rc'], 3)
         self.assertTrue(res['summary']['parse_errors'])
 
+    def test_usage_update_keeps_session_binding(self):
+        events = self.success_events()
+        events.insert(2, {'type': 'system', 'subtype': 'usage_update',
+                          'session_id': 'S-1', '_meta': {}})
+        res = self.run_entry(self.tmp / 'out-usage', self.write_spec(events))
+        self.assertEqual(res['rc'], 0)
+        self.assertTrue(res['summary']['report_bound'])
+
+        events[2]['session_id'] = 'S-DRIFT'
+        res = self.run_entry(self.tmp / 'out-usage-drift', self.write_spec(events))
+        self.assertEqual(res['rc'], 3)
+        self.assertTrue(any('session_id drift' in error
+                            for error in res['summary']['parse_errors']))
+
     # ---- 会话漂移 ----
     def test_session_drift_in_events_rejects(self):
         rep = report_text(self.STAGE, str(self.workspace))

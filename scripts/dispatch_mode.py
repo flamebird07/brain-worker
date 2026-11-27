@@ -94,7 +94,7 @@ MODE_LABELS = {'strong': '强', 'medium': '中', 'weak': '弱'}
 MODE_NOTES = {
     'strong': '强档 · 两内置 Qwen4-Max-Preview／Claude／ZCode · 全部无时段门',
     'medium': '中档 · 仅 ZCode／Claude／两内置 Qwen4-Max-Preview · Max 夜间门 + Claude 高峰门',
-    'weak': '弱档 · 5 个可新派池 · 纯优先级队列（无时段门）',
+    'weak': '弱档 · 4 个可新派池 · 纯优先级队列（无时段门）',
 }
 # 每档可新派范围的纯文字描述（回执/浮窗文案用，绝不承载数字层号/容量，防漂移）。
 # BW-QWEN4-SONUS-REMOVE-20261115：Sonus 已从所有档位去除；两内置 Max 改为 Qwen4-Max-Preview。

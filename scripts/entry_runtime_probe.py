@@ -13,6 +13,7 @@ import argparse
 import json
 import os
 import shutil
+import subprocess
 import sys
 from pathlib import Path
 
@@ -195,18 +196,43 @@ def opencode_tool_profile():
     return {'allowed_tools': tools, 'command_execution': 'bash' in tools}
 
 
+def claude_credential_ready(environ=None):
+    """Check configuration and local credential presence without revealing a secret."""
+    env = os.environ if environ is None else environ
+    try:
+        source = claude_direct.load_entry_config().get('credential_source') or {}
+        mode = source.get('mode')
+        if mode == 'token_env':
+            return bool(env.get(source.get('env') or 'ANTHROPIC_API_KEY'))
+        if mode == 'credential_file':
+            return bool(source.get('path')) and Path(source['path']).is_file()
+        if mode == 'keychain':
+            result = subprocess.run(claude_direct.keychain_lookup_args(source), stdin=subprocess.DEVNULL,
+                                    stdout=subprocess.DEVNULL, stderr=subprocess.DEVNULL, timeout=5)
+            return result.returncode == 0
+    except (OSError, ValueError, TypeError, AttributeError, subprocess.SubprocessError):
+        pass
+    return False
+
+
 def main(argv=None):
     parser = argparse.ArgumentParser(description='Inspect configured worker runtimes without launching them')
     parser.add_argument('runtimes', nargs='*', help='executor names; default: all configured executor types')
     parser.add_argument('--json', action='store_true', help='emit JSON for scripts')
+    parser.add_argument('--credentials', action='store_true',
+                        help='include credential-presence booleans, without retrieving secrets')
     args = parser.parse_args(argv)
     names = args.runtimes or list(RUNTIME_PROBES)
     results = {name: probe_runtime(name) for name in names}
+    readiness = {'claude': claude_credential_ready()} if 'claude' in results and args.credentials else {}
     if args.json:
-        print(json.dumps(results, sort_keys=True))
+        output = {'runtimes': results, 'credential_ready': readiness} if args.credentials else results
+        print(json.dumps(output, sort_keys=True))
     else:
         for name, status in results.items():
             print(f'{name}: {status}')
+            if name in readiness:
+                print(f'  credential_present: {str(readiness[name]).lower()}')
     return 0
 
 

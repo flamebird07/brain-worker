@@ -584,41 +584,63 @@ def main(argv=None) -> int:
                                       'WorkBuddy']},
                          ensure_ascii=False))
         return 2
-    if args.timeout_seconds is not None and args.timeout_seconds <= 0:
-        print(json.dumps({'dispatch_failed': True, 'sent': False,
-                          'dispatched': False,
-                          'reason': 'timeout_out_of_bounds',
-                          'reasons': [f'--timeout-seconds must be positive when supplied, '
-                                      f'got {args.timeout_seconds!r}; omit it for no '
-                                      'wall-clock limit (no silent default is applied)']},
-                         ensure_ascii=False))
-        return 2
     # BW-LIMIT30-20261019-S3：GLM 与 DeepSeek 额度独立，不再在读取配置前要求当轮
     # DeepSeek 限额证据；旧 `--codebuddy-quota-evidence` 仅作兼容诊断，缺省照常进入正式
     # 入口（工作区/容量/权限/同任务/真实权限拒绝门完全不变）。
-    cfg = cb.load_entry_config(args.config)
-    tools_items = cb.parse_tools_arg(args.tools)
+    def report_result(out, prompt_sha256=None):
+        out.setdefault('dispatched', False)
+        if not out.get('dispatched') and args.dispatch_claim:
+            out['prestart_release'] = dp.release_unstarted_claim(
+                args.dispatch_store, args.dispatch_claim, task_id=args.task_id,
+                runtime=RUNTIME, model=args.model, workspace=args.workspace,
+                stage=args.stage, prompt_sha256=prompt_sha256)
+        print(json.dumps(out, ensure_ascii=False))
+        if not out.get('dispatched'):
+            return 2
+        return 0 if out.get('passed') else 3
+
+    if args.timeout_seconds is not None and args.timeout_seconds <= 0:
+        return report_result({
+            'dispatch_failed': True, 'sent': False, 'reason': 'timeout_out_of_bounds',
+            'reasons': [f'--timeout-seconds must be positive when supplied, '
+                        f'got {args.timeout_seconds!r}; omit it for no wall-clock limit'],
+        })
+
+    try:
+        prompt_bytes = Path(args.prompt_file).read_bytes()
+    except OSError as exc:
+        return report_result({'dispatch_failed': True, 'sent': False,
+                              'reason': 'prompt_unavailable', 'error_class': type(exc).__name__})
+    prompt_sha = _sha(prompt_bytes)
+    try:
+        cfg = cb.load_entry_config(args.config)
+    except (OSError, ValueError, TypeError, KeyError) as exc:
+        reason = 'entry_config_missing' if isinstance(exc, FileNotFoundError) else 'entry_config_invalid'
+        return report_result({'dispatch_failed': True, 'sent': False, 'reason': reason,
+                              'error_class': type(exc).__name__}, prompt_sha)
     plan = None
     active_tasks = None
-    if args.dispatch_plan:
-        plan = json.loads(Path(args.dispatch_plan).read_text(encoding='utf-8'))
-        if args.active_tasks:
-            active_tasks = json.loads(Path(args.active_tasks).read_text(encoding='utf-8'))
-    prompt_bytes = Path(args.prompt_file).read_bytes()
+    try:
+        tools_items = cb.parse_tools_arg(args.tools)
+        if args.dispatch_plan:
+            plan = json.loads(Path(args.dispatch_plan).read_text(encoding='utf-8'))
+            if args.active_tasks:
+                active_tasks = json.loads(Path(args.active_tasks).read_text(encoding='utf-8'))
+    except (OSError, ValueError) as exc:
+        return report_result({'dispatch_failed': True, 'sent': False,
+                              'reason': 'precheck_failed', 'error_class': type(exc).__name__},
+                             prompt_sha)
     # 缺省 None：普通新派发不加墙钟限制；只有显式正数才交给 run 生效。
     timeout_seconds = args.timeout_seconds
     out = run(cfg, workspace=args.workspace, prompt_file=Path(args.prompt_file),
               out_dir=Path(args.output_dir), stage=args.stage, task_id=args.task_id,
               model=args.model, tools_items=tools_items,
               allowed_tools=args.allowed_tools, disallowed_tools=args.disallowed_tools,
-              session_id=args.session_id, prompt_sha256=_sha(prompt_bytes),
+              session_id=args.session_id, prompt_sha256=prompt_sha,
               claim_token=args.dispatch_claim, dispatch_store=args.dispatch_store,
               plan=plan, active_tasks=active_tasks, timeout_seconds=timeout_seconds,
               codebuddy_quota_evidence=args.codebuddy_quota_evidence)
-    print(json.dumps(out, ensure_ascii=False))
-    if not out.get('dispatched'):
-        return 2
-    return 0 if out.get('passed') else 3
+    return report_result(out, prompt_sha)
 
 
 if __name__ == '__main__':

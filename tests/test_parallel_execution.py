@@ -260,7 +260,13 @@ class ParallelRehearsalTests(unittest.TestCase):
             'from datetime import datetime, timezone\n'
             'import dispatch_pool as dp\n'
             f'dp.utcnow = lambda: datetime(2026, 10, 8, 15, 0, 0, tzinfo=timezone.utc)\n'
-            'import qoder_direct\n'
+            'import qoder_direct, os, subprocess\n'
+            'original_popen = subprocess.Popen\n'
+            'def fixture_popen(argv, *args, **kwargs):\n'
+            '    if os.name == "nt" and os.path.basename(argv[0]).startswith("qodercn_cli_stub_"):\n'
+            '        argv = [sys.executable, *argv]\n'
+            '    return original_popen(argv, *args, **kwargs)\n'
+            'qoder_direct.subprocess.Popen = fixture_popen\n'
             'sys.exit(qoder_direct.main())\n',
             encoding='utf-8', newline='\n')
         return str(runner)

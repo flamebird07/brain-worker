@@ -37,6 +37,8 @@
   仍 ZCode 后、两区 Flash 前）。证据回执（若提供）仍只含路径/SHA-256/原因码/白名单分类，
   不回显原始错误、headers、Cookie、密钥或令牌。历史证据不改写；正常授权/容量/工作区/同任务/
   真实权限拒绝门不动。旧 DB 限额标记与取消码/正文 429 等仍不构成任何派发依据。
+- macOS 上已用 CodeBuddy CLI 2.183.0 验证正式 GLM 入口。流中的 `system/usage_update`
+  用量事件仍校验会话 ID，不参与协议终态和执行证据判定。
 - 容量生命周期：`consume_for_entry(executor='codebuddy')` 认领 → `mark_running` → `bind_child`
   （必须 `bound=true`）→ 真实退出后 `finish`；启动前失败 `start_failed` 释放；已启动但终态
   无法确认 `mark_unknown` 保留占位。绝不误清别人的锁、不删真实锁、不新建冷却表/服务。

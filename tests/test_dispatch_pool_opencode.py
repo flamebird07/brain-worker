@@ -133,6 +133,25 @@ class IndependentSlotTests(_PoolBase):
         self.assertEqual(r.get('reason'), 'capacity_full')
         self.assertFalse(r.get('sent', True), r)
 
+    def test_prestart_release_requires_exact_scope_and_unstarted_state(self):
+        workspace = str(self._ws_for('prestart'))
+        reservation = dp.reserve(self.store, task_id='prestart', runtime='opencode',
+                                 model=DEEPSEEK, workspace=workspace, prompt_sha256='p',
+                                 stage='s', now=NIGHT, _preclaim=False)
+        token = reservation['token']
+        scope = dict(task_id='prestart', runtime='opencode', model=DEEPSEEK,
+                     workspace=workspace, stage='s', prompt_sha256='p')
+        wrong_scope = dict(scope, prompt_sha256='wrong')
+        self.assertFalse(dp.release_unstarted_claim(self.store, token, **wrong_scope)['released'])
+        self.assertEqual(self.active(DPOOL), 1)
+        self.assertTrue(dp.release_unstarted_claim(self.store, token, **scope)['released'])
+        self.assertFalse(dp.release_unstarted_claim(self.store, token, **scope)['released'])
+
+        running = dp.reserve(self.store, now=NIGHT, _preclaim=False, **scope)['token']
+        self.assertTrue(dp.mark_running(self.store, running, now=NIGHT)['settled'])
+        self.assertFalse(dp.release_unstarted_claim(self.store, running, **scope)['released'])
+        self.assertEqual(self.active(DPOOL), 1)
+
     def test_retired_model_refuses_new_claims_and_old_attempt_still_settles(self):
         self.reserve('d1', 'opencode', DEEPSEEK)
         for claim in (dp.reserve, dp.select_and_claim):

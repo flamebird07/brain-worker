@@ -8,6 +8,10 @@
 
 总墙钟上限仍为 1800 秒。正式入口同时按 stdout JSONL 观察有效事件；连续 300 秒没有任何可解析且带 `type` 的事件时终止本次子进程并记录 `stalled_no_progress=true`、`termination_reason=stalled_no_progress`，保留原始 stdout/stderr，已确认终态后释放本槽。普通噪声、半行和不可解析文本不冒充进展。用户明确要求本次继续等待时可传 `--no-progress-timeout-seconds 0` 关闭无进展门，但总墙钟仍必须保留；负值在 Popen 前拒绝。
 
+入口也监视本轮私有 OpenCode 日志。收到该免费模型的明确 `Free usage limit reached`
+流错误后立即终止，确认退出后释放槽位，并在回执标记 `free_quota_exhausted` 与
+`failure_classification.quota=true`。额度重置时间由服务端决定。
+
 ## 精确模型硬门
 
 - 传入 `--model deepseek-v4.1-flash-free`，CLI 收到 `opencode/deepseek-v4.1-flash-free`。

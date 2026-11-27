@@ -654,11 +654,11 @@ def parse_stream(stdout_bytes: bytes, model_requested: str,
                     if removed_keys:
                         errors.append(f'line {lineno}: duplicate init removed fields '
                                       f'{removed_keys}; rejected')
-            elif subtype == 'status':
-                pass  # 正常进度事件，保留但不参与终态判定
+            elif subtype in ('status', 'usage_update'):
+                pass  # 进度和用量事件保留会话校验，不参与终态判定
             else:
                 errors.append(f'line {lineno}: system event subtype '
-                              f'{subtype!r} is not "init" or "status"')
+                              f'{subtype!r} is not "init", "status" or "usage_update"')
         elif etype == 'assistant':
             message = event.get('message')
             if not isinstance(message, dict):

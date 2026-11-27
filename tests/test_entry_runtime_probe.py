@@ -187,6 +187,13 @@ class ClaudeProbeTests(_CfgBase):
         self._patch_default(claude_direct, cfg)
         self.assertEqual(erp.probe_runtime('claude'), erp.UNKNOWN)
 
+    def test_token_env_reports_presence_only(self):
+        cfg = self._write_cfg('cl-source.json', {'credential_source': {'mode': 'token_env'}})
+        self._patch_default(claude_direct, cfg)
+        with unittest.mock.patch.object(claude_direct, 'resolve_token', side_effect=AssertionError):
+            self.assertFalse(erp.claude_credential_ready({}))
+            self.assertTrue(erp.claude_credential_ready({'ANTHROPIC_API_KEY': 'synthetic'}))
+
     def test_never_touches_credentials(self):
         # 探针只读路径字段：配置里即使带着 credential_source，也绝不触发
         # resolve_token（真触发即 AssertionError 当场失败）。

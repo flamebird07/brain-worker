@@ -2354,6 +2354,35 @@ def validate_claim(store_path, token, *, task_id=None, runtime=None, model=None,
             'attempt': attempt}
 
 
+def release_unstarted_claim(store_path, token, *, task_id, runtime, model,
+                            workspace, stage, prompt_sha256=None) -> dict:
+    """Release only the exact caller's reservation before any process is bound."""
+    if not token:
+        return {'released': False, 'reason': 'no_claim'}
+    try:
+        with closing(connect(store_path)) as conn:
+            conn.execute('BEGIN IMMEDIATE')
+            row = conn.execute('SELECT * FROM attempts WHERE token=?', (token,)).fetchone()
+            if (row is None or row['state'] != 'reserved' or row['child_pid'] is not None
+                    or row['wrapper_pid'] is not None or row['chat_id'] is not None):
+                conn.rollback()
+                return {'released': False, 'reason': 'not_unstarted_reservation'}
+            check = _validate_attempt_row(row, task_id=task_id, runtime=runtime, model=model,
+                                          workspace=workspace, stage=stage,
+                                          prompt_sha256=prompt_sha256)
+            if not check['ok']:
+                conn.rollback()
+                return {'released': False, 'reason': 'claim_scope_mismatch'}
+            conn.execute("UPDATE attempts SET state='start_failed', terminal='start_failed', "
+                         "ended_at_utc=?, success=0 WHERE token=? AND state='reserved'",
+                         (_iso(utcnow()), token))
+            conn.commit()
+            return {'released': True, 'terminal': 'start_failed'}
+    except (OSError, sqlite3.Error) as exc:
+        return {'released': False, 'reason': 'shared_state_error',
+                'error_class': type(exc).__name__}
+
+
 def consume_for_entry(store_path=None, *, task_id, runtime, model, workspace,
                       prompt_sha256, stage=None, chat_id=None, claim_token=None,
                       wrapper_pid=None, wrapper_created=None, now=None,
