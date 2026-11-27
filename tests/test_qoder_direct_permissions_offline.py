@@ -267,6 +267,9 @@ def main() -> int:
         env['STUB_MODE'] = 'ok'
         env['STUB_REPORT_FILE'] = str(reportp)
         # 并发容量池隔离：每个 out 用各自全新的临时 store，绝不读写真实 ~/.brain-worker 池。
+        mode_file = RUN_DIR / 'dispatch-mode.json'
+        mode_file.write_text(json.dumps({'mode': 'medium'}), encoding='utf-8')
+        env['BRAIN_WORKER_DISPATCH_MODE_FILE'] = str(mode_file)
         env['BRAIN_WORKER_DISPATCH_STORE'] = str(
             RUN_DIR / ('dispatch-' + Path(out_dir).name + '.sqlite3'))
         cmd = [sys.executable, wrapper,
@@ -335,10 +338,12 @@ def main() -> int:
     # 场景 D：CLI 传空 --allowed-tools 应被拒绝（不允许静默过滤成零）
     outD = RUN_DIR / 'e-cli-empty-rule'
     rD = run_cli(outD, ['--allowed-tools', ''])
+    denied = json.loads(rD.stdout)
     check('CLI empty --allowed-tools rejected before subprocess (no silent filter)',
-          rD.returncode != 0 and not (outD / 'request.json').exists()
-          and (b'non-empty' in rD.stderr or b'whitespace' in rD.stderr),
-          f'rc={rD.returncode}, stderr={rD.stderr.decode("utf-8","replace")[:220]}')
+          rD.returncode == 2 and not (outD / 'request.json').exists()
+          and denied.get('permission_args_rejected') is True and denied.get('sent') is False
+          and any('non-empty' in reason for reason in denied.get('reasons', [])),
+          denied)
 
     # 场景 E：CLI 空白 --allowed-tools 应被拒绝
     outE = RUN_DIR / 'e-cli-ws-rule'

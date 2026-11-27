@@ -186,14 +186,17 @@ class PureFunctionTests(unittest.TestCase):
             raw = _jsonl([ev_tool(status='error',
                                   error='Permission denied [{"permission":"external_directory"}]',
                                   input={'filePath': str(workspace / 'input.txt')})]) + b'\n'
-            process = subprocess.Popen(
-                [sys.executable, '-c',
-                 f'import sys,time; sys.stdout.buffer.write({raw!r}); sys.stdout.flush(); time.sleep(20)'],
-                stdin=subprocess.PIPE, stdout=subprocess.PIPE, stderr=subprocess.PIPE)
+            capture = workspace / 'stdout.jsonl'
+            with capture.open('wb') as stdout:
+                process = subprocess.Popen(
+                    [sys.executable, '-c',
+                     f'import sys,time; sys.stdout.buffer.write({raw!r}); sys.stdout.flush(); time.sleep(20)'],
+                    stdin=subprocess.PIPE, stdout=stdout, stderr=subprocess.PIPE)
             try:
                 with self.assertRaises(od.WorkspaceBoundaryDenied):
                     od._communicate_with_no_progress_watch(
-                        process, b'', total_seconds=5, idle_seconds=0, workspace=workspace)
+                        process, b'', total_seconds=5, idle_seconds=0, workspace=workspace,
+                        stdout_path=capture)
             finally:
                 process.kill()
                 process.communicate(timeout=5)

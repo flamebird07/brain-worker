@@ -164,6 +164,9 @@ def main():
         env['STUB_MODE'] = mode
         env['STUB_REPORT_FILE'] = str(repfp)
         # 并发容量池隔离：每个 out 用各自全新的临时 store，绝不读写真实 ~/.brain-worker 池。
+        mode_file = RUN_DIR / 'dispatch-mode.json'
+        mode_file.write_text(json.dumps({'mode': 'medium'}), encoding='utf-8')
+        env['BRAIN_WORKER_DISPATCH_MODE_FILE'] = str(mode_file)
         env['BRAIN_WORKER_DISPATCH_STORE'] = str(
             RUN_DIR / ('dispatch-' + Path(out).name + '.sqlite3'))
         cmd = [sys.executable, wrapper, '--workspace', root,

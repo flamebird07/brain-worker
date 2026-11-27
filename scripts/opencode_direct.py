@@ -158,7 +158,7 @@ def _json_progress_count(raw) -> int:
 
 
 def _communicate_with_no_progress_watch(proc, payload, total_seconds, idle_seconds,
-                                        monotonic=time.monotonic, *, workspace=None):
+                                        monotonic=time.monotonic, *, workspace=None, stdout_path=None):
     """用短等待片段观察 stdout JSONL；总墙钟和无进展墙钟彼此独立。"""
     started = monotonic()
     last_progress = started
@@ -179,7 +179,7 @@ def _communicate_with_no_progress_watch(proc, payload, total_seconds, idle_secon
             return proc.communicate(input=payload if first else None, timeout=wait_for)
         except subprocess.TimeoutExpired as exc:
             first = False
-            partial = exc.output or b''
+            partial = stdout_path.read_bytes() if stdout_path is not None else (exc.output or b'')
             if workspace is not None:
                 end = partial.rfind(b'\n', boundary_offset) + 1
                 if end > boundary_offset:
@@ -669,9 +669,16 @@ def run(cfg, *, workspace, prompt_file, out_dir, stage, task_id, model,
         private_dirs = build_private_dirs(out)
         child_env = build_subprocess_env(cfg, private_dirs, environ, workspace=workspace)
         started_at_utc = now if clock_injected else _now_utc()
-        proc = popen_factory(argv, cwd=str(workspace), stdin=subprocess.PIPE,
-                             stdout=subprocess.PIPE, stderr=subprocess.PIPE,
-                             env=child_env)
+        stdout_path = out / 'stdout.jsonl' if popen_factory is subprocess.Popen else None
+        if stdout_path is not None:
+            # Windows communicate() does not expose partial pipe output until EOF.
+            # A file keeps progress and permission events observable on every host.
+            with stdout_path.open('wb') as stdout:
+                proc = popen_factory(argv, cwd=str(workspace), stdin=subprocess.PIPE,
+                                     stdout=stdout, stderr=subprocess.PIPE, env=child_env)
+        else:
+            proc = popen_factory(argv, cwd=str(workspace), stdin=subprocess.PIPE,
+                                 stdout=subprocess.PIPE, stderr=subprocess.PIPE, env=child_env)
         started = True
         dp.mark_running(dispatch_store, claim, wrapper_pid=os.getpid(),
                         now=started_at_utc)
@@ -709,7 +716,7 @@ def run(cfg, *, workspace, prompt_file, out_dir, stage, task_id, model,
             if popen_factory is subprocess.Popen:
                 stdout_bytes, stderr_bytes = _communicate_with_no_progress_watch(
                     proc, sent_payload, timeout_seconds, no_progress_timeout_seconds,
-                    workspace=workspace)
+                    workspace=workspace, stdout_path=stdout_path)
             else:
                 stdout_bytes, stderr_bytes = proc.communicate(input=sent_payload,
                                                               timeout=timeout_seconds)
@@ -784,7 +791,10 @@ def run(cfg, *, workspace, prompt_file, out_dir, stage, task_id, model,
     evidence = {}
     downstream_error = None
     try:
-        (out / 'stdout.jsonl').write_bytes(stdout_bytes)
+        if stdout_path is not None:
+            stdout_bytes = stdout_path.read_bytes()
+        else:
+            (out / 'stdout.jsonl').write_bytes(stdout_bytes)
         (out / 'stderr.log').write_bytes(stderr_bytes)
         (out / 'events.jsonl').write_bytes(stdout_bytes)
         (out / 'sent-payload-stdin.bin').write_bytes(sent_payload)
@@ -841,7 +851,8 @@ def run(cfg, *, workspace, prompt_file, out_dir, stage, task_id, model,
                                 'backend/account identity'),
             'exit_code': exit_code, 'timed_out': timed_out,
             'stalled_no_progress': stalled_no_progress,
-            'termination_reason': ('stalled_no_progress' if stalled_no_progress else
+            'termination_reason': ('workspace_boundary_denied' if workspace_boundary_denied else
+                                   'stalled_no_progress' if stalled_no_progress else
                                    ('wall_clock_timeout' if timed_out else None)),
             'protocol_success': protocol_success,
             'workspace_boundary_denied': workspace_boundary_denied,
