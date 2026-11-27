@@ -1,7 +1,9 @@
 ---
 name: brain-worker
-description: 主脑负责规划与独立验收，工程执行交已授权外部 Agent。支持 CodeBuddy 两模型、Qoder 国际（Qwen4-Max-Preview/Flash；Sonus 已于 2026-11-15 从所有档位去除新派）与 CN、Claude/deepseek-flash、OpenCode 两个指定 free 模型、ZCode/GLM-5.3（恢复可派、容量 1）；Luna 已删除并强制禁用。手动三档 strong/medium/weak 共享派发策略（默认 weak，仅影响新派发）；strong/medium/weak 常态可新派分别为 4/4/5 池、5/5/6 槽（BW-WEAK-RESTRUCTURE-20261116 起弱档只保留两 OpenCode 免费模型/CodeBuddy GLM/Claude/ZCode GLM-5.3-Flash——全部 Qoder 池与 codebuddy:deepseek-v4.1-flash 从弱档移除，物理总容量 17；此前 BW-QWEN4-SONUS-REMOVE-20261115 起 Sonus 从所有档位去除、两内置 Max 改名 Qwen4-Max-Preview）；2026-10-28 用户要求从所有档位禁用 `qodercn:Qwen-3.8-Max`（Qoder CN／token plan／Qwen-3.8-Max），不影响 CN 内置 `qodercn:Qwen4-Max-Preview`；旧池键 `qoder:Qwen3.8-Max`/`qodercn:Qwen3.8-Max` 降为 legacy-retired（0 容量、在途照常安全计数与结算、绝不新派）；精确模型、优先级、时段、30分钟限额展示/重派规则、权限边界与收尾要求以正文和 references 为准。
+description: 主脑负责规划与独立验收，工程执行交已授权外部 Agent。支持 CodeBuddy 两模型、Qoder 国际（Qwen4-Max-Preview/Flash；Sonus 已于 2026-11-15 从所有档位去除新派）与 CN、Claude/deepseek-flash、OpenCode/deepseek-v4.1-flash-free、ZCode/GLM-5.3（恢复可派、容量 1）；Luna 已删除并强制禁用。手动三档 strong/medium/weak 共享派发策略（默认 weak，仅影响新派发）；strong/medium/weak 常态可新派分别为 4/4/5 池、5/5/6 槽（BW-WEAK-RESTRUCTURE-20261116 起弱档只保留两 OpenCode 免费模型/CodeBuddy GLM/Claude/ZCode GLM-5.3-Flash——全部 Qoder 池与 codebuddy:deepseek-v4.1-flash 从弱档移除，物理总容量 17；此前 BW-QWEN4-SONUS-REMOVE-20261115 起 Sonus 从所有档位去除、两内置 Max 改名 Qwen4-Max-Preview）；2026-10-28 用户要求从所有档位禁用 `qodercn:Qwen-3.8-Max`（Qoder CN／token plan／Qwen-3.8-Max），不影响 CN 内置 `qodercn:Qwen4-Max-Preview`；旧池键 `qoder:Qwen3.8-Max`/`qodercn:Qwen3.8-Max` 降为 legacy-retired（0 容量、在途照常安全计数与结算、绝不新派）；精确模型、优先级、时段、30分钟限额展示/重派规则、权限边界与收尾要求以正文和 references 为准。
 ---
+
+**2026-11-27 用户指令**：`opencode:glm-5.3-flash-free` 已退役。正式入口和所有档位仅保留 OpenCode 的 `deepseek-v4.1-flash-free`。退役池不显示在浮窗，历史在途继续计入总占用并按原流程结算。弱档为 4 池、5 槽，国内总容量为 16。此处覆盖下方历史口径。
 
 ## 当前派工方式（2026-11-18）
 
@@ -15,7 +17,7 @@ description: 主脑负责规划与独立验收，工程执行交已授权外部 
 2. **执行端预检**：本机任务应先检查通用配置及已配置的专用直连入口（如 ZCode、Qoder），再判断可用方式。预检遇到本机权限错误时，按原权限流程核验；用实测结果区分本机访问权限与模型不可用。
 3. **正式派工**：预检通过后，核对实际接收方、将接触的项目数据和对应授权。私有源码即使复制到临时目录，仍按原数据范围核对。若正式调用在启动前被审批拒绝，报告实际理由、接收方和授权缺口，记录派工 0 次；在缺口解决前仅继续已授权的本机工作。人工转发同样须遵守数据授权。
 
-**弱档顺序**：ZCode 排在两路 Qoder Flash 之后，是弱档最后一个自动派发候选。浮窗使用同一优先级。
+**弱档顺序**：OpenCode DeepSeek → CodeBuddy GLM → Claude → ZCode GLM-5.3-Flash。浮窗按同一顺序显示。
 
 **强档优先级（2026-11-15）**：Qoder 国际和 CN 内置 `Qwen4-Max-Preview` 并列第一，其次 Claude，最后 ZCode。强档派发与浮窗行序使用这套共享策略。
 
@@ -38,7 +40,7 @@ description: 主脑负责规划与独立验收，工程执行交已授权外部 
 - 档位是**全宿主共享的手动三档**：strong（强）／medium（中）／weak（弱），**默认 weak**。唯一策略来源是 `scripts/dispatch_mode.py`（档位持久化在 `~/.brain-worker/dispatch-mode.json`，可用 `BRAIN_WORKER_DISPATCH_MODE_FILE` 覆盖；`dispatch_pool`/`stage_selection`/浮窗消费同一份，每次裁决现读、绝不缓存）。浮窗手动切换后原子保存，**只影响之后的新派发**：在途 attempt（reserved/running/unknown）绝不追杀、不假释放、不改派，按原状态自然结束。缺文件/畸形 JSON/非法值/不可读一律**安全回落 weak** 并如实回报来源与错误短码；Claude 时段门依赖 `deepseek_offpeak` 加载/运行异常一律 **fail-closed**（当作窗口关闭），绝不 fail-open。单次 reserve/select-and-claim/consume/claim-due 事务内档位只读一次，切档不会令同一事务前后不一致。
 - **strong（强档）**：常态 4 池、5 槽（BW-QWEN4-SONUS-REMOVE-20261115 起 Sonus 去除）；`zcode:GLM-5.3`（层=2，1 槽）> `claude:deepseek-flash`（层=3，2 槽）> 两内置 Qwen4-Max-Preview（层=4，各 1 槽），全部无时段门。Sonus、CN token plan Max 与其余非本档池一律 `mode_excluded`。
 - **medium（中档）**：4 池、5 槽；两内置 Qwen4-Max-Preview（层=1，各 1 槽）> Claude（层=2，2 槽）> ZCode（层=3，1 槽），不含 Sonus 和 CN token plan Max。两内置 Max 仅北京时间 22:00（含）–次日 08:00（不含）可新派；Claude 保留工作日高峰门；ZCode 无时段门。
-- **weak（弱档，默认）**：5 池、6 槽（BW-WEAK-RESTRUCTURE-20261116 用户明确指令：全部 Qoder 池与 codebuddy:deepseek-v4.1-flash 从弱档移除，弱档 ZCode 只用 GLM-5.3-Flash，Claude 调到倒数第二）。层序：两 OpenCode 免费模型=1 > CodeBuddy GLM=2 > Claude=3 > ZCode GLM-5.3-Flash=4。弱档为**纯优先级队列**（BW-WEAK-TIER-ENFORCE-20261122 用户指令：简化逻辑——只看层序与空位，不参照 availability/限额短窗/时段门/executor 冲突/入口运行时；请求组合不是队首 → routing_required 到队首，绝不跳队直派 zcode），无任何时段门；被移出的池（含 ZCode GLM-5.3）在弱档一律 mode_excluded，遗留在途照常安全计数与自然终态。
+- **weak（弱档，默认）**：4 池、5 槽（BW-WEAK-RESTRUCTURE-20261116 用户明确指令：全部 Qoder 池与 codebuddy:deepseek-v4.1-flash 从弱档移除，弱档 ZCode 只用 GLM-5.3-Flash，Claude 调到倒数第二）。层序：OpenCode DeepSeek=1 > CodeBuddy GLM=2 > Claude=3 > ZCode GLM-5.3-Flash=4。弱档为**纯优先级队列**（BW-WEAK-TIER-ENFORCE-20261122 用户指令：简化逻辑——只看层序与空位，不参照 availability/限额短窗/时段门/executor 冲突/入口运行时；请求组合不是队首 → routing_required 到队首，绝不跳队直派 zcode），无任何时段门；被移出的池（含 ZCode GLM-5.3）在弱档一律 mode_excluded，遗留在途照常安全计数与自然终态。
 - 三档只决定「哪些池可新派、按什么层序、受哪些时段门」；层内既有公平规则（真实在途少者优先、CN 自定义 Max 子优先、平票 stable tie）、1800 秒真实限额短窗、各池容量、总守卫、工作区单写、权限门、失败轮转、Luna 禁用全部照旧。下方「Claude 全天」「国际 Max 全天」等旧权威段一律为被本段覆盖的历史档案；浮窗行序与当前档层序一致。浮窗展示（BW-WIDGET-LEGACY-VISIBILITY-20261023 + BW-QWEN4-SONUS-REMOVE-20261115）：strong/medium 常态只显示本档参与的 4 个池；被本档排除且 attempts 无任何在途（reserved/running/unknown）的池整行不显示（Sonus 三档空闲一律整行隐藏），有遗留在途的排除池整行保留并按真实状态显示（统一标「本档不参与」；Sonus 遗留在途标「不接新派（用户指令）」、CN token plan Max 标「已禁用（用户指令）」）直到真实终态（在途只认 attempts ACTIVE_STATES，绝不按历史失败/时间推断）；weak 仍显示全部行（不含 Sonus，除非其有遗留在途）；过滤只影响展示 rows，汇总占用/容量/activity 签名不变。
 
 Sonus 再次暂时禁用（BW-SONUS-TEMP-DISABLE-20261028-R2，用户明确指令，**历史档案，已被 2026-11-15 BW-QWEN4-SONUS-REMOVE-20261115 去除覆盖**）：`qoder:Sonus` 从 strong/medium/weak **所有档位**的可新派集合中剔除，唯一权威开关 `scripts/dispatch_mode.py` 的 `SONUS_TEMP_DISABLED = True`（可逆：改回 False 即完整恢复三档常态口径）。AUTO 不选它（strong AUTO 首选变为 ZCode=2，strong 实际 4 池/5 槽）；显式 reserve/select-and-claim/consume/claim-due/正式 qoder 入口一律 `mode_excluded`（sent=false、零新占位、绝不静默换模型），文案明确「暂时禁用（用户指令）」，绝不伪装成额度、认证、时段、容量或永久退役。容量登记（独立 1 槽）、模型字面量、优先级表历史层号（STRONG_PRIORITY 仍记 Sonus=1）、宿主递归排除、物理总容量 16 与历史 attempt 全部保留；绝不加入 legacy/retired。浮窗：三档空闲时 Sonus 整行隐藏；遗留 reserved/running/unknown Sonus 整行保留、真实状态与占用照常并标「暂时禁用（用户指令）」直到真实终态。禁用只针对**新派发**——禁用前合法取得且仍 reserved 的精确 Sonus claim 沿既有完整校验（token/task/workspace/PID/容量/权限）继续启动/结束，例外绝不泛化到其它 mode_excluded 池；已有 running/unknown 不追杀、不改派、不假释放。恢复启用与旧禁用段均为历史档案。
@@ -1073,10 +1075,8 @@ BW-LIMIT30-20261019-S3 覆盖旧门口径：GLM 不再依赖当轮 DeepSeek 限�
 
 ## OpenCode CLI 正式直连入口（2026-10-19，BW-OPENCODE-20261019-S1/S3）
 
-用户授权 OpenCode CLI 作为正式派工入口，**只服务两个精确免费模型**
-`opencode:deepseek-v4.1-flash-free` 与 `opencode:glm-5.3-flash-free`，各自独立 1 槽计入
-`MAIN_FORCE_CAPACITY`（国内总 14→**16**，原 14 槽一项未减），优先级同层=4（ZCode 之后、条件
-CodeBuddy GLM=5 之前）；**无时段门、无 CodeBuddy 当轮额度前提、绝不付费回退**——其它 model
+OpenCode CLI 只派发精确模型 `opencode:deepseek-v4.1-flash-free`，占独立 1 槽，
+位于弱档首位。**无时段门、无 CodeBuddy 当轮额度前提、绝不付费回退**。其它模型
 在配置读取/建输出/容量认领/Popen 之前固定拒绝（`cli_model_rejected`，零副作用）。正式入口
 `scripts/opencode_direct.py`：argv `run --pure --model opencode/<ID> --format json`、完整九节
 契约 + 任务原文经 stdin 发送、默认 1800s 有界墙钟（`--timeout-seconds` 仅正数生效）；

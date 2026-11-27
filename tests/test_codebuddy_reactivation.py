@@ -167,7 +167,7 @@ class _PoolBase(unittest.TestCase):
         # 层2 codebuddy:glm-5.3-flash 请求一律被队列接管（routing_required 到队首）；
         # 要真实 claim GLM 必须先占满层1 两 OpenCode（与 test_zcode_appserver_direct
         # 的 _occupy_higher_weak_slots 同一模式）。
-        for i, m in enumerate((dp.OPENCODE_DEEPSEEK_MODEL, dp.OPENCODE_GLM_MODEL)):
+        for i, m in enumerate(dp.OPENCODE_MODELS):
             r = self.reserve(f'pre-weak-oc-{i}', 'opencode', m, 'opencode')
             assert r.get('allowed'), (m, r)
 
@@ -198,10 +198,10 @@ class TestCodebuddyPoolPriority(_PoolBase):
         # BW-WEAK-RESTRUCTURE-20261116: 物理总 17（16 + 弱档专用 zcode:GLM-5.3-Flash
         # 独立 1 槽）；ALL_POOL_KEYS 为全档位策略池并集（12 池、不含 strong 专属 Sonus）
         # 合计 16；weak 可新派集合 5 池 6 槽（deepseek 已移出弱档）。
-        self.assertEqual(dp.DOMESTIC_TOTAL_CAPACITY, 17)
-        self.assertEqual(sum(dp.capacity_for(k) for k in dm.ALL_POOL_KEYS), 16)
+        self.assertEqual(dp.DOMESTIC_TOTAL_CAPACITY, 16)
+        self.assertEqual(sum(dp.capacity_for(k) for k in dm.ALL_POOL_KEYS), 15)
         self.assertEqual(sum(dp.capacity_for(k)
-                             for k in dm.allowed_pools_for_mode('weak')), 6)
+                             for k in dm.allowed_pools_for_mode('weak')), 5)
 
     def test_pool_priority_codebuddy_is_five(self):
         # BW-WEAK-RESTRUCTURE-20261116: 弱档层表重排（层号重新连续编号）——两 OpenCode=1 >
@@ -210,7 +210,7 @@ class TestCodebuddyPoolPriority(_PoolBase):
         # 都不可新派，后者仅 strong/medium）。
         self.assertEqual(dp.POOL_PRIORITY, dict(dm.WEAK_PRIORITY))
         self.assertEqual(dp.POOL_PRIORITY[dp.OPENCODE_DEEPSEEK_POOL_KEY], 1)
-        self.assertEqual(dp.POOL_PRIORITY[dp.OPENCODE_GLM_POOL_KEY], 1)
+        self.assertNotIn(dp.OPENCODE_GLM_POOL_KEY, dp.POOL_PRIORITY)
         self.assertEqual(dp.POOL_PRIORITY[CB_GLM], 2)
         self.assertEqual(dp.POOL_PRIORITY[CLAUDE], 3)
         self.assertEqual(dp.POOL_PRIORITY[dp.ZCODE_FLASH_POOL_KEY], 4)
@@ -250,7 +250,6 @@ class TestCodebuddyPoolPriority(_PoolBase):
         # BW-WEAK-TIER-ENFORCE-20261122: 弱档纯优先级队列——队列走完全满即如实
         # capacity_full（不再是 mode_excluded；被移出弱档的池由入口档位硬门单独拒）。
         self.reserve('o1', 'opencode', 'deepseek-v4.1-flash-free', 'opencode')
-        self.reserve('o2', 'opencode', 'glm-5.3-flash-free', 'opencode')
         out = self.reserve('t3', 'opencode', 'deepseek-v4.1-flash-free', 'auto')
         self.assertTrue(out.get('routing_required'), out)
         self.assertEqual(out['selected']['pool_key'], CB_GLM, out)
@@ -395,14 +394,13 @@ class TestCodebuddyPoolPriority(_PoolBase):
         self.seed(CN_CUSTOM_MAX, 2, task_prefix='full')
         self.seed(CLAUDE, 2, task_prefix='full')
         self.seed(dp.OPENCODE_DEEPSEEK_POOL_KEY, 1, task_prefix='full')
-        self.seed(dp.OPENCODE_GLM_POOL_KEY, 1, task_prefix='full')
         self.seed(QFLASH, 2, task_prefix='full')
         self.seed(CN_FLASH, 2, task_prefix='full')
         # BW-STRONG-SONUS-20261024：weak 不能新派 Sonus；按真实形态 seed 一条 strong
         # 遗留在途，使全局在途达到物理总 17。
         self.seed(dp.SONUS_POOL_KEY, 1, task_prefix='full')
         with closing(dp.connect(self.store)) as conn:
-            self.assertEqual(dp._domestic_active(conn), 17)
+            self.assertEqual(dp._domestic_active(conn), 16)
         # 满载后再派弱档可派池（CodeBuddy GLM）：总守卫如实 capacity_full +
         # domestic_full=true，绝不派第 18 个（deepseek 池已无任何档位可新派，
         # 不再作本机制的载体）。
@@ -513,7 +511,7 @@ class TestLiveTransport(unittest.TestCase):
         # BW-WEAK-TIER-ENFORCE-20261122: 弱档纯优先级队列——占满层1 两 OpenCode（独立
         # 工作区、独立任务），使层2 codebuddy:glm-5.3-flash 成为队首；与
         # test_zcode_appserver_direct 的 _occupy_higher_weak_slots 同一模式。
-        for i, m in enumerate((dp.OPENCODE_DEEPSEEK_MODEL, dp.OPENCODE_GLM_MODEL)):
+        for i, m in enumerate(dp.OPENCODE_MODELS):
             r = dp.reserve(store or self.store, task_id=f'pre-weak-oc-{i}',
                            runtime='opencode', model=m,
                            workspace=str(self.base / f'pre-weak-oc-{i}'),

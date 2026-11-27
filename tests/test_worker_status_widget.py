@@ -143,20 +143,20 @@ class TestModuleDiscipline(_WidgetBase):
         # 且排第一；medium/weak 空闲隐藏（Sonus 仍为 strong 专属）。
         # BW-WEAK-RESTRUCTURE-20261116：弱档收窄为 5 池并新增 zcode:GLM-5.3-Flash 独立行
         # ——静态 ROW_DEFS 共 13 行；各档空闲可见行由 read_snapshot 按当前档动态过滤。
-        self.assertEqual(order[:13], [
+        self.assertEqual(order[:12], [
             dp.SONUS_POOL_KEY,
             dp.CN_CUSTOM_MAX_POOL_KEY, dp.CN_MAX_POOL_KEY,
             dp.CLAUDE_POOL_KEY, dp.QMAX_POOL_KEY, dp.CODEBUDDY_POOL_KEY,
-            dp.OPENCODE_DEEPSEEK_POOL_KEY, dp.OPENCODE_GLM_POOL_KEY,
+            dp.OPENCODE_DEEPSEEK_POOL_KEY,
             dp.CODEBUDDY_GLM_POOL_KEY, dp.QFLASH_POOL_KEY, dp.CN_FLASH_POOL_KEY,
             dp.ZCODE_POOL_KEY, dp.ZCODE_FLASH_POOL_KEY])
-        self.assertEqual(order[13:], [dp.LUNA_KEY])  # 本测试模块为历史用例追加的 Luna 行
-        self.assertNotIn(dp.LUNA_KEY, order[:13])
+        self.assertEqual(order[12:], [dp.LUNA_KEY])  # 本测试模块为历史用例追加的 Luna 行
+        self.assertNotIn(dp.LUNA_KEY, order[:12])
         # 生产 ROW_DEFS 原件：恰好 13 行、含且只含一个 Sonus、一个 ZCode 与一个
         # ZCode GLM-5.3-Flash 行、无 Luna（BW-WEAK-RESTRUCTURE-20261116）。
         prod_order = [pk for pk, _, _ in PROD_ROW_DEFS]
-        self.assertEqual(prod_order, order[:13])
-        self.assertEqual(len(prod_order), 13)
+        self.assertEqual(prod_order, order[:12])
+        self.assertEqual(len(prod_order), 12)
         self.assertEqual(prod_order.count(dp.SONUS_POOL_KEY), 1)
         self.assertEqual(prod_order.count(dp.ZCODE_POOL_KEY), 1)
         # BW-WEAK-RESTRUCTURE-20261116：弱档专用 GLM-5.3-Flash 恰好一行（独立池键）。
@@ -188,7 +188,7 @@ class TestModuleDiscipline(_WidgetBase):
         # dispatch_mode.WEAK_PRIORITY），弱档层表收窄为 5 池且层号连续 1..4。
         weak_prios = [dp.POOL_PRIORITY[pk] for pk in dm.WEAK_POOL_KEYS]
         self.assertEqual(weak_prios, sorted(weak_prios), weak_prios)
-        self.assertEqual(weak_prios, [1, 1, 2, 3, 4])
+        self.assertEqual(weak_prios, [1, 2, 3, 4])
         self.assertEqual(dp.POOL_PRIORITY, dict(dm.WEAK_PRIORITY))
         # 国际 Qoder Max 行紧邻 Claude 之后（用户明确要求"排到 Claude 后面"）。
         self.assertEqual(prod_order.index(dp.QMAX_POOL_KEY),
@@ -200,17 +200,17 @@ class TestModuleDiscipline(_WidgetBase):
         # BW-WEAK-RESTRUCTURE-20261116：弱档收窄并新增 zcode:GLM-5.3-Flash 独立 1 槽，
         # 物理总 16→17；全部档位策略池并集（ALL_POOL_KEYS，12 池）合计 16，
         # 加 strong 专属 Sonus 1 槽恰为物理总 17。
-        self.assertEqual(dp.DOMESTIC_TOTAL_CAPACITY, 17)
+        self.assertEqual(dp.DOMESTIC_TOTAL_CAPACITY, 16)
         self.assertEqual((sum(dp.MAIN_FORCE_CAPACITY.values())
-                          + sum(dp.OVERFLOW_CAPACITY.values())), 17)
+                          + sum(dp.OVERFLOW_CAPACITY.values())), 16)
         self.assertEqual(dp.MAIN_FORCE_CAPACITY[dp.SONUS_POOL_KEY], 1)
-        self.assertEqual(sum(dp.capacity_for(k) for k in dm.ALL_POOL_KEYS), 16)
+        self.assertEqual(sum(dp.capacity_for(k) for k in dm.ALL_POOL_KEYS), 15)
         self.assertEqual(dp.MAIN_FORCE_CAPACITY[dp.ZCODE_POOL_KEY], 1)
         # BW-WEAK-RESTRUCTURE-20261116：弱档 ZCode 专用 GLM-5.3-Flash 独立 1 槽。
         self.assertEqual(dp.MAIN_FORCE_CAPACITY[dp.ZCODE_FLASH_POOL_KEY], 1)
         self.assertEqual(dp.MAIN_FORCE_CAPACITY[dp.CODEBUDDY_GLM_POOL_KEY], 1)
         self.assertEqual(dp.MAIN_FORCE_CAPACITY[dp.OPENCODE_DEEPSEEK_POOL_KEY], 1)
-        self.assertEqual(dp.MAIN_FORCE_CAPACITY[dp.OPENCODE_GLM_POOL_KEY], 1)
+        self.assertEqual(dp.capacity_for(dp.OPENCODE_GLM_POOL_KEY), 0)
         # 用户明确要求的完整 CN 名称，绝不再写「CN 内置/CN 自定义」。
         labels = dict((pk, label) for pk, label, _ in wsw.ROW_DEFS)
         self.assertEqual(labels[dp.CN_MAX_POOL_KEY], 'Qoder CN／Qwen4-Max-Preview')
@@ -307,13 +307,13 @@ class TestSnapshotStates(_WidgetBase):
         # BW-STRONG-SONUS-20261024：物理总 16；BW-WEAK-RESTRUCTURE-20261116：弱档收窄
         # 为 5 个可新派池——空闲只显示这 5 行（Sonus 与被移出弱档的池空闲整行隐藏）；
         # 测试模块追加的 Luna 兼容行不属档位。
-        self.assertEqual(snap['domestic_total_capacity'], 17)
+        self.assertEqual(snap['domestic_total_capacity'], 16)
         policy_rows = [r for r in snap['rows'] if r['pool_key'] != dp.LUNA_KEY]
-        self.assertEqual(len(policy_rows), 5)
+        self.assertEqual(len(policy_rows), 4)
         # BW-WEAK-RESTRUCTURE-20261116：弱档 5 池按层序（层内平票按静态行序）：
         # 两 OpenCode(1) > CodeBuddy GLM(2) > Claude(3) > ZCode GLM-5.3-Flash(4)。
         self.assertEqual([r['pool_key'] for r in policy_rows],
-                         [dp.OPENCODE_DEEPSEEK_POOL_KEY, dp.OPENCODE_GLM_POOL_KEY,
+                         [dp.OPENCODE_DEEPSEEK_POOL_KEY,
                           dp.CODEBUDDY_GLM_POOL_KEY, dp.CLAUDE_POOL_KEY,
                           dp.ZCODE_FLASH_POOL_KEY])
         self.assertNotIn(dp.SONUS_POOL_KEY, [r['pool_key'] for r in snap['rows']])
@@ -381,7 +381,7 @@ class TestSnapshotStates(_WidgetBase):
         self.assertEqual(glm['state'], 'idle')
         self.assertEqual(snap['domestic_active'], 1)
         # BW-WEAK-RESTRUCTURE-20261116：物理总 16→17（新增弱档专用 GLM-5.3-Flash 独立槽）。
-        self.assertEqual(snap['domestic_total_capacity'], 17)
+        self.assertEqual(snap['domestic_total_capacity'], 16)
         # 两模型可同时各 1 在途 → 总占用 2，绝不按共享槽压成 1。
         with closing(self._conn()) as conn:
             self._insert(conn, 'g1', dp.CODEBUDDY_GLM_POOL_KEY, 'reserved',
@@ -532,7 +532,7 @@ class TestSnapshotStates(_WidgetBase):
         self.assertEqual(snap['luna_active'], 1)
         self.assertEqual(snap['domestic_active'], 0)
         # BW-WEAK-RESTRUCTURE-20261116：物理总 16→17（Luna 不计入国内总占用）。
-        self.assertEqual(snap['domestic_total_capacity'], 17)
+        self.assertEqual(snap['domestic_total_capacity'], 16)
 
     def test_retired_pools_not_shown_but_real_in_flight_counted(self):
         with closing(self._conn()) as conn:
@@ -560,7 +560,7 @@ class TestModeExcludedRowVisibility(_WidgetBase):
     # BW-WEAK-RESTRUCTURE-20261116：弱档专用 zcode:GLM-5.3-Flash 在 strong/medium 也是
     # 排除池（strong/medium 只保留 zcode:GLM-5.3），一并纳入整行隐藏断言。
     EXCLUDED = (dp.CODEBUDDY_POOL_KEY, dp.CODEBUDDY_GLM_POOL_KEY,
-                dp.OPENCODE_DEEPSEEK_POOL_KEY, dp.OPENCODE_GLM_POOL_KEY,
+                dp.OPENCODE_DEEPSEEK_POOL_KEY,
                 dp.QFLASH_POOL_KEY, dp.CN_FLASH_POOL_KEY, dp.ZCODE_FLASH_POOL_KEY)
 
     def test_strong_medium_hide_excluded_rows_without_in_flight(self):
@@ -591,10 +591,22 @@ class TestModeExcludedRowVisibility(_WidgetBase):
                 # 汇总口径与档位允许池不受 rows 过滤影响。
                 self.assertEqual(snap['domestic_active'], 0, mode)
                 # BW-WEAK-RESTRUCTURE-20261116：物理总 16→17。
-                self.assertEqual(snap['domestic_total_capacity'], 17, mode)
+                self.assertEqual(snap['domestic_total_capacity'], 16, mode)
                 self.assertEqual(snap['retired_active'], 0, mode)
                 self.assertEqual(set(snap['dispatch_mode_allowed_pools']),
                                  allowed, mode)
+
+    def test_retired_opencode_glm_is_hidden_but_counts_in_flight(self):
+        with closing(self._conn()) as conn:
+            self._insert(conn, 'og-old', dp.OPENCODE_GLM_POOL_KEY, 'unknown',
+                         started=T0 - timedelta(seconds=60))
+        for mode in ('strong', 'medium', 'weak'):
+            with dispatch_mode(mode):
+                snap = self._snap()
+                self.assertNotIn(dp.OPENCODE_GLM_POOL_KEY,
+                                 {row['pool_key'] for row in snap['rows']})
+                self.assertEqual(snap['retired_active'], 1)
+                self.assertEqual(snap['domestic_active'], 1)
 
     def test_excluded_pools_with_legacy_in_flight_stay_visible(self):
         probe = _probe({4321: {'pid': 4321, 'state': 'alive', 'created': '111'}})
@@ -602,7 +614,7 @@ class TestModeExcludedRowVisibility(_WidgetBase):
             # 三个排除池各一种遗留在途：running（匹配活 PID）、reserved、unknown。
             self._insert(conn, 'cb1', dp.CODEBUDDY_POOL_KEY, 'running', child_pid=4321,
                          child_created='111', started=T0 - timedelta(seconds=600))
-            self._insert(conn, 'og1', dp.OPENCODE_GLM_POOL_KEY, 'reserved',
+            self._insert(conn, 'od1', dp.OPENCODE_DEEPSEEK_POOL_KEY, 'reserved',
                          reserved=T0 - timedelta(seconds=300))
             self._insert(conn, 'qf1', dp.QFLASH_POOL_KEY, 'unknown',
                          started=T0 - timedelta(seconds=60))
@@ -611,10 +623,10 @@ class TestModeExcludedRowVisibility(_WidgetBase):
                 snap = self._snap(probe=probe)
                 shown = {r['pool_key'] for r in snap['rows']}
                 # 遗留在途行必须保留；无在途的排除池仍整行隐藏。
-                for pk in (dp.CODEBUDDY_POOL_KEY, dp.OPENCODE_GLM_POOL_KEY,
+                for pk in (dp.CODEBUDDY_POOL_KEY, dp.OPENCODE_DEEPSEEK_POOL_KEY,
                            dp.QFLASH_POOL_KEY):
                     self.assertIn(pk, shown, (mode, pk))
-                for pk in (dp.OPENCODE_DEEPSEEK_POOL_KEY, dp.CODEBUDDY_GLM_POOL_KEY,
+                for pk in (dp.OPENCODE_GLM_POOL_KEY, dp.CODEBUDDY_GLM_POOL_KEY,
                            dp.CN_FLASH_POOL_KEY):
                     self.assertNotIn(pk, shown, (mode, pk))
                 cb = self._row(snap, dp.CODEBUDDY_POOL_KEY)
@@ -625,7 +637,7 @@ class TestModeExcludedRowVisibility(_WidgetBase):
                 self.assertEqual(cb['active'], 1)
                 self.assertEqual(cb['attempts'][0]['display_state'], 'running')
                 self.assertEqual(cb['attempts'][0]['elapsed_seconds'], 600)
-                og = self._row(snap, dp.OPENCODE_GLM_POOL_KEY)
+                og = self._row(snap, dp.OPENCODE_DEEPSEEK_POOL_KEY)
                 self.assertEqual(og['state'], 'reserved')
                 self.assertTrue(og['mode_excluded'])
                 self.assertEqual(og['attempts'][0]['display_state'], 'reserved')
@@ -637,7 +649,7 @@ class TestModeExcludedRowVisibility(_WidgetBase):
                 # 在途汇总不因 rows 过滤改变（占位仍权威计数，绝不释放）。
                 self.assertEqual(snap['domestic_active'], 3, mode)
                 # BW-WEAK-RESTRUCTURE-20261116：物理总 16→17。
-                self.assertEqual(snap['domestic_total_capacity'], 17, mode)
+                self.assertEqual(snap['domestic_total_capacity'], 16, mode)
                 self.assertEqual(snap['retired_active'], 0, mode)
                 # 展开视图保留遗留在途行；精简视图照常列出真实运行行。
                 self.assertIn(dp.CODEBUDDY_POOL_KEY,
@@ -718,7 +730,7 @@ class TestModeExcludedRowVisibility(_WidgetBase):
                 self.assertIn('不接新派', detail)
                 self.assertEqual(snap['domestic_active'], 1, mode)
                 # BW-WEAK-RESTRUCTURE-20261116：物理总 16→17。
-                self.assertEqual(snap['domestic_total_capacity'], 17, mode)
+                self.assertEqual(snap['domestic_total_capacity'], 16, mode)
         # 真实终态后：三档都不再显示 Sonus 行，计数归零。
         with closing(self._conn()) as conn:
             conn.execute("UPDATE attempts SET state='finished', terminal='finished', "
@@ -758,7 +770,7 @@ class TestUserDisabledCustomMax(_WidgetBase):
                     self.assertIn(('mode', '已禁用（用户指令）'), wsw.row_badges(row))
                     self.assertEqual(snap['domestic_active'], 1)
                     # BW-WEAK-RESTRUCTURE-20261116：物理总 16→17。
-                    self.assertEqual(snap['domestic_total_capacity'], 17)
+                    self.assertEqual(snap['domestic_total_capacity'], 16)
                     self.assertEqual(snap['retired_active'], 0)
                     self.assertIn(pk, {r['pool_key'] for r in wsw.view_rows(snap, expanded=True)})
             with closing(self._conn()) as conn:
@@ -782,7 +794,7 @@ class TestLastResultAndLimits(_WidgetBase):
             # BW-WEAK-RESTRUCTURE-20261116：两区 Flash 已移出弱档（空闲整行隐藏，且不属
             # strong/medium 集合），改用弱档现役 OpenCode GLM / ZCode GLM-5.3-Flash 验证
             # 同一 last_result 语义（last_result 计算对所有行同一路径）。
-            self._insert(conn, 'f1', dp.OPENCODE_GLM_POOL_KEY, 'finished',
+            self._insert(conn, 'f1', dp.OPENCODE_DEEPSEEK_POOL_KEY, 'finished',
                          started=T0, ended=T0, terminal='finished', success=0)
             self._insert(conn, 'c1', dp.CLAUDE_POOL_KEY, 'finished',
                          started=T0, ended=T0, terminal='finished', success=1)
@@ -791,7 +803,7 @@ class TestLastResultAndLimits(_WidgetBase):
                          'unknown')
         self.assertEqual(self._row(snap, dp.CODEBUDDY_GLM_POOL_KEY)['last_result_label'],
                          '上轮调用待核')
-        self.assertEqual(self._row(snap, dp.OPENCODE_GLM_POOL_KEY)['last_result'], 'failed')
+        self.assertEqual(self._row(snap, dp.OPENCODE_DEEPSEEK_POOL_KEY)['last_result'], 'failed')
         self.assertEqual(self._row(snap, dp.CLAUDE_POOL_KEY)['last_result'], 'passed')
         self.assertEqual(self._row(snap, dp.ZCODE_FLASH_POOL_KEY)['last_result'], 'none')
 
@@ -996,7 +1008,7 @@ class TestQuota30Window(_WidgetBase):
         # 的池验证非窗口池保持原有“绑定最新 attempt token”规则与既有期限。
         # BW-WEAK-RESTRUCTURE-20261116：两区 Flash 已移出弱档（空闲整行隐藏），非窗口池
         # 改用弱档现役的 OpenCode GLM（同样不在窗口表，token 规则同路径）。
-        pk = dp.OPENCODE_GLM_POOL_KEY
+        pk = dp.OPENCODE_DEEPSEEK_POOL_KEY
         self.assertNotIn(pk, wsw.WINDOW_LIMIT_POOLS)
         with closing(self._conn()) as conn:
             conn.execute('INSERT INTO main_force_limits(pool_key, limited, task_id, '
@@ -1315,10 +1327,10 @@ class TestGuiHelpers(_WidgetBase):
         with closing(self._conn()) as conn:
             conn.execute('INSERT INTO main_force_limits(pool_key, limited, task_id, '
                          'attempt_token, recorded_at_utc) VALUES(?,?,?,?,?)',
-                         (dp.OPENCODE_GLM_POOL_KEY, 1, 'T-q', 'q-old', _iso(T0)))
-            self._insert(conn, 'q-old', dp.OPENCODE_GLM_POOL_KEY, 'finished', started=T0,
+                         (dp.OPENCODE_DEEPSEEK_POOL_KEY, 1, 'T-q', 'q-old', _iso(T0)))
+            self._insert(conn, 'q-old', dp.OPENCODE_DEEPSEEK_POOL_KEY, 'finished', started=T0,
                          ended=T0, terminal='finished', success=0)
-        qrow = self._row(self._snap(), dp.OPENCODE_GLM_POOL_KEY)
+        qrow = self._row(self._snap(), dp.OPENCODE_DEEPSEEK_POOL_KEY)
         self.assertTrue(qrow['prev_limited'])
         qtext = wsw.detail_text(qrow)
         self.assertIn('上轮限额', qtext)
@@ -2651,7 +2663,7 @@ class LunaDisabledWidgetTests(unittest.TestCase):
         # strong 专属 Sonus 行；BW-WEAK-RESTRUCTURE-20261116：新增弱档专用
         # zcode:GLM-5.3-Flash 行 → 生产 ROW_DEFS 为 13（含且只含一个 ZCode 行、
         # 一个 ZCode GLM-5.3-Flash 行、一个 Sonus 行）。
-        self.assertEqual(len(wsw.ROW_DEFS), 13)
+        self.assertEqual(len(wsw.ROW_DEFS), 12)
         self.assertEqual([row[0] for row in wsw.ROW_DEFS].count(dp.ZCODE_POOL_KEY), 1)
         self.assertEqual([row[0] for row in wsw.ROW_DEFS].count(dp.ZCODE_FLASH_POOL_KEY), 1)
         self.assertEqual([row[0] for row in wsw.ROW_DEFS].count(dp.SONUS_POOL_KEY), 1)

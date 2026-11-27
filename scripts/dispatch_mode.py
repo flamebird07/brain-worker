@@ -8,9 +8,8 @@ BW-MANUAL-THREE-MODE-20261023（用户明确指令，当前权威）：
 - 缺文件 / 畸形 / 读失败一律**安全回落 weak**，并把真实来源与读取错误如实回报（
   `source` / `error`），绝不把错误冒充成用户选过的 strong/medium。
 
-三档常态新派池数 strong/medium/weak=4/4/5，槽数=5/5/6；物理登记为 17
-（BW-WEAK-RESTRUCTURE-20261116 起：弱档收窄为 5 池并新增 zcode:GLM-5.3-Flash 独立
-1 槽，16→17）。strong 常态：两内置 Qwen4-Max-Preview(1) > Claude(2) > ZCode(3)，全部无时段门。
+三档常态新派池数 strong/medium/weak=4/4/4，槽数=5/5/5；物理登记为 16。
+2026-11-27 起 OpenCode GLM 退役。strong 常态：两内置 Qwen4-Max-Preview(1) > Claude(2) > ZCode(3)，全部无时段门。
 
 BW-QWEN4-SONUS-REMOVE-20261115（用户明确指令，**当前权威**）：
 - Sonus（qoder:Sonus）从**所有档位**（含 strong）去除新派资格——`SONUS_TEMP_DISABLED
@@ -104,7 +103,7 @@ MODE_NOTES = {
 MODE_SCOPE_TEXT = {
     'strong': '两内置 Qwen4-Max-Preview／Claude／ZCode（4 池）',
     'medium': 'ZCode／Claude／两内置 Qwen4-Max-Preview（4 池）',
-    'weak': '两 OpenCode 免费模型／CodeBuddy GLM／Claude／ZCode GLM-5.3-Flash（5 池）',
+    'weak': 'OpenCode DeepSeek／CodeBuddy GLM／Claude／ZCode GLM-5.3-Flash（4 池）',
 }
 
 # ------------------------------------------------------------------ 池名（权威字面量）
@@ -130,7 +129,6 @@ USER_DISABLED_POOL_KEYS = frozenset((QMAX_CN_CUSTOM_POOL_KEY,))
 CODEBUDDY_DEEPSEEK_POOL_KEY = 'codebuddy:deepseek-v4.1-flash'
 CODEBUDDY_GLM_POOL_KEY = 'codebuddy:glm-5.3-flash'
 OPENCODE_DEEPSEEK_POOL_KEY = 'opencode:deepseek-v4.1-flash-free'
-OPENCODE_GLM_POOL_KEY = 'opencode:glm-5.3-flash-free'
 QFLASH_INTL_POOL_KEY = 'qoder:Qwen3.8-Flash'
 QFLASH_CN_POOL_KEY = 'qodercn:Qwen3.8-Flash'
 # BW-STRONG-SONUS-20261024：国际 Qoder / Sonus 的精确池字面量（runtime qoder + CLI
@@ -161,8 +159,8 @@ STRONG_POOL_KEYS = (SONUS_POOL_KEY,) + NARROW_POOL_KEYS
 STRONG_ONLY_POOL_KEYS = (SONUS_POOL_KEY,)
 # weak 的完整可派集合（BW-WEAK-RESTRUCTURE-20261116：用户指令——全部 Qoder 池与
 # codebuddy:deepseek-v4.1-flash 从弱档去除，弱档 ZCode 只用 GLM-5.3-Flash，Claude 调到
-# 倒数第二；Sonus 本就不属于 weak 全候选）。5 池：
-WEAK_POOL_KEYS = (OPENCODE_DEEPSEEK_POOL_KEY, OPENCODE_GLM_POOL_KEY,
+# 倒数第二；Sonus 本就不属于 weak 全候选）。现有 4 池：
+WEAK_POOL_KEYS = (OPENCODE_DEEPSEEK_POOL_KEY,
                   CODEBUDDY_GLM_POOL_KEY, CLAUDE_POOL_KEY, ZCODE_FLASH_POOL_KEY)
 # 全部档位策略池的并集（浮窗行登记与「本档不参与」遗留显示的判定来源）：weak 新集 +
 # 曾属弱档、现被移出但仍在 strong/medium 或留有历史在途的池。集合成员必须都在
@@ -199,7 +197,6 @@ MEDIUM_PRIORITY = {
 # dispatch_pool.POOL_PRIORITY 仍是本表的兼容别名（同一份数值），不另存一份漂移副本。
 WEAK_PRIORITY = {
     OPENCODE_DEEPSEEK_POOL_KEY: 1,
-    OPENCODE_GLM_POOL_KEY: 1,
     CODEBUDDY_GLM_POOL_KEY: 2,
     CLAUDE_POOL_KEY: 3,
     ZCODE_FLASH_POOL_KEY: 4,

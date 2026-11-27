@@ -209,8 +209,8 @@ class RoundFailedRetryTests(_Base):
         两个 OpenCode 免费槽（弱档层=1 同层、无时段门，时钟无关）复现同一语义。"""
         import contextlib
         import io
-        oc_glm = dp.OPENCODE_GLM_POOL_KEY
-        auth = self.auth('auto', 'T', 's2', [OC_DS, oc_glm],
+        cb_glm = dp.CODEBUDDY_GLM_POOL_KEY
+        auth = self.auth('auto', 'T', 's2', [OC_DS, cb_glm],
                          round_failed_candidates=[OC_DS])
         buf = io.StringIO()
         with contextlib.redirect_stdout(buf):
@@ -221,7 +221,7 @@ class RoundFailedRetryTests(_Base):
         out = json.loads(buf.getvalue())
         self.assertEqual(out['round_failed_candidates'], [OC_DS])
         self.assertEqual(out['candidate_filters'][OC_DS], 'already_tried_this_round')
-        self.assertEqual(out['selected']['pool_key'], oc_glm)
+        self.assertEqual(out['selected']['pool_key'], cb_glm)
 
 
 class RoundFailedValidationTests(_Base):

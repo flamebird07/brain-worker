@@ -2,6 +2,7 @@ import json
 import re
 import tempfile
 import unittest
+from unittest import mock
 from pathlib import Path
 
 from scripts import dispatch_pool as dp
@@ -184,21 +185,43 @@ class GuardOnePoolKeyRealityTests(DesktopSkillTestBase):
         # 后，宿主排除集回到退役前的最小一致形态：Qoder 宿主排除自身 Max 三池与 ZCode
         # 精确组合；ZCode 宿主递归排除自己（zcode:GLM-5.3，且仅此一键）。被排除键仍必须
         # 是引擎真实可派键（G1 由上面的 dispatchable 用例兜住）。
-        self.assertEqual(installer.HOST_EXCLUDED["zcode"], ("zcode:GLM-5.3",))
+        self.assertEqual(installer.HOST_EXCLUDED["zcode"],
+                         ("zcode:GLM-5.3", "zcode:GLM-5.3-Flash"))
         self.assertIn("zcode:GLM-5.3", installer.HOST_EXCLUDED["qoder"])
         self.assertIn("qoder:Qwen4-Max-Preview", installer.HOST_EXCLUDED["qoder"])
         self.assertIn("zcode:GLM-5.3", dp.CAPACITY)
 
     def test_sonus_excluded_by_qoder_host_only(self):
         # BW-STRONG-SONUS-20261024：qoder:Sonus 是 strong 专属独立 1 槽正常池；
-        # Qoder 桌面宿主必须排除它（绝不递归自派自己），ZCode 宿主范围不扩大。
+        # Qoder 桌面宿主必须排除它（绝不递归自派自己）。
         # 该键必须是引擎真实可派键，否则 G1 的 dispatchable 断言会先兜住。
         self.assertIn("qoder:Sonus", installer.HOST_EXCLUDED["qoder"])
         self.assertNotIn("qoder:Sonus", installer.HOST_EXCLUDED["zcode"])
-        self.assertEqual(installer.HOST_EXCLUDED["zcode"], ("zcode:GLM-5.3",))
+        self.assertEqual(installer.HOST_EXCLUDED["zcode"],
+                         ("zcode:GLM-5.3", "zcode:GLM-5.3-Flash"))
         self.assertIn("qoder:Sonus", installer.HOST_EXCLUDED_UNION)
         self.assertIn("qoder:Sonus", dp.CAPACITY)
         self.assertEqual(dp.CAPACITY["qoder:Sonus"], 1)
+
+    def test_every_registered_zcode_pool_is_excluded(self):
+        zcode_keys = {key for key in dp.CAPACITY if key.startswith("zcode:")}
+        self.assertEqual(set(installer.HOST_EXCLUDED["zcode"]), zcode_keys)
+        for key in zcode_keys:
+            self.assertIn(key, installer.HOST_EXCLUDED_UNION)
+
+    def test_new_zcode_pool_requires_host_rule_update(self):
+        dp.CAPACITY["zcode:Future-Test"] = 1
+        try:
+            with self.assertRaisesRegex(ValueError, "missing host exclusion zcode:Future-Test"):
+                installer.validate_host_exclusions()
+        finally:
+            del dp.CAPACITY["zcode:Future-Test"]
+
+    def test_trae_editions_are_explicit_and_share_the_template(self):
+        for host in ("trae", "trae-cn"):
+            self.assertIn(host, installer.SUPPORTED_HOSTS)
+            for signal in installer.HOST_SIGNALS[host]:
+                self.assertIn(signal, self.template_text)
 
     def test_rejects_exclusion_naming_a_renamed_pool_key(self):
         with self.assertRaisesRegex(ValueError, "renamed or retired"):
@@ -479,6 +502,66 @@ class SingleSourceTests(DesktopSkillTestBase):
 
 
 class CommandLineTests(DesktopSkillTestBase):
+    def test_default_host_selection_remains_zcode_and_qoder(self):
+        self.assertEqual(installer.HOSTS, ("zcode", "qoder"))
+        self.assertEqual(installer._default_target_roots()["trae"],
+                         Path.home() / ".trae" / "skills")
+        self.assertEqual(installer._default_target_roots()["trae-cn"],
+                         Path.home() / ".trae-cn" / "skills")
+
+    def test_api_platform_gate_precedes_install_writes_and_check(self):
+        with tempfile.TemporaryDirectory() as raw:
+            root = Path(raw)
+            engine = self._make_engine(root)
+            target = root / "would-write"
+            with mock.patch.object(installer.sys, "platform", "linux"):
+                with self.assertRaisesRegex(ValueError, "require macOS"):
+                    installer.install(
+                        source_root=self.repo_root,
+                        engine_root=engine,
+                        target_roots={"trae": target},
+                        hosts=("trae",),
+                    )
+                with self.assertRaisesRegex(ValueError, "require macOS"):
+                    installer.check(
+                        source_root=self.repo_root,
+                        target_roots={"trae-cn": target},
+                        hosts=("trae-cn",),
+                    )
+            self.assertFalse(target.exists())
+
+    def test_cli_platform_gate_rejects_both_editions_before_writes(self):
+        with tempfile.TemporaryDirectory() as raw:
+            root = Path(raw)
+            engine = self._make_engine(root)
+            for host in ("trae", "trae-cn"):
+                target = root / host
+                with mock.patch.object(installer.sys, "platform", "linux"):
+                    code = installer.main([
+                        "install", "--source-root", str(self.repo_root),
+                        "--engine-root", str(engine), "--hosts", host,
+                        "--trae-root", str(target), "--trae-cn-root", str(target),
+                    ])
+                self.assertEqual(code, 2)
+                self.assertFalse(target.exists())
+
+    def test_install_and_check_both_trae_editions_on_macos(self):
+        with tempfile.TemporaryDirectory() as raw:
+            root = Path(raw)
+            engine = self._make_engine(root)
+            roots = {"trae": root / "trae-skills", "trae-cn": root / "trae-cn-skills"}
+            with mock.patch.object(installer.sys, "platform", "darwin"):
+                installed = installer.install(
+                    source_root=self.repo_root, engine_root=engine,
+                    target_roots=roots, hosts=("trae", "trae-cn"),
+                )
+                checked = installer.check(
+                    source_root=self.repo_root, target_roots=roots,
+                    hosts=("trae", "trae-cn"),
+                )
+            self.assertEqual(installed["hosts"], ["trae", "trae-cn"])
+            self.assertTrue(checked["byte_identical_across_hosts"])
+
     def test_cli_check_reports_ready_after_install(self):
         with tempfile.TemporaryDirectory() as raw:
             root = Path(raw)

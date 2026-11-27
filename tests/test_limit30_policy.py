@@ -399,8 +399,7 @@ class TestCodeBuddyIndependentOfWindow(_PoolBase):
         # BW-WEAK-TIER-ENFORCE-20261122: 弱档纯优先级队列——先按队序占满层1 两 OpenCode，
         # GLM（层2）才是队首可被真实 claim；GLM 占用后再占满层3/层4（claude×2、zcode
         # flash），同模型第 2 个请求面对全满队列才如实 capacity_full（而非被队列改派）。
-        for i, (rt, m) in enumerate((('opencode', dp.OPENCODE_DEEPSEEK_MODEL),
-                                     ('opencode', dp.OPENCODE_GLM_MODEL))):
+        for i, (rt, m) in enumerate((('opencode', dp.OPENCODE_DEEPSEEK_MODEL),)):
             occ = dp.reserve(self.store, task_id=f'pre-weak-{i}', runtime=rt,
                              model=m, workspace=self.ws(f'pre-weak-{i}'),
                              prompt_sha256=SHA64, stage='pre-weak', executor=rt,

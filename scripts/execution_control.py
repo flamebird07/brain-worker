@@ -34,6 +34,11 @@ import sys
 from datetime import datetime, timezone
 from pathlib import Path
 
+if __package__:
+    from . import dispatch_pool as dp
+else:
+    import dispatch_pool as dp
+
 FAILURE_TYPES = ('quota_429', 'permission_rule_denied', 'permission_client_missing',
                  'protocol_parse_failure', 'model_execution_failure',
                  'authentication_failure', 'tools_channel_disabled', 'test_failure')
@@ -353,6 +358,8 @@ def preflight(plan, actual, *, active_tasks=None, max_concurrency=None) -> dict:
     for label, obj in (('plan', plan), ('actual', actual)):
         rt = obj.get('runtime') if isinstance(obj, dict) else None
         mdl = obj.get('model') if isinstance(obj, dict) else None
+        if rt == dp.OPENCODE_RUNTIME and mdl == dp.OPENCODE_GLM_MODEL:
+            retired_reasons.append(f'{label} OpenCode model {mdl!r} is retired')
         if isinstance(rt, str) and rt.lower() in RETIRED_DIRECT_RUNTIMES:
             # BW-CODEBUDDY-MAIN-S3 + BW-CODEBUDDY-GLM-FALLBACK-20261018：仅当
             # runtime=codebuddy 且 model 精确等于两个已恢复模型之一时放行；其它 CodeBuddy

@@ -243,7 +243,6 @@ MAIN_FORCE_POOLS = (('zcode', 'GLM-5.3'),
                     ('claude', 'deepseek-flash'),
                     ('codebuddy', 'deepseek-v4.1-flash'),
                     ('opencode', 'deepseek-v4.1-flash-free'),
-                    ('opencode', 'glm-5.3-flash-free'),
                     ('codebuddy', 'glm-5.3-flash'),
                     ('qoder', 'Sonus'))
 MAIN_FORCE_CAPACITY = {'zcode:GLM-5.3': 1,
@@ -258,7 +257,6 @@ MAIN_FORCE_CAPACITY = {'zcode:GLM-5.3': 1,
                        'qodercn:Qwen-3.8-Max': 2,
                        'claude:deepseek-flash': 2,
                        'opencode:deepseek-v4.1-flash-free': 1,
-                       'opencode:glm-5.3-flash-free': 1,
                        'qoder:Sonus': 1}
 OVERFLOW_POOLS = (('qoder', 'Qwen3.8-Flash'), ('qodercn', 'Qwen3.8-Flash'))
 OVERFLOW_CAPACITY = {'qoder:Qwen3.8-Flash': 2, 'qodercn:Qwen3.8-Flash': 2}
@@ -282,7 +280,15 @@ MODE_EXCLUDED = 'mode_excluded'
 # 释放；不再有任何新 claim 落到该池（AUTO/executor=qodercn/显式 combo 均拒绝）。
 # BW-ZCODE-RETIRE-20261020 → BW-ZCODE-RESTORE-1-20261022：zcode:GLM-5.3 曾同机制全局
 # 退役，现按用户明确指令恢复为正常可派池（容量 1、层=2），不再列入退役清单。
-LEGACY_RETIRED_POOL_KEYS = ('qodercn:DeepSeek-Flash',)
+OPENCODE_RUNTIME = 'opencode'
+OPENCODE_DEEPSEEK_MODEL = 'deepseek-v4.1-flash-free'
+OPENCODE_DEEPSEEK_POOL_KEY = f'{OPENCODE_RUNTIME}:{OPENCODE_DEEPSEEK_MODEL}'
+OPENCODE_MODELS = (OPENCODE_DEEPSEEK_MODEL,)
+OPENCODE_POOL_KEYS = (OPENCODE_DEEPSEEK_POOL_KEY,)
+# 已退役，仅用于识别历史账本记录及拒绝旧请求。
+OPENCODE_GLM_MODEL = 'glm-5.3-flash-free'
+OPENCODE_GLM_POOL_KEY = f'{OPENCODE_RUNTIME}:{OPENCODE_GLM_MODEL}'
+LEGACY_RETIRED_POOL_KEYS = ('qodercn:DeepSeek-Flash', OPENCODE_GLM_POOL_KEY)
 # BW-QWEN4-SONUS-REMOVE-20261115：两个 Qoder 内置 Max 改名 Qwen4-Max-Preview 后，旧池键
 # （qoder:Qwen3.8-Max / qodercn:Qwen3.8-Max）同样以 0 容量 legacy-retired 登记——旧池在途
 # attempt 继续安全计数（计入 _domestic_active/物理总 17 守卫）与结算（finish/reconcile 到
@@ -295,7 +301,7 @@ LUNA_RUNTIME = 'luna'
 LUNA_MODEL = 'native'
 LUNA_ASK_TIMEOUT_SECONDS = 300
 DOMESTIC_TOTAL_CAPACITY = (sum(MAIN_FORCE_CAPACITY.values())
-                           + sum(OVERFLOW_CAPACITY.values()))  # 13 主力(含 Sonus 1 与 zcode Flash 1) + 4 Flash = 17
+                           + sum(OVERFLOW_CAPACITY.values()))  # 12 主力 + 4 Flash = 16
 
 # pool_key -> capacity（None 表示无上限，仅 Luna；0 表示已退出正常池但保留历史真实在途）。
 CAPACITY = {}
@@ -316,9 +322,9 @@ MODE_POOLS_UNKNOWN = tuple(k for k in (dm.ALL_POOL_KEYS + dm.STRONG_ONLY_POOL_KE
 # claude），故其容量已在上面 CAPACITY.update 中登记；BW-CLAUDE-CAPACITY2 起容量为 2。
 # 关键口径（BW-OPENCODE-20261019 现行权威；BW-STRONG-SONUS-20261024 增补；
 # BW-WEAK-RESTRUCTURE-20261116 当前权威）：
-#  - DOMESTIC_TOTAL_CAPACITY = 17：ZCode GLM-5.3 与弱档专用 GLM-5.3-Flash 各 1 槽、
+#  - DOMESTIC_TOTAL_CAPACITY = 16：ZCode GLM-5.3 与弱档专用 GLM-5.3-Flash 各 1 槽、
 #    两个 CodeBuddy 模型（deepseek-v4.1-flash / glm-5.3-flash）
-#    与两个 OpenCode 免费模型（deepseek-v4.1-flash-free / glm-5.3-flash-free）
+#    与 OpenCode 免费模型（deepseek-v4.1-flash-free）
 #    **各独立 1 槽、互不占位互斥**，qoder:Sonus 另有 strong 专属独立 1 槽
 #    （Sonus 现全档禁用，登记保留），
 #    claude 与它们在途都计入国内总在途（_domestic_active 只排除 Luna）；
@@ -331,7 +337,7 @@ MODE_POOLS_UNKNOWN = tuple(k for k in (dm.ALL_POOL_KEYS + dm.STRONG_ONLY_POOL_KE
 #    AFTER-20261023）；1800 秒真实限额短窗、容量 2、总守卫与工作区单写照旧；
 #  - codebuddy:deepseek-v4.1-flash **不受任何时段门约束**：既不套 Max 北京夜间窗，也无
 #    Claude 离峰窗；仅经自身 capacity=1 与总在途 15 守卫，无任何跨模型回退。
-#    两个 OpenCode 免费模型同样无时段门、无额度前提，仅经各自 capacity=1 与总守卫；
+#    OpenCode DeepSeek 同样无时段门、无额度前提，仅经 capacity=1 与总守卫；
 #  - codebuddy:glm-5.3-flash 同样无时段门，额度独立（BW-LIMIT30-20261019-S3 起不再要求
 #    当轮 DeepSeek 限额证据，缺省候选即含），仅经自身 capacity=1 守卫。
 #    CodeBuddy 其它旧模型仍不恢复、不进候选池。
@@ -357,17 +363,6 @@ CODEBUDDY_CAPACITY = MAIN_FORCE_CAPACITY[CODEBUDDY_POOL_KEY]
 CODEBUDDY_GLM_MODEL = 'glm-5.3-flash'
 CODEBUDDY_GLM_POOL_KEY = f'{CODEBUDDY_RUNTIME}:{CODEBUDDY_GLM_MODEL}'
 CODEBUDDY_GLM_CAPACITY = MAIN_FORCE_CAPACITY[CODEBUDDY_GLM_POOL_KEY]
-# BW-OPENCODE-20261019 用户明确：OpenCode 独立 CLI 只开放两个**精确免费模型 ID**
-# （deepseek-v4.1-flash-free / glm-5.3-flash-free），各自独立 1 槽、同级（层=6），优先级低于
-# CodeBuddy deepseek（层=5）且高于 CodeBuddy GLM（层=7，额度独立）；
-# 无时段门、无 CodeBuddy 额度前提、绝不自动付费回退。
-OPENCODE_RUNTIME = 'opencode'
-OPENCODE_DEEPSEEK_MODEL = 'deepseek-v4.1-flash-free'
-OPENCODE_GLM_MODEL = 'glm-5.3-flash-free'
-OPENCODE_MODELS = (OPENCODE_DEEPSEEK_MODEL, OPENCODE_GLM_MODEL)
-OPENCODE_POOL_KEYS = tuple(f'{OPENCODE_RUNTIME}:{m}' for m in OPENCODE_MODELS)
-OPENCODE_DEEPSEEK_POOL_KEY = OPENCODE_POOL_KEYS[0]
-OPENCODE_GLM_POOL_KEY = OPENCODE_POOL_KEYS[1]
 # 已弃用（BW-WORKER-WIDGET-20261018-S3）：两个 CodeBuddy 模型改为各自独立 1 槽，不再存在
 # 跨模型共享物理槽。旧同名常量仅保留空元组供既有 import 兼容，任何代码/文案都不得再据此
 # 推导共享容量或跨模型占位互斥。
@@ -965,7 +960,7 @@ def _domestic_active(conn) -> int:
     """国内总在途保护计数（BW-POOL-SPLIT-20261010-S3 + BW-CLAUDE-DEEPSEEK-S3）：统计**所有
     非 Luna 的在途 attempt**，含 claude:deepseek-flash 以及仍在途的 retired DeepSeek 与超额
     旧 Max（迁移债务）。这样即便某个新池按各自容量看似有空位，只要真实总在途已达物理总容量
-    （现为 16：主力含两个 CodeBuddy 各 1、两个 OpenCode 各 1 + claude 2 + 两地区 Flash 各 2），就不会派出超额的国内槽；减少容量不杀
+    （现为 16），就不会派出超额的国内槽；减少容量不杀
     老任务，老任务依真实终态自然释放后计数才下降。Luna（救援池、无上限）不计入国内总额。"""
     row = conn.execute(
         'SELECT COUNT(*) AS n FROM attempts WHERE pool_key != ? AND state IN (%s)'
@@ -2963,6 +2958,10 @@ def _scope_candidate_allowlist(scope):
             isinstance(x, str) and x.strip() for x in value):
         return False, None
     cand = {x.strip() for x in value}
+    # Saved scopes may include the retired OpenCode model alongside active pools.
+    cand.discard(OPENCODE_GLM_POOL_KEY)
+    if not cand:
+        return False, None
     for k in cand:
         if k == LUNA_KEY or k in LEGACY_RETIRED_POOL_KEYS or k not in CAPACITY:
             return False, None
@@ -3514,8 +3513,8 @@ def claim_due(store_path=None, *, task_id, now=None, scope=None,
                     # scope 绑定 codebuddy 的票据只回收两个精确 CodeBuddy 池。
                     allowed = {CODEBUDDY_POOL_KEY, CODEBUDDY_GLM_POOL_KEY}
                 elif scope_executor == OPENCODE_RUNTIME:
-                    # scope 绑定 opencode 的票据只回收两个精确免费模型池。
-                    allowed = {OPENCODE_DEEPSEEK_POOL_KEY, OPENCODE_GLM_POOL_KEY}
+                    # scope 绑定 opencode 的票据只回收仍开放的免费模型池。
+                    allowed = set(OPENCODE_POOL_KEYS)
                 if scope_allowlist is not None:
                     # 与 executor/combo 收窄后的候选取交集；无执行器约束时也只允许
                     # 名单内候选参与本任务回收。

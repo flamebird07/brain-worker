@@ -76,7 +76,6 @@ class NativeLifecycleTests(unittest.TestCase):
                        ('claude', 'deepseek-flash', 'claude'),
                        ('claude', 'deepseek-flash', 'claude')]
         plan_weak = [('opencode', dp.OPENCODE_DEEPSEEK_MODEL, 'opencode'),
-                     ('opencode', dp.OPENCODE_GLM_MODEL, 'opencode'),
                      ('codebuddy', 'glm-5.3-flash', 'codebuddy'),
                      ('zcode', 'GLM-5.3-Flash', 'zcode')]
         tokens = []
@@ -114,7 +113,7 @@ class NativeLifecycleTests(unittest.TestCase):
         self.assertEqual(st['domestic']['active'], dp.DOMESTIC_TOTAL_CAPACITY,
                          st['domestic'])
         # BW-WEAK-RESTRUCTURE-20261116：物理总 16→17（新增弱档专用 GLM-5.3-Flash 槽）。
-        self.assertEqual(st['domestic']['active'], 17, st['domestic'])
+        self.assertEqual(st['domestic']['active'], 16, st['domestic'])
         # 1 个 zcode:GLM-5.3（强档真实 reserve）记 committed_zcode；两内置 Max 真实
         # reserve 记 committed_qoder=2（CN 自定义 Max×2 为直插遗留，不记 rotation）。
         self.assertEqual(st['rotation']['committed_zcode'], 1, st['rotation'])

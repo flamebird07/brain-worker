@@ -261,16 +261,16 @@ class SameOrderAndGuardsTests(_Base):
         # BW-WEAK-RESTRUCTURE-20261116: 16→17（新增弱档专用 zcode:GLM-5.3-Flash 独立
         # 1 槽）；ALL_POOL_KEYS 为全档位策略池并集（12 池、不含 Sonus）合计 16；
         # weak 可新派 5 池 6 槽（全部 Qoder 与 codebuddy:deepseek 移出弱档）。
-        self.assertEqual(dp.DOMESTIC_TOTAL_CAPACITY, 17)
+        self.assertEqual(dp.DOMESTIC_TOTAL_CAPACITY, 16)
         self.assertEqual(dp.capacity_for(CN_CUSTOM_MAX), 2)
         self.assertEqual(dp.capacity_for(ZCODE), 1)
         self.assertEqual(dp.capacity_for(dp.ZCODE_FLASH_POOL_KEY), 1)
         self.assertEqual(dp.capacity_for(dp.SONUS_POOL_KEY), 1)
         self.assertEqual(sum(dp.MAIN_FORCE_CAPACITY.values())
-                         + sum(dp.OVERFLOW_CAPACITY.values()), 17)
-        self.assertEqual(sum(dp.capacity_for(k) for k in dm.ALL_POOL_KEYS), 16)
+                         + sum(dp.OVERFLOW_CAPACITY.values()), 16)
+        self.assertEqual(sum(dp.capacity_for(k) for k in dm.ALL_POOL_KEYS), 15)
         self.assertEqual(sum(dp.capacity_for(k)
-                             for k in dm.allowed_pools_for_mode('weak')), 6)
+                             for k in dm.allowed_pools_for_mode('weak')), 5)
 
     def test_workspace_single_write_guard_unchanged(self):
         # 同 workspace 在途互斥语义不变（恢复后的 zcode executor 与 codebuddy executor
@@ -280,7 +280,7 @@ class SameOrderAndGuardsTests(_Base):
         # BW-WEAK-TIER-ENFORCE-20261122: 弱档纯优先级队列——先按队序占满层1 两 OpenCode，
         # 层2 codebuddy:glm-5.3-flash 才是队首可被 claim（与 test_zcode_appserver_direct
         # 的 _occupy_higher_weak_slots 同一模式）；单写守卫本意不变。
-        for i, m in enumerate((dp.OPENCODE_DEEPSEEK_MODEL, dp.OPENCODE_GLM_MODEL)):
+        for i, m in enumerate(dp.OPENCODE_MODELS):
             occ = self.reserve(f'pre-weak-oc-{i}', 'opencode', m, executor='opencode')
             self.assertTrue(occ.get('allowed'), (m, occ))
         shared = self.ws('shared')
@@ -330,13 +330,13 @@ class UserDisabledCustomMaxTests(_Base):
         self.assertEqual(dp.capacity_for(CN_CUSTOM_MAX), 2)
         # BW-WEAK-RESTRUCTURE-20261116: 物理总 17（16 + 弱档专用 zcode:GLM-5.3-Flash
         # 独立 1 槽）。
-        self.assertEqual(dp.DOMESTIC_TOTAL_CAPACITY, 17)
+        self.assertEqual(dp.DOMESTIC_TOTAL_CAPACITY, 16)
         import install_desktop_skill as installer
         self.assertIn(CN_CUSTOM_MAX, installer.HOST_EXCLUDED['qoder'])
         # BW-QWEN4-SONUS-REMOVE-20261115：Sonus 从所有档位去除——strong/medium 4 池/5 槽。
         # BW-WEAK-RESTRUCTURE-20261116: weak 收窄为 5 池/6 槽（两 OpenCode／CodeBuddy
         # GLM／Claude／ZCode GLM-5.3-Flash；全部 Qoder 池与 codebuddy:deepseek 移出）。
-        for mode, count, slots in (('strong', 4, 5), ('medium', 4, 5), ('weak', 5, 6)):
+        for mode, count, slots in (('strong', 4, 5), ('medium', 4, 5), ('weak', 4, 5)):
             pools = dm.allowed_pools_for_mode(mode)
             self.assertEqual(len(pools), count)
             self.assertEqual(sum(dp.capacity_for(pk) for pk in pools), slots)
@@ -345,7 +345,7 @@ class UserDisabledCustomMaxTests(_Base):
             # 移出全部 Qoder 池——改断言弱档新集合（两 OpenCode／CodeBuddy GLM／Claude／
             # ZCode GLM-5.3-Flash）。
             if mode == 'weak':
-                for pk in (dp.OPENCODE_DEEPSEEK_POOL_KEY, dp.OPENCODE_GLM_POOL_KEY,
+                for pk in (dp.OPENCODE_DEEPSEEK_POOL_KEY,
                            dp.CODEBUDDY_GLM_POOL_KEY, CLAUDE,
                            dp.ZCODE_FLASH_POOL_KEY):
                     self.assertIn(pk, pools)

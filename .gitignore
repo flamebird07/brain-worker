@@ -40,6 +40,7 @@ scripts/codebuddy-entry.json
 scripts/quota-routes.json
 # Claude Code CLI private entry (real config/DPAPI pointer; only the example is committed)
 scripts/claude-entry.local.json
+scripts/opencode-entry.json
 tests/*-run-*/
 
 # Private review inputs/outputs kept on the local machine only

@@ -153,15 +153,15 @@ class CapacityAndRotationTests(_Store):
         self.assertEqual(dp.capacity_for('codebuddy:deepseek-v4.1-flash'), 1)
         self.assertEqual(dp.capacity_for('codebuddy:glm-5.3-flash'), 1)
         self.assertEqual(dp.capacity_for(dp.OPENCODE_DEEPSEEK_POOL_KEY), 1)
-        self.assertEqual(dp.capacity_for(dp.OPENCODE_GLM_POOL_KEY), 1)
+        self.assertEqual(dp.capacity_for(dp.OPENCODE_GLM_POOL_KEY), 0)
         # BW-STRONG-SONUS-20261024：物理总 16（strong 专属 Sonus 1 槽）；
         # BW-WEAK-RESTRUCTURE-20261116：新增弱档专用 zcode:GLM-5.3-Flash 独立 1 槽，
         # 物理总 16→17；弱档可新派集合收窄为 5 池共 6 槽（两 OpenCode 各 1 +
         # CodeBuddy GLM 1 + claude 2 + GLM-5.3-Flash 1）。
         self.assertEqual(dp.capacity_for(dp.SONUS_POOL_KEY), 1)
         self.assertEqual(dp.capacity_for(dp.ZCODE_FLASH_POOL_KEY), 1)
-        self.assertEqual(dp.DOMESTIC_TOTAL_CAPACITY, 17)
-        self.assertEqual(weak_new_dispatch_capacity(), 6)
+        self.assertEqual(dp.DOMESTIC_TOTAL_CAPACITY, 16)
+        self.assertEqual(weak_new_dispatch_capacity(), 5)
         # ZCode（BW-ZCODE-RESTORE-1-20261022 恢复、严格 1 槽）/ 国际组合容量。
         self.assertEqual(dp.capacity_for(ZCODE), 1)
         self.assertEqual(dp.capacity_for(QMAX), 1)
@@ -208,7 +208,6 @@ class CapacityAndRotationTests(_Store):
                        ('cl0', 'claude', 'deepseek-flash', 'claude'),
                        ('cl1', 'claude', 'deepseek-flash', 'claude')]
         fill_weak = [('oc0', 'opencode', dp.OPENCODE_DEEPSEEK_MODEL, 'opencode'),
-                     ('oc1', 'opencode', dp.OPENCODE_GLM_MODEL, 'opencode'),
                      ('zf0', 'zcode', 'GLM-5.3-Flash', 'zcode')]
         with dispatch_mode('medium'):
             for tid, rt, md, ex in fill_medium:
@@ -230,11 +229,11 @@ class CapacityAndRotationTests(_Store):
                         ('cf0', CN_FLASH), ('cf1', CN_FLASH)):
             self._insert_leftover(f'left-{tid}', pk, task_id=tid)
         st = dp.status(self.store, now=T0)
-        self.assertEqual(st['domestic']['active'], 16)
+        self.assertEqual(st['domestic']['active'], 15)
         # 补充一条 strong 遗留 Sonus 在途 → 物理 17/17。
         insert_sonus_leftover(self.store)
         st = dp.status(self.store, now=T0)
-        self.assertEqual(st['domestic']['active'], 17)
+        self.assertEqual(st['domestic']['active'], 16)
         self.assertTrue(st['domestic']['full'])
         self.assertEqual(self.active(CN_FLASH), 2)
         # 物理 17/17 满时的诚实裁决（BW-WEAK-RESTRUCTURE-20261116）：
@@ -316,7 +315,6 @@ class CapacityAndRotationTests(_Store):
         # 占位），它才是队首可被 claim。
         with dispatch_mode('weak'):
             for i, (rt, m) in enumerate((('opencode', dp.OPENCODE_DEEPSEEK_MODEL),
-                                         ('opencode', dp.OPENCODE_GLM_MODEL),
                                          ('claude', 'deepseek-flash'),
                                          ('claude', 'deepseek-flash'))):
                 occ = dp.select_and_claim(self.store, task_id=f'pre-weak-{i}',
@@ -449,7 +447,6 @@ class TerminalReleaseTests(_Store):
         # 两 OpenCode 免费槽与弱档专用 GLM-5.3-Flash 经真实显式 claim 补齐。
         with dispatch_mode('weak'):
             for tid, rt, md in (('oc0', 'opencode', dp.OPENCODE_DEEPSEEK_MODEL),
-                                ('oc1', 'opencode', dp.OPENCODE_GLM_MODEL),
                                 ('zf0', 'zcode', 'GLM-5.3-Flash')):
                 r = dp.select_and_claim(self.store, task_id=tid, runtime=rt, model=md,
                                         workspace=self.ws(tid),
@@ -459,7 +456,7 @@ class TerminalReleaseTests(_Store):
         # 补一条 strong 遗留 Sonus 在途 → 物理 17/17 才满。
         insert_sonus_leftover(self.store)
         st = dp.status(self.store, now=T0)['domestic']
-        self.assertEqual(st['active'], 17)
+        self.assertEqual(st['active'], 16)
         self.assertTrue(st['full'])  # 17/17 才满
 
 
@@ -478,7 +475,6 @@ class DomesticReclaimTests(_Store):
                        ('r3c', 'claude', 'deepseek-flash', 'claude'),
                        ('r3d', 'claude', 'deepseek-flash', 'claude')]
         fill_weak = [('r8', 'opencode', dp.OPENCODE_DEEPSEEK_MODEL, 'opencode'),
-                     ('r9', 'opencode', dp.OPENCODE_GLM_MODEL, 'opencode'),
                      ('rzf', 'zcode', 'GLM-5.3-Flash', 'zcode')]
         toks = {}
         with dispatch_mode('medium'):
@@ -503,11 +499,11 @@ class DomesticReclaimTests(_Store):
                         ('r6', CN_FLASH), ('r7', CN_FLASH)):
             self._insert_leftover(f'rc-left-{tid}', pk, task_id=tid)
         st = dp.status(self.store, now=T0)['domestic']
-        self.assertEqual(st['active'], 16)
+        self.assertEqual(st['active'], 15)
         # 补 strong 遗留 Sonus 1 槽 = 物理 17/17。
         insert_sonus_leftover(self.store)
         st = dp.status(self.store, now=T0)['domestic']
-        self.assertEqual(st['active'], 17)
+        self.assertEqual(st['active'], 16)
         self.assertTrue(st['full'])
         scope = {'task_id': 'ask-rc', 'stage': 's1', 'chat_id': 'c1',
                  'workspace': self.ws('ask-rc'), 'prompt_sha256': 'a' * 64}

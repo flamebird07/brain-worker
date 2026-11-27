@@ -154,7 +154,7 @@ class _Base(unittest.TestCase):
         # 层2 codebuddy:glm-5.3-flash 请求一律被队列接管（routing_required 到队首）；
         # 要真实 claim GLM 必须先占满层1 两 OpenCode（与 test_zcode_appserver_direct
         # 的 _occupy_higher_weak_slots 同一模式）。
-        for i, m in enumerate((dp.OPENCODE_DEEPSEEK_MODEL, dp.OPENCODE_GLM_MODEL)):
+        for i, m in enumerate(dp.OPENCODE_MODELS):
             r = dp.reserve(store or self.store, task_id=f'pre-weak-oc-{i}',
                            runtime='opencode', model=m,
                            workspace=self.ws(f'pre-weak-oc-{i}'),
@@ -325,7 +325,7 @@ class TestPlannerGlmCondition(_Base):
                             codebuddy_quota_evidence=self.evidence())
         self.assertTrue(receipt['codebuddy_glm_allowed'], receipt)
         self.assertIn(receipt['selected']['pool_key'],
-                      (dp.OPENCODE_DEEPSEEK_POOL_KEY, dp.OPENCODE_GLM_POOL_KEY),
+                      dp.OPENCODE_POOL_KEYS,
                       receipt)
         self.assertNotEqual(receipt['selected']['pool_key'], GLM)
         # BW-WEAK-RESTRUCTURE-20261116: 被移出的池在弱档如实标 mode_excluded。
@@ -621,7 +621,7 @@ class TestIndependentModelSlots(_Base):
         # BW-WEAK-RESTRUCTURE-20261116: 16→17（新增弱档专用 zcode:GLM-5.3-Flash 独立
         # 1 槽）。两 OpenCode 免费模型各独立 1 槽、独立计数。弱档不能新派 Sonus，这里
         # 按真实形态 seed 一条 strong 遗留在途以满足 17/17。
-        self.assertEqual(dp.DOMESTIC_TOTAL_CAPACITY, 17)
+        self.assertEqual(dp.DOMESTIC_TOTAL_CAPACITY, 16)
         self.assertEqual(dp.CAPACITY[GLM], 1)
         self.assertEqual(dp.MAIN_FORCE_CAPACITY[GLM], 1)
         self.seed(ZCODE, 1)
@@ -633,13 +633,12 @@ class TestIndependentModelSlots(_Base):
         self.seed(CN_CUSTOM_MAX, 2)
         self.seed(CLAUDE, 2)
         self.seed(dp.OPENCODE_DEEPSEEK_POOL_KEY, 1)
-        self.seed(dp.OPENCODE_GLM_POOL_KEY, 1)
         self.seed(QFLASH, 2)
         self.seed(CN_FLASH, 2)
         self.seed(dp.SONUS_POOL_KEY, 1)
         st = dp.status(self.store, now=T_NIGHT)
-        self.assertEqual(st['domestic']['capacity'], 17)
-        self.assertEqual(st['domestic']['active'], 17)
+        self.assertEqual(st['domestic']['capacity'], 16)
+        self.assertEqual(st['domestic']['active'], 16)
         self.assertEqual(st['pools'][CB]['active'], 1)
         self.assertEqual(st['pools'][CB]['free'], 0)
         self.assertEqual(st['pools'][GLM]['active'], 1)
@@ -649,7 +648,7 @@ class TestIndependentModelSlots(_Base):
         self.assertNotIn('shared_active', st['pools'][GLM])
         self.assertNotIn('shared_group', st['pools'][GLM])
         self.assertNotIn('shared_capacity', st['pools'][CB])
-        self.assertEqual(sum(p['active'] for p in st['pools'].values()), 17)
+        self.assertEqual(sum(p['active'] for p in st['pools'].values()), 16)
         # BW-WEAK-RESTRUCTURE-20261116: 满载后 GLM 如实 capacity_full；deepseek 已无
         # 任何档位可新派——显式请求如实 mode_excluded（sent=false、零占位）。
         out = dp.reserve(self.store, task_id='full-glm',

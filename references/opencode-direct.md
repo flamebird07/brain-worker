@@ -1,28 +1,19 @@
 # OpenCode CLI 正式直连入口（opencode-direct，BW-OPENCODE-20261019-S1/S3）
 
-本文件描述 `scripts/opencode_direct.py`：OpenCode CLI 作为**正式派工入口**，只服务两个
-**精确免费模型**，各自占用容量池里**独立 1 槽**（BW-OPENCODE-20261019-S3 计入
-`MAIN_FORCE_CAPACITY`，国内总容量 14→**16**，原 14 槽一项未减）。实现以
-`scripts/opencode_direct.py` 为准，不一致时以代码为准并回修文档。
+正式入口 `scripts/opencode_direct.py` 只服务
+`opencode:deepseek-v4.1-flash-free`，独立 1 槽。
+`opencode:glm-5.3-flash-free` 已于 2026-11-27 退役，旧记录仍可结算。
 
 ## 无进展看门狗（BW-DISPATCH-WAIT-20261019-S1）
 
 总墙钟上限仍为 1800 秒。正式入口同时按 stdout JSONL 观察有效事件；连续 300 秒没有任何可解析且带 `type` 的事件时终止本次子进程并记录 `stalled_no_progress=true`、`termination_reason=stalled_no_progress`，保留原始 stdout/stderr，已确认终态后释放本槽。普通噪声、半行和不可解析文本不冒充进展。用户明确要求本次继续等待时可传 `--no-progress-timeout-seconds 0` 关闭无进展门，但总墙钟仍必须保留；负值在 Popen 前拒绝。
 
-## 精确模型硬门（仅两个免费 ID，绝不付费回退）
+## 精确模型硬门
 
-- `opencode:deepseek-v4.1-flash-free`（`--model deepseek-v4.1-flash-free`）与
-  `opencode:glm-5.3-flash-free`（`--model glm-5.3-flash-free`）；argv 内模型 ID 拼为
-  `opencode/<ID>`。
-- 其它任何 model 在**任何副作用之前**拒绝（`cli_model_rejected`，exit 2）：不读配置后继续、
-  不建 outdir、不 claim、不 Popen。**绝不自动回退付费模型或别的 OpenCode 模型**；每个 run
-  只调用一次 CLI。
-- 两池各自独立 1 槽（不同工作区可并发各 1 在途，同模型第 2 个仍拒绝，结束只释放自己的槽）；
-  **无时段门**（不套 Claude 离峰窗、也不套 Max 北京夜间窗）、**无 CodeBuddy 当轮额度前提**，
-  也不承载 `main_force_limits` 限额标记（`QUOTA_LIMITABLE_POOLS` 不含 OpenCode）；仍受
-  总 16 守卫、同 `task_id` 防重、同真实 workspace 单写入与 unknown 保占位约束。
-- 调度优先级：层=4（ZCode 之后、条件 CodeBuddy GLM=5 之前、两区 Flash 之前），两池同层按
-  真实在途数平衡、平票 pool_key stable tie；详见 [global-dispatch](global-dispatch.md)。
+- 传入 `--model deepseek-v4.1-flash-free`，CLI 收到 `opencode/deepseek-v4.1-flash-free`。
+- 其它模型在读配置、创建输出目录、申请容量或启动进程前以 `cli_model_rejected` 拒绝，退出码 2。
+- DeepSeek 在弱档排第一，无时段门或 CodeBuddy 额度前提，仍受国内总容量、
+  task ID 去重、同一工作区单写与 unknown 保占位约束。见 [全局派工](global-dispatch.md)。
 
 ## CLI 形态与传输
 

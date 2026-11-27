@@ -1,11 +1,11 @@
 ---
 name: brain-worker
-description: 在 ZCode 或 Qoder 桌面端使用本机 brain-worker 规划、派发和独立验收工程任务；需要调用共享牛马池、查看牛马状态或继续受阻任务时使用。
+description: 在 ZCode、Qoder 或 TRAE 桌面端使用本机 brain-worker 规划、派发和独立验收工程任务；需要调用共享牛马池、查看牛马状态或继续受阻任务时使用。
 ---
 
 # Brain Worker Desktop Entry
 
-ZCode 桌面端与 Qoder 桌面端共用的**同一份**入口，安装到两个宿主目录的内容字节相同。实际调度、容量、优先级、时段、限额和执行器入口全部继续使用同一套 brain-worker 引擎，本文不复制任何可漂移的规则。
+ZCode、Qoder 与 TRAE 桌面端共用的**同一份**入口，安装到各宿主目录的内容字节相同。实际调度、容量、优先级、时段、限额和执行器入口全部继续使用同一套 brain-worker 引擎，本文不复制任何可漂移的规则。
 
 ## 引擎位置
 
@@ -30,22 +30,26 @@ ZCode 桌面端与 Qoder 桌面端共用的**同一份**入口，安装到两个
 
 这是本文**唯一**承载的宿主特有信息：本宿主自己不能派发哪些牛马。识别在运行时完成，安装期不分叉。
 
-按下列信号判定当前宿主，取第一个命中的：
+按下列信号判定当前宿主，取第一个命中的；识别信号可为环境变量或加载器提供的 Skill 源文件路径：
 
-| 宿主 | 识别信号（环境变量存在即命中） | 本宿主不可派发的精确组合 |
+| 宿主 | 识别信号 | 本宿主不可派发的精确组合 |
 |---|---|---|
 | Qoder 桌面 | `QODER_CONFIG_DIR` 或 `QODERCN_CONFIG_DIR` 或 `QODER_PRODUCT_ID` | `qoder:Qwen4-Max-Preview`、`qodercn:Qwen-3.8-Max`、`qodercn:Qwen4-Max-Preview`、`zcode:GLM-5.3`、`qoder:Sonus` |
-| ZCode 桌面 | `ZCODE_SKILL_DIR` 或 `ZCODE_DESKTOP_CONTEXT_PROMPT_ENABLED` 或 `ZCODE_APP_VERSION` | `zcode:GLM-5.3`（宿主不递归自派自己；BW-ZCODE-RESTORE-1-20261022 起该组合恢复为引擎正常可派主力，故须显式排除） |
+| ZCode 桌面 | `ZCODE_SKILL_DIR` 或 `ZCODE_DESKTOP_CONTEXT_PROMPT_ENABLED` 或 `ZCODE_APP_VERSION` | 所有 `zcode:*` 组合；当前包括 `zcode:GLM-5.3` 与 `zcode:GLM-5.3-Flash` |
+| TRAE 国际版（仅 macOS） | 注入的 Skill 源文件路径 `~/.trae/skills/brain-worker/SKILL.md` | 无额外组合 |
+| TRAE CN（仅 macOS） | 注入的 Skill 源文件路径 `~/.trae-cn/skills/brain-worker/SKILL.md` | 无额外组合 |
+
+TRAE 必须根据宿主提供的**实际注入 Skill 源文件路径**识别；不得用工作目录推断。源路径无法读取或匹配时按 unknown 处理并 fail-closed。
 
 **无法确定宿主时必须 fail-closed：排除上表全部组合的并集**，并在回执中说明宿主未识别。绝不默认放行、绝不猜测宿主、绝不因为识别失败而放宽候选。
 
-构造本轮 `allowed_candidates` 时施加上表排除集，并在回执中记录 `host_excluded_candidates=[<本宿主实际排除的组合>]` 与 `host_identified_as=<qoder-desktop|zcode-desktop|unknown>`，防止宿主递归启动自己或占用本宿主不可派发的通道。
+构造本轮 `allowed_candidates` 时施加上表排除集，并在回执中记录 `host_excluded_candidates=[<本宿主实际排除的组合>]` 与 `host_identified_as=<qoder-desktop|zcode-desktop|trae-desktop|trae-cn-desktop|unknown>`，防止宿主递归启动自己或占用本宿主不可派发的通道。若引擎返回 `routing_required`，在下一次调用前必须再次检查目标组合是否命中当前宿主排除集；命中时不得调用该目标，应基于已过滤的 `allowed_candidates` 重新规划。
 
 排除集只收窄本轮候选，**绝不修改完整授权集合**。未列入排除集的其余已授权组合照常可接受派发，仍由引擎按优先级、时段、容量和限额裁决。
 
 ## 共享派发三档（强／中／弱）
 
-brain-worker 的派发档位是**全宿主共享的手动三档**：strong（强）、medium（中）、weak（弱），**默认 weak**。ZCode 桌面、Qoder 桌面与主脑宿主读的是**同一份**档位状态，不存在按宿主分叉的私有档位。
+brain-worker 的派发档位是**全宿主共享的手动三档**：strong（强）、medium（中）、weak（弱），**默认 weak**。ZCode 桌面、Qoder 桌面、TRAE 与主脑宿主读的是**同一份**档位状态，不存在按宿主分叉的私有档位。
 
 - 档位状态文件：`~/.brain-worker/dispatch-mode.json`（可用环境变量 `BRAIN_WORKER_DISPATCH_MODE_FILE` 覆盖）。浮窗手动切换后原子保存，**只影响之后的新派发**；已在途的任务绝不中断、追杀或改派，按原状态自然结束。
 - 缺文件、损坏 JSON、非法值或不可读路径时**安全回落 weak**，回执如实报出来源与错误短码，绝不把读取错误冒充成用户选过的档位。

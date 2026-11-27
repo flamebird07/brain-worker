@@ -1,6 +1,8 @@
 # brain-worker
 
-**弱档顺序**：ZCode 排在两路 Qoder Flash 之后，是弱档最后一个自动派发候选。浮窗使用同一优先级。
+**2026-11-27 用户指令**：`opencode:glm-5.3-flash-free` 已退役。正式入口和所有档位仅保留 OpenCode 的 `deepseek-v4.1-flash-free`。退役池不显示在浮窗，历史在途继续计入总占用并按原流程结算。弱档为 4 池、5 槽，国内总容量为 16。此处覆盖下方历史口径。
+
+**弱档顺序**：OpenCode DeepSeek → CodeBuddy GLM → Claude → ZCode GLM-5.3-Flash。浮窗按同一顺序显示。
 
 **2026-11-14 当前权威：BW-MAC-COMPAT-20261114（macOS 兼容性，S1/S2）**。本仓库在 macOS（darwin/arm64，实测 ZCode 桌面 3.18.2 + ChatGPT 桌面端）上完成兼容性开发：
 
@@ -16,9 +18,9 @@
 3. **Claude Code 调到弱档倒数第二**——`claude:deepseek-flash`（容量 2、工作日高峰门）位于 CodeBuddy GLM 之后、ZCode GLM-5.3-Flash（最后）之前。
 4. **`codebuddy:deepseek-v4.1-flash` 从弱档取消**——同 Qoder 池，自此无任何档位可新派（mode_excluded，登记保留）。
 
-**2026-11-22 当前权威：BW-WEAK-TIER-ENFORCE-20261122（用户明确指令：简化逻辑——弱档只看优先级）**。weak = **纯优先级队列**：按层序取第一个有空位的池（两 OpenCode 免费模型 > CodeBuddy GLM > Claude > ZCode GLM-5.3-Flash），**不参照 availability、限额短窗、时段门、executor 组合冲突、入口运行时等任何其它判断**；请求组合不是队首 → routing_required 到队首（Cursor/Codex 等宿主直接调 zcode 入口也会被队列接管，绝不跳队直派 zcode）；队列全满 → capacity_full。弱档**无任何时段门**（Claude 高峰门从弱档移除，仅存于 medium）。物理总容量 **17**。浮窗弱档空闲只显示 5 池，被移出弱档的池有真实在途遗留时整行保留并标「本档不参与」。
+**2026-11-22 当前权威：BW-WEAK-TIER-ENFORCE-20261122（用户明确指令：简化逻辑——弱档只看优先级）**。weak = **纯优先级队列**：按层序取第一个有空位的池（OpenCode DeepSeek > CodeBuddy GLM > Claude > ZCode GLM-5.3-Flash），**不参照 availability、限额短窗、时段门、executor 组合冲突、入口运行时等任何其它判断**；请求组合不是队首 → routing_required 到队首（Cursor/Codex 等宿主直接调 zcode 入口也会被队列接管，绝不跳队直派 zcode）；队列全满 → capacity_full。弱档**无任何时段门**（Claude 高峰门从弱档移除，仅存于 medium）。物理总容量 **17**。浮窗弱档空闲只显示 4 池，被移出弱档的池有真实在途遗留时整行保留并标「本档不参与」。
 
-当前新派范围：strong 常态 4 池/5 槽（两内置 Qwen4-Max-Preview > Claude > ZCode，全部无时段门）；medium **4 池/5 槽**（两内置 Qwen4-Max-Preview > Claude > ZCode；Max 夜间门 + Claude 高峰门）；weak **5 池/6 槽**（纯优先级队列，见上）。物理总容量 **17**。
+当前新派范围：strong 常态 4 池/5 槽（两内置 Qwen4-Max-Preview > Claude > ZCode，全部无时段门）；medium **4 池/5 槽**（两内置 Qwen4-Max-Preview > Claude > ZCode；Max 夜间门 + Claude 高峰门）；weak **4 池/5 槽**（纯优先级队列，见上）。物理总容量 **16**。
 
 **2026-11-15 当前权威：BW-QWEN4-SONUS-REMOVE-20261115（用户明确指令；弱档口径已被上方 BW-WEAK-RESTRUCTURE-20261116 覆盖）**。两项变更：
 
@@ -63,11 +65,11 @@
 
 ### 桌面入口统一与入口运行时资格门（2026-10-20，BW-UNIFIED-DESKTOP-ENTRY-20261020）
 
-**BW-ZCODE-RESTORE-1-20261022（用户明确指令，当前权威，覆盖本文下方旧层序/总数）**：`zcode:GLM-5.3` 恢复为正常可派主力池——容量严格 **1**、AUTO 层序紧跟三路 Qwen4-Max-Preview 之后：三 Qoder Max(1) > ZCode(2) > claude(3) > CodeBuddy deepseek(4) > 两 OpenCode 免费模型(5) > CodeBuddy GLM(6) > 两区 Flash(7)；同层既有公平规则不变。国内配置合计 **15** 槽（由 MAIN_FORCE+OVERFLOW 求和自动得出）。`executor=zcode`、显式组合与 AUTO 按既有资格门恢复：保留 ZCode 最近真实限额 1800 秒短窗（恰满 1800 秒自动恢复可选，不删原标记、不宣称额度恢复）、availability 诊断、同工作区单写、容量与总守卫；绝不伪造额度健康、不清理历史状态。浮窗重新显示 ZCode 一行，行序与 `POOL_PRIORITY` 一致；`retired_active` 语义仍只适用于真正退役池（`qodercn:DeepSeek-Flash`）。宿主排除集恢复最小一致形态：Qoder 宿主排除自身 Max 三池与 `zcode:GLM-5.3`，ZCode 宿主递归排除自己。本文下方“ZCode 已退役”“总数 14”等段落均为历史口径。
+**BW-ZCODE-RESTORE-1-20261022（用户明确指令，当前权威，覆盖本文下方旧层序/总数）**：`zcode:GLM-5.3` 恢复为正常可派主力池——容量严格 **1**、AUTO 层序紧跟三路 Qwen4-Max-Preview 之后：三 Qoder Max(1) > ZCode(2) > claude(3) > CodeBuddy deepseek(4) > 两 OpenCode 免费模型(5) > CodeBuddy GLM(6) > 两区 Flash(7)；同层既有公平规则不变。国内配置合计 **15** 槽（由 MAIN_FORCE+OVERFLOW 求和自动得出）。`executor=zcode`、显式组合与 AUTO 按既有资格门恢复：保留 ZCode 最近真实限额 1800 秒短窗（恰满 1800 秒自动恢复可选，不删原标记、不宣称额度恢复）、availability 诊断、同工作区单写、容量与总守卫；绝不伪造额度健康、不清理历史状态。浮窗重新显示 ZCode 一行，行序与 `POOL_PRIORITY` 一致；`retired_active` 语义仍只适用于真正退役池（`qodercn:DeepSeek-Flash`）。宿主排除规则：Qoder 排除原有自身 Max 池与 `zcode:GLM-5.3`；ZCode 宿主排除所有 `zcode:*` 池，当前为 `zcode:GLM-5.3` 与 `zcode:GLM-5.3-Flash`。本文下方“ZCode 已退役”“总数 14”等段落均为历史口径。
 
 **BW-CLAUDE-TURN-BUDGET-20261021（当前权威）**：Claude 工程入口默认从固定 40 调整为有界 120 轮，并一次性预置最后 10 轮收尾指令；显式任务覆盖仍受支持且回执记录来源。`error_max_turns` 归类为 `turn_budget_exhausted`，与额度、认证、权限、网络和业务失败分开；CLI `num_turns` 与工具调用数分别记录。若存在成功工具回执或显式受控文件变化，入口生成只含可信事实的 `continuation.json`，绝不冒充原 Agent 九节报告；零进展不生成成果性接续包。墙钟、权限即时停止、连接类有界重试、真实退出释放与 unknown 保留规则不变。
 
-ZCode 与 Qoder 桌面端共用**同一份**宿主无关入口 `desktop-skill/SKILL.md`：`scripts/install_desktop_skill.py install` 渲染一次并把字节相同的内容装进两个宿主目录（`~/.zcode/skills/brain-worker` 与 `~/.qoder-cn/skills/brain-worker`），三道守卫强制同源——排除集池 key 必须仍是引擎可派发键（G1，`install`/`check` 双拒）、Luna 禁用规则与主 Skill 同源（G2）、两宿主安装内容字节一致（G3）。适配器只承载各宿主自己不可派发的精确组合与运行时识别信号（识别失败 fail-closed 取并集），优先级/时段/容量/池 key 清单一律只在共享代码。`scripts/entry_runtime_probe.py` 对六个执行器运行时做三态（present/missing/unknown）只读探测，复用各入口自己的配置加载器；`stage_selection` 回执新增 `entry_runtime_status`/`entry_runtime_missing` 逐候选可见性，并把**确凿缺失**（入口配置存在而其指向的运行时文件不存在）的候选以 `entry_runtime_missing` 过滤原因挡在资格门外；未配置的引擎副本（无私有入口配置，如裸 CI 环境）与依赖环境的解析失败一律 unknown、绝不挡门，探针自身异常整体降级 unknown（fail-open），绝不影响授权集合回显。
+ZCode、Qoder 与 TRAE 桌面端共用**同一份**入口 `desktop-skill/SKILL.md`。默认 `scripts/install_desktop_skill.py install` 仍只安装 ZCode/Qoder；macOS 可显式用 `--hosts trae` 或 `--hosts trae-cn`（也可同时选两版）安装至 `~/.trae/skills` 或 `~/.trae-cn/skills`，`check` 用相同参数核验。TRAE 的 Python install/check 接口也会在非 macOS 系统拒绝执行。宿主安装字节保持一致。守卫包括：排除集池 key 必须仍是引擎可派发键（G1，`install`/`check` 双拒）、ZCode 所有已注册池均须纳入 ZCode 宿主排除集、Luna 禁用规则与主 Skill 同源（G2）、各宿主安装内容字节一致（G3）。宿主识别信号及排除集见桌面入口；TRAE 按注入的 Skill 源文件路径识别，不能从 cwd 猜测，源路径不可用时按 unknown fail-closed。优先级/时段/容量/池 key 清单仍只在共享代码。`scripts/entry_runtime_probe.py` 对六个执行器运行时做三态（present/missing/unknown）只读探测，复用各入口自己的配置加载器；`stage_selection` 回执新增 `entry_runtime_status`/`entry_runtime_missing` 逐候选可见性，并把**确凿缺失**（入口配置存在而其指向的运行时文件不存在）的候选以 `entry_runtime_missing` 过滤原因挡在资格门外；未配置的引擎副本（无私有入口配置，如裸 CI 环境）与依赖环境的解析失败一律 unknown、绝不挡门，探针自身异常整体降级 unknown（fail-open），绝不影响授权集合回显。
 
 主脑队列纪律（BW-HOST-QUEUE-20261020，三宿主一致）：插话入队不打断、todo 唯一进度真相、不空转交还、长操作后台、互不冲突才并行（同工作区单写入者，同仓并行用 worktree）。详见 canonical 主 Skill「脑的队列与停顿纪律」节。
 

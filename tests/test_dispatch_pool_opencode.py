@@ -107,29 +107,21 @@ class _PoolBase(unittest.TestCase):
 class CapacityConstantTests(_PoolBase):
     def test_capacity_and_total_constants(self):
         self.assertEqual(dp.MAIN_FORCE_CAPACITY[DPOOL], 1)
-        self.assertEqual(dp.MAIN_FORCE_CAPACITY[GPOOL], 1)
+        self.assertNotIn(GPOOL, dp.MAIN_FORCE_CAPACITY)
         self.assertIn((dp.OPENCODE_RUNTIME, DEEPSEEK), dp.MAIN_FORCE_POOLS)
-        self.assertIn((dp.OPENCODE_RUNTIME, GLM), dp.MAIN_FORCE_POOLS)
+        self.assertNotIn((dp.OPENCODE_RUNTIME, GLM), dp.MAIN_FORCE_POOLS)
         self.assertEqual(dp.capacity_for(DPOOL), 1)
-        self.assertEqual(dp.capacity_for(GPOOL), 1)
+        self.assertEqual(dp.capacity_for(GPOOL), 0)
         self.assertTrue(dp.is_known_pool(DPOOL))
-        self.assertTrue(dp.is_known_pool(GPOOL))
+        self.assertIn(GPOOL, dp.LEGACY_RETIRED_POOL_KEYS)
         # BW-WEAK-RESTRUCTURE-20261116: 物理总 17（原 16 + 弱档专用 zcode:GLM-5.3-Flash
         # 独立 1 槽；Sonus 槽仍在册）。
-        self.assertEqual(dp.DOMESTIC_TOTAL_CAPACITY, 17)
+        self.assertEqual(dp.DOMESTIC_TOTAL_CAPACITY, 16)
 
 
 class IndependentSlotTests(_PoolBase):
-    def test_one_model_full_does_not_block_the_other(self):
+    def test_full_queue_refuses_second_deepseek_claim(self):
         self.reserve('d1', 'opencode', DEEPSEEK)
-        # 另一免费模型独立槽照常 claim（互不占位）——BW-WEAK-TIER-ENFORCE-20261122：
-        # 弱档纯优先级队列下 DPOOL 满时队首轮到 GPOOL，先验证独立槽 claim 再占满全队列。
-        self.reserve('g1', 'opencode', GLM)
-        self.assertEqual(self.active(DPOOL), 1)
-        self.assertEqual(self.active(GPOOL), 1)
-        # BW-WEAK-TIER-ENFORCE-20261122：弱档纯优先级队列——同池第二个请求在队列尚有
-        # 空位时被接管为 routing；要复现「同池第二个如实 capacity_full」，按队列序占满
-        # 其余弱档槽（CBGLM/claude×2/zcode-flash），队列走完 → capacity_full。
         self.reserve('cbg', 'codebuddy', dp.CODEBUDDY_GLM_MODEL, executor='codebuddy')
         self.reserve('cl1', 'claude', 'deepseek-flash', executor='claude')
         self.reserve('cl2', 'claude', 'deepseek-flash', executor='claude')
@@ -141,18 +133,27 @@ class IndependentSlotTests(_PoolBase):
         self.assertEqual(r.get('reason'), 'capacity_full')
         self.assertFalse(r.get('sent', True), r)
 
-    def test_release_frees_only_own_slot(self):
-        tok_d = self.reserve('d1', 'opencode', DEEPSEEK)
-        tok_g = self.reserve('g1', 'opencode', GLM)
-        fin = dp.finish(self.store, tok_g, terminal='start_failed', now=NIGHT)
-        self.assertTrue(fin.get('released'), fin)
+    def test_retired_model_refuses_new_claims_and_old_attempt_still_settles(self):
+        self.reserve('d1', 'opencode', DEEPSEEK)
+        for claim in (dp.reserve, dp.select_and_claim):
+            result = claim(self.store, task_id='g1', runtime='opencode', model=GLM,
+                           workspace=str(self._ws_for('g1')), prompt_sha256='p',
+                           executor='opencode', now=NIGHT, _preclaim=False)
+            self.assertEqual(result['reason'], 'unknown_pool')
+            self.assertFalse(result['sent'])
+        self.assertEqual(self.active(GPOOL), 0)
+
+        insert_legacy_inflight(self.store, token='g-old', task_id='old',
+                               pool_key=GPOOL, runtime='opencode', model=GLM)
+        self.assertTrue(dp.mark_running(self.store, 'g-old', now=NIGHT)['settled'])
+        self.assertTrue(dp.bind_child(self.store, 'g-old', 8123, child_created='old',
+                                      now=NIGHT)['bound'])
+        self.assertEqual(self.active(GPOOL), 1)
+        self.assertTrue(dp.finish(self.store, 'g-old', terminal='finished',
+                                  prober=lambda pid: {'state': 'dead'},
+                                  now=NIGHT)['released'])
         self.assertEqual(self.active(GPOOL), 0)
         self.assertEqual(self.active(DPOOL), 1)
-        # 深槽仍满：再来一个 deepseek 组合仍拒。
-        r = dp.reserve(self.store, task_id='d2', runtime='opencode', model=DEEPSEEK,
-                       workspace=str(self._ws_for('d2')), prompt_sha256='p',
-                       executor='opencode', now=NIGHT, _preclaim=False)
-        self.assertFalse(r.get('allowed'), r)
 
     def test_unknown_holds_capacity_and_is_never_preempted(self):
         tok = self.reserve('d1', 'opencode', DEEPSEEK)
@@ -164,7 +165,6 @@ class IndependentSlotTests(_PoolBase):
         # BW-WEAK-TIER-ENFORCE-20261122：弱档纯优先级队列——unknown 占位绝不抢占的
         # capacity_full 断言需队列走完：按队列序占满其余弱档槽（GPOOL/CBGLM/claude×2/
         # zcode-flash）后再请求 DPOOL。
-        self.reserve('g1', 'opencode', GLM)
         self.reserve('cbg', 'codebuddy', dp.CODEBUDDY_GLM_MODEL, executor='codebuddy')
         self.reserve('cl1', 'claude', 'deepseek-flash', executor='claude')
         self.reserve('cl2', 'claude', 'deepseek-flash', executor='claude')
@@ -177,7 +177,7 @@ class IndependentSlotTests(_PoolBase):
 
     def test_same_workspace_guard_spans_both_pools(self):
         self.reserve('d1', 'opencode', DEEPSEEK, ws=self.ws_shared)
-        r = dp.reserve(self.store, task_id='g1', runtime='opencode', model=GLM,
+        r = dp.reserve(self.store, task_id='g1', runtime='opencode', model=DEEPSEEK,
                        workspace=str(self.ws_shared), prompt_sha256='p',
                        executor='opencode', now=NIGHT, _preclaim=False)
         self.assertFalse(r.get('allowed'), r)
@@ -236,8 +236,7 @@ class ExactDesignationTests(_PoolBase):
 
 class NoWindowNoQuotaGateTests(_PoolBase):
     def test_no_time_window_gate_beijing_day(self):
-        for pk in (DPOOL, GPOOL):
-            self.assertFalse(dp._max_window_blocks(pk, DAY), pk)
+        self.assertFalse(dp._max_window_blocks(DPOOL, DAY))
         r = dp.reserve(self.store, task_id='day1', runtime='opencode', model=DEEPSEEK,
                        workspace=str(self._ws_for('day1')), prompt_sha256='p',
                        executor='opencode', now=DAY, _preclaim=False)
@@ -285,14 +284,12 @@ class NoWindowNoQuotaGateTests(_PoolBase):
         # BW-WEAK-TIER-ENFORCE-20261122：弱档纯优先级队列——先按队列序验证 OpenCode
         # 免费槽无额度前提的真实 claim（层1 deepseek 满后队首=glm-free），再排空层1
         # 两槽使 CBGLM（层2）成为队首被真实 claim。
-        self.reserve('ocd0', 'opencode', DEEPSEEK, now=DAY)
-        tok = self.reserve('oc1', 'opencode', GLM, now=DAY)
+        tok = self.reserve('oc1', 'opencode', DEEPSEEK, now=DAY)
         res = dp.consume_for_entry(self.store, task_id='oc1', runtime='opencode',
-                                   model=GLM, workspace=str(self._ws_for('oc1')),
+                                   model=DEEPSEEK, workspace=str(self._ws_for('oc1')),
                                    prompt_sha256='p', claim_token=tok, now=DAY,
                                    executor='opencode')
         self.assertTrue(res.get('allowed'), res)
-        # 层1 两 OpenCode 槽均已占满（ocd0 + oc1）→ 队首=CBGLM（层2）被真实 claim。
         r = dp.reserve(self.store, task_id='glm1', runtime='codebuddy',
                        model=dp.CODEBUDDY_GLM_MODEL, workspace=str(self._ws_for('glm1')),
                        prompt_sha256='p', executor='codebuddy', now=DAY,
@@ -317,7 +314,7 @@ class AutoTierOrderTests(_PoolBase):
         self.assertFalse(r_cb.get('sent', True), r_cb)
         r = self.select('a0', 'codebuddy', dp.CODEBUDDY_GLM_MODEL)
         self.assertTrue(r.get('routing_required'), r)
-        self.assertIn(r['selected']['pool_key'], (DPOOL, GPOOL), r)
+        self.assertIn(r['selected']['pool_key'], (DPOOL,), r)
 
     def test_auto_after_zcode_before_conditional_cbglm(self):
         # BW-WEAK-RESTRUCTURE-20261116: 弱档 ZCode 只用 GLM-5.3-Flash(tier4)，
@@ -335,21 +332,20 @@ class AutoTierOrderTests(_PoolBase):
         r = self.select('a1', 'codebuddy', dp.CODEBUDDY_GLM_MODEL)
         self.assertTrue(r.get('routing_required'), r)
         self.assertFalse(r.get('sent', True), r)
-        self.assertIn(r['selected']['pool_key'], (DPOOL, GPOOL), r)
+        self.assertIn(r['selected']['pool_key'], (DPOOL,), r)
         # 把 AUTO 选中的池真实占住（经显式 opencode 入口，确定性）。
         self.reserve('a1', 'opencode',
                      DEEPSEEK if r['selected']['pool_key'] == DPOOL else GLM)
         # 只剩另一个 OpenCode 槽：tier1 OpenCode 仍先于 tier2 CBGLM（GLM 额度独立始终候选）。
         r2 = self.select('a2', 'codebuddy', dp.CODEBUDDY_GLM_MODEL)
-        self.assertTrue(r2.get('routing_required'), r2)
-        self.assertIn(r2['selected']['pool_key'], (DPOOL, GPOOL), r2)
+        self.assertFalse(r2['allowed'], r2)
+        self.assertEqual(r2['reason'], 'capacity_full', r2)
 
     def test_auto_falls_to_cbglm_then_flash_when_opencode_full(self):
         # BW-WEAK-RESTRUCTURE-20261116: 两地区 Flash（qoder/qodercn:Qwen3.8-Flash）已从
         # 弱档移除，弱档兜底链改为 OpenCode(1) → CBGLM(2) → Claude(3) → ZCode
         # GLM-5.3-Flash(4)；本用例沿新链验证逐层回落，末层 GLM-5.3-Flash 直接 claim。
         self.reserve('of1', 'opencode', DEEPSEEK)
-        self.reserve('of2', 'opencode', GLM)
         # 两 OpenCode(1) 满 → tier2 CBGLM 先于 Claude/ZCodeFlash（GLM 额度独立、始终候选）。
         r = self.select('a1', 'zcode', 'GLM-5.3-Flash')
         self.assertTrue(r.get('routing_required'), r)
@@ -365,30 +361,13 @@ class AutoTierOrderTests(_PoolBase):
         self.assertTrue(r2.get('claimed'), r2)
         self.assertEqual(r2['pool_key'], dp.ZCODE_FLASH_POOL_KEY, r2)
 
-    def test_two_opencode_pools_balanced_same_tier(self):
-        # BW-WEAK-RESTRUCTURE-20261116: OpenCode 现为弱档 tier1，无需再预填上层；
-        # 用 AUTO 请求 CBGLM(tier2) 组合确保每轮都 routing 到 OpenCode 层。
-        picks = []
-        for i in range(2):
-            r = self.select(f'bal{i}', 'codebuddy', dp.CODEBUDDY_GLM_MODEL)
-            self.assertTrue(r.get('routing_required'), r)
-            pk = r['selected']['pool_key']
-            self.assertIn(pk, (DPOOL, GPOOL), r)
-            picks.append(pk)
-            self.reserve(f'bal{i}', 'opencode',
-                         DEEPSEEK if pk == DPOOL else GLM)
-        # 两槽同层按真实在途平衡：两轮 AUTO 应分到两个不同池。
-        self.assertEqual(set(picks), {DPOOL, GPOOL}, picks)
 
-    def test_opencode_beats_conditional_cbglm_even_when_cbglm_first_free(self):
-        # BW-WEAK-RESTRUCTURE-20261116: 新弱档层序下 OpenCode(tier1) 仍先于 CBGLM(tier2)。
+
+    def test_full_deepseek_slot_advances_to_codebuddy(self):
         self.reserve('od', 'opencode', DEEPSEEK)
-        # deepseek 槽已满、glm-5.3-flash-free 仍空；GLM 始终参与候选 → tier1 OpenCode
-        # 仍先于 tier2 CodeBuddy GLM。
         r = self.select('a1', 'codebuddy', dp.CODEBUDDY_GLM_MODEL)
-        self.assertTrue(r.get('routing_required'), r)
-        self.assertEqual(r['selected']['pool_key'], GPOOL, r)
-
+        self.assertTrue(r['allowed'], r)
+        self.assertEqual(r['pool_key'], dp.CODEBUDDY_GLM_POOL_KEY)
 
 class TotalGuardSixteenTests(_PoolBase):
     def test_all_fifteen_weak_slots_plus_sonus_leftover(self):
@@ -398,7 +377,6 @@ class TotalGuardSixteenTests(_PoolBase):
         # Sonus）按各自真实形态补齐，构造物理全满 17 的总守卫场景。
         toks = []                                        # weak 6 槽（真实新派）
         toks.append(self.reserve('od', 'opencode', DEEPSEEK))
-        toks.append(self.reserve('og', 'opencode', GLM))
         toks.append(self.reserve('cbg', 'codebuddy', dp.CODEBUDDY_GLM_MODEL,
                                  executor='codebuddy'))
         toks.append(self.reserve('cl1', 'claude', 'deepseek-flash', executor='claude'))
@@ -418,7 +396,7 @@ class TotalGuardSixteenTests(_PoolBase):
         # strong 遗留 Sonus 在途（weak/medium 永不可新派）按真实形态直插。
         insert_sonus_leftover(self.store)                 # 12
         st = dp.status(self.store, now=NIGHT)
-        self.assertEqual(st['domestic']['active'], 12)
+        self.assertEqual(st['domestic']['active'], 11)
         self.assertFalse(st['domestic']['full'])
         # 已被移出所有档位的池（CB deepseek 1 + 两地区 Flash 各 2 = 5 槽）按「重构前派出、
         # 仍在途」的历史形态直插，补齐物理全满 17。
@@ -438,8 +416,8 @@ class TotalGuardSixteenTests(_PoolBase):
                                pool_key=dp.CN_FLASH_POOL_KEY, runtime='qodercn',
                                model='Qwen3.8-Flash')
         st = dp.status(self.store, now=NIGHT)
-        self.assertEqual(st['domestic']['active'], 17)
-        self.assertEqual(dp.DOMESTIC_TOTAL_CAPACITY, 17)
+        self.assertEqual(st['domestic']['active'], 16)
+        self.assertEqual(dp.DOMESTIC_TOTAL_CAPACITY, 16)
         self.assertTrue(st['domestic']['full'])
         r = dp.reserve(self.store, task_id='over', runtime='opencode', model=DEEPSEEK,
                        workspace=str(self._ws_for('over')), prompt_sha256='p',

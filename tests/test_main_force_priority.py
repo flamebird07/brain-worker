@@ -44,8 +44,7 @@ CN_CUSTOM_MAX = 'qodercn:Qwen-3.8-Max'
 CLAUDE = 'claude:deepseek-flash'
 ZCODE = 'zcode:GLM-5.3'  # BW-ZCODE-RESTORE-1-20261022：恢复可派主力（容量 1、层=2）
 OC_DS = dp.OPENCODE_DEEPSEEK_POOL_KEY
-OC_GLM = dp.OPENCODE_GLM_POOL_KEY
-OPENCODES = (OC_DS, OC_GLM)
+OPENCODES = (OC_DS,)
 QFLASH = 'qoder:Qwen3.8-Flash'
 CN_FLASH = 'qodercn:Qwen3.8-Flash'
 RETIRED_DS = 'qodercn:DeepSeek-Flash'
@@ -294,7 +293,7 @@ class WindowAndGateTests(_Base):
         # （mode_excluded）；08:00 claude 午前离峰开、其余弱档池（含 zcode
         # GLM-5.3-Flash，已入 MAIN_FORCE_POOLS）无时段门。锁定真实合格集合。
         self.assertNotIn(ZCODE, elig)
-        self.assertEqual(elig, {OC_DS, OC_GLM, dp.CODEBUDDY_GLM_POOL_KEY, CLAUDE,
+        self.assertEqual(elig, {OC_DS, dp.CODEBUDDY_GLM_POOL_KEY, CLAUDE,
                                 dp.ZCODE_FLASH_POOL_KEY})
         # BW-ZCODE-RESTORE-1-20261022：medium 档 ZCode 无时段门，白天照常在候选
         # （Max 夜窗 08:00 右开 → 三个 Max 仍被挡）。
@@ -352,8 +351,6 @@ class HighLevelDispatchTests(_Base):
         # → 层2 CodeBuddy GLM → 层3 claude×2 → 层4 zcode flash）占位，跳队请求会被
         # routing_required 到队首而非 claim。
         self.assertTrue(self.reserve('od1', 'opencode', dp.OPENCODE_DEEPSEEK_MODEL,
-                                     'opencode').get('allowed'))
-        self.assertTrue(self.reserve('od2', 'opencode', dp.OPENCODE_GLM_MODEL,
                                      'opencode').get('allowed'))
         self.assertTrue(self.reserve('cbg', 'codebuddy', dp.CODEBUDDY_GLM_MODEL,
                                      'codebuddy').get('allowed'))
@@ -421,8 +418,6 @@ class HighLevelDispatchTests(_Base):
         # CodeBuddy GLM），claude（层3）才是队首可被 claim；单写守卫本意不变。
         self.assertTrue(self.reserve('oc1', 'opencode', dp.OPENCODE_DEEPSEEK_MODEL,
                                      'opencode').get('allowed'))
-        self.assertTrue(self.reserve('oc2', 'opencode', dp.OPENCODE_GLM_MODEL,
-                                     'opencode').get('allowed'))
         self.assertTrue(self.reserve('cbg0', 'codebuddy', dp.CODEBUDDY_GLM_MODEL,
                                      'codebuddy').get('allowed'))
         shared = self.ws('shared')
@@ -435,24 +430,24 @@ class HighLevelDispatchTests(_Base):
     def test_total_capacity_and_slots(self):
         # BW-WEAK-RESTRUCTURE-20261116 当前权威物理总数 17：原 16 槽 + 弱档新独立池
         # `zcode:GLM-5.3-Flash` 独立 1 槽（与 strong/medium 的 zcode:GLM-5.3 互不占位）。
-        self.assertEqual(dp.DOMESTIC_TOTAL_CAPACITY, 17)
+        self.assertEqual(dp.DOMESTIC_TOTAL_CAPACITY, 16)
         self.assertEqual(dp.capacity_for(dp.SONUS_POOL_KEY), 1)
         self.assertEqual(dp.capacity_for(dp.ZCODE_FLASH_POOL_KEY), 1)
         # dm.ALL_POOL_KEYS = 全档位策略池并集 12 池：容量合计 = 物理 17 − strong 专属
         # Sonus 1 = 16；弱档可新派容量 = 6。
-        self.assertEqual(sum(dp.capacity_for(k) for k in dm.ALL_POOL_KEYS), 16)
-        self.assertEqual(sum(dp.capacity_for(k) for k in dm.WEAK_POOL_KEYS), 6)
+        self.assertEqual(sum(dp.capacity_for(k) for k in dm.ALL_POOL_KEYS), 15)
+        self.assertEqual(sum(dp.capacity_for(k) for k in dm.WEAK_POOL_KEYS), 5)
         self.assertEqual(dp.capacity_for(CODEBUDDY), 1)
         self.assertEqual(dp.capacity_for('codebuddy:glm-5.3-flash'), 1)
         self.assertEqual(dp.capacity_for(dp.OPENCODE_DEEPSEEK_POOL_KEY), 1)
-        self.assertEqual(dp.capacity_for(dp.OPENCODE_GLM_POOL_KEY), 1)
+        self.assertEqual(dp.capacity_for(dp.OPENCODE_GLM_POOL_KEY), 0)
         self.assertEqual(dp.capacity_for(ZCODE), 1)
         self.assertIn(ZCODE, dp.MAIN_FORCE_KEYS)
         # BW-WEAK-RESTRUCTURE-20261116: POOL_PRIORITY 是 dm.WEAK_PRIORITY 的兼容别名
         # （单一来源 dispatch_mode，同一数值），弱档层序重新连续编号。
         self.assertEqual(dp.POOL_PRIORITY, dm.WEAK_PRIORITY)
         self.assertEqual(dp.POOL_PRIORITY, {
-            dp.OPENCODE_DEEPSEEK_POOL_KEY: 1, dp.OPENCODE_GLM_POOL_KEY: 1,
+            dp.OPENCODE_DEEPSEEK_POOL_KEY: 1,
             'codebuddy:glm-5.3-flash': 2,
             CLAUDE: 3,
             dp.ZCODE_FLASH_POOL_KEY: 4})

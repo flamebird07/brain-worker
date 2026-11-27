@@ -191,17 +191,25 @@ class PreflightTests(unittest.TestCase):
 
     def test_opencode_read_dirs_refused(self):
         g = _grants(add_dirs=('C:\\ref',))
-        plan = _plan(runtime='opencode', model='glm-5.3-flash-free',
+        plan = _plan(runtime='opencode', model='deepseek-v4.1-flash-free',
                      grants={'edits': g['edits'], 'bash': g['bash'],
                              'read_dirs': g['read_dirs']},
                      tool_visibility=g['tool_visibility'],
                      visible_tools=g['visible_tools'],
                      allowed_tools=g['allowed_tools'],
                      disallowed_tools=g['disallowed_tools'])
-        actual = _actual(runtime='opencode', model='glm-5.3-flash-free', grants=g)
+        actual = _actual(runtime='opencode', model='deepseek-v4.1-flash-free', grants=g)
         r = ec.preflight(plan, actual)
         self.assertFalse(r['ok'])
         self.assertTrue(any('no external read-only directory' in x for x in r['reasons']))
+
+    def test_retired_opencode_model_refused_in_preflight(self):
+        model = dp.OPENCODE_GLM_MODEL
+        r = ec.preflight(_plan(runtime='opencode', model=model),
+                         _actual(runtime='opencode', model=model))
+        self.assertFalse(r['ok'])
+        self.assertFalse(r['sent'])
+        self.assertTrue(any('is retired' in reason for reason in r['reasons']))
 
     def test_opencode_plain_read_plan_passes_preflight(self):
         # 无精确 edits/bash/read_dirs 的普通只读计划：整工具模式下如实通过预检

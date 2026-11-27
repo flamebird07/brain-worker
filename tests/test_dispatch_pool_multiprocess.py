@@ -203,7 +203,6 @@ class _SpawnMixin(unittest.TestCase):
         全部可新派槽经显式 executor 保证确定性，返回 12 个真实新派 token。"""
         toks = []
         weak_plan = [('opencode', dp.OPENCODE_DEEPSEEK_MODEL, 'opencode'),
-                     ('opencode', dp.OPENCODE_GLM_MODEL, 'opencode'),
                      ('codebuddy', 'glm-5.3-flash', 'codebuddy'),
                      ('claude', 'deepseek-flash', 'claude'),
                      ('claude', 'deepseek-flash', 'claude'),

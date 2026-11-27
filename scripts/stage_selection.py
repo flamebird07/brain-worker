@@ -350,6 +350,9 @@ def _filter_candidates(conn, allowed, zcode_blocked, now, requirements=None,
     mode_allowed = set(dmode.allowed_pools_for_mode(mode))
     filters, passed = {}, []
     for pk in allowed:
+        if pk == dp.OPENCODE_GLM_POOL_KEY:
+            filters[pk] = 'retired_pool'
+            continue
         if not _allowed_candidate(pk):
             filters[pk] = 'unauthorized'
             continue
@@ -400,6 +403,8 @@ def _per_candidate_view(allowed, filters, mode=None):
             view[pk] = dp.MODE_EXCLUDED
         else:
             view[pk] = filters.get(pk, 'eligible')
+    if dp.OPENCODE_GLM_POOL_KEY in aset:
+        view[dp.OPENCODE_GLM_POOL_KEY] = 'retired_pool'
     return view
 
 
@@ -581,7 +586,9 @@ def plan_stage_selection(authorization, *, previous=None, store_path=None, quota
     if not allowed:
         return _refuse('empty_allowed_candidates')
     for pk in allowed:
-        if not _allowed_candidate(pk):
+        # Existing authorizations may still list the retired OpenCode model.
+        # Keep the original scope in the receipt and filter that pool out.
+        if pk != dp.OPENCODE_GLM_POOL_KEY and not _allowed_candidate(pk):
             return _refuse('unauthorized_candidate', repr(pk))
 
     # BW-LIMIT30-20261019-S3 用户最新明确（覆盖 BW-CODEBUDDY-GLM-FALLBACK-20261018 的旧条件）：

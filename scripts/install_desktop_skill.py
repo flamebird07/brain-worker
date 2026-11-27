@@ -30,7 +30,8 @@ MANAGED_BY = "brain-worker-desktop-adapter"
 # instead of refusing to touch a directory this script family created.
 LEGACY_MANAGED_BY = ("brain-worker-zcode-adapter", "brain-worker-qoder-adapter")
 
-HOSTS = ("zcode", "qoder")
+HOSTS = ("zcode", "qoder")  # Preserve the established default selection.
+SUPPORTED_HOSTS = HOSTS + ("trae", "trae-cn")
 
 HOST_EXCLUDED = {
     # BW-ZCODE-RESTORE-1-20261022：zcode:GLM-5.3 恢复为引擎正常可派主力（容量 1）——
@@ -47,7 +48,9 @@ HOST_EXCLUDED = {
         "zcode:GLM-5.3",
         "qoder:Sonus",
     ),
-    "zcode": ("zcode:GLM-5.3",),
+    "zcode": ("zcode:GLM-5.3", "zcode:GLM-5.3-Flash"),
+    "trae": (),
+    "trae-cn": (),
 }
 # Fail-closed set applied when the host cannot be identified at runtime.
 HOST_EXCLUDED_UNION = tuple(
@@ -62,7 +65,16 @@ HOST_SIGNALS = {
     # 排除、过度削弱 ZCode 宿主，因此必须用实测存在的信号。
     "zcode": ("ZCODE_SKILL_DIR", "ZCODE_DESKTOP_CONTEXT_PROMPT_ENABLED",
               "ZCODE_APP_VERSION"),
+    # TRAE host identity comes from the injected Skill source path, never cwd.
+    "trae": ("~/.trae/skills/brain-worker/SKILL.md",),
+    "trae-cn": ("~/.trae-cn/skills/brain-worker/SKILL.md",),
 }
+
+
+def _require_macos(hosts: tuple[str, ...]) -> None:
+    selected = set(hosts) & {"trae", "trae-cn"}
+    if selected and sys.platform != "darwin":
+        raise ValueError(f"TRAE desktop hosts require macOS: {sorted(selected)}")
 
 # The adapter must carry only host-specific information.  Anything the shared
 # engine already enforces is a drift hazard if restated here, so literal values
@@ -97,6 +109,8 @@ def _default_target_roots() -> dict[str, Path]:
     return {
         "zcode": home / ".zcode" / "skills",
         "qoder": home / ".qoder-cn" / "skills",
+        "trae": home / ".trae" / "skills",
+        "trae-cn": home / ".trae-cn" / "skills",
     }
 
 
@@ -171,6 +185,10 @@ def validate_host_exclusions(host_excluded: dict[str, tuple[str, ...]] | None = 
             )
             if not dispatchable:
                 stale.append(f"{host}: {candidate}")
+    # Newly registered ZCode pools must be explicitly guarded before install.
+    zcode_keys = {key for key in dp.CAPACITY if key.startswith("zcode:")}
+    missing_zcode = zcode_keys - set(mapping.get("zcode", ()))
+    stale.extend(f"zcode: missing host exclusion {key}" for key in sorted(missing_zcode))
     if stale:
         raise ValueError(
             "desktop skill excludes pool keys the engine cannot dispatch "
@@ -190,7 +208,7 @@ def validate_template_text(text: str) -> None:
     # Validate the table against the engine before checking that the prose carries
     # it, so a renamed pool key reports itself instead of an "omitted" exclusion.
     validate_host_exclusions()
-    for host in HOSTS:
+    for host in SUPPORTED_HOSTS:
         for candidate in HOST_EXCLUDED[host]:
             if candidate not in text:
                 raise ValueError(
@@ -295,9 +313,10 @@ def install(*, source_root: Path, engine_root: Path, target_roots: dict[str, Pat
             hosts: tuple[str, ...] = HOSTS) -> dict:
     source_root = source_root.resolve()
     engine_root = engine_root.resolve()
-    unknown = [h for h in hosts if h not in HOSTS]
+    unknown = [h for h in hosts if h not in SUPPORTED_HOSTS]
     if unknown:
         raise ValueError(f"unknown desktop hosts: {unknown}")
+    _require_macos(hosts)
     template = source_root / "desktop-skill" / "SKILL.md"
 
     _validate_engine(engine_root)
@@ -335,6 +354,10 @@ def install(*, source_root: Path, engine_root: Path, target_roots: dict[str, Pat
 
 def check(*, source_root: Path, target_roots: dict[str, Path],
           hosts: tuple[str, ...] = HOSTS) -> dict:
+    unknown = [h for h in hosts if h not in SUPPORTED_HOSTS]
+    if unknown:
+        raise ValueError(f"unknown desktop hosts: {unknown}")
+    _require_macos(hosts)
     source_root = source_root.resolve()
     template = source_root / "desktop-skill" / "SKILL.md"
     template_text = _validate_template(template)
@@ -385,6 +408,10 @@ def _resolve_target_roots(args) -> dict[str, Path]:
         roots["zcode"] = Path(args.zcode_root)
     if args.qoder_root is not None:
         roots["qoder"] = Path(args.qoder_root)
+    if args.trae_root is not None:
+        roots["trae"] = Path(args.trae_root)
+    if args.trae_cn_root is not None:
+        roots["trae-cn"] = Path(args.trae_cn_root)
     return roots
 
 
@@ -397,9 +424,11 @@ def main(argv: list[str] | None = None) -> int:
     parser.add_argument("--engine-root", type=Path, default=_default_engine_root())
     parser.add_argument("--zcode-root", dest="zcode_root", type=Path, default=None)
     parser.add_argument("--qoder-root", dest="qoder_root", type=Path, default=None)
+    parser.add_argument("--trae-root", dest="trae_root", type=Path, default=None)
+    parser.add_argument("--trae-cn-root", dest="trae_cn_root", type=Path, default=None)
     parser.add_argument(
         "--hosts", default=",".join(HOSTS),
-        help=f"comma-separated subset of {','.join(HOSTS)}",
+        help=f"comma-separated subset of {','.join(SUPPORTED_HOSTS)}",
     )
     args = parser.parse_args(argv)
     hosts = tuple(h.strip() for h in args.hosts.split(",") if h.strip())

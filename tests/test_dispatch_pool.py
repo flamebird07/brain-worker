@@ -173,7 +173,6 @@ class _PoolBase(unittest.TestCase):
     # > 层3 claude(2) > 层4 zcode:GLM-5.3-Flash(1)，合计 6 槽。
     WEAK_QUEUE_COMBOS = (
         ('opencode', dp.OPENCODE_DEEPSEEK_MODEL),
-        ('opencode', dp.OPENCODE_GLM_MODEL),
         ('codebuddy', dp.CODEBUDDY_GLM_MODEL),
         ('claude', dp.CLAUDE_MODEL),
         ('claude', dp.CLAUDE_MODEL),
@@ -224,12 +223,11 @@ class _PoolBase(unittest.TestCase):
         # BW-WEAK-TIER-ENFORCE-20261122：弱档 6 槽按队列序 claim——层1 两 OpenCode 先行，
         # CBGLM 层2 次之（其上方层1 已满），claude 层3、zcode:GLM-5.3-Flash 层4 收尾。
         weak_plan = [('f12', 'opencode', dp.OPENCODE_DEEPSEEK_MODEL, 'opencode'),
-                     ('f13', 'opencode', dp.OPENCODE_GLM_MODEL, 'opencode'),
                      ('f6', 'claude', 'deepseek-flash', 'claude'),
                      ('f7', 'claude', 'deepseek-flash', 'claude'),
                      ('fzflash', 'zcode', 'GLM-5.3-Flash', 'zcode')]
         oc_toks = [self.reserve_exec(t, rt, md, ex)
-                   for (t, rt, md, ex) in weak_plan[:2]]
+                   for (t, rt, md, ex) in weak_plan[:1]]
         glm = dp.reserve(self.store, task_id='fglm', runtime='codebuddy',
                          model='glm-5.3-flash',
                          workspace=str(self._ws_for('fglm')), prompt_sha256='p',
@@ -237,7 +235,7 @@ class _PoolBase(unittest.TestCase):
                          now=T0, _preclaim=False)
         self.assertClaimed(glm, 'codebuddy:glm-5.3-flash')
         weak_toks = [self.reserve_exec(t, rt, md, ex)
-                     for (t, rt, md, ex) in weak_plan[2:]]
+                     for (t, rt, md, ex) in weak_plan[1:]]
         # strong/medium 专属池经 medium 档真实 claim；自定义 Max 临时清空用户禁用集。
         with dispatch_mode('medium'):
             with user_disabled_pools(frozenset()):
@@ -255,12 +253,12 @@ class _PoolBase(unittest.TestCase):
         self.seed_attempt('f11', 'f11-task', 'qodercn:Qwen3.8-Flash')
         toks = [glm['token'], medium_toks[0], medium_toks[1], medium_toks[2],
                 medium_toks[3], medium_toks[4], weak_toks[0], weak_toks[1],
-                'f8', 'f9', 'f10', 'f11', oc_toks[0], oc_toks[1]]
+                'f8', 'f9', 'f10', 'f11', oc_toks[0], weak_toks[2]]
         # 弱档不能新派 Sonus；用 strong 遗留在途补足第 17 个物理名额。
         insert_sonus_leftover(self.store, reserved_at_utc=dp._iso(T0))
         st = dp.status(self.store, now=T0)
         self.assertEqual(st['domestic']['active'], dp.DOMESTIC_TOTAL_CAPACITY)
-        self.assertEqual(st['domestic']['active'], 17)
+        self.assertEqual(st['domestic']['active'], 16)
         self.assertTrue(st['domestic']['full'])
         self.assertEqual(st['pools'][dp.SONUS_POOL_KEY]['active'], 1)
         self.assertEqual(st['pools']['codebuddy:glm-5.3-flash']['active'], 1)
@@ -269,7 +267,7 @@ class _PoolBase(unittest.TestCase):
         self.assertEqual(st['pools']['qodercn:Qwen-3.8-Max']['active'], 2)
         self.assertEqual(st['pools']['claude:deepseek-flash']['active'], 2)
         self.assertEqual(st['pools']['opencode:deepseek-v4.1-flash-free']['active'], 1)
-        self.assertEqual(st['pools']['opencode:glm-5.3-flash-free']['active'], 1)
+        self.assertEqual(st['pools']['opencode:glm-5.3-flash-free']['active'], 0)
         self.assertEqual(st['pools']['qoder:Qwen3.8-Flash']['active'], 2)
         self.assertEqual(st['pools']['qodercn:Qwen3.8-Flash']['active'], 2)
         self.assertEqual(st['pools']['zcode:GLM-5.3']['active'], 1)
@@ -305,10 +303,10 @@ class CapacityAndKnownPoolTests(_PoolBase):
         self.assertEqual(dp.capacity_for('codebuddy:deepseek-v4.1-flash'), 1)
         self.assertEqual(dp.capacity_for('codebuddy:glm-5.3-flash'), 1)
         self.assertEqual(dp.capacity_for('opencode:deepseek-v4.1-flash-free'), 1)
-        self.assertEqual(dp.capacity_for('opencode:glm-5.3-flash-free'), 1)
+        self.assertEqual(dp.capacity_for('opencode:glm-5.3-flash-free'), 0)
         self.assertEqual(dp.capacity_for('qoder:Sonus'), 1)
-        self.assertEqual(dp.DOMESTIC_TOTAL_CAPACITY, 17)
-        self.assertEqual(weak_new_dispatch_capacity(), 6)
+        self.assertEqual(dp.DOMESTIC_TOTAL_CAPACITY, 16)
+        self.assertEqual(weak_new_dispatch_capacity(), 5)
 
     def test_is_known_pool(self):
         for pk in ('zcode:GLM-5.3', 'qoder:Qwen4-Max-Preview',
@@ -431,7 +429,6 @@ class MainForceRotationTests(_PoolBase):
         # capacity_full（原意「绝不偷换模型落库/绝不跨档兜底」保留：sent=false、
         # 零新占位，绝不偷换记到 Flash 池）。
         for i, pool in enumerate([dp.OPENCODE_DEEPSEEK_POOL_KEY,
-                                  dp.OPENCODE_GLM_POOL_KEY,
                                   dp.CODEBUDDY_GLM_POOL_KEY,
                                   dp.CLAUDE_POOL_KEY, dp.CLAUDE_POOL_KEY,
                                   'zcode:GLM-5.3-Flash']):
@@ -486,7 +483,6 @@ class OverflowRoutingTests(_PoolBase):
                                   'qodercn:Qwen-3.8-Max', 'qodercn:Qwen-3.8-Max',
                                   dp.CLAUDE_POOL_KEY, dp.CLAUDE_POOL_KEY,
                                   dp.OPENCODE_DEEPSEEK_POOL_KEY,
-                                  dp.OPENCODE_GLM_POOL_KEY,
                                   dp.CODEBUDDY_GLM_POOL_KEY,
                                   'zcode:GLM-5.3-Flash']):
             self.seed_attempt(f'ff-m{i}', f'ff-main-task-{i}', pool)
@@ -1090,9 +1086,9 @@ class StatusTests(_PoolBase):
             self.reserve('q', 'qoder', 'Qwen4-Max-Preview')
         st = dp.status(self.store, now=T0)
         self.assertEqual(set(st['pools']), set(dp.CAPACITY))
-        self.assertEqual(st['domestic']['capacity'], 17)
+        self.assertEqual(st['domestic']['capacity'], 16)
         self.assertEqual(st['domestic']['active'], 3)   # 2 本次 + 1 CodeBuddy 基线占位
-        self.assertEqual(st['domestic']['free'], 14)
+        self.assertEqual(st['domestic']['free'], 13)
         self.assertFalse(st['domestic']['full'])
         self.assertEqual(st['rotation']['committed_zcode'], 0)
         self.assertEqual(st['rotation']['committed_qoder'], 1)
@@ -1105,7 +1101,7 @@ class StatusTests(_PoolBase):
                      _preclaim=False)
         st = dp.status(self.store, now=T0)
         # Luna 在途不占国内名额口径（国内仍为 17/17，Luna 单列且无上限）。
-        self.assertEqual(st['domestic']['active'], 17)
+        self.assertEqual(st['domestic']['active'], 16)
         self.assertEqual(st['pools'][dp.LUNA_KEY]['active'], 1)
 
 
@@ -1633,7 +1629,7 @@ class QuotaLimitWindowTests(_PoolBase):
         # 弱档层序（BW-WEAK-TIER-ENFORCE-20261122 纯优先级队列）：GLM-5.3-Flash 是层4、
         # 队尾——先按真实形态直插占位填满其上方全部槽（两 OpenCode 层1 + CBGLM 层2 +
         # claude 层3 两槽），AUTO 请求才轮到它真实 claim。
-        for i, pool in enumerate([dp.OPENCODE_DEEPSEEK_POOL_KEY, dp.OPENCODE_GLM_POOL_KEY,
+        for i, pool in enumerate([dp.OPENCODE_DEEPSEEK_POOL_KEY,
                                   dp.CODEBUDDY_GLM_POOL_KEY,
                                   dp.CLAUDE_POOL_KEY, dp.CLAUDE_POOL_KEY]):
             self.seed_attempt(f'aauto-above-{i}', f'aauto-above-task-{i}', pool)

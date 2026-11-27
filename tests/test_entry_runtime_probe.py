@@ -273,7 +273,7 @@ class StageSelectionIntegrationTests(unittest.TestCase):
     完全相同的探针硬门语义（missing 挡 / unknown 与崩溃 fail-open / fixed 诚实拒绝）。"""
 
     OC_DS = dp.OPENCODE_DEEPSEEK_POOL_KEY
-    OC_GLM = dp.OPENCODE_GLM_POOL_KEY
+    CB_GLM = dp.CODEBUDDY_GLM_POOL_KEY
 
     def setUp(self):
         self._tmp = tempfile.TemporaryDirectory(prefix='bw-erp-ss-')
@@ -290,7 +290,7 @@ class StageSelectionIntegrationTests(unittest.TestCase):
     def _plan(self, mode='auto', fixed=None):
         auth = {'selection_mode': mode, 'quote': '探针硬门回归',
                 'authorization_scope': {'task_id': 'T-ERP', 'stage': 's1'},
-                'allowed_candidates': [self.OC_DS, self.OC_GLM]}
+                'allowed_candidates': [self.OC_DS, self.CB_GLM]}
         if mode == 'fixed':
             auth['user_direct_selection'] = True
             auth['runtime'], auth['model'] = fixed
@@ -304,19 +304,19 @@ class StageSelectionIntegrationTests(unittest.TestCase):
 
     def test_receipt_carries_visibility_fields(self):
         with self._probe({self.OC_DS: erp.PRESENT,
-                          self.OC_GLM: erp.PRESENT}):
+                          self.CB_GLM: erp.PRESENT}):
             receipt = self._plan()
         self.assertIsNone(receipt.get('refused'))
         self.assertEqual(set(receipt['entry_runtime_status']),
-                         {self.OC_DS, self.OC_GLM})
+                         {self.OC_DS, self.CB_GLM})
         self.assertEqual(receipt['entry_runtime_missing'], [])
 
     def test_gate_excludes_definitive_missing(self):
         with self._probe({self.OC_DS: erp.MISSING,
-                          self.OC_GLM: erp.PRESENT}):
+                          self.CB_GLM: erp.PRESENT}):
             receipt = self._plan()
         self.assertIsNone(receipt.get('refused'))
-        self.assertEqual(receipt['selected']['pool_key'], self.OC_GLM)
+        self.assertEqual(receipt['selected']['pool_key'], self.CB_GLM)
         excluded = {row['pool_key']: row['reason']
                     for row in receipt['excluded_candidates_with_reason']}
         self.assertEqual(excluded.get(self.OC_DS), 'entry_runtime_missing')
@@ -325,9 +325,9 @@ class StageSelectionIntegrationTests(unittest.TestCase):
     def test_unknown_and_probe_crash_never_gate(self):
         outcomes = []
         for stub in ({self.OC_DS: erp.PRESENT,
-                      self.OC_GLM: erp.PRESENT},
+                      self.CB_GLM: erp.PRESENT},
                      {self.OC_DS: erp.UNKNOWN,
-                      self.OC_GLM: erp.UNKNOWN},
+                      self.CB_GLM: erp.UNKNOWN},
                      RuntimeError('probe crashed')):
             patcher = (unittest.mock.patch.object(erp, 'probe_entry_runtimes',
                                                   side_effect=stub)
@@ -338,7 +338,7 @@ class StageSelectionIntegrationTests(unittest.TestCase):
             self.assertEqual(receipt['selected']['pool_key'], self.OC_DS)
             outcomes.append(receipt['entry_runtime_status'])
         self.assertEqual(outcomes[1], {self.OC_DS: erp.UNKNOWN,
-                                       self.OC_GLM: erp.UNKNOWN})
+                                       self.CB_GLM: erp.UNKNOWN})
         self.assertEqual(outcomes[2], outcomes[1])  # 崩溃降级 unknown，fail-open
 
     def test_fixed_to_dead_runtime_refuses_honestly(self):
@@ -346,7 +346,7 @@ class StageSelectionIntegrationTests(unittest.TestCase):
         # 现在会在探针之前被 mode_excluded 拒绝）改为弱档可新派的 opencode 免费池，
         # 保持「fixed 点名死通道 → 探针 missing 诚实拒绝」本意。
         with self._probe({self.OC_DS: erp.MISSING,
-                          self.OC_GLM: erp.PRESENT}):
+                          self.CB_GLM: erp.PRESENT}):
             receipt = self._plan(mode='fixed',
                                  fixed=('opencode', dp.OPENCODE_DEEPSEEK_MODEL))
         self.assertEqual(receipt['refused'], 'fixed_candidate_unavailable')
@@ -354,13 +354,13 @@ class StageSelectionIntegrationTests(unittest.TestCase):
 
     def test_all_missing_refuses_no_eligible(self):
         with self._probe({self.OC_DS: erp.MISSING,
-                          self.OC_GLM: erp.MISSING}):
+                          self.CB_GLM: erp.MISSING}):
             receipt = self._plan()
         self.assertEqual(receipt['refused'], 'no_eligible_candidate')
         excluded = {row['pool_key']: row['reason']
                     for row in receipt['excluded_candidates_with_reason']}
         self.assertEqual(excluded, {self.OC_DS: 'entry_runtime_missing',
-                                    self.OC_GLM: 'entry_runtime_missing'})
+                                    self.CB_GLM: 'entry_runtime_missing'})
 
     def test_early_refusal_receipt_lacks_visibility_fields(self):
         receipt = ss.plan_stage_selection(None, store_path=self.store, task_id='T-ERP',

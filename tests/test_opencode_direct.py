@@ -184,8 +184,7 @@ class PureFunctionTests(unittest.TestCase):
         argv = od.build_argv('C:/tools/opencode.exe', DEEPSEEK)
         self.assertEqual(argv, ['C:/tools/opencode.exe', 'run', '--pure', '--model',
                                 f'opencode/{DEEPSEEK}', '--format', 'json'])
-        self.assertEqual(od.build_argv('x', GLM)[4], f'opencode/{GLM}')
-        for bad in (dp.CODEBUDDY_MODEL, dp.CODEBUDDY_GLM_MODEL,
+        for bad in (GLM, dp.CODEBUDDY_MODEL, dp.CODEBUDDY_GLM_MODEL,
                     'deepseek-v4.1-flash-free ', 'opencode/go', 'gpt-5', ''):
             with self.assertRaises(ValueError, msg=repr(bad)):
                 od.build_argv('x', bad)
@@ -626,27 +625,13 @@ class LifecycleTests(unittest.TestCase):
                          hashlib.sha256(sent).hexdigest())
         self.assertEqual(request['timeout_seconds'], od.DEFAULT_TIMEOUT_SECONDS)
 
-    def test_glm_model_claims_only_its_own_pool(self):
-        # BW-WEAK-TIER-ENFORCE-20261122: 弱档纯优先级队列——层1 内 deepseek-free 按
-        # pool_key 排序在 glm-free 之前，deepseek 有空位时 glm 请求只会被 routing_required
-        # 到队首；先以独立 task/workspace 真实占住 deepseek 槽，glm-free 才是队首可被
-        # claim。用例结束真实终态释放占位，两池计数归零（断言原样保留、不放宽）。
-        holder = dp.reserve(self.store, task_id='hold-ds', runtime='opencode',
-                            model=DEEPSEEK, workspace=str(self.base / 'ws-hold-ds'),
-                            prompt_sha256=self.sha(), stage=STAGE,
-                            executor='opencode', now=NOW, _preclaim=False)
-        self.assertTrue(holder.get('allowed'), holder)
-        tok = self.claim(model=GLM)
-        fake = FakePopen(success_stream(workspace=str(self.ws)), sink=self.sink)
-        out = self.run_entry(fake, model=GLM, claim_token=tok)
-        self.assertEqual(out['pool_key'], GPOOL)
-        self.assertTrue(out['passed'], out)
-        self.assertIn(f'opencode/{GLM}', fake.argv)
-        rel = dp.finish(self.store, holder['token'], terminal='cancelled', now=NOW,
-                        wrapper_pid=None)
-        self.assertTrue(rel.get('released') or rel.get('settled'), rel)
-        self.assertEqual(self.active(GPOOL), 0)
-        self.assertEqual(self.active(DPOOL), 0)
+    def test_retired_glm_is_refused_before_dispatch(self):
+        fake = FakePopen(b'', sink=self.sink)
+        out = self.run_entry(fake, model=GLM, claim_token=None)
+        self.assertEqual(out['reason'], 'cli_model_rejected')
+        self.assertFalse(out['sent'])
+        self.assertEqual(self.sink, [])
+        self.assertFalse((self.base / 'out').exists())
 
     def test_auto_claim_without_token_scoped_to_opencode_no_window_gate(self):
         # 北京时间白天（Max 时段门关闭处）：executor='opencode' 的自动认领照常落到
@@ -660,7 +645,7 @@ class LifecycleTests(unittest.TestCase):
 
     # ---- 前置拒绝：零副作用、零 Popen ----
     def test_non_free_model_refused_before_any_side_effect(self):
-        for bad in (dp.CODEBUDDY_MODEL, 'gpt-5', 'opencode/go'):
+        for bad in (GLM, dp.CODEBUDDY_MODEL, 'gpt-5', 'opencode/go'):
             with self.subTest(bad=bad):
                 fake = FakePopen(b'', sink=self.sink)
                 out = self.run_entry(fake, model=bad, claim_token=None)
@@ -720,20 +705,19 @@ class LifecycleTests(unittest.TestCase):
 
     def test_pool_full_refused_zero_popen(self):
         # 两个 OpenCode 槽各被别的 task 真实占满（不同 workspace）→ 本 task 拒绝、0 Popen。
-        ws2, ws3 = self.base / 'ws2', self.base / 'ws3'
-        ws2.mkdir(); ws3.mkdir()
-        for t, m, w in (('o1', DEEPSEEK, ws2), ('o2', GLM, ws3)):
-            r = dp.reserve(self.store, task_id=t, runtime='opencode', model=m,
-                           workspace=str(w), prompt_sha256='p', stage='s',
-                           executor='opencode', now=NOW, _preclaim=False)
-            self.assertTrue(r.get('allowed'), r)
+        other_workspace = self.base / 'ws2'
+        other_workspace.mkdir()
+        r = dp.reserve(self.store, task_id='o1', runtime='opencode', model=DEEPSEEK,
+                       workspace=str(other_workspace), prompt_sha256='p', stage='s',
+                       executor='opencode', now=NOW, _preclaim=False)
+        self.assertTrue(r['allowed'], r)
         fake = FakePopen(b'', sink=self.sink)
         out = self.run_entry(fake, claim_token=None)
         self.assertTrue(out['dispatch_failed'])
         self.assertFalse(out.get('sent'))
         self.assertEqual(self.sink, [])
         self.assertEqual(self.active(DPOOL), 1)
-        self.assertEqual(self.active(GPOOL), 1)
+        self.assertEqual(self.active(GPOOL), 0)
 
     def test_same_workspace_single_writer_guard(self):
         # 别的 task 已在本 workspace 在途 → 即使我有合法 claim token，也在 Popen 前拒绝。

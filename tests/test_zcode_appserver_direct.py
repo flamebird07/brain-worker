@@ -249,7 +249,6 @@ class AppServerTransportTests(unittest.TestCase):
         # CodeBuddy GLM/Claude×2 共 5 槽），zcode:GLM-5.3-Flash 才成为队首可被本传输
         # 真实 claim；队列判断只看层序与空位。
         combos = [('opencode', dp.OPENCODE_DEEPSEEK_MODEL),
-                  ('opencode', dp.OPENCODE_GLM_MODEL),
                   ('codebuddy', dp.CODEBUDDY_GLM_MODEL),
                   ('claude', 'deepseek-flash'),
                   ('claude', 'deepseek-flash')]

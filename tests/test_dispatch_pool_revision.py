@@ -125,7 +125,7 @@ class TempStoreMixin:
                 (token, task_id, runtime, model, pool, state, child_pid, child_created,
                  wrapper_pid, wrapper_created))
 
-    def fill_domestic(self, prefix='seed', n=14):
+    def fill_domestic(self, prefix='seed', n=13):
         # BW-ZCODE-RESTORE-1-20261022 + BW-WEAK-RESTRUCTURE-20261116：真实现役主力共 14
         # 槽：两内置 Max 各 1 + CN 自定义 Max×2 + ZCode×1（容量 1）+ claude:deepseek-flash×2
         # + 两地区 Flash 各 2 + 两个 OpenCode 免费模型各 1 独立槽 + zcode:GLM-5.3-Flash×1
@@ -135,7 +135,7 @@ class TempStoreMixin:
             + ['qodercn:Qwen4-Max-Preview'] + ['qodercn:Qwen-3.8-Max'] * 2 \
             + ['claude:deepseek-flash'] * 2 \
             + ['qoder:Qwen3.8-Flash'] * 2 + ['qodercn:Qwen3.8-Flash'] * 2 \
-            + [dp.OPENCODE_DEEPSEEK_POOL_KEY, dp.OPENCODE_GLM_POOL_KEY] \
+            + [dp.OPENCODE_DEEPSEEK_POOL_KEY] \
             + [dp.ZCODE_POOL_KEY, 'zcode:GLM-5.3-Flash']
         for i in range(n):
             self.seed_attempt(f'{prefix}-{i}', f'{prefix}-task-{i}', pools[i])
@@ -203,7 +203,6 @@ class TestUnifiedPolicy(TempStoreMixin, unittest.TestCase):
                                               executor=ex, now=T0, _preclaim=False)
                     self.assertTrue(out['allowed'], out)
         fill_weak = [('t8', 'opencode', dp.OPENCODE_DEEPSEEK_MODEL, 'opencode'),
-                     ('t9oc', 'opencode', dp.OPENCODE_GLM_MODEL, 'opencode'),
                      ('t1zf', 'zcode', 'GLM-5.3-Flash', 'zcode')]
         for tid, rt, md, ex in fill_weak:
             out = dp.select_and_claim(self.store, task_id=tid, runtime=rt, model=md,
@@ -220,7 +219,7 @@ class TestUnifiedPolicy(TempStoreMixin, unittest.TestCase):
                               task_id='t-strong-sonus')
         self.assertEqual(dp.status(self.store, now=T0)['domestic']['active'],
                          dp.DOMESTIC_TOTAL_CAPACITY)
-        self.assertEqual(dp.status(self.store, now=T0)['domestic']['active'], 17)
+        self.assertEqual(dp.status(self.store, now=T0)['domestic']['active'], 16)
         with dispatch_mode('medium'):
             # 全部槽已满 → 再一个 AUTO 现役国内组合 capacity_full 且 domestic_full
             # （物理总守卫 17 先于一切候选选择）；点名 ZCode（容量 1 已占满）同样
@@ -741,8 +740,7 @@ class TestOverflowNotSubstitutedZ2(TempStoreMixin, unittest.TestCase):
                                  + ['qodercn:Qwen-3.8-Max'] * 2
                                  + [dp.ZCODE_POOL_KEY]
                                  + ['claude:deepseek-flash'] * 2
-                                 + [dp.OPENCODE_DEEPSEEK_POOL_KEY,
-                                    dp.OPENCODE_GLM_POOL_KEY]
+                                 + [dp.OPENCODE_DEEPSEEK_POOL_KEY]
                                  + ['zcode:GLM-5.3-Flash']):
             self.seed_attempt(f'm-{i}', f'm-task-{i}', pool)
 

@@ -199,8 +199,8 @@ class AuthorizationTests(_Base):
                 self.assertEqual(excluded[pk]['reason'], 'mode_excluded', pk)
             # BW-WEAK-RESTRUCTURE-20261116: 选中层=1 已是弱档最高层 → 无更高层排除。
             self.assertEqual(r['higher_priority_exclusions'], [], r)
-            self.assertEqual(r['next_candidate']['priority'], 1)
-            self.assertIn(r['next_candidate']['pool_key'], dp.OPENCODE_POOL_KEYS)
+            self.assertEqual(r['next_candidate']['priority'], 2)
+            self.assertEqual(r['next_candidate']['pool_key'], dp.CODEBUDDY_GLM_POOL_KEY)
         with dispatch_mode('strong'):
             r = self.plan(self.auth('auto', 'T', 's2', allowed), now=T_DAY)
             self.assertEqual(r['dispatch_mode'], 'strong', r)
@@ -277,6 +277,18 @@ class AuthorizationTests(_Base):
         self.assertIn('Bash(python -m unittest tests.test_main)',
                       plan['allowed_tools'])
 
+    def test_existing_allowlist_filters_retired_opencode_glm(self):
+        self.build_store()
+        allowed = [dp.OPENCODE_GLM_POOL_KEY, dp.OPENCODE_DEEPSEEK_POOL_KEY]
+        r = self.plan(self.auth('auto', 'T', 's2', allowed), now=T_DAY)
+        self.assertEqual(r['allowed_candidates'], allowed)
+        self.assertEqual(r['candidate_filters'][dp.OPENCODE_GLM_POOL_KEY], 'retired_pool')
+        self.assertEqual(r['selected']['pool_key'], dp.OPENCODE_DEEPSEEK_POOL_KEY)
+
+        r = self.plan(self.auth('auto', 'T', 's2', allowed[:1]), now=T_DAY)
+        self.assertIsNone(r['selected'])
+        self.assertEqual(r['refused'], 'no_eligible_candidate')
+
     def test_recent_limits_and_day_windows_select_opencode_before_flash(self):
         self.build_store()
         with closing(dp.connect(self.store)) as conn:
@@ -302,7 +314,7 @@ class AuthorizationTests(_Base):
         self.assertEqual(r['candidate_filters'][dp.ZCODE_POOL_KEY], 'mode_excluded', r)
         self.assertEqual(r['candidate_filters'][dp.CODEBUDDY_POOL_KEY], 'mode_excluded')
         self.assertEqual(r['candidate_filters'][dp.ZCODE_FLASH_POOL_KEY], 'eligible', r)
-        self.assertEqual(r['selected']['pool_key'], dp.OPENCODE_GLM_POOL_KEY, r)
+        self.assertEqual(r['selected']['pool_key'], dp.CODEBUDDY_GLM_POOL_KEY, r)
         self.assertNotIn(r['selected']['pool_key'], dp.OVERFLOW_KEYS)
 
     def test_fixed_cn_flash_kept_even_with_free_main(self):
@@ -402,7 +414,6 @@ class AuthorizationTests(_Base):
         # 两 OpenCode 独立槽都真实占满后，executor='opencode' 规划如实拒绝，绝不借
         # 别的执行器/别的模型（包括同区 Flash）顶替。
         self.reserve('o1', 'opencode', dp.OPENCODE_DEEPSEEK_MODEL, executor='opencode')
-        self.reserve('o2', 'opencode', dp.OPENCODE_GLM_MODEL, executor='opencode')
         auth = self.auth('executor', 'T2', 's2', ALL_MAINS + ALL_FLASH,
                          executor='opencode')
         r = self.plan(auth, task='T2')
@@ -632,7 +643,7 @@ class ReorderTierTests(_Base):
         # （priority_for_pool 返回 None）。medium/strong 层序另测。
         self.assertEqual(dp.POOL_PRIORITY, dict(dm.WEAK_PRIORITY))
         self.assertEqual(dp.POOL_PRIORITY, {
-            dp.OPENCODE_DEEPSEEK_POOL_KEY: 1, dp.OPENCODE_GLM_POOL_KEY: 1,
+            dp.OPENCODE_DEEPSEEK_POOL_KEY: 1,
             dp.CODEBUDDY_GLM_POOL_KEY: 2,
             dp.CLAUDE_POOL_KEY: 3,
             dp.ZCODE_FLASH_POOL_KEY: 4})
@@ -718,7 +729,7 @@ class WindowAndLimitTests(_Base):
         self.reserve('o1', 'opencode', dp.OPENCODE_DEEPSEEK_MODEL, executor='opencode')
         r2 = self.plan(self.auth('auto', 'T2', 's2', LEGACY_MAINS + ALL_FLASH),
                        task='T2', now=T_DAY)
-        self.assertEqual(r2['selected']['pool_key'], dp.OPENCODE_GLM_POOL_KEY, r2)
+        self.assertEqual(r2['selected']['pool_key'], dp.CLAUDE_POOL_KEY, r2)
         # BW-WEAK-TIER-ENFORCE-20261122: weak 无时段门——claude 合格。
         self.assertEqual(r2['candidate_filters'][dp.CLAUDE_POOL_KEY], 'eligible', r2)
 
@@ -791,7 +802,6 @@ class WindowAndLimitTests(_Base):
         # （层1 两 OpenCode → 层2 CodeBuddy GLM → 层3 claude×2）占位，跳队请求会被
         # routing_required 到队首而非 claim。
         self.reserve('o1', 'opencode', dp.OPENCODE_DEEPSEEK_MODEL, executor='opencode')
-        self.reserve('o2', 'opencode', dp.OPENCODE_GLM_MODEL, executor='opencode')
         self.reserve('g1', 'codebuddy', 'glm-5.3-flash', executor='codebuddy')
         self.reserve('a', 'claude', 'deepseek-flash', executor='claude')
         self.reserve('b', 'claude', 'deepseek-flash', executor='claude')
@@ -1228,8 +1238,6 @@ class PermissionGrantsTests(_Base):
         # 精确需求下无逐文件能力的现役候选如实 permission_incompatible。
         self.assertEqual(r['candidate_filters'][dp.OPENCODE_DEEPSEEK_POOL_KEY],
                          'permission_incompatible')
-        self.assertEqual(r['candidate_filters'][dp.OPENCODE_GLM_POOL_KEY],
-                         'permission_incompatible')
         self.assertEqual(r['candidate_filters'][dp.ZCODE_FLASH_POOL_KEY],
                          'permission_incompatible')
         # BW-WEAK-TIER-ENFORCE-20261122: weak 无时段门——claude 合格（队列接管排序）。
@@ -1247,7 +1255,7 @@ class PermissionGrantsTests(_Base):
         self.build_store()
         self.reserve('o1', 'opencode', dp.OPENCODE_DEEPSEEK_MODEL, executor='opencode')
         r = self.plan(self.auth('auto', 'T', 's2', LEGACY_MAINS + ALL_FLASH), now=T_DAY)
-        self.assertEqual(r['selected']['pool_key'], dp.OPENCODE_GLM_POOL_KEY, r)
+        self.assertEqual(r['selected']['pool_key'], dp.CLAUDE_POOL_KEY, r)
         self.assertEqual(r['candidate_filters'][dp.ZCODE_POOL_KEY], 'mode_excluded', r)
         self.assertEqual(r['candidate_filters'][dp.ZCODE_FLASH_POOL_KEY], 'eligible', r)
         self.assertEqual(r['permission_requirements'],
@@ -1568,7 +1576,7 @@ class TaskScopeTests(_Base):
         r = self.plan(self.auth('auto', 'T', 's2', LEGACY_MAINS + ALL_FLASH), now=T_DAY,
                       task_scope=self.SCOPE)
         self.assertEqual(r['refused'], None, r)
-        self.assertEqual(r['selected']['pool_key'], dp.OPENCODE_GLM_POOL_KEY, r)
+        self.assertEqual(r['selected']['pool_key'], dp.CLAUDE_POOL_KEY, r)
         self.assertEqual(r['candidate_filters'][dp.ZCODE_POOL_KEY], 'mode_excluded')
         self.assertEqual(r['candidate_filters'][dp.ZCODE_FLASH_POOL_KEY], 'eligible')
         self.assertEqual(r['permission_requirements'],
@@ -1645,7 +1653,7 @@ class TaskScopeTests(_Base):
         details = r['permission_incompatibility_details']
         self.assertNotIn(dp.ZCODE_FLASH_POOL_KEY, details, details)
         self.assertIn(dp.OPENCODE_DEEPSEEK_POOL_KEY, details, details)
-        self.assertIn(dp.OPENCODE_GLM_POOL_KEY, details, details)
+        self.assertNotIn(dp.OPENCODE_GLM_POOL_KEY, details, details)
 
     def test_scope_never_bypasses_existing_guards(self):
         """fixed 不换执行器、缺授权、availability 阻断、在途、工作区冲突都不被

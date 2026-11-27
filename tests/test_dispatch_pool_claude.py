@@ -77,7 +77,6 @@ class _ClaudeBase(unittest.TestCase):
     # > 层3 claude(2) > 层4 zcode:GLM-5.3-Flash(1)，合计 6 槽。
     WEAK_QUEUE_COMBOS = (
         ('opencode', dp.OPENCODE_DEEPSEEK_MODEL),
-        ('opencode', dp.OPENCODE_GLM_MODEL),
         ('codebuddy', dp.CODEBUDDY_GLM_MODEL),
         ('claude', 'deepseek-flash'),
         ('claude', 'deepseek-flash'),
@@ -130,8 +129,6 @@ class _ClaudeBase(unittest.TestCase):
         队列 claim，改按真实在途形态直插占位，使 AUTO 在 claude 仍空闲时队首=claude。"""
         self.assertTrue(self._reserve('oc0', 'opencode', dp.OPENCODE_DEEPSEEK_MODEL,
                                       'opencode', now).get('allowed'))
-        self.assertTrue(self._reserve('oc1', 'opencode', dp.OPENCODE_GLM_MODEL,
-                                      'opencode', now).get('allowed'))
         self.assertTrue(self._reserve('cbg', 'codebuddy', dp.CODEBUDDY_GLM_MODEL,
                                       'codebuddy', now).get('allowed'))
         # BW-WEAK-TIER-ENFORCE-20261122：层4 槽按真实在途形态直插（队列序在 claude 之后）。
@@ -164,7 +161,7 @@ class CapacityAndRouting(_ClaudeBase):
         # 两 OpenCode 免费模型各独立 1 槽、ZCode GLM-5.3 与弱档专用 GLM-5.3-Flash 各
         # 严格 1 槽、strong 专属 Sonus 1 槽）+ 4 Flash = 17；weak 可新派收窄为 6
         # （Sonus/Max/zcode:GLM-5.3/CB deepseek/Flash 弱档均不可新派）。
-        self.assertEqual(dp.DOMESTIC_TOTAL_CAPACITY, 17)
+        self.assertEqual(dp.DOMESTIC_TOTAL_CAPACITY, 16)
         self.assertEqual(dp.DOMESTIC_TOTAL_CAPACITY,
                          sum(dp.MAIN_FORCE_CAPACITY.values())
                          + sum(dp.OVERFLOW_CAPACITY.values()))
@@ -374,7 +371,7 @@ class CapacityAndRouting(_ClaudeBase):
                           dp.SONUS_POOL_KEY, 'running',
                           dp._iso(OFFPEAK_NIGHT)))
         st = dp.status(self.store, now=OFFPEAK_NIGHT)
-        self.assertEqual(st['domestic']['active'], 17, st['domestic'])
+        self.assertEqual(st['domestic']['active'], 16, st['domestic'])
         self.assertEqual(st['pools'][CLAUDE]['active'], 1, st['pools'][CLAUDE])
         # BW-WEAK-TIER-ENFORCE-20261122：弱档纯优先级队列不查物理总守卫（超额迁移在途
         # 让队列仍有空位时物理总已达 17——疑似引擎回归、已单独报告）；「总守卫绝不派

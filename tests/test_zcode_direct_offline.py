@@ -585,7 +585,6 @@ def _occupy_higher_weak_slots(store):
     # 派发；与 test_zcode_appserver_direct 的 _occupy_higher_weak_slots 同一模式（真实
     # reserve 占位、独立任务/工作区，绝不伪造在途形态）。
     combos = [('opencode', dp.OPENCODE_DEEPSEEK_MODEL),
-              ('opencode', dp.OPENCODE_GLM_MODEL),
               ('codebuddy', dp.CODEBUDDY_GLM_MODEL),
               ('claude', 'deepseek-flash'),
               ('claude', 'deepseek-flash')]

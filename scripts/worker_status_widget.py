@@ -11,12 +11,9 @@ BW-WORKER-WIDGET-20261018-S2 边界（必须遵守）：
   子 PID 死亡、创建身份不明或 PID 复用**都不释放占位**；但展示层主行状态绝不只信
   DB `running`——没有匹配活 PID 的 running 在主行显著标「待核」（待核优先，不被同池
   另一个真 running 掩盖），只有创建身份匹配的活 PID 才显示「运行中」。
-- 两个 CodeBuddy 模型（deepseek-v4.1-flash / glm-5.3-flash）与两个 OpenCode 免费模型
-  （deepseek-v4.1-flash-free / glm-5.3-flash-free）**各自独立 1 槽、互不占位互斥**，
-  各行独立计数；物理总 17（`dp.DOMESTIC_TOTAL_CAPACITY`；BW-WEAK-RESTRUCTURE-20261116
-  起 ZCode 弱档专用 GLM-5.3-Flash 另有独立 1 槽，16→17）。
-- Luna 不显示为生产行；真正退役池（qodercn:DeepSeek-Flash）的旧在途仅通过汇总字段
-  `retired_active` 保留审计口径。
+- 两个 CodeBuddy 模型和 OpenCode DeepSeek 各占独立 1 槽，物理总容量读取
+  `dp.DOMESTIC_TOTAL_CAPACITY`。退役池（含 OpenCode GLM）的在途只在
+  `retired_active` 中汇总；Luna 不显示为生产行。
 - 界面不显示 token、argv、prompt、原始错误正文或任何秘密；`--once` 输出的 JSON
   同样只含脱敏后的状态字段。
 - 空闲自动关机（BW-WIDGET-IDLE-20261018-S2）：默认不勾选、不持久化；勾选后连续
@@ -67,11 +64,8 @@ import stage_selection as ss  # noqa: E402
 import dispatch_mode as dmode  # noqa: E402  手动三档（strong/medium/weak）共享策略
 
 # ------------------------------------------------------------------ 展示常量
-# 13 个已知池行：weak/medium/strong 各按**当前档**动态排序（read_snapshot 末尾按
-# dispatch_mode.priority_map_for_mode 重排），本表只定名称/注释与 stable-tie 基准序
-# （BW-WEAK-RESTRUCTURE-20261116 弱档层序：两 OpenCode(1) > CodeBuddy GLM(2) >
-# Claude(3，倒数第二) > ZCode GLM-5.3-Flash(4，最后)；全部 Qoder 池与 codebuddy
-# deepseek 已移出弱档，空闲隐藏、遗留在途标「本档不参与」；Sonus 不参与 weak）。
+# 当前档行序读取 dispatch_mode.priority_map_for_mode；本表只定名称、注释和同层基准序。
+# 弱档空闲行：OpenCode DeepSeek、CodeBuddy GLM、Claude、ZCode GLM-5.3-Flash。
 # BW-QWEN4-SONUS-REMOVE-20261115（当前权威）：Sonus 从所有档位去除新派——三档空闲一律
 # 整行隐藏（绝不显示可派行）；真实在途（reserved/running/unknown 遗留）整行保留并标
 # 「不接新派（用户指令）」直到真实终态；遗留 reserved 不放行启动（安全释放 start_failed）。
@@ -88,8 +82,6 @@ ROW_DEFS = (
     (dp.QMAX_POOL_KEY, 'Qoder 国际／Qwen4-Max-Preview', '主力 Max · 国际内置 · 全天'),
     (dp.CODEBUDDY_POOL_KEY, 'CodeBuddy 国际／Deepseek-V4.1-Flash', '主力 · 无时段门'),
     (dp.OPENCODE_DEEPSEEK_POOL_KEY, 'OpenCode／deepseek-v4.1-flash-free',
-     '主力 · 独立 1 槽 · 无时段门'),
-    (dp.OPENCODE_GLM_POOL_KEY, 'OpenCode／glm-5.3-flash-free',
      '主力 · 独立 1 槽 · 无时段门'),
     (dp.CODEBUDDY_GLM_POOL_KEY, 'CodeBuddy 国际／GLM-5.3-Flash',
      '独立 1 槽 · 与 DeepSeek 额度独立 · 无证据前置门'),

@@ -1,7 +1,9 @@
 # 桌面状态浮窗（只读牛马看板）
 
+**2026-11-27 用户指令**：`opencode:glm-5.3-flash-free` 已退役。正式入口和所有档位仅保留 OpenCode 的 `deepseek-v4.1-flash-free`。退役池不显示在浮窗，历史在途继续计入总占用并按原流程结算。弱档为 4 池、5 槽，国内总容量为 16。此处覆盖下方历史口径。
+
 **BW-WEAK-RESTRUCTURE-20261116 起弱档可见行收窄为 5 池**（两 OpenCode 免费模型 / CodeBuddy GLM / Claude / ZCode GLM-5.3-Flash）：全部 Qoder 池与 codebuddy deepseek 空闲时整行隐藏，有真实在途遗留时整行保留标「本档不参与」；`ZCode／GLM-5.3-Flash` 为新增独立行；总占用显示 x/17。BW-WEAK-TIER-ENFORCE-20261122 起弱档为纯优先级队列（无时段门）：行序即队列序，空闲显示按层序。下文历史段落中「weak 显示全部 N 池」「两 Flash 兜底」等表述凡与本段冲突者以本段为准。
-**弱档顺序**：ZCode 排在两路 Qoder Flash 之后，是弱档最后一个自动派发候选。浮窗使用同一优先级。
+**弱档顺序**：OpenCode DeepSeek → CodeBuddy GLM → Claude → ZCode GLM-5.3-Flash。浮窗按同一顺序显示。
 
 macOS 版沿用同一共享派发数据库。标题栏省去右上角关闭叉，可用 ⌘Q 退出。
 不显示空闲自动关机及计时。强、中、弱按钮使用浅色文字和深色背景，

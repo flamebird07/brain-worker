@@ -1,8 +1,6 @@
 """opencode_direct — OpenCode CLI 正式直连入口（BW-OPENCODE-20261019-S1）。
 
-只服务两个**精确免费模型**：
-  - opencode/deepseek-v4.1-flash-free
-  - opencode/glm-5.3-flash-free
+只服务 **opencode/deepseek-v4.1-flash-free**。
 其它 model 在任何副作用之前拒绝；绝不自动付费回退、绝不跨模型重派。
 
 设计边界（严格对齐本轮用户任务，不新增服务/库/表/后台重试/余额查询）：
