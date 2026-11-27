@@ -318,7 +318,11 @@ def build_subprocess_env(cfg: dict, token: str, environ=None) -> dict:
     child = dict(base)
     for var in _CLEARED_CHILD_ENV:
         child.pop(var, None)
-    extra = cfg.get('env') or {}
+    extra = cfg.get('env')
+    if extra is None:
+        extra = {}
+    if not isinstance(extra, dict):
+        raise ValueError('cfg env must be a mapping')
     for k, v in extra.items():
         if str(k) in _CLEARED_CHILD_ENV or str(k) == 'CLAUDE_CODE_SIMPLE':
             raise ValueError(f'cfg env must not reintroduce cleared/forbidden var {k!r}')
@@ -1735,9 +1739,13 @@ def run(cfg: dict, *, workspace: str, prompt_file: Path, out_dir: Path, stage: s
                 'reason': 'credential_unavailable', 'error_class': type(exc).__name__,
                 'reasons': [f'credential resolution failed before any claim ({type(exc).__name__})']}
 
-    child_env = build_subprocess_env(effective_cfg, token, environ)
-    child_env['PWD'] = str(Path(workspace).resolve())
-    child_env.pop('OLDPWD', None)
+    try:
+        child_env = build_subprocess_env(effective_cfg, token, environ)
+        child_env['PWD'] = str(Path(workspace).resolve())
+        child_env.pop('OLDPWD', None)
+    except (OSError, ValueError, RuntimeError) as exc:
+        return {'dispatch_failed': True, 'sent': False, 'dispatched': False,
+                'reason': 'entry_environment_invalid', 'error_class': type(exc).__name__}
     secret = child_env.get('ANTHROPIC_API_KEY', '')
 
     # (3b) 连接类故障有界重试参数（BW-CLAUDE-RETRY-FIX）：默认 5s/15s 至多 2 次额外

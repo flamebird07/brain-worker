@@ -552,6 +552,16 @@ class LifecycleTests(unittest.TestCase):
                           is_engineering_task=is_eng, bind_child_pid=bind_child_pid,
                           required_tools=['Read'] if is_eng else None)
 
+    def test_rejected_environment_stops_before_claim(self):
+        cfg = dict(self.cfg(), env={'ANTHROPIC_AUTH_TOKEN': SECRET})
+        with mock.patch.object(self, 'cfg', return_value=cfg):
+            out = self.run_with(FakePopen([], self.sink))
+        self.assertEqual(out['reason'], 'entry_environment_invalid')
+        self.assertFalse(out['dispatched'])
+        self.assertNotIn(SECRET, json.dumps(out))
+        self.assertEqual(self.sink, [])
+        self.assertFalse(self.store.exists())
+
     def success_stream(self):
         body = _report_body('BW-CLAUDE-DEEPSEEK-S3', str(self.ws))
         return _jsonl([
