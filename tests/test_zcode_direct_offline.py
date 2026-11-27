@@ -125,6 +125,9 @@ def main() -> int:
                       write_file=None, write_text=None):
         counter['n'] += 1
         env = os.environ.copy()
+        mode_file = RUN_DIR / 'dispatch-mode.json'
+        mode_file.write_text(json.dumps({'mode': 'strong'}), encoding='utf-8')
+        env['BRAIN_WORKER_DISPATCH_MODE_FILE'] = str(mode_file)
         # 额度门禁隔离：显式临时 store/routes，绝不写真实 ~/.brain-worker 状态，
         # 也不默认禁用门禁；未匹配路由时进保守共享组，门禁路径仍被真实执行。
         env['BRAIN_WORKER_QUOTA_STORE'] = str(RUN_DIR / 'quota-store' / 'state.sqlite3')
